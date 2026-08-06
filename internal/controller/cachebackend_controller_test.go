@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
@@ -49,7 +50,7 @@ func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendR
 		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
 		WithObjects(objs...).
 		Build()
-	return &CacheBackendReconciler{
+	r := &CacheBackendReconciler{
 		Client: c,
 		Scheme: scheme,
 		Log:    logr.Discard(),
@@ -58,6 +59,22 @@ func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendR
 		// actually exercise the clear path rather than skipping
 		// the check on a nil pointer.
 		serverInstanceCascade: newServerInstanceCascade(),
+	}
+	configureTestRegistries(r)
+	return r
+}
+
+func configureTestRegistries(r *CacheBackendReconciler) {
+	registries := builtinadapters.New()
+	r.Registry = registries.Runtime
+	r.BackendRegistry = registries.Storage
+}
+
+func TestDispatchRequiresAdapterRegistries(t *testing.T) {
+	r := &CacheBackendReconciler{}
+	_, err := r.dispatch(context.Background(), logr.Discard(), lmcacheBackend("cache", "ns1"))
+	if err == nil || !strings.Contains(err.Error(), "adapter registries are not configured") {
+		t.Fatalf("dispatch error = %v, want missing-registry error", err)
 	}
 }
 
@@ -1891,12 +1908,14 @@ func newReconcilerWithInterceptor(scheme *runtime.Scheme, funcs interceptor.Func
 		WithObjects(objs...).
 		WithInterceptorFuncs(funcs).
 		Build()
-	return &CacheBackendReconciler{
+	r := &CacheBackendReconciler{
 		Client:                c,
 		Scheme:                scheme,
 		Log:                   logr.Discard(),
 		serverInstanceCascade: newServerInstanceCascade(),
 	}
+	configureTestRegistries(r)
+	return r
 }
 
 // TestReconcileLMCacheConflictThenConverge guards against a stuck-Degraded

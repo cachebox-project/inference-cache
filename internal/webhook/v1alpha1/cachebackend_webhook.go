@@ -23,7 +23,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
@@ -111,23 +110,9 @@ type CacheBackendValidator struct {
 	// [DefaultValidationRules] is used.
 	Rules []ValidationRule
 
-	// Registry resolves the runtime adapter for a (runtime, backend) pair
-	// at admission time. A nil Registry falls back to
-	// [defaultShippingRegistry], which uses the same complete built-in
-	// composition as cmd/controller. The
-	// bare zero value (`&CacheBackendValidator{}`) therefore admits every
-	// (engine, backend) pair the running controller supports, including
-	// External and SGLang backends — so admission doesn't silently reject an
-	// otherwise-valid CR just because the caller forgot to pass a registry.
+	// Registry resolves the runtime adapter for a (runtime, backend) pair at
+	// admission time. The composition root must inject it.
 	Registry *adapterruntime.Registry
-}
-
-// defaultShippingRegistry returns a Registry with every adapter the
-// production cmd/controller wiring installs. Centralised in
-// internal/adapters/builtin so every nil fallback admits the same set the
-// running controller does.
-func defaultShippingRegistry() *adapterruntime.Registry {
-	return builtinadapters.New().Runtime
 }
 
 // ValidationRule is the seam plugged-in admission rules implement. It
@@ -659,13 +644,13 @@ func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.Er
 //
 // registry is the runtime-adapter [adapterruntime.Registry] the validator
 // consults for the (engine, backend) compatibility check AND for the
-// engineOverrides reserved-args/env check; passing nil falls back to
-// [defaultShippingRegistry] (the complete internal/adapters/builtin
-// composition), mirroring cmd/controller's production wiring so a zero-value
-// validator sees the same adapter set the running controller does.
-// cmd/controller threads the same instance the reconciler + pod webhook
-// receive so all three layers agree on what's supported.
+// engineOverrides reserved-args/env check. cmd/controller threads the same
+// non-nil instance the reconciler + pod webhook receive so all three layers
+// agree on what's supported.
 func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterruntime.Registry) error {
+	if registry == nil {
+		return fmt.Errorf("runtime adapter registry is required")
+	}
 	return ctrl.NewWebhookManagedBy(mgr, &cachev1alpha1.CacheBackend{}).
 		WithDefaulter(&CacheBackendDefaulter{}).
 		WithValidator(&CacheBackendValidator{Registry: registry}).
@@ -1005,7 +990,10 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 	}
 	registry := v.Registry
 	if registry == nil {
-		registry = defaultShippingRegistry()
+		return field.ErrorList{field.InternalError(
+			field.NewPath("spec", "integration", "engine"),
+			fmt.Errorf("runtime adapter registry is not configured"),
+		)}
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(cb)
 	adapter, err := registry.Select(runtimeID, cb)
@@ -1101,9 +1089,10 @@ func (v *CacheBackendValidator) checkEngineOverrides(cb *cachev1alpha1.CacheBack
 	}
 	registry := v.Registry
 	if registry == nil {
-		// Mirror checkRuntimeAdapter's fallback exactly so pair selection and
-		// reserved-arg/env enforcement always use the same shipping set.
-		registry = defaultShippingRegistry()
+		return append(errs, field.InternalError(
+			basePath,
+			fmt.Errorf("runtime adapter registry is not configured"),
+		))
 	}
 	runtimeID := adapterruntime.ResolveRuntimeID(cb)
 	adapter, err := registry.Select(runtimeID, cb)

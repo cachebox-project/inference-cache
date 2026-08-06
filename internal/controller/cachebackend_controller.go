@@ -26,7 +26,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
@@ -198,13 +197,11 @@ type CacheBackendReconciler struct {
 	// refreshMatchedEnginePods fall through to the embedded
 	// client.Client so existing fake-client tests still work).
 	APIReader client.Reader
-	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
-	// falls back to the complete built-in runtime registry assembled by
-	// internal/adapters/builtin, matching the shipping controller. Set
-	// explicitly only in tests that need a custom adapter set.
+	// Registry resolves the runtime adapter to use for a CacheBackend. The
+	// composition root must inject it before reconciliation starts.
 	Registry *adapterruntime.Registry
 	// BackendRegistry resolves remote provider lifecycle independently from
-	// engine/runtime wiring. Nil uses the shipping provider registry.
+	// engine/runtime wiring. The composition root must inject it.
 	BackendRegistry *backendadapter.Registry
 	// MatchedEnginePodsRequeueInterval overrides the self-requeue cadence
 	// that keeps status.matchedEnginePods fresh between unrelated reconcile
@@ -394,14 +391,10 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // the selected runtime/provider adapter. Unsupported combinations also shed any
 // previously managed workload.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
-	var shippingRegistries builtinadapters.Registries
 	if r.Registry == nil || r.BackendRegistry == nil {
-		shippingRegistries = builtinadapters.New()
+		return ctrl.Result{}, fmt.Errorf("adapter registries are not configured")
 	}
 	registry := r.Registry
-	if registry == nil {
-		registry = shippingRegistries.Runtime
-	}
 	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 	storage := backend.Spec.EffectiveRemoteStorage()
 
@@ -503,11 +496,7 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return r.reconcileHostOnly(ctx, backend)
 	}
 
-	backendRegistry := r.BackendRegistry
-	if backendRegistry == nil {
-		backendRegistry = shippingRegistries.Storage
-	}
-	provider, err := backendRegistry.Select(storage)
+	provider, err := r.BackendRegistry.Select(storage)
 	if err != nil {
 		logger.V(1).Info("no remote-storage provider for backend; treating as unmanaged",
 			"provider", storage.Provider, "ownership", storage.Ownership,

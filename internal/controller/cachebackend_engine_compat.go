@@ -9,7 +9,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
@@ -104,7 +103,7 @@ func (r *CacheBackendReconciler) detectEngineConnectorCrashLoop(ctx context.Cont
 func (r *CacheBackendReconciler) engineContainerName(backend *cachev1alpha1.CacheBackend) string {
 	registry := r.Registry
 	if registry == nil {
-		registry = builtinadapters.New().Runtime
+		return ""
 	}
 	adapter, err := registry.Select(adapterruntime.ResolveRuntimeID(backend), backend)
 	if err != nil {

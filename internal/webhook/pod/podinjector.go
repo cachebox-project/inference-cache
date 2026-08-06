@@ -15,7 +15,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
@@ -97,10 +96,8 @@ type EngineInjector struct {
 	Reader client.Reader
 
 	// Registry resolves the runtime adapter for a (runtime, backend) pair.
-	// nil falls back to the complete internal/adapters/builtin composition.
-	// Mirrors the production cmd/controller wiring so a bare `EngineInjector{}`
-	// doesn't silently fail-open on External CRs that the running webhook
-	// would have wired.
+	// The composition root injects the complete shipping registry. A nil value
+	// is treated as a webhook misconfiguration and fails open.
 	Registry *adapterruntime.Registry
 
 	// Log is the handler's logger. nil falls back to logf.FromContext at
@@ -161,7 +158,8 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	runtimeID := adapterruntime.ResolveRuntimeID(cache)
 	registry := h.Registry
 	if registry == nil {
-		registry = builtinadapters.New().Runtime
+		log.Error(fmt.Errorf("runtime adapter registry is not configured"), "fail-open: webhook is not configured")
+		return failOpen(req, &pod, "runtime adapter registry is not configured (fail-open)")
 	}
 	adapter, err := registry.Select(runtimeID, cache)
 	if err != nil {

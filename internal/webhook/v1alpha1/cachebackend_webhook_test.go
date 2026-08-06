@@ -33,6 +33,18 @@ func newBackend() *cachev1alpha1.CacheBackend {
 
 func i32p(v int32) *int32 { return &v }
 
+func defaultShippingRegistry() *adapterruntime.Registry {
+	registry := adapterruntime.NewRegistry()
+	registry.Register(builtinruntime.NewVLLMLMCacheAdapter())
+	registry.Register(builtinruntime.NewSGLangLMCacheAdapter())
+	registry.Register(builtinruntime.NewSGLangHiCacheAdapter())
+	return registry
+}
+
+func shippingValidator() *CacheBackendValidator {
+	return &CacheBackendValidator{Registry: defaultShippingRegistry()}
+}
+
 func newHiCacheBackend() *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "hicache", Namespace: "team-a"},
@@ -58,7 +70,7 @@ func newHiCacheBackend() *cachev1alpha1.CacheBackend {
 }
 
 func TestValidator_SGLangHiCacheAccepted(t *testing.T) {
-	if _, err := (&CacheBackendValidator{}).ValidateCreate(context.Background(), newHiCacheBackend()); err != nil {
+	if _, err := (shippingValidator()).ValidateCreate(context.Background(), newHiCacheBackend()); err != nil {
 		t.Fatalf("valid SGLangHiCache rejected: %v", err)
 	}
 }
@@ -74,12 +86,12 @@ func TestValidator_CanonicalSGLangHiCacheRejectsRemoteStorage(t *testing.T) {
 		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
 		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 	}
-	requireInvalidWithCause(t, &CacheBackendValidator{}, cb, "spec.remoteStorage.provider",
+	requireInvalidWithCause(t, shippingValidator(), cb, "spec.remoteStorage.provider",
 		"does not accept remote binding protocol")
 }
 
 func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
-	validator := &CacheBackendValidator{}
+	validator := shippingValidator()
 
 	t.Run("sglang host-only", func(t *testing.T) {
 		cb := newBackend()
@@ -298,7 +310,7 @@ func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 }
 
 func TestValidator_LegacyToCanonicalMigrationIsAtomic(t *testing.T) {
-	validator := &CacheBackendValidator{}
+	validator := shippingValidator()
 	old := newBackend()
 	old.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	old.Spec.BackendConfig = map[string]string{
@@ -384,7 +396,7 @@ func TestValidator_SGLangHiCacheContract(t *testing.T) {
 			cb.Spec.HiCache.MemoryLayout = "tensor_first"
 		}, "memoryLayout"},
 	}
-	validator := &CacheBackendValidator{}
+	validator := shippingValidator()
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cb := newHiCacheBackend()
@@ -400,7 +412,7 @@ func TestValidator_SGLangHiCacheContract(t *testing.T) {
 func TestValidator_HiCacheBlockRejectedOnOtherTypes(t *testing.T) {
 	cb := newBackend()
 	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
-	_, err := (&CacheBackendValidator{}).ValidateCreate(context.Background(), cb)
+	_, err := (shippingValidator()).ValidateCreate(context.Background(), cb)
 	if err == nil || !strings.Contains(err.Error(), "spec.hiCache") {
 		t.Fatalf("ValidateCreate error = %v, want hiCache type-scope error", err)
 	}
@@ -420,7 +432,7 @@ func TestValidator_SGLangHiCacheArgsAreReserved(t *testing.T) {
 			cb.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
 				SuppressArgs: []string{flag},
 			}
-			_, err := (&CacheBackendValidator{}).ValidateCreate(context.Background(), cb)
+			_, err := (shippingValidator()).ValidateCreate(context.Background(), cb)
 			if err == nil || !strings.Contains(err.Error(), flag) || !strings.Contains(err.Error(), "reserved") {
 				t.Fatalf("ValidateCreate error = %v, want reserved %s", err, flag)
 			}
@@ -719,7 +731,7 @@ func requireUpdateInvalidWithCause(t *testing.T, v *CacheBackendValidator, oldCB
 }
 
 func TestValidator_HappyPath_LMCacheAdmitted(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("happy-path LMCache rejected: %v", err)
@@ -774,7 +786,7 @@ func TestValidator_MooncakeWarnsUntilEngineHostNetworkOptIn(t *testing.T) {
 		"canonical": canonicalMooncakeBackendWithEngineHostNetwork(false),
 	} {
 		t.Run(name, func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			warnings, err := v.ValidateCreate(context.Background(), cb)
 			if err != nil {
 				t.Fatalf("a Mooncake backend must still be admitted (warning, not rejection): %v", err)
@@ -804,7 +816,7 @@ func TestValidator_MooncakeOptInSilencesTheWarning(t *testing.T) {
 		"canonical": canonicalMooncakeBackendWithEngineHostNetwork(true),
 	} {
 		t.Run(name, func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			warnings, err := v.ValidateCreate(context.Background(), cb)
 			if err != nil {
 				t.Fatalf("an opted-in Mooncake backend must be admitted: %v", err)
@@ -820,7 +832,7 @@ func TestValidator_EngineHostNetworkRejectedOnBackendThatDoesNotNeedIt(t *testin
 	// The flag would silently do nothing on a pod-network backend while leaving the
 	// operator convinced they had granted their engine host networking. hostNetwork
 	// is a privilege — a no-op that looks like it granted one is worse than an error.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := mooncakeBackendWithEngineHostNetwork(true)
 	cb.Spec.RemoteStorage = nil
 	requireInvalidWithCause(t, v, cb, "spec.integration.engineHostNetwork",
@@ -836,7 +848,7 @@ func TestValidator_EngineHostNetworkGoesInertWhenTypeFlipsAwayFromMooncake(t *te
 	// object *introduces* — errors already present on the old object are filtered
 	// out. The old object here (Mooncake + flag) is valid, so the error IS newly
 	// introduced and must be caught. Nothing about that is obvious from the rule.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	old := mooncakeBackendWithEngineHostNetwork(true)
 	newCB := mooncakeBackendWithEngineHostNetwork(true)
 	newCB.Spec.RemoteStorage = nil
@@ -848,7 +860,7 @@ func TestValidator_DroppingEngineHostNetworkWithTheTypeFlipIsAccepted(t *testing
 	// The escape hatch the rejection above implies: retyping away from Mooncake is
 	// fine as long as the flag goes with it. If this failed, the rule would have
 	// wedged the object — rejecting both keeping and dropping the flag.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	old := mooncakeBackendWithEngineHostNetwork(true)
 	newCB := mooncakeBackendWithEngineHostNetwork(false)
 	newCB.Spec.RemoteStorage = nil
@@ -868,7 +880,7 @@ func TestValidator_EngineHostNetworkCannotGoInertViaEventsOnly(t *testing.T) {
 	// Pinned because that safety is emergent, not stated: it comes from two
 	// independent rules meeting. Loosening either one — allowing events-only
 	// Mooncake, say — would silently open the inert-flag hole this asserts shut.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := mooncakeBackendWithEngineHostNetwork(true)
 	cb.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
 	requireInvalidWithCause(t, v, cb, "spec.remoteStorage",
@@ -891,7 +903,7 @@ func TestValidator_WarningTextStaysConcise(t *testing.T) {
 func TestValidator_NonMooncakeEmitsNoHostNetworkWarning(t *testing.T) {
 	// Blast radius: the DEFAULT (vLLM) LMCache pairing — engine unset defaults to
 	// vLLM — must stay warning-free (the Mooncake mesh warning does not apply to it).
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
 	warnings, err := v.ValidateCreate(context.Background(), cb)
@@ -976,7 +988,7 @@ func TestValidator_MooncakeMultiReplicaRejected(t *testing.T) {
 	// bind the node ports the first already holds, and on a different node it comes up
 	// as an independent master and silently splits the store. Both failures surface
 	// long after the object looks healthy, so admission rejects them at write time.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	setCanonicalMooncakeStorage(cb)
 	two := int32(2)
@@ -985,7 +997,7 @@ func TestValidator_MooncakeMultiReplicaRejected(t *testing.T) {
 }
 
 func TestValidator_MooncakeAutoscalingRejected(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	setCanonicalMooncakeStorage(cb)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
@@ -994,7 +1006,7 @@ func TestValidator_MooncakeAutoscalingRejected(t *testing.T) {
 
 func TestValidator_MooncakeSingletonAndDisabledReplicasAccepted(t *testing.T) {
 	// 1 is the singleton; 0 is the "disabled" case. Neither can split the store.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	for _, replicas := range []int32{0, 1} {
 		cb := newBackend()
 		setCanonicalMooncakeStorage(cb)
@@ -1009,7 +1021,7 @@ func TestValidator_MooncakeSingletonAndDisabledReplicasAccepted(t *testing.T) {
 func TestValidator_LMCacheScaleOutUnaffectedByMooncakeRule(t *testing.T) {
 	// Blast radius: the lm:// server is an ordinary pod-network workload and must
 	// keep scaling out (and autoscaling) normally.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
 	three := int32(3)
@@ -1037,7 +1049,7 @@ func TestValidator_SGLangRedisL2MultiReplicaRejected(t *testing.T) {
 	// (the MP worker's --l2-adapter target). A second pod behind the one Service
 	// shards the keyspace across independent instances, so a key stored via one is a
 	// miss via the other — the L2 silently partitions. Reject at write time.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := sglangLMCacheBackend()
 	two := int32(2)
 	cb.Spec.Replicas = &two
@@ -1045,7 +1057,7 @@ func TestValidator_SGLangRedisL2MultiReplicaRejected(t *testing.T) {
 }
 
 func TestValidator_SGLangRedisL2AutoscalingRejected(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := sglangLMCacheBackend()
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{}
 	requireInvalidWithCause(t, v, cb, "spec.autoscaling", "not supported for the (sglang, LMCache) backend")
@@ -1053,7 +1065,7 @@ func TestValidator_SGLangRedisL2AutoscalingRejected(t *testing.T) {
 
 func TestValidator_SGLangRedisL2SingletonAndDisabledAccepted(t *testing.T) {
 	// 1 is the singleton; 0 is "disabled". Neither partitions the keyspace.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	for _, replicas := range []int32{0, 1} {
 		cb := sglangLMCacheBackend()
 		r := replicas
@@ -1070,7 +1082,7 @@ func TestValidator_SGLangEventsOnlyScaleOutAccepted(t *testing.T) {
 	// fire. Rejecting here would be factually wrong (the message explains a Redis
 	// split that cannot happen) and would make SGLang gratuitously stricter than an
 	// otherwise-identical (vllm, LMCache) events-only backend.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 
 	t.Run("multi-replica is admitted", func(t *testing.T) {
 		cb := sglangLMCacheBackend()
@@ -1107,7 +1119,7 @@ func TestValidator_SGLangEventsOnlyScaleOutAccepted(t *testing.T) {
 func TestValidator_VLLMLMCacheScaleOutUnaffectedBySGLangRule(t *testing.T) {
 	// Blast radius: vLLM's lm:// server is an ordinary pod-network workload and must
 	// keep scaling out (and autoscaling) — the singleton rule is (sglang, LMCache)-only.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend() // Type=LMCache, engine defaults to vllm
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	three := int32(3)
@@ -1119,7 +1131,7 @@ func TestValidator_VLLMLMCacheScaleOutUnaffectedBySGLangRule(t *testing.T) {
 }
 
 func TestValidator_InvalidKernelCheckAnnotationRejected(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 
 	// A typo for "strict" would silently fall back to "auto" (report-only) and
 	// disable the fail-closed gate — reject it at admission instead.
@@ -1153,7 +1165,7 @@ func TestValidator_ResourcesLimitsBelowRequestsRejected(t *testing.T) {
 	// admission with a field-scoped error rather than admit a CR the
 	// pod will refuse later (and that the operator would have to
 	// diagnose through downstream kubectl-describe spelunking).
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
@@ -1170,7 +1182,7 @@ func TestValidator_ResourcesLimitsBelowRequestsRejected(t *testing.T) {
 func TestValidator_ResourcesLimitsEqualRequestsAdmitted(t *testing.T) {
 	// limits == requests is the canonical "exact size" intent and must
 	// admit. The rule only rejects strict-less-than.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
@@ -1184,7 +1196,7 @@ func TestValidator_ResourcesLimitsEqualRequestsAdmitted(t *testing.T) {
 func TestValidator_ResourcesRequestsOnlyAdmitted(t *testing.T) {
 	// Requests-only is a valid shape (no upper bound declared); the
 	// rule MUST NOT synthesise a phantom limit to compare against.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
@@ -1198,7 +1210,7 @@ func TestValidator_ResourcesLimitsOnlyAdmitted(t *testing.T) {
 	// Limits-only is also valid (scheduler treats limit as the request
 	// when no request is given); no comparison is meaningful, so the
 	// rule must not fire.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("8Gi")},
@@ -1217,7 +1229,7 @@ func TestValidator_ResourcesFractionalExtendedRejected(t *testing.T) {
 	// storage) allow fractional values and are not affected.
 	for _, side := range []string{"requests", "limits"} {
 		t.Run(side, func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			cb := newBackend()
 			cb.Spec.Resources = &corev1.ResourceRequirements{}
 			entry := corev1.ResourceList{
@@ -1243,7 +1255,7 @@ func TestValidator_ResourcesFractionalExtendedRejected(t *testing.T) {
 func TestValidator_ResourcesIntegerExtendedAdmitted(t *testing.T) {
 	// Integer extended-resource quantities (e.g. nvidia.com/gpu: 1)
 	// admit — the rule fires only on fractional values.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{
@@ -1262,7 +1274,7 @@ func TestValidator_ResourcesFractionalCPUAdmitted(t *testing.T) {
 	// Standard overcommittable CPU MUST still accept fractional values
 	// (250m is the canonical kubelet shape) — the integer rule applies
 	// only to vendor-prefixed extended resources.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
@@ -1284,7 +1296,7 @@ func TestValidator_ResourcesRequestsOnlyNonOvercommittableRejected(t *testing.T)
 		"nvidia.com/gpu",
 	} {
 		t.Run(string(name), func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			cb := newBackend()
 			qty := "1"
 			if name == "hugepages-2Mi" {
@@ -1304,7 +1316,7 @@ func TestValidator_ResourcesLimitsOnlyNonOvercommittableAdmitted(t *testing.T) {
 	// Limits-only IS admitted for non-overcommittable resources —
 	// K8s auto-populates requests from limits when only limits is set.
 	// The rule we add fires only on the requests-only direction.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{
@@ -1322,7 +1334,7 @@ func TestValidator_ResourcesRequestsOnlyOvercommittableAdmitted(t *testing.T) {
 	// "no upper bound" pattern and admits today.
 	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
 		t.Run(string(name), func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			cb := newBackend()
 			cb.Spec.Resources = &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{name: resource.MustParse("1")},
@@ -1352,7 +1364,7 @@ func TestValidator_ResourcesNonOvercommittableMismatchRejected(t *testing.T) {
 		{"nvidia gpu mismatch", corev1.ResourceName("nvidia.com/gpu"), "1", "2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			cb := newBackend()
 			cb.Spec.Resources = &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{tc.resource: resource.MustParse(tc.req)},
@@ -1367,7 +1379,7 @@ func TestValidator_ResourcesNonOvercommittableMismatchRejected(t *testing.T) {
 
 func TestValidator_ResourcesNonOvercommittableEqualAdmitted(t *testing.T) {
 	// The same non-overcommittable resources admit when limits == requests.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")},
@@ -1388,7 +1400,7 @@ func TestValidator_ResourcesReservedPrefixesRejected(t *testing.T) {
 		"requests.kubernetes.io/myresource",
 	} {
 		t.Run(name, func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			cb := newBackend()
 			cb.Spec.Resources = &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -1407,7 +1419,7 @@ func TestValidator_ResourcesInvalidNameRejected(t *testing.T) {
 	// a CR can be admitted with structurally-malformed names ("memory!",
 	// empty string), and the kubelet rejects the pod later. Reject at
 	// admission so the regression surfaces at `kubectl apply`.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
@@ -1426,7 +1438,7 @@ func TestValidator_ResourcesUnqualifiedNonStandardNameRejected(t *testing.T) {
 	// prefixed (e.g. "nvidia.com/gpu"). Reject at admission so the
 	// operator sees a field-scoped error at `kubectl apply` rather
 	// than chasing it through a child Deployment apply.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
@@ -1445,7 +1457,7 @@ func TestValidator_ResourcesMalformedHugepagesRejected(t *testing.T) {
 	// same shapes at write time.
 	for _, name := range []string{"hugepages-", "hugepages-nope", "hugepages-0"} {
 		t.Run(name, func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			cb := newBackend()
 			cb.Spec.Resources = &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -1478,7 +1490,7 @@ func TestValidator_ResourcesStandardContainerResourceNamesAdmitted(t *testing.T)
 		{corev1.ResourceName("hugepages-1Gi"), "2Gi"},
 	} {
 		t.Run(string(tc.name), func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			cb := newBackend()
 			cb.Spec.Resources = &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{tc.name: resource.MustParse(tc.qty)},
@@ -1506,7 +1518,7 @@ func TestValidator_ResourcesHugepagesQuantityMustBeDivisible(t *testing.T) {
 		{"hugepages-1Gi", "512Mi"}, // 512Mi is not a multiple of 1Gi
 	} {
 		t.Run(tc.page+"/"+tc.qty, func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			cb := newBackend()
 			cb.Spec.Resources = &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -1537,7 +1549,7 @@ func TestValidator_ResourcesHugepagesAlignedQuantityAdmitted(t *testing.T) {
 		{"hugepages-1Gi", "4Gi"},
 	} {
 		t.Run(tc.page+"/"+tc.qty, func(t *testing.T) {
-			v := &CacheBackendValidator{}
+			v := shippingValidator()
 			cb := newBackend()
 			cb.Spec.Resources = &corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -1559,7 +1571,7 @@ func TestValidator_ResourcesValidExtendedNameAdmitted(t *testing.T) {
 	// the rule MUST admit them so operators can declare e.g.
 	// nvidia.com/gpu on the cache-server container (rare but not
 	// structurally forbidden).
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{
@@ -1577,7 +1589,7 @@ func TestValidator_ResourcesNegativeRequestRejected(t *testing.T) {
 	// kubelet rejects the negative quantity only when the pod tries
 	// to schedule. Reject at admission with a field-scoped error so
 	// the regression surfaces at `kubectl apply`.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("-1Gi")},
@@ -1587,7 +1599,7 @@ func TestValidator_ResourcesNegativeRequestRejected(t *testing.T) {
 }
 
 func TestValidator_ResourcesNegativeLimitRejected(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("-100m")},
@@ -1601,7 +1613,7 @@ func TestValidator_ResourcesZeroQuantityAdmitted(t *testing.T) {
 	// operator who writes `requests.memory: "0"` is explicitly opting
 	// into "no guaranteed minimum", which is a valid (if unusual)
 	// shape. Only strictly-negative quantities are rejected.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("0")},
@@ -1620,7 +1632,7 @@ func TestValidator_ResourcesClaimsRejected(t *testing.T) {
 	// would render a Deployment the apiserver rejects because the claim
 	// names don't resolve at the pod level. Reject at admission until the
 	// renderer learns to thread resourceClaims onto the PodSpec.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Claims: []corev1.ResourceClaim{{Name: "gpu-claim"}},
@@ -1632,7 +1644,7 @@ func TestValidator_ResourcesClaimsRejected(t *testing.T) {
 func TestValidator_ResourcesEmptyClaimsAdmitted(t *testing.T) {
 	// A nil/empty Claims slice MUST admit — the rule only fires on
 	// operator-supplied entries, never on the absence of the field.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
@@ -1647,7 +1659,7 @@ func TestValidator_ResourcesCPULimitsBelowRequestsRejected(t *testing.T) {
 	// Requests and Limits maps — it's not specific to memory. CPU is
 	// the obvious second case worth pinning so future contributors don't
 	// silently narrow the rule back to memory-only.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
@@ -1666,7 +1678,7 @@ func TestValidator_ReplicasZeroWithAutoscalingAndNilMinReplicasRejected(t *testi
 	// "scale to zero" intent without notification. Admission must reject
 	// the combination so the operator either sets the floor explicitly or
 	// removes the autoscaling block to truly scale to zero.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Replicas = i32p(0)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 10}
@@ -1683,7 +1695,7 @@ func TestValidator_ReplicasZeroWithAutoscalingAndExplicitMinReplicasAdmitted(t *
 	// schema enforces Minimum=1 on minReplicas, so the smallest legal
 	// explicit value here is 1; true scale-to-zero requires removing the
 	// autoscaling block entirely, which the next test covers.)
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Replicas = i32p(0)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{
@@ -1698,7 +1710,7 @@ func TestValidator_ReplicasZeroWithAutoscalingAndExplicitMinReplicasAdmitted(t *
 func TestValidator_ReplicasZeroWithoutAutoscalingAdmitted(t *testing.T) {
 	// Pure scale-to-zero (no autoscaling block) is allowed. The HPA-fallback
 	// trap only applies when autoscaling is opted into.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Replicas = i32p(0)
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
@@ -1707,7 +1719,7 @@ func TestValidator_ReplicasZeroWithoutAutoscalingAdmitted(t *testing.T) {
 }
 
 func TestValidator_CrossNamespaceEndpointWithoutOptInRejected(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	setCanonicalExternalStorage(cb, "shared-cache.team-b.svc.cluster.local:9000")
 	requireInvalidWithCause(t, v, cb, "spec.remoteStorage.endpoint",
@@ -1728,7 +1740,7 @@ func TestValidator_CrossNamespaceEndpointWithOptInAdmitted(t *testing.T) {
 }
 
 func TestValidator_CanonicalCrossNamespaceEndpointWithoutOptInRejected(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
 	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
@@ -1741,7 +1753,7 @@ func TestValidator_CanonicalCrossNamespaceEndpointWithoutOptInRejected(t *testin
 }
 
 func TestValidator_CanonicalCrossNamespaceEndpointWithOptInAdmitted(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
 	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
@@ -2011,7 +2023,7 @@ func TestValidator_AggregatesMultipleViolations(t *testing.T) {
 	// Here: non-positive host memory plus scale-to-zero with autoscaling and no
 	// explicit minReplicas. Both rules should fire on
 	// the same spec.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	zeroQuantity := resource.MustParse("0")
 	cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
@@ -2033,7 +2045,7 @@ func TestValidator_AggregatesMultipleViolations(t *testing.T) {
 
 func TestValidator_Update_NewObjectChecked(t *testing.T) {
 	// ValidateUpdate validates the new object just as create does.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	old := newBackend()
 	newCB := newBackend()
 	newCB.Spec.Type = cachev1alpha1.CacheBackendType("unsupported")
@@ -2046,7 +2058,7 @@ func TestValidator_Update_NewObjectChecked(t *testing.T) {
 func TestValidator_Delete_AlwaysAllowed(t *testing.T) {
 	// Even a structurally-broken backend must be deletable so operators can
 	// clean up bad state — the validator must never block delete.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Type = cachev1alpha1.CacheBackendType("unsupported")
 	if _, err := v.ValidateDelete(context.Background(), cb); err != nil {
@@ -2367,19 +2379,29 @@ func TestValidator_RuntimeAdapter_DeleteSkipsCheck(t *testing.T) {
 	}
 }
 
-func TestValidator_RuntimeAdapter_NilRegistry_AdmitsExternal(t *testing.T) {
-	// The nil-Registry fallback mirrors production cmd/controller wiring
-	// through the complete built-in composition, so a bare
-	// `CacheBackendValidator{}` admits the same set the running controller does.
-	// Without External in the fallback, this CR would be rejected for "no
-	// adapter supports (vllm, External)" even though the production webhook
-	// wires it just fine.
-	v := &CacheBackendValidator{}
+func TestValidator_RuntimeAdapter_ShippingRegistryAdmitsExternal(t *testing.T) {
+	// The explicitly injected shipping registry must admit the same pair the
+	// running controller can reconcile and inject.
+	v := shippingValidator()
 	cb := newBackend()
 	setCanonicalExternalStorage(cb, "ext.example.com:8200")
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-		t.Fatalf("nil-Registry fallback rejected vLLM+External: %v", err)
+		t.Fatalf("shipping registry rejected vLLM+External: %v", err)
+	}
+}
+
+func TestValidator_RuntimeAdapter_NilRegistryRejectsMisconfiguration(t *testing.T) {
+	v := &CacheBackendValidator{}
+	_, err := v.ValidateCreate(context.Background(), newBackend())
+	if err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "registry is not configured") {
+		t.Fatalf("ValidateCreate error = %v, want invalid missing-registry error", err)
+	}
+}
+
+func TestSetupCacheBackendWebhookRequiresRegistry(t *testing.T) {
+	if err := SetupCacheBackendWebhookWithManager(nil, nil); err == nil || !strings.Contains(err.Error(), "registry is required") {
+		t.Fatalf("SetupCacheBackendWebhookWithManager error = %v, want missing-registry error", err)
 	}
 }
 
@@ -2388,7 +2410,7 @@ func TestValidator_RuntimeAdapter_NilRegistryFallsBackToDefault(t *testing.T) {
 	// against the complete built-in registry — the production safety net for
 	// cmd/controller wiring drift. The built-in registry ships the vLLM+LMCache
 	// adapter, so the happy pair admits.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend() // type=LMCache
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
@@ -2399,7 +2421,7 @@ func TestValidator_RuntimeAdapter_NilRegistryFallsBackToDefault(t *testing.T) {
 func TestValidator_RuntimeAdapter_VLLMPlusMooncakeAdmittedViaShippingRegistry(t *testing.T) {
 	// Mooncake is a remote binding for the vLLM/LMCache runtime pair, so the
 	// shipping registry must admit it without a provider-specific runtime adapter.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	setCanonicalMooncakeStorage(cb)
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
@@ -2856,9 +2878,9 @@ func TestValidator_EngineOverrides_MooncakeBackendChecksReservedSet(t *testing.T
 	// mooncakestore:// remote), so the same runtime adapter declares the same
 	// reserved args/env. An operator must not be able to
 	// un-wire it via engineOverrides any more than on LMCache/External. Use the
-	// built-in shipping registry (via the nil fallback) so the shipping
+	// explicitly injected built-in shipping registry so the shipping
 	// adapter's ReservedArgs/ReservedEnv drive the admission check.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 
 	// Arg side: suppressing the connector arg must hard-reject, naming the flag.
 	cbArg := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
@@ -2889,7 +2911,7 @@ func TestValidator_EngineOverrides_NilRegistry_FallsBackToShippingSet(t *testing
 	// operator un-wire the cache at the engine pod. Pin both halves of
 	// the contract: nil-registry rejects External + suppressed
 	// --kv-transfer-config with a field-scoped error.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		SuppressArgs: []string{"--kv-transfer-config"},
 	})
@@ -2972,7 +2994,7 @@ func TestValidator_EventsOnly_AutoscalingRejected(t *testing.T) {
 }
 
 func TestValidator_EventsOnly_RemoteStorageRejected(t *testing.T) {
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
 	cb.Spec.Integration = eventsOnlyIntegration()
@@ -3007,10 +3029,10 @@ func TestValidator_EventsOnly_MooncakeRejected(t *testing.T) {
 	// (vLLM, Mooncake) adapter is registered: the runtime-adapter check ADMITS
 	// the pair (Mooncake is supported), so without the events-only rule's
 	// type check the CR would slip through and reconcile as active events-only.
-	// Use the built-in shipping registry via the nil fallback so the
+	// Use the explicitly injected built-in shipping registry so the
 	// runtime-adapter check passes and
 	// the events-only rule is the one that fires, on spec.integration.mode.
-	v := &CacheBackendValidator{}
+	v := shippingValidator()
 	cb := newBackend()
 	setCanonicalMooncakeStorage(cb)
 	cb.Spec.Integration = eventsOnlyIntegration()

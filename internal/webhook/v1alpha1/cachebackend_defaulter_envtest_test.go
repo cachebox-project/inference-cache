@@ -84,9 +84,8 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	if err != nil {
 		t.Fatalf("ctrl.NewManager: %v", err)
 	}
-	// A nil registry uses defaultShippingRegistry, the same complete built-in
-	// composition as production cmd/controller wiring.
-	if err := SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
+	// Inject the same complete runtime set as the production composition root.
+	if err := SetupCacheBackendWebhookWithManager(mgr, defaultShippingRegistry()); err != nil {
 		t.Fatalf("SetupCacheBackendWebhookWithManager: %v", err)
 	}
 
@@ -363,7 +362,7 @@ func TestDefaulter_AutoscalingMinReplicasNotRecomputedOnReplicasUpdate(t *testin
 	if err != nil {
 		t.Fatalf("ctrl.NewManager: %v", err)
 	}
-	if err := SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
+	if err := SetupCacheBackendWebhookWithManager(mgr, defaultShippingRegistry()); err != nil {
 		t.Fatalf("SetupCacheBackendWebhookWithManager: %v", err)
 	}
 

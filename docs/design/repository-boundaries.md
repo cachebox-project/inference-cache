@@ -17,9 +17,9 @@ the target layout is a sequence of migrations, not a flag day.
 4. `pkg/adapters` contains extension contracts that out-of-tree adapters may
    implement. Shipping implementations and registration belong under
    `internal/adapters`.
-5. `internal/adapters/builtin` is the sole composition root for adapters
-   shipped by repository binaries. Production and nil fallbacks use the same
-   complete registries.
+5. `internal/adapters/builtin` owns the complete shipping registry factory.
+   Each binary invokes it at its composition root and injects the resulting
+   registries; controller and webhook packages do not construct fallbacks.
 6. Implementation packages may depend on extension contracts. Extension
    contracts must not depend on controller, webhook, server, or built-in
    implementation packages.

@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
@@ -198,8 +199,9 @@ func newHandler(t *testing.T, objs ...client.Object) *EngineInjector {
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
 	return &EngineInjector{
-		Reader: c,
-		Log:    logr.Discard(),
+		Reader:   c,
+		Registry: builtinadapters.New().Runtime,
+		Log:      logr.Discard(),
 	}
 }
 
@@ -274,7 +276,7 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
 		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 	}
-	h := newHandler(t, cb) // nil registry uses the complete built-in composition
+	h := newHandler(t, cb) // helper explicitly injects the complete built-in composition
 	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
 	req := newRequest(t, pod, ns)
 
@@ -702,7 +704,7 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 	// SGLang engine pod must get the kvevent-subscriber sidecar tagged
 	// --hash-scheme=sglang (the load-bearing scheme tag) + --ignore-block-removed
 	// (LMCache is an L2 tier). Builds the relevant adapters with the subscriber
-	// image option used by cmd/controller because the no-arg nil fallback
+	// image option used by cmd/controller because the no-option registry
 	// renders no sidecar (auto-attach opt-in).
 	const ns = "engines"
 	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
@@ -1502,7 +1504,7 @@ func TestHandle_SidecarOptInDefaultsToNoSidecar(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
-	h := newHandler(t, cb) // built-in nil fallback, with no subscriber image
+	h := newHandler(t, cb) // built-in registry, with no subscriber image
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
 
@@ -1870,6 +1872,23 @@ func TestHandle_ListError_FailOpen(t *testing.T) {
 	}
 	if len(resp.Patches) != 0 {
 		t.Fatalf("expected no patches on fail-open, got %d", len(resp.Patches))
+	}
+}
+
+func TestHandle_NilRegistry_FailsOpen(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	h := &EngineInjector{Reader: c, Log: logr.Discard()}
+
+	resp := h.Handle(context.Background(), newRequest(t,
+		vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns))
+	if !resp.Allowed || len(resp.Patches) != 0 {
+		t.Fatalf("nil registry must fail open without patches: Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "registry is not configured") {
+		t.Fatalf("response message = %v, want missing-registry diagnostic", resp.Result)
 	}
 }
 
