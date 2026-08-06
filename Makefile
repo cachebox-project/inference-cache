@@ -6,6 +6,7 @@ $(LOCALBIN):
 
 GO_CMD ?= go
 GO_FMT ?= gofmt
+PYTHON ?= python3
 MODULE := github.com/cachebox-project/inference-cache
 GO_VERSION := $(shell awk '/^go /{print $$2}' go.mod | head -n1)
 
@@ -50,6 +51,7 @@ BUF_VERSION ?= v1.69.0
 GOVULNCHECK_VERSION ?= v1.3.0
 PROMTOOL_VERSION ?= 3.0.1
 KUSTOMIZE_VERSION ?= v5.7.0
+RUFF_VERSION ?= 0.16.1
 # SHA256 checksums of the upstream Prometheus release tarballs we extract
 # `promtool` from. Sourced from
 # https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/sha256sums.txt
@@ -71,6 +73,8 @@ LOCAL_BUF := $(LOCALBIN)/buf
 LOCAL_PROMTOOL := $(LOCALBIN)/promtool
 LOCAL_KUSTOMIZE := $(LOCALBIN)/kustomize
 GOVULNCHECK := $(LOCALBIN)/govulncheck
+RUFF_VENV := $(LOCALBIN)/ruff-venv
+RUFF := $(RUFF_VENV)/bin/ruff
 BUF ?= $(shell command -v buf 2>/dev/null || echo $(LOCAL_BUF))
 # PROMTOOL is resolved AT RECIPE TIME, not parse time — so the version
 # check in the `promtool` target above can replace a stale local binary
@@ -103,6 +107,14 @@ golangci-lint: $(LOCALBIN) ## Install golangci-lint locally; reinstall when the 
 	@if ! { [ -x $(GOLANGCI_LINT) ] && $(GOLANGCI_LINT) --version 2>/dev/null | grep -qF "has version $(GOLANGCI_LINT_VERSION:v%=%) "; }; then \
 		rm -f $(GOLANGCI_LINT); \
 		GOTOOLCHAIN=go$(GO_VERSION) GOBIN=$(LOCALBIN) $(GO_CMD) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+	fi
+
+.PHONY: ruff
+ruff: $(LOCALBIN) ## Install Ruff in an isolated local virtual environment.
+	@if ! { [ -x $(RUFF) ] && [ "$$($(RUFF) --version 2>/dev/null)" = "ruff $(RUFF_VERSION)" ]; }; then \
+		rm -rf $(RUFF_VENV); \
+		$(PYTHON) -m venv $(RUFF_VENV); \
+		$(RUFF_VENV)/bin/python -m pip install --disable-pip-version-check --quiet "ruff==$(RUFF_VERSION)"; \
 	fi
 
 .PHONY: protoc-gen-go
@@ -208,6 +220,10 @@ lint: fmt vet ## Run lightweight local lint checks.
 .PHONY: ci-lint
 ci-lint: golangci-lint ## Run golangci-lint.
 	$(GOLANGCI_LINT) run --timeout 5m
+
+.PHONY: python-lint
+python-lint: ruff ## Lint the reference-stack Python scripts with Ruff.
+	$(RUFF) check docs/reference-stack/scripts
 
 .PHONY: tidy
 tidy: ## Tidy Go modules.
@@ -567,7 +583,7 @@ verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alertin
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs verify-syft-pin verify-minimal-base test-minimal-images fmt-check vet ci-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + Syft/minimal-image policy + fmt + vet + lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs verify-syft-pin verify-minimal-base test-minimal-images fmt-check vet ci-lint python-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + Syft/minimal-image policy + Go/Python lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.

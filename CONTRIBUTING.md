@@ -18,6 +18,7 @@ Run the baseline checks before sending a PR:
 make proto-gen
 make proto-lint
 make lint
+make python-lint
 make test-race
 make build
 make cover-check # fail if logic-package coverage drops below COVER_MIN (90%)
@@ -36,6 +37,8 @@ how integration coverage actually exists in this repo (adapter helpers tested
 through the adapter, predicates tested through the controller). The floor is
 a ratchet: raise it as coverage improves.
 `make ci-lint` runs the golangci-lint configuration used by CI.
+`make python-lint` installs the pinned Ruff release into the ignored `bin/`
+directory and lints Python scripts under `docs/reference-stack/scripts/`.
 `make proto-lint` lints the gRPC contract with [buf](https://buf.build) (configured in `buf.yaml`);
 buf is used for linting only — code generation stays on `protoc` (`make proto-gen`).
 `make verify-minimal-base` and `make test-minimal-images` enforce the shipped
@@ -136,7 +139,7 @@ The check (Makefile + `.githooks/pre-commit` + CI) scans every tracked file exce
 
 Run `make install-hooks` once per clone. Thereafter:
 
-- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + format + vet + golangci-lint + Prometheus rules + golden vectors + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`. CI also runs heavier gates that are not part of the local push hook, including the Rust/network-backed `make tokenize-cgo-test` job for the optional `smgcgo` tokenizer build tag.
+- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + format + vet + Go/Python lint + Prometheus rules + golden vectors + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`. CI also runs heavier gates that are not part of the local push hook, including the Rust/network-backed `make tokenize-cgo-test` job for the optional `smgcgo` tokenizer build tag.
 - **Before opening a PR**, run `make pre-pr` — it runs `make ci`, then a generated-code drift check, then `make verify-samples` (server-side dry-run of every YAML under `config/samples/` against an envtest apiserver + the CacheBackend admission webhook), then prints the review checklist. Review the diff against the tech spec before submitting.
 
 Emergency override for the push gate: `git push --no-verify` (discouraged).
