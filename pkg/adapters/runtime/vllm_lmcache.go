@@ -10,7 +10,6 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
-	provideradapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
@@ -157,12 +156,6 @@ func (vllmLMCacheAdapter) ReservedEnv() []string {
 		EnvInferenceCacheFailOpen,
 		EnvPythonHashSeed,
 	}
-}
-
-// ResolveCacheServer is the pre-separation compatibility renderer. Production
-// provider lifecycle resolves through pkg/adapters/backend/provider.
-func (vllmLMCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return provideradapter.ResolveLMCacheServer(cache)
 }
 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the

@@ -13,6 +13,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	provideradapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 )
 
 func newLMCacheBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
@@ -21,11 +22,17 @@ func newLMCacheBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
 	return cb
 }
 
-// resolvePod unwraps ResolveCacheServer for tests that only assert on the
+// resolveLMCacheServer keeps the provider-rendering assertions independent
+// from the runtime adapter now that provider lifecycle is a separate seam.
+func resolveLMCacheServer(_ KVCacheRuntimeAdapter, cb *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return provideradapter.ResolveLMCacheServer(cb)
+}
+
+// resolvePod unwraps the provider renderer for tests that only assert on the
 // rendered pod, failing on error or a nil result.
 func resolvePod(t *testing.T, a KVCacheRuntimeAdapter, cb *cachev1alpha1.CacheBackend) *corev1.PodSpec {
 	t.Helper()
-	pod, _, err := ResolveLegacyCacheServer(a, cb)
+	pod, _, err := resolveLMCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -63,7 +70,7 @@ func TestVLLMLMCacheResolveCacheServer(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 
-	pod, svc, err := ResolveLegacyCacheServer(a, cb)
+	pod, svc, err := resolveLMCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -120,7 +127,7 @@ func TestVLLMLMCacheResolveCacheServer(t *testing.T) {
 // whose data plane genuinely cannot work without it.
 func TestVLLMLMCacheResolveCacheServerStaysPodNetworkAndVirtualIP(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
-	pod, svc, err := ResolveLegacyCacheServer(a, newLMCacheBackend(nil))
+	pod, svc, err := resolveLMCacheServer(a, newLMCacheBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -139,7 +146,7 @@ func TestVLLMLMCacheResolveCacheServerHasReadinessProbe(t *testing.T) {
 	// adapter must render a TCP probe targeting the named lmcache port so
 	// Ready waits on the real accept loop.
 	a := NewVLLMLMCacheAdapter()
-	pod, _, err := ResolveLegacyCacheServer(a, newLMCacheBackend(nil))
+	pod, _, err := resolveLMCacheServer(a, newLMCacheBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -159,7 +166,7 @@ func TestVLLMLMCacheResolveCacheServerBoundsRawNilResources(t *testing.T) {
 	// The renderer keeps the 4Gi/8Gi safety bounds even when an object bypasses
 	// the mutating webhook and reaches the raw-struct path with nil resources.
 	a := NewVLLMLMCacheAdapter()
-	pod, _, err := ResolveLegacyCacheServer(a, newLMCacheBackend(nil))
+	pod, _, err := resolveLMCacheServer(a, newLMCacheBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -182,7 +189,7 @@ func TestVLLMLMCacheResolveCacheServerHasCPURequestWhenAutoscaled(t *testing.T) 
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-	pod, _, err := ResolveLegacyCacheServer(a, cb)
+	pod, _, err := resolveLMCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -379,7 +386,7 @@ func TestVLLMLMCacheResolveCacheServerImageOverride(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(map[string]string{"serverImage": "registry.example.com/lmcache:pinned"})
 
-	pod, _, err := ResolveLegacyCacheServer(a, cb)
+	pod, _, err := resolveLMCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -394,7 +401,7 @@ func TestVLLMLMCacheResolveCacheServerCommandOverride(t *testing.T) {
 		"serverCommand": "python3 -m lmcache.v1.multiprocess.server --cpu-buffer-size 60",
 	})
 
-	pod, _, err := ResolveLegacyCacheServer(a, cb)
+	pod, _, err := resolveLMCacheServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -415,7 +422,7 @@ func TestVLLMLMCacheResolveCacheServerCommandOverride(t *testing.T) {
 
 func TestVLLMLMCacheResolveCacheServerNilCache(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
-	if _, _, err := ResolveLegacyCacheServer(a, nil); err == nil {
+	if _, _, err := resolveLMCacheServer(a, nil); err == nil {
 		t.Fatalf("ResolveCacheServer(nil) returned no error")
 	}
 }

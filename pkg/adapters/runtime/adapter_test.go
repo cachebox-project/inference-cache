@@ -153,19 +153,6 @@ func TestReferenceAdapterSupports(t *testing.T) {
 	}
 }
 
-func TestReferenceAdapterResolveCacheServerIsNil(t *testing.T) {
-	a := NewReferenceAdapter()
-	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "")
-
-	pod, svc, err := ResolveLegacyCacheServer(a, cb)
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
-	}
-	if pod != nil || svc != nil {
-		t.Fatalf("ResolveCacheServer = (%v, %v), want (nil, nil) — reference adapter renders no cache-server", pod, svc)
-	}
-}
-
 func TestReferenceAdapterInjectEngineConfigMerges(t *testing.T) {
 	a := NewReferenceAdapter()
 	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "")

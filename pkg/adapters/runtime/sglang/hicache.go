@@ -67,13 +67,6 @@ func (a hiCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, bindi
 	return a.InjectEngineConfig(pod, "", cache)
 }
 
-func (hiCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	if err := ValidateHiCacheBackend(cache); err != nil {
-		return nil, nil, err
-	}
-	return nil, nil, nil
-}
-
 func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *cachev1alpha1.CacheBackend) error {
 	cfg, err := resolveHiCacheConfig(cache)
 	if err != nil {

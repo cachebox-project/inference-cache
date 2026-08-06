@@ -51,13 +51,6 @@ func (referenceAdapter) Supports(runtime RuntimeID, cache *cachev1alpha1.CacheBa
 	return runtime == RuntimeReference
 }
 
-// ResolveCacheServer renders no cache-server: the reference adapter wires
-// engine/router pods directly to whatever endpoint the reconciler discovered,
-// matching backends (such as LMCache) that colocate the cache with the engine.
-func (referenceAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return nil, nil, nil
-}
-
 // InjectEngineConfig sets [EnvCacheEndpoint] on every container in pod,
 // merging with existing env entries: an existing entry with the same name is
 // updated in place (no duplicates), and unrelated entries are left untouched.

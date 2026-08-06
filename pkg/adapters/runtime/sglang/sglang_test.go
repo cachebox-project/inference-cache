@@ -13,6 +13,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	provideradapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
@@ -56,6 +57,10 @@ func hasMount(ms []corev1.VolumeMount, name string) bool {
 	return false
 }
 
+func resolveRedisServer(_ runtimeadapter.KVCacheRuntimeAdapter, cb *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+	return provideradapter.ResolveRedisL2Server(cb)
+}
+
 func TestSGLangSupports(t *testing.T) {
 	a := NewAdapter()
 	cases := []struct {
@@ -91,7 +96,7 @@ func TestSGLangSupportedPairs(t *testing.T) {
 
 func TestSGLangResolveCacheServer(t *testing.T) {
 	a := NewAdapter()
-	pod, svc, err := runtimeadapter.ResolveLegacyCacheServer(a, newSGLangBackend(nil))
+	pod, svc, err := resolveRedisServer(a, newSGLangBackend(nil))
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -113,7 +118,7 @@ func TestSGLangResolveCacheServer(t *testing.T) {
 func TestSGLangResolveCacheServerImageOverride(t *testing.T) {
 	a := NewAdapter()
 	cb := newSGLangBackend(map[string]string{"redisImage": "registry.example.com/redis:pinned"})
-	pod, _, err := runtimeadapter.ResolveLegacyCacheServer(a, cb)
+	pod, _, err := resolveRedisServer(a, cb)
 	if err != nil {
 		t.Fatalf("ResolveCacheServer: %v", err)
 	}
@@ -123,7 +128,7 @@ func TestSGLangResolveCacheServerImageOverride(t *testing.T) {
 }
 
 func TestSGLangResolveCacheServerNilCache(t *testing.T) {
-	if _, _, err := runtimeadapter.ResolveLegacyCacheServer(NewAdapter(), nil); err == nil {
+	if _, _, err := resolveRedisServer(NewAdapter(), nil); err == nil {
 		t.Fatalf("ResolveCacheServer(nil) returned no error")
 	}
 }

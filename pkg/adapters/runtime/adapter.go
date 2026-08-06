@@ -102,24 +102,6 @@ type KVCacheRuntimeAdapter interface {
 	EngineContainerName() string
 }
 
-// LegacyCacheServerRenderer is the pre-separation provider-rendering seam.
-// Shipping provider adapters call the standalone Resolve*Server functions
-// directly; this interface remains only so legacy tests and out-of-tree
-// adapters can migrate without keeping provider lifecycle on
-// KVCacheRuntimeAdapter.
-type LegacyCacheServerRenderer interface {
-	ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error)
-}
-
-// ResolveLegacyCacheServer invokes the pre-separation rendering seam.
-func ResolveLegacyCacheServer(adapter KVCacheRuntimeAdapter, cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	renderer, ok := adapter.(LegacyCacheServerRenderer)
-	if !ok {
-		return nil, nil, fmt.Errorf("runtime adapter has no legacy cache-server renderer")
-	}
-	return renderer.ResolveCacheServer(cache)
-}
-
 // EndpointRequirement is an optional adapter capability for engine-local
 // integrations that do not dial a separate cache server. Adapters that do not
 // implement it require an endpoint by default, preserving network-backed
