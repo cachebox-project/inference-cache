@@ -279,7 +279,7 @@ SGLang supports two peer cache integrations:
 > **SGLang drives LMCache in multiprocess (MP) mode (implemented, GPU-validated end to end).** Unlike vLLM, SGLang reads LMCache config from a **`--lmcache-config-file`** (carrying `mp_host`/`mp_port`), attaches to a **node-local MP worker** over ZMQ + a shared-memory data path, and offloads to a shared **L2 store** (the worker's `--l2-adapter`) — it does NOT use a cluster-reachable `lm://` server (`lm://` is not even a valid MP `--l2-adapter` type). So the `(sglang, LMCache)` data plane differs from vLLM's on **both** halves, and the sections below reflect that. Authoritative design + validation evidence: [`sglang-lmcache-mp-mode.md`](sglang-lmcache-mp-mode.md).
 
 SGLang is the second runtime the cache plane supports (`spec.runtime: SGLang`,
-`spec.type: LMCache`; adapter at `pkg/adapters/runtime/sglang`). Its engine
+`spec.type: LMCache`; adapter at `internal/adapters/builtin/runtime`). Its engine
 adapter configures the node-local MP worker and accepts either no binding
 (host-only) or a RESP binding. The independent Redis provider adapter creates a
 Redis workload only when `spec.remoteStorage` explicitly selects
@@ -334,7 +334,7 @@ Deliberately **not** injected for SGLang (a real engine difference, not an omiss
 
 **`spec.integration.role` support.** vLLM maps the role onto its LMCache connector's `kv_role` (ReadOnly→`kv_consumer`, WriteOnly→`kv_producer`, ReadWrite→`kv_both`). SGLang's `--enable-lmcache` integration has **no `kv_role` split** — it always both stores and retrieves — so a `(sglang, LMCache)` backend supports only `ReadWrite` (the default). Admission **rejects** `ReadOnly` / `WriteOnly` for SGLang (`rejectUnsupportedSGLangRole`) rather than silently treating them as ReadWrite; the rule lifts if SGLang's LMCache integration gains a producer/consumer split.
 
-**Reserved set** (`pkg/adapters/runtime/sglang`): `ReservedArgs()` = `--enable-lmcache`, `--lmcache-config-file`; `ReservedEnv()` = `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN`. In MP mode the old lm:// `LMCACHE_REMOTE_URL` is neither injected nor reserved. `VLLM_USE_V1` / `PYTHONHASHSEED` are not reserved because they are never injected.
+**Reserved set** (`internal/adapters/builtin/runtime`): `ReservedArgs()` = `--enable-lmcache`, `--lmcache-config-file`; `ReservedEnv()` = `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN`. In MP mode the old lm:// `LMCACHE_REMOTE_URL` is neither injected nor reserved. `VLLM_USE_V1` / `PYTHONHASHSEED` are not reserved because they are never injected.
 
 The two override surfaces are separate: `spec.lmCache` shapes the worker
 sidecar, while `spec.integration.engineOverrides` edits the engine container's
@@ -827,7 +827,7 @@ an override that would remove connector wiring regardless of provider
 ownership. See
 [Mooncake provider configuration](#mooncake-provider-configuration).
 
-The SGLang+LMCache adapter (`pkg/adapters/runtime/sglang`) reserves a **different** set, because SGLang's engine-side wire is the LMCache MP wire, not the `lm://` one (see [SGLang engine support](#sglang-engine-support)): `ReservedArgs()` = `--enable-lmcache`, `--lmcache-config-file`; `ReservedEnv()` = `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN`. Suppressing `--lmcache-config-file` un-wires MP mode (the engine aborts at startup without it), hence its reservation. In MP mode the lm:// `LMCACHE_REMOTE_URL` is neither injected nor reserved, and `VLLM_USE_V1` / `PYTHONHASHSEED` are never injected for SGLang. Reservation is per-adapter precisely so each engine guards only the flags/env its own integration cannot function without.
+The SGLang+LMCache adapter (`internal/adapters/builtin/runtime`) reserves a **different** set, because SGLang's engine-side wire is the LMCache MP wire, not the `lm://` one (see [SGLang engine support](#sglang-engine-support)): `ReservedArgs()` = `--enable-lmcache`, `--lmcache-config-file`; `ReservedEnv()` = `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN`. Suppressing `--lmcache-config-file` un-wires MP mode (the engine aborts at startup without it), hence its reservation. In MP mode the lm:// `LMCACHE_REMOTE_URL` is neither injected nor reserved, and `VLLM_USE_V1` / `PYTHONHASHSEED` are never injected for SGLang. Reservation is per-adapter precisely so each engine guards only the flags/env its own integration cannot function without.
 
 `LMCACHE_CHUNK_SIZE`, `LMCACHE_REMOTE_SERDE`, `LMCACHE_LOCAL_CPU`, `LMCACHE_MAX_LOCAL_CPU_SIZE` are deliberately NOT reserved — they are perf/mode tunables the operator may legitimately want to change. Canonical chunk size, serializer, and host-memory capacity use `spec.lmCache`; `engineOverrides.env` remains the engine-agnostic seam for explicit environment-level tuning.
 

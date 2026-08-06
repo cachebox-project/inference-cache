@@ -45,24 +45,22 @@ controller binary:
   HiCache;
 - the complete managed and external remote-storage provider set.
 
-`pkg/adapters/runtime.NewCoreRegistry` intentionally contains only adapters
-implemented in that package. Its old `DefaultRegistry` name remains as a
-deprecated compatibility wrapper and must not be used as a shipping default.
+`pkg/adapters/runtime.NewRegistry` constructs the empty public registry.
+Shipping implementations are registered only by the built-in composition
+root, so the extension contract does not select concrete adapters.
 
 ## `pkg/` classification
 
 The following table is the migration inventory. "Supported" means an
-intentional extension or reusable Go API. "Internalize" means the package is
-owned by repository binaries and will move under `internal/` in a later,
-behavior-preserving change.
+intentional extension or reusable Go API. "Internal" means the package is
+owned by repository binaries and is not a supported external import path.
 
 | Current package | Classification | Owner / rationale | Planned target |
 |---|---|---|---|
 | `pkg/adapters/backend` | Supported | Remote-storage provider and binding extension contracts | Keep |
 | `internal/adapters/builtin/storage` | Internal | Shipping provider implementations | Keep |
-| `pkg/adapters/runtime` | Split | Runtime extension contracts mixed with shipping vLLM implementations | Contracts stay; implementations move under `internal/adapters/builtin/runtime` |
-| `pkg/adapters/runtime/sglang` | Internalize | Shipping SGLang implementations | `internal/adapters/builtin/runtime` |
-| `pkg/adapters/runtime/internal/enginewire` | Internalize | Shared implementation detail of built-in runtime adapters | `internal/enginebinding` or built-in runtime subtree |
+| `pkg/adapters/runtime` | Supported | Runtime extension contracts, registry, and shared wire constants | Keep |
+| `internal/adapters/builtin/runtime` | Internal | Shipping vLLM and SGLang implementations and engine-wire rendering | Keep |
 | `pkg/adapters/engine` | Internalize | Subscriber-side ingest and metrics implementation | `internal/subscriber` |
 | `pkg/adapters/engineclient` | Supported | Harness-facing engine egress client with no binary owner | Keep |
 | `pkg/fingerprint` | Supported | Reusable content-fingerprint contract used across integrations | Keep |

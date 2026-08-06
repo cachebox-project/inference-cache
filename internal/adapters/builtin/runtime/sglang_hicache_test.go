@@ -1,4 +1,4 @@
-package sglang
+package runtime
 
 import (
 	"reflect"
@@ -11,7 +11,6 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
 func newHiCacheBackend(spec *cachev1alpha1.SGLangHiCacheSpec) *cachev1alpha1.CacheBackend {
@@ -33,7 +32,7 @@ func newHiCacheBackend(spec *cachev1alpha1.SGLangHiCacheSpec) *cachev1alpha1.Cac
 }
 
 func TestHiCacheAdapterContract(t *testing.T) {
-	adapter := NewHiCacheAdapter()
+	adapter := NewSGLangHiCacheAdapter()
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
 
 	if !adapter.Supports(runtimeadapter.RuntimeSGLang, cache) {
@@ -74,7 +73,7 @@ func TestHiCacheInjectsOnlyRequestedFlags(t *testing.T) {
 	pod := &corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
-				Name:  enginewire.SGLangEngineContainerName,
+				Name:  SGLangEngineContainerName,
 				Image: "sglang:test",
 				Args:  []string{"--model-path", "model"},
 				Env:   []corev1.EnvVar{{Name: "KEEP", Value: "true"}},
@@ -85,7 +84,7 @@ func TestHiCacheInjectsOnlyRequestedFlags(t *testing.T) {
 	}
 	beforeNonArgs := pod.DeepCopy()
 
-	if err := NewHiCacheAdapter().InjectEngineConfig(pod, "", cache); err != nil {
+	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	args := pod.Containers[0].Args
@@ -115,7 +114,7 @@ func TestHiCacheInjectsOnlyRequestedFlags(t *testing.T) {
 func TestHiCacheOptionalFieldsStayOmitted(t *testing.T) {
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "1.5"})
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "only"}}}
-	if err := NewHiCacheAdapter().InjectEngineConfig(pod, "", cache); err != nil {
+	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	if got, ok := testArgValue(pod.Containers[0].Args, SGLangHiCacheRatioArg); !ok || got != "1.5" {
@@ -145,10 +144,10 @@ func TestHiCacheMatchingArgsArePreserved(t *testing.T) {
 		SGLangHiCacheMemoryLayoutArg, "page_first",
 	}
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{
-		Name: enginewire.SGLangEngineContainerName,
+		Name: SGLangEngineContainerName,
 		Args: append([]string(nil), originalArgs...),
 	}}}
-	if err := NewHiCacheAdapter().InjectEngineConfig(pod, "", cache); err != nil {
+	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	if !reflect.DeepEqual(pod.Containers[0].Args, originalArgs) {
@@ -173,21 +172,21 @@ func TestHiCacheConflictsFailAtomically(t *testing.T) {
 		{"different optional value", []string{SGLangHiCacheWritePolicyArg, "write_back"}},
 		{"enable carries value", []string{SGLangEnableHiCacheArg + "=true"}},
 		{"duplicate enable", []string{SGLangEnableHiCacheArg, SGLangEnableHiCacheArg}},
-		{"LMCache enabled", []string{enginewire.SGLangEnableLMCacheArg}},
-		{"LMCache config", []string{enginewire.SGLangConfigFileArg, "/tmp/lmcache.yaml"}},
+		{"LMCache enabled", []string{SGLangEnableLMCacheArg}},
+		{"LMCache config", []string{SGLangConfigFileArg, "/tmp/lmcache.yaml"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := &corev1.PodSpec{
 				Containers: []corev1.Container{{
-					Name: enginewire.SGLangEngineContainerName,
+					Name: SGLangEngineContainerName,
 					Args: append([]string(nil), tc.args...),
 					Env:  []corev1.EnvVar{{Name: "KEEP", Value: "yes"}},
 				}},
 				Volumes: []corev1.Volume{{Name: "keep"}},
 			}
 			before := pod.DeepCopy()
-			if err := NewHiCacheAdapter().InjectEngineConfig(pod, "", base); err == nil {
+			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", base); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if !reflect.DeepEqual(pod, before) {
@@ -213,12 +212,12 @@ func TestHiCacheOmittedOptionalArgsFailAtomicallyWhenMalformedOrDuplicated(t *te
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{
-				Name: enginewire.SGLangEngineContainerName,
+				Name: SGLangEngineContainerName,
 				Args: append([]string(nil), tc.args...),
 				Env:  []corev1.EnvVar{{Name: "KEEP", Value: "yes"}},
 			}}}
 			before := pod.DeepCopy()
-			if err := NewHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil {
+			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if !reflect.DeepEqual(pod, before) {
@@ -282,7 +281,7 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 			cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
 			tc.mutate(cache)
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "sglang"}}}
-			if err := NewHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil {
+			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if len(pod.Containers[0].Args) != 0 {
@@ -298,14 +297,14 @@ func TestHiCacheMultiContainerRequiresSGLangName(t *testing.T) {
 		{Name: "engine"},
 		{Name: "metrics"},
 	}}
-	if err := NewHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil ||
+	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil ||
 		!strings.Contains(err.Error(), `none is named "sglang"`) {
 		t.Fatalf("InjectEngineConfig error = %v, want missing sglang container", err)
 	}
 }
 
 func TestHiCacheReservedArgs(t *testing.T) {
-	got := NewHiCacheAdapter().ReservedArgs()
+	got := NewSGLangHiCacheAdapter().ReservedArgs()
 	want := []string{
 		SGLangEnableHiCacheArg,
 		SGLangHiCacheSizeArg,
@@ -317,7 +316,7 @@ func TestHiCacheReservedArgs(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReservedArgs = %v, want %v", got, want)
 	}
-	if got := NewHiCacheAdapter().ReservedEnv(); len(got) != 0 {
+	if got := NewSGLangHiCacheAdapter().ReservedEnv(); len(got) != 0 {
 		t.Fatalf("ReservedEnv = %v, want empty", got)
 	}
 }
@@ -325,7 +324,7 @@ func TestHiCacheReservedArgs(t *testing.T) {
 func TestHiCacheObservationSidecarReusesSGLangRenderer(t *testing.T) {
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
 	cache.Spec.BackendConfig = map[string]string{"model": "model-a"}
-	adapter := NewHiCacheAdapter(
+	adapter := NewSGLangHiCacheAdapter(
 		runtimeadapter.WithSubscriberImage("subscriber:test"),
 		runtimeadapter.WithPolicyServerGRPCAddress("policy:50051"),
 	)

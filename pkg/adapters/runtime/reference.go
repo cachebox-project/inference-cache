@@ -6,7 +6,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
 // RuntimeReference is the [RuntimeID] the in-tree reference adapter matches.
@@ -114,7 +113,17 @@ func injectEndpointEnv(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha
 		return fmt.Errorf("inject %s config: pod has no containers", role)
 	}
 	for i := range pod.Containers {
-		pod.Containers[i].Env = enginewire.UpsertEnv(pod.Containers[i].Env, corev1.EnvVar{Name: envName, Value: endpoint})
+		pod.Containers[i].Env = upsertEnv(pod.Containers[i].Env, corev1.EnvVar{Name: envName, Value: endpoint})
 	}
 	return nil
+}
+
+func upsertEnv(env []corev1.EnvVar, want corev1.EnvVar) []corev1.EnvVar {
+	for i := range env {
+		if env[i].Name == want.Name {
+			env[i] = want
+			return env
+		}
+	}
+	return append(env, want)
 }

@@ -1,6 +1,6 @@
 # Design: LMCache MP mode — the converged worker model (SGLang now, vLLM migration)
 
-Status: **implemented and GPU-validated** for SGLang (Phase 2, increments 1–2); increment 3 (operator surface + the remaining SPOF containment) is open — see [Phased delivery](#phased-delivery). Facts below are live-validated unless marked otherwise. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Adapters: `pkg/adapters/runtime/sglang`, `pkg/adapters/runtime` (vLLM)
+Status: **implemented and GPU-validated** for SGLang (Phase 2, increments 1–2); increment 3 (operator surface + the remaining SPOF containment) is open — see [Phased delivery](#phased-delivery). Facts below are live-validated unless marked otherwise. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Adapters: `internal/adapters/builtin/runtime`, `pkg/adapters/runtime` (vLLM)
 
 **LMCache upstream now recommends multiprocess (MP) mode for *both* vLLM and
 SGLang** (its quickstart: MP is *"recommended"* for vLLM via `LMCacheMPConnector`,

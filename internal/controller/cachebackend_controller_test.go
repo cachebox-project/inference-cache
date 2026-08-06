@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
@@ -1259,7 +1260,8 @@ func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
 		},
 	}
 	r := newReconciler(scheme, cb)
-	r.Registry = adapterruntime.NewCoreRegistry()
+	r.Registry = adapterruntime.NewRegistry()
+	r.Registry.Register(builtinruntime.NewVLLMLMCacheAdapter())
 
 	reconcile(t, r, "cache", "ns1")
 

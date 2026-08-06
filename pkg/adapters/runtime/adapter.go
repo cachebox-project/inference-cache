@@ -294,8 +294,8 @@ func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 	return RuntimeID(strings.ToLower(string(cache.Spec.EffectiveRuntime())))
 }
 
-// Options configures the runtime adapters [NewCoreRegistry] constructs and is
-// passed through by the built-in production composition. Zero values are
+// Options configures runtime adapters and is passed through by the built-in
+// production composition. Zero values are
 // valid: empty PolicyServerGRPCAddress falls back to the package default, and
 // empty SubscriberImage disables sidecar auto-attach (see the field doc for
 // why).
@@ -333,24 +333,4 @@ func WithSubscriberImage(image string) Option {
 // WithPolicyServerGRPCAddress sets [Options.PolicyServerGRPCAddress].
 func WithPolicyServerGRPCAddress(addr string) Option {
 	return func(o *Options) { o.PolicyServerGRPCAddress = addr }
-}
-
-// NewCoreRegistry returns a Registry containing the vLLM+LMCache runtime
-// adapter implemented in this package. Remote providers such as Mooncake and
-// externally owned storage are selected independently through remoteStorage
-// and passed to this adapter as structured bindings.
-func NewCoreRegistry(opts ...Option) *Registry {
-	r := NewRegistry()
-	r.Register(NewVLLMLMCacheAdapter(opts...))
-	return r
-}
-
-// DefaultRegistry is retained for source compatibility with existing
-// extension tests. In-repository binaries and nil fallbacks use the complete
-// composition root in internal/adapters/builtin.
-//
-// Deprecated: use NewCoreRegistry when intentionally testing only adapters
-// implemented by this package.
-func DefaultRegistry(opts ...Option) *Registry {
-	return NewCoreRegistry(opts...)
 }

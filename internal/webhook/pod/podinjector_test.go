@@ -26,10 +26,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
+
+func newVLLMRegistry(opts ...adapterruntime.Option) *adapterruntime.Registry {
+	registry := adapterruntime.NewRegistry()
+	registry.Register(builtinruntime.NewVLLMLMCacheAdapter(opts...))
+	return registry
+}
 
 func externalLMCacheStorage(endpoint string) *cachev1alpha1.CacheBackendRemoteStorageSpec {
 	return &cachev1alpha1.CacheBackendRemoteStorageSpec{
@@ -206,7 +212,7 @@ func newHandlerWithSubscriber(t *testing.T, objs ...client.Object) *EngineInject
 	t.Helper()
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
-	reg := adapterruntime.NewCoreRegistry(
+	reg := newVLLMRegistry(
 		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
 	)
 	return &EngineInjector{
@@ -711,8 +717,8 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.NewCoreRegistry(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage))
-	reg.Register(sglangadapter.NewAdapter(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage)))
+	reg := newVLLMRegistry(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage))
+	reg.Register(builtinruntime.NewSGLangLMCacheAdapter(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage)))
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
@@ -1109,7 +1115,7 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.NewCoreRegistry()
+	reg := newVLLMRegistry()
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
@@ -1177,7 +1183,7 @@ func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
 			}
 			s := newScheme(t)
 			c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-			reg := adapterruntime.NewCoreRegistry()
+			reg := newVLLMRegistry()
 			h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 			pod := vllmEnginePod("engine", map[string]string{"app": "vllm"})
@@ -1257,7 +1263,7 @@ func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.NewCoreRegistry()
+	reg := newVLLMRegistry()
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-race", map[string]string{"app": "vllm"})
@@ -1301,7 +1307,7 @@ func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.NewCoreRegistry()
+	reg := newVLLMRegistry()
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-stale", map[string]string{"app": "vllm"})
@@ -1350,7 +1356,7 @@ func TestHandle_ExternalBackend_UpperCaseSchemeNormalised(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.NewCoreRegistry()
+	reg := newVLLMRegistry()
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-up", map[string]string{"app": "vllm"})
@@ -2672,7 +2678,7 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	// Configure the shipping vLLM adapter's subscriber image so the events-only
 	// sidecar path is live.
-	reg := adapterruntime.NewCoreRegistry(
+	reg := newVLLMRegistry(
 		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
 	)
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}

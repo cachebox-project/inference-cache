@@ -22,6 +22,17 @@ func newLMCacheBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
 	return cb
 }
 
+func newCacheBackend(backendType cachev1alpha1.CacheBackendType, engine string) *cachev1alpha1.CacheBackend {
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
+		Spec:       cachev1alpha1.CacheBackendSpec{Type: backendType},
+	}
+	if engine != "" {
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: engine}
+	}
+	return cb
+}
+
 // resolveLMCacheServer keeps the provider-rendering assertions independent
 // from the runtime adapter now that provider lifecycle is a separate seam.
 func resolveLMCacheServer(_ KVCacheRuntimeAdapter, cb *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
@@ -479,11 +490,11 @@ func TestVLLMLMCacheInjectEngineConfig(t *testing.T) {
 		t.Fatalf("HF_TOKEN was clobbered: got %q, want secret-token", v)
 	}
 	// Existing args are preserved + the connector arg pair is appended.
-	if !containsArg(engine.Args, "--enable-prefix-caching") {
+	if !vllmContainsArg(engine.Args, "--enable-prefix-caching") {
 		t.Fatalf("--enable-prefix-caching was dropped: %v", engine.Args)
 	}
 	wantTransfer := kvTransferConfig(cachev1alpha1.CacheBackendIntegrationRoleReadWrite)
-	if !containsArgPair(engine.Args, defaultEngineKVTransferConfigArg, wantTransfer) {
+	if !vllmContainsArgPair(engine.Args, defaultEngineKVTransferConfigArg, wantTransfer) {
 		t.Fatalf("connector args missing %s %s: %v", defaultEngineKVTransferConfigArg, wantTransfer, engine.Args)
 	}
 
@@ -632,7 +643,7 @@ func TestVLLMLMCacheInjectEngineConfigRoleMapping(t *testing.T) {
 				t.Fatalf("InjectEngineConfig: %v", err)
 			}
 			wantValue := fmt.Sprintf(`{"kv_connector":"LMCacheConnectorV1","kv_role":%q}`, tc.wantKVRole)
-			if !containsArgPair(pod.Containers[0].Args, defaultEngineKVTransferConfigArg, wantValue) {
+			if !vllmContainsArgPair(pod.Containers[0].Args, defaultEngineKVTransferConfigArg, wantValue) {
 				t.Fatalf("Args = %v, want pair (%s, %s)", pod.Containers[0].Args, defaultEngineKVTransferConfigArg, wantValue)
 			}
 		})
@@ -915,10 +926,11 @@ func TestVLLMLMCacheEngineContainerName(t *testing.T) {
 	}
 }
 
-func TestNewCoreRegistryResolvesVLLMLMCache(t *testing.T) {
-	r := NewCoreRegistry()
+func TestRegistryResolvesVLLMLMCache(t *testing.T) {
+	r := NewRegistry()
+	r.Register(NewVLLMLMCacheAdapter())
 	if r.Len() == 0 {
-		t.Fatalf("NewCoreRegistry has no adapters")
+		t.Fatalf("registry has no adapters")
 	}
 	got, err := r.Select(RuntimeVLLM, newLMCacheBackend(nil))
 	if err != nil {
@@ -991,10 +1003,10 @@ func TestVLLMLMCacheObservationSidecarShape(t *testing.T) {
 	}
 	// Downward-API env vars carry the pod's name/namespace at start time —
 	// vital because pod.Name is empty at admission for generateName pods.
-	if !envHasFieldRef(c.Env, "POD_NAME", "metadata.name") {
+	if !vllmEnvHasFieldRef(c.Env, "POD_NAME", "metadata.name") {
 		t.Fatalf("env missing POD_NAME via downward API: %v", c.Env)
 	}
-	if !envHasFieldRef(c.Env, "POD_NAMESPACE", "metadata.namespace") {
+	if !vllmEnvHasFieldRef(c.Env, "POD_NAMESPACE", "metadata.namespace") {
 		t.Fatalf("env missing POD_NAMESPACE via downward API: %v", c.Env)
 	}
 	wantArgFragments := []string{
@@ -1014,7 +1026,7 @@ func TestVLLMLMCacheObservationSidecarShape(t *testing.T) {
 		"--ignore-block-removed=true",
 	}
 	for _, want := range wantArgFragments {
-		if !containsArg(c.Args, want) {
+		if !vllmContainsArg(c.Args, want) {
 			t.Fatalf("subscriber args missing %q; args = %v", want, c.Args)
 		}
 	}
@@ -1047,7 +1059,7 @@ func TestVLLMLMCacheInjectEngineConfigEventsOnlyIsNoOp(t *testing.T) {
 	if got := len(pod.Containers[0].Env); got != 0 {
 		t.Fatalf("events-only must not inject connector env; env = %v", pod.Containers[0].Env)
 	}
-	if containsArg(pod.Containers[0].Args, defaultEngineKVTransferConfigArg) {
+	if vllmContainsArg(pod.Containers[0].Args, defaultEngineKVTransferConfigArg) {
 		t.Fatalf("events-only must not inject the KV connector arg; args = %v", pod.Containers[0].Args)
 	}
 }
@@ -1081,7 +1093,7 @@ func TestVLLMLMCacheObservationSidecarEventsOnlyForwardsEvictions(t *testing.T) 
 		"--model-id=Qwen/Qwen3.6-27B",
 		"--hash-scheme=vllm",
 	} {
-		if !containsArg(c.Args, want) {
+		if !vllmContainsArg(c.Args, want) {
 			t.Fatalf("events-only subscriber missing %q; args = %v", want, c.Args)
 		}
 	}
@@ -1102,7 +1114,7 @@ func TestVLLMLMCacheObservationSidecarHonoursOptions(t *testing.T) {
 	if c.Image != "registry.example.com/subscriber:pinned" {
 		t.Fatalf("image override ignored: got %q", c.Image)
 	}
-	if !containsArg(c.Args, "--server=ic-server.custom-ns.svc.cluster.local:9090") {
+	if !vllmContainsArg(c.Args, "--server=ic-server.custom-ns.svc.cluster.local:9090") {
 		t.Fatalf("server address override ignored; args = %v", c.Args)
 	}
 }
@@ -1209,11 +1221,11 @@ func TestVLLMLMCacheObservationSidecarBadInput(t *testing.T) {
 	}
 }
 
-// envHasFieldRef returns true if env contains an entry named name backed by
+// vllmEnvHasFieldRef returns true if env contains an entry named name backed by
 // a fieldRef whose FieldPath matches the given path. Used to assert the
 // downward-API env the subscriber needs to resolve $(POD_NAME) /
 // $(POD_NAMESPACE) at container start.
-func envHasFieldRef(env []corev1.EnvVar, name, path string) bool {
+func vllmEnvHasFieldRef(env []corev1.EnvVar, name, path string) bool {
 	for _, e := range env {
 		if e.Name == name && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil && e.ValueFrom.FieldRef.FieldPath == path {
 			return true
@@ -1235,7 +1247,7 @@ func TestReferenceAdapterObservationSidecarIsNil(t *testing.T) {
 	}
 }
 
-func containsArg(args []string, want string) bool {
+func vllmContainsArg(args []string, want string) bool {
 	for _, a := range args {
 		if a == want {
 			return true
@@ -1244,7 +1256,7 @@ func containsArg(args []string, want string) bool {
 	return false
 }
 
-func containsArgPair(args []string, flag, value string) bool {
+func vllmContainsArgPair(args []string, flag, value string) bool {
 	for i, a := range args {
 		if a == flag && i+1 < len(args) && args[i+1] == value {
 			return true

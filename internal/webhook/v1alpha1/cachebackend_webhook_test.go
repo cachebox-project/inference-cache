@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
@@ -2115,7 +2116,7 @@ func (stubVLLMLMCacheAdapter) EngineContainerName() string { return "vllm" }
 // production wiring registers.
 func stubRegistry() *adapterruntime.Registry {
 	r := adapterruntime.NewRegistry()
-	r.Register(adapterruntime.NewVLLMLMCacheAdapter())
+	r.Register(builtinruntime.NewVLLMLMCacheAdapter())
 	return r
 }
 
