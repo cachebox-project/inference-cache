@@ -51,7 +51,7 @@ ClusterIP, engines-anywhere model.
 - The recommended durable / shared topology is the **Mooncake backend**. Its
   managed workload lifecycle lives in the provider adapter
   (`internal/adapters/builtin/storage/mooncake.go`), while the vLLM runtime adapter
-  (`pkg/adapters/runtime/vllm_mooncake.go`) owns engine wiring.
+  (`internal/adapters/builtin/runtime/vllm_lmcache.go`) owns engine wiring.
 - **Generalizable rule:** surface a `max*` / storage / quota field on a CRD only
   when the cache plane **authoritatively owns** the resource being limited. When
   it does not, omit the field or express the capability as a backend choice

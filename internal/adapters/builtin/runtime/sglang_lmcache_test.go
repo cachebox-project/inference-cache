@@ -55,6 +55,10 @@ func newSGLangBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
 	return cb
 }
 
+func respBinding(endpoint string) *backendadapter.Binding {
+	return &backendadapter.Binding{Protocol: backendadapter.ProtocolRESP, Endpoint: endpoint}
+}
+
 func findInitContainer(cs []corev1.Container, name string) *corev1.Container {
 	for i := range cs {
 		if cs[i].Name == name {
@@ -174,12 +178,12 @@ func TestSGLangCanonicalHostOnlyBindingDoesNotSelectRedis(t *testing.T) {
 		},
 	}
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "sglang", Image: "sglang:test"}}}
-	adapter := NewSGLangLMCacheAdapter().(runtimeadapter.RemoteBindingAdapter)
-	if !adapter.SupportsRemoteBinding(nil) {
+	adapter := NewSGLangLMCacheAdapter()
+	if !adapter.SupportsBinding(nil) {
 		t.Fatal("SGLang LMCache adapter rejected host-only binding")
 	}
-	if err := adapter.InjectEngineConfigWithBinding(pod, (*backendadapter.Binding)(nil), cache); err != nil {
-		t.Fatalf("InjectEngineConfigWithBinding: %v", err)
+	if err := adapter.InjectEngineConfig(pod, nil, cache); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	worker := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
 	if worker == nil {
@@ -212,7 +216,7 @@ func TestSGLangInjectEngineConfig(t *testing.T) {
 		},
 	}
 
-	if err := a.InjectEngineConfig(pod, "cache.ns1.svc.cluster.local:6379", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, respBinding("cache.ns1.svc.cluster.local:6379"), cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 
@@ -298,7 +302,7 @@ func TestSGLangInjectEngineConfigSingleContainerPodAcceptsAnyName(t *testing.T) 
 	a := NewSGLangLMCacheAdapter()
 	cb := newSGLangBackend(nil)
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine", Image: "img"}}}
-	if err := a.InjectEngineConfig(pod, "cache.ns1.svc:6379", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, respBinding("cache.ns1.svc:6379"), cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	if !containsArg(pod.Containers[0].Args, SGLangConfigFileArg) {
@@ -313,7 +317,7 @@ func TestSGLangInjectEngineConfigMultiContainerWithoutSGLangNameErrors(t *testin
 		{Name: "engine"},
 		{Name: "sidecar"},
 	}}
-	err := a.InjectEngineConfig(pod, "cache.ns1.svc:65432", cb)
+	err := a.InjectEngineConfig(pod, respBinding("cache.ns1.svc:65432"), cb)
 	if err == nil {
 		t.Fatalf("expected an error for multi-container pod without an sglang-named container")
 	}
@@ -328,10 +332,10 @@ func TestSGLangInjectEngineConfigIdempotent(t *testing.T) {
 	a := NewSGLangLMCacheAdapter()
 	cb := newSGLangBackend(nil)
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Image: "img"}}}
-	if err := a.InjectEngineConfig(pod, "first.svc:6379", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, respBinding("first.svc:6379"), cb); err != nil {
 		t.Fatalf("first InjectEngineConfig: %v", err)
 	}
-	if err := a.InjectEngineConfig(pod, "second.svc:6379", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, respBinding("second.svc:6379"), cb); err != nil {
 		t.Fatalf("second InjectEngineConfig: %v", err)
 	}
 	// --enable-lmcache appears exactly once (no duplicate on re-inject).
@@ -374,7 +378,7 @@ func TestSGLangInjectEngineConfigConfigOverrides(t *testing.T) {
 		"mpPort":      "6000",
 	})
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Image: "img"}}}
-	if err := a.InjectEngineConfig(pod, "x.svc:6379", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, respBinding("x.svc:6379"), cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	worker := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
@@ -412,7 +416,7 @@ func TestSGLangInjectEngineConfigReusesExistingDevShm(t *testing.T) {
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}},
 		}},
 	}
-	if err := a.InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+	if err := a.InjectEngineConfig(pod, respBinding("r.svc:6379"), newSGLangBackend(nil)); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	n := 0
@@ -452,7 +456,7 @@ func TestSGLangInjectEngineConfigRejectsConfigPathCollision(t *testing.T) {
 		Image:        "sglang:test",
 		VolumeMounts: []corev1.VolumeMount{{Name: "operator-cfg", MountPath: "/etc/lmcache"}},
 	}}}
-	err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil))
+	err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, respBinding("r.svc:6379"), newSGLangBackend(nil))
 	if err == nil {
 		t.Fatalf("want an error when the engine already mounts the adapter-owned config path")
 	}
@@ -508,7 +512,7 @@ func TestSGLangInjectEngineConfigRejectsForeignReservedNames(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			before := tc.pod.DeepCopy()
-			err := NewSGLangLMCacheAdapter().InjectEngineConfig(tc.pod, "r.svc:6379", newSGLangBackend(nil))
+			err := NewSGLangLMCacheAdapter().InjectEngineConfig(tc.pod, respBinding("r.svc:6379"), newSGLangBackend(nil))
 			if err == nil {
 				t.Fatalf("want an error when %s", tc.name)
 			}
@@ -535,10 +539,10 @@ func TestSGLangInjectEngineConfigReinjectionConvergesOnCurrentRender(t *testing.
 	// endpoint rather than reject it, duplicate it, or leave the stale one.
 	a := NewSGLangLMCacheAdapter()
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Image: "img"}}}
-	if err := a.InjectEngineConfig(pod, "first.svc:6379", newSGLangBackend(nil)); err != nil {
+	if err := a.InjectEngineConfig(pod, respBinding("first.svc:6379"), newSGLangBackend(nil)); err != nil {
 		t.Fatalf("first InjectEngineConfig: %v", err)
 	}
-	if err := a.InjectEngineConfig(pod, "second.svc:6379", newSGLangBackend(nil)); err != nil {
+	if err := a.InjectEngineConfig(pod, respBinding("second.svc:6379"), newSGLangBackend(nil)); err != nil {
 		t.Fatalf("second InjectEngineConfig: %v", err)
 	}
 	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
@@ -594,7 +598,7 @@ func TestSGLangInjectEngineConfigRejectsUnwritableDevShm(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := NewSGLangLMCacheAdapter().InjectEngineConfig(tc.pod, "r.svc:6379", newSGLangBackend(nil))
+			err := NewSGLangLMCacheAdapter().InjectEngineConfig(tc.pod, respBinding("r.svc:6379"), newSGLangBackend(nil))
 			if err == nil {
 				t.Fatalf("want an error when the engine's /dev/shm is not writable scratch (%s)", tc.name)
 			}
@@ -620,7 +624,7 @@ func TestSGLangInjectEngineConfigReusesWritableNonEmptyDirDevShm(t *testing.T) {
 			VolumeSource: corev1.VolumeSource{NFS: &corev1.NFSVolumeSource{Server: "s", Path: "/p", ReadOnly: false}},
 		}},
 	}
-	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, respBinding("r.svc:6379"), newSGLangBackend(nil)); err != nil {
 		t.Fatalf("InjectEngineConfig rejected a writable /dev/shm: %v", err)
 	}
 	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
@@ -647,7 +651,7 @@ func TestSGLangInjectEngineConfigWorkerSeesTheGPU(t *testing.T) {
 	// the env is not dropped as dead weight — the failure it prevents is a wedged
 	// engine, not a cache miss.
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Image: "sglang:test"}}}
-	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, respBinding("r.svc:6379"), newSGLangBackend(nil)); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
@@ -671,7 +675,7 @@ func TestSGLangInjectEngineConfigWorkerRestrictedSecurityContext(t *testing.T) {
 	// fail-open). And it must add NO capabilities (an added cap is itself a Restricted
 	// violation; IPC_LOCK is not needed — GPU access is via device files, not caps).
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Image: "sglang:test"}}}
-	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, respBinding("r.svc:6379"), newSGLangBackend(nil)); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
@@ -718,7 +722,7 @@ func TestSGLangInjectEngineConfigWorkerMirrorsEngineUserIdentity(t *testing.T) {
 			RunAsNonRoot: &nonRoot, RunAsUser: &uid, RunAsGroup: &gid,
 		},
 	}}}
-	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, respBinding("r.svc:6379"), newSGLangBackend(nil)); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
@@ -735,7 +739,7 @@ func TestSGLangInjectEngineConfigWorkerMirrorsEngineUserIdentity(t *testing.T) {
 	// And it does NOT force a read-only rootfs or a fixed UID when the engine sets
 	// none — that would risk breaking the vendor image's writes / CUDA-IPC.
 	pod2 := &corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Image: "sglang:test"}}}
-	_ = NewSGLangLMCacheAdapter().InjectEngineConfig(pod2, "r.svc:6379", newSGLangBackend(nil))
+	_ = NewSGLangLMCacheAdapter().InjectEngineConfig(pod2, respBinding("r.svc:6379"), newSGLangBackend(nil))
 	w2 := findInitContainer(pod2.InitContainers, "lmcache-mp-worker")
 	if w2.SecurityContext.RunAsUser != nil {
 		t.Errorf("runAsUser forced to %v when engine set none — must inherit from the pod, not override the image", w2.SecurityContext.RunAsUser)
@@ -760,7 +764,7 @@ func TestSGLangInjectEngineConfigMirrorsDevShmSubPath(t *testing.T) {
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}},
 		}},
 	}
-	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, "r.svc:6379", newSGLangBackend(nil)); err != nil {
+	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, respBinding("r.svc:6379"), newSGLangBackend(nil)); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
@@ -883,7 +887,7 @@ func TestSGLangInjectEngineConfigRejectsUnshareableDevShm(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := NewSGLangLMCacheAdapter().InjectEngineConfig(tc.pod, "r.svc:6379", newSGLangBackend(nil))
+			err := NewSGLangLMCacheAdapter().InjectEngineConfig(tc.pod, respBinding("r.svc:6379"), newSGLangBackend(nil))
 			if err == nil {
 				t.Fatalf("want an error when the engine's /dev/shm is unshareable (%s)", tc.name)
 			}
@@ -902,7 +906,7 @@ func TestSGLangInjectEngineConfigWorkerHasMemoryBudget(t *testing.T) {
 		Name: SGLangEngineContainerName, Image: "sglang:test",
 	}}}
 	cb := newSGLangBackend(map[string]string{"l1SizeGB": "8"})
-	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, "r.svc:6379", cb); err != nil {
+	if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, respBinding("r.svc:6379"), cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	w := findInitContainer(pod.InitContainers, "lmcache-mp-worker")
@@ -950,7 +954,7 @@ func TestSGLangInjectEngineConfigSanitizesNumericConfig(t *testing.T) {
 		t.Run(tc.key+"="+tc.bad, func(t *testing.T) {
 			cb := newSGLangBackend(map[string]string{tc.key: tc.bad})
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Image: "img"}}}
-			if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, "r.svc:6379", cb); err != nil {
+			if err := NewSGLangLMCacheAdapter().InjectEngineConfig(pod, respBinding("r.svc:6379"), cb); err != nil {
 				t.Fatalf("InjectEngineConfig: %v", err)
 			}
 			joined := strings.Join(findInitContainer(pod.InitContainers, "lmcache-mp-worker").Args, " ")
@@ -981,7 +985,7 @@ func TestSGLangInjectEngineConfigFailOpen(t *testing.T) {
 			cb := newSGLangBackend(nil)
 			cb.Spec.Integration.FailOpen = tc.failOpen
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName}}}
-			if err := a.InjectEngineConfig(pod, "x.svc:65432", cb); err != nil {
+			if err := a.InjectEngineConfig(pod, respBinding("x.svc:65432"), cb); err != nil {
 				t.Fatalf("InjectEngineConfig: %v", err)
 			}
 			if v, _ := lookupEnv(pod.Containers[0].Env, EnvInferenceCacheFailOpen); v != tc.want {
@@ -999,17 +1003,17 @@ func TestSGLangInjectEngineConfigBadInput(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{"nil pod", func() error { return a.InjectEngineConfig(nil, "x.svc:65432", cb) }},
-		{"nil cache", func() error { return a.InjectEngineConfig(good, "x.svc:65432", nil) }},
-		{"empty endpoint", func() error { return a.InjectEngineConfig(good, "", cb) }},
-		{"no containers", func() error { return a.InjectEngineConfig(&corev1.PodSpec{}, "x.svc:65432", cb) }},
+		{"nil pod", func() error { return a.InjectEngineConfig(nil, respBinding("x.svc:65432"), cb) }},
+		{"nil cache", func() error { return a.InjectEngineConfig(good, respBinding("x.svc:65432"), nil) }},
+		{"empty endpoint", func() error { return a.InjectEngineConfig(good, respBinding(""), cb) }},
+		{"no containers", func() error { return a.InjectEngineConfig(&corev1.PodSpec{}, respBinding("x.svc:65432"), cb) }},
 		// The resp --l2-adapter takes an INTEGER port, emitted unquoted into JSON. A
 		// non-numeric or out-of-range port would render invalid JSON, the worker would
 		// fail to parse it and never bind its ZMQ port, and the engine would sit behind
 		// the startup probe forever — reject at admission and let the webhook fail open.
-		{"non-numeric port", func() error { return a.InjectEngineConfig(good, "r.svc:redis", cb) }},
-		{"port out of range", func() error { return a.InjectEngineConfig(good, "r.svc:70000", cb) }},
-		{"zero port", func() error { return a.InjectEngineConfig(good, "r.svc:0", cb) }},
+		{"non-numeric port", func() error { return a.InjectEngineConfig(good, respBinding("r.svc:redis"), cb) }},
+		{"port out of range", func() error { return a.InjectEngineConfig(good, respBinding("r.svc:70000"), cb) }},
+		{"zero port", func() error { return a.InjectEngineConfig(good, respBinding("r.svc:0"), cb) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1024,7 +1028,7 @@ func TestSGLangInjectRouterConfigIsNoop(t *testing.T) {
 	a := NewSGLangLMCacheAdapter()
 	cb := newSGLangBackend(nil)
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "router", Env: []corev1.EnvVar{{Name: "EXISTING", Value: "x"}}}}}
-	if err := a.InjectRouterConfig(pod, "x.svc:65432", cb); err != nil {
+	if err := a.InjectRouterConfig(pod, respBinding("x.svc:65432"), cb); err != nil {
 		t.Fatalf("InjectRouterConfig: %v", err)
 	}
 	if len(pod.Containers[0].Env) != 1 || pod.Containers[0].Env[0].Name != "EXISTING" {
@@ -1032,7 +1036,7 @@ func TestSGLangInjectRouterConfigIsNoop(t *testing.T) {
 	}
 	// Truly a no-op even on bad input (router-less backend must never force
 	// callers to special-case it).
-	if err := a.InjectRouterConfig(nil, "x", cb); err != nil {
+	if err := a.InjectRouterConfig(nil, respBinding("x"), cb); err != nil {
 		t.Fatalf("InjectRouterConfig(nil pod) = %v, want nil", err)
 	}
 }

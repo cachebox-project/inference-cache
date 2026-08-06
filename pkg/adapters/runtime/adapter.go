@@ -40,17 +40,23 @@ type KVCacheRuntimeAdapter interface {
 	// (runtime, backend) pair; cache is never nil at the call site.
 	Supports(runtime RuntimeID, cache *cachev1alpha1.CacheBackend) bool
 
-	// InjectEngineConfig mutates pod so the engine talks to the cache at
-	// endpoint. Implementations MUST merge: preserve existing containers,
-	// env, args, and volumes; only add or update what they own. Safe to call
-	// repeatedly on the same pod.
-	InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error
+	// SupportsBinding reports whether the adapter accepts the structured remote
+	// storage binding. A nil binding means host-only operation. Admission and
+	// reconciliation call this before injection so unsupported runtime/provider
+	// combinations fail at the contract boundary.
+	SupportsBinding(binding *backendadapter.Binding) bool
+
+	// InjectEngineConfig mutates pod so the engine uses binding. Implementations
+	// MUST merge: preserve existing containers, env, args, and volumes; only add
+	// or update what they own. Safe to call repeatedly on the same pod. A nil
+	// binding means host-only operation.
+	InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error
 
 	// InjectRouterConfig mutates a router pod so it can route cache-aware
-	// requests through endpoint. Same merge contract as InjectEngineConfig.
+	// requests through binding. Same merge contract as InjectEngineConfig.
 	// Backends without a router component should return nil without
 	// touching pod.
-	InjectRouterConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error
+	InjectRouterConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error
 
 	// ObservationSidecar returns the container that observes the engine pod
 	// for the cache plane (the KV-event subscriber for vLLM/LMCache), or
@@ -99,72 +105,6 @@ type KVCacheRuntimeAdapter interface {
 	// name (e.g. the reference adapter writes to every container) — the
 	// webhook skips override application in that case.
 	EngineContainerName() string
-}
-
-// EndpointRequirement is an optional adapter capability for engine-local
-// integrations that do not dial a separate cache server. Adapters that do not
-// implement it require an endpoint by default, preserving network-backed
-// adapter behavior while allowing engine-local caches to opt out.
-type EndpointRequirement interface {
-	RequiresEndpoint() bool
-}
-
-// RemoteBindingAdapter is the canonical engine-side capability. It accepts an
-// optional structured remote binding and owns no provider lifecycle.
-type RemoteBindingAdapter interface {
-	SupportsRemoteBinding(*backendadapter.Binding) bool
-	InjectEngineConfigWithBinding(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error
-}
-
-// AdapterRequiresEndpoint returns the endpoint requirement declared by
-// adapter, defaulting to true for adapters that predate EndpointRequirement.
-func AdapterRequiresEndpoint(adapter KVCacheRuntimeAdapter) bool {
-	requirement, ok := adapter.(EndpointRequirement)
-	return !ok || requirement.RequiresEndpoint()
-}
-
-// AdapterRequiresEndpointFor evaluates endpoint need for a concrete cache
-// hierarchy. Binding-aware adapters accept nil for host-only operation.
-func AdapterRequiresEndpointFor(adapter KVCacheRuntimeAdapter, binding *backendadapter.Binding) bool {
-	if bindingAware, ok := adapter.(RemoteBindingAdapter); ok {
-		return !bindingAware.SupportsRemoteBinding(binding) || binding != nil
-	}
-	return AdapterRequiresEndpoint(adapter)
-}
-
-// ValidateRemoteBinding verifies that adapter explicitly accepts binding.
-func ValidateRemoteBinding(adapter KVCacheRuntimeAdapter, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
-	bindingAware, ok := adapter.(RemoteBindingAdapter)
-	if !ok {
-		return fmt.Errorf("runtime adapter does not implement the remote-binding contract")
-	}
-	if !bindingAware.SupportsRemoteBinding(binding) {
-		return fmt.Errorf("runtime adapter does not accept remote binding protocol %q", bindingProtocol(binding))
-	}
-	return nil
-}
-
-// InjectEngineConfigWithBinding routes canonical resources through the
-// structured binding contract.
-func InjectEngineConfigWithBinding(adapter KVCacheRuntimeAdapter, pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
-	if err := ValidateRemoteBinding(adapter, binding, cache); err != nil {
-		return err
-	}
-	if bindingAware, ok := adapter.(RemoteBindingAdapter); ok {
-		return bindingAware.InjectEngineConfigWithBinding(pod, binding, cache)
-	}
-	endpoint := ""
-	if binding != nil {
-		endpoint = binding.Endpoint
-	}
-	return adapter.InjectEngineConfig(pod, endpoint, cache)
-}
-
-func bindingProtocol(binding *backendadapter.Binding) backendadapter.Protocol {
-	if binding == nil {
-		return ""
-	}
-	return binding.Protocol
 }
 
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter

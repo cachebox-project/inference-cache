@@ -53,20 +53,14 @@ func (sglangHiCacheAdapter) SupportedPairs() []runtimeadapter.SupportedPair {
 	}}
 }
 
-func (sglangHiCacheAdapter) RequiresEndpoint() bool { return false }
-
-func (sglangHiCacheAdapter) SupportsRemoteBinding(binding *backendadapter.Binding) bool {
+func (sglangHiCacheAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
 	return binding == nil
 }
 
-func (a sglangHiCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+func (sglangHiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	if binding != nil {
 		return fmt.Errorf("SGLang HiCache adapter does not support remote binding protocol %q", binding.Protocol)
 	}
-	return a.InjectEngineConfig(pod, "", cache)
-}
-
-func (sglangHiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *cachev1alpha1.CacheBackend) error {
 	cfg, err := resolveHiCacheConfig(cache)
 	if err != nil {
 		return err
@@ -181,7 +175,7 @@ func (sglangHiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, ca
 	return nil
 }
 
-func (sglangHiCacheAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+func (sglangHiCacheAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
 	return nil
 }
 
@@ -451,7 +445,4 @@ func equivalentNumber(actual, desired string) bool {
 		actualValue == desiredValue
 }
 
-var (
-	_ runtimeadapter.KVCacheRuntimeAdapter = sglangHiCacheAdapter{}
-	_ runtimeadapter.EndpointRequirement   = sglangHiCacheAdapter{}
-)
+var _ runtimeadapter.KVCacheRuntimeAdapter = sglangHiCacheAdapter{}

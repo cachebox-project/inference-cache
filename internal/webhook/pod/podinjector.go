@@ -177,15 +177,20 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		return failOpen(req, &pod, fmt.Sprintf("unsupported remote-storage provider (fail-open): %v", protocolErr))
 	}
 	binding := backendadapter.BindingFor(storage, protocol, endpoint)
+	if !adapter.SupportsBinding(binding) {
+		log.V(1).Info("fail-open: runtime adapter rejected remote-storage binding",
+			"runtime", string(runtimeID), "protocol", string(protocol))
+		return failOpen(req, &pod, fmt.Sprintf("adapter does not support remote-storage protocol %q (fail-open)", protocol))
+	}
 	// Events-only (tier-1 routing) backends provision no server, so they publish
 	// no endpoint — and they wire no KV connector, so they need none. The
 	// endpoint gate exists ONLY because the connector requires a dial target
 	// (an empty/malformed LMCACHE_REMOTE_URL crashes the engine at startup); an
 	// events-only pod injects only the observation sidecar (InjectEngineConfig
 	// is a no-op in this mode), so bypass the gate and inject without one.
-	// Engine-local adapters such as native SGLang HiCache also bypass this
-	// gate through the optional EndpointRequirement capability.
-	if endpoint == "" && !cache.Spec.IsEventsOnly() && adapterruntime.AdapterRequiresEndpointFor(adapter, binding) {
+	// Engine-local adapters such as native SGLang HiCache have a nil binding and
+	// therefore bypass this network-endpoint gate.
+	if binding != nil && binding.Endpoint == "" && !cache.Spec.IsEventsOnly() {
 		// The endpoint source is type-scoped (see effectiveEndpoint).
 		// Three reasons we can land here:
 		//   - managed CR: reconciler hasn't published status.endpoint
@@ -261,7 +266,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// The observation-sidecar append and the wired/injected-by logic below stay
 	// as-is (events-only's only wiring is the subscriber sidecar).
 	if !cache.Spec.IsEventsOnly() {
-		if err := adapterruntime.InjectEngineConfigWithBinding(adapter, &mutated.Spec, binding, cache); err != nil {
+		if err := adapter.InjectEngineConfig(&mutated.Spec, binding, cache); err != nil {
 			log.V(1).Info("fail-open: adapter rejected pod",
 				"runtime", string(runtimeID), "error", err.Error())
 			return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
@@ -549,23 +554,22 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 // effectiveEndpoint returns the address the engine pod should be wired
 // to for the given CacheBackend. The source is type-scoped:
 //
-//   - External: spec.endpoint is authoritative — the operator owns it,
+//   - External ownership: spec.remoteStorage.endpoint is authoritative — the operator owns it,
 //     admission validates it, status.endpoint is just a reconciler
 //     mirror that may briefly lag during an update. If a new pod
 //     admits between an operator's spec.endpoint update and the
 //     status patch, status would still hold the OLD value and the
 //     pod would boot wired to the stale address; pod admission is
-//     CREATE-only so that bad wiring is permanent. Preferring
-//     trimmed spec.endpoint over status here avoids that race and is
+//     CREATE-only so that bad wiring is permanent. Preferring the trimmed
+//     remoteStorage endpoint over status here avoids that race and is
 //     consistent with admission's view of the truth.
-//   - Managed types (LMCache, Mooncake): status.endpoint is the only
+//   - Managed storage: status.endpoint is the only
 //     source — the reconciler builds it from the live Service it
-//     provisions, and spec.endpoint is admission-rejected for these
-//     types (see rejectEndpointOnNonExternal), so there's nothing
-//     else to fall back on. The webhook must wait for status.
-//   - Engine-local types (SGLangHiCache): no endpoint is required. The
-//     selected adapter's EndpointRequirement capability bypasses the gate
-//     before this empty result is consumed.
+//     provisions, and spec.remoteStorage.endpoint is admission-rejected for
+//     managed ownership, so there's nothing else to fall back on. The webhook
+//     must wait for status.
+//   - Engine-local caches: no endpoint is required. They carry a nil binding,
+//     which bypasses the endpoint gate before this empty result is consumed.
 //
 // Returns "" when no endpoint is currently usable; callers fail-open.
 //
@@ -579,7 +583,7 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 // race against an old controller build can't leak whitespace to the
 // engine wire.
 //
-// For External CRs with an empty/whitespace spec.endpoint there is NO
+// For external storage with an empty/whitespace spec.remoteStorage.endpoint there is NO
 // fallback to status. The reconciler treats that state as
 // Ready=False/ExternalEndpointMissing — falling back here would wire
 // new pods to a stale status the reconciler considers unusable, which

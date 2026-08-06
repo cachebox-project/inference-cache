@@ -257,7 +257,7 @@ Two surfaces today:
   (and the other three) to read each primitive's per-field merge
   semantics.
 - The reserved list for the vLLM + LMCache adapter lives in the adapter
-  source: `pkg/adapters/runtime/vllm_lmcache.go`'s `ReservedArgs()` and
+  source: `internal/adapters/builtin/runtime/vllm_lmcache.go`'s `ReservedArgs()` and
   `ReservedEnv()` methods. Each entry is commented with WHY it is
   reserved.
 

@@ -29,8 +29,17 @@ import (
 	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
+
+type remoteOnlyRuntimeAdapter struct {
+	adapterruntime.KVCacheRuntimeAdapter
+}
+
+func (remoteOnlyRuntimeAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
+	return binding != nil
+}
 
 func newScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -1250,6 +1259,33 @@ func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
 	}
 	if len(deps.Items) != 0 {
 		t.Fatalf("deployments = %d, want 0 for unmanaged events-only", len(deps.Items))
+	}
+}
+
+func TestReconcileEventsOnlyAdapterRejectingHostOnlyBindingIsUnmanaged(t *testing.T) {
+	scheme := newScheme(t)
+	cb := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1", Generation: 1},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+			},
+		},
+	}
+	r := newReconciler(scheme, cb)
+	r.Registry = adapterruntime.NewRegistry()
+	r.Registry.Register(remoteOnlyRuntimeAdapter{KVCacheRuntimeAdapter: builtinruntime.NewVLLMLMCacheAdapter()})
+
+	reconcile(t, r, "cache", "ns1")
+
+	got := getBackend(t, r, "cache", "ns1")
+	if ready := findCondition(got.Status.Conditions, conditionTypeReady); ready != nil {
+		t.Fatalf("events-only adapter rejecting nil binding must not publish Ready; got %+v", ready)
+	}
+	if prog := findCondition(got.Status.Conditions, conditionTypeProgressing); prog != nil {
+		t.Fatalf("events-only adapter rejecting nil binding must not publish Progressing; got %+v", prog)
 	}
 }
 

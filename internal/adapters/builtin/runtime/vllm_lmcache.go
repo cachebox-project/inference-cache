@@ -133,34 +133,18 @@ func (vllmLMCacheAdapter) ReservedEnv() []string {
 }
 
 // InjectEngineConfig adds the LMCache connector arg and LMCACHE_* env to the
-// vLLM container in pod, delegating to the shared engine-wire helper. The
-// External backend adapter calls the same helper with an operator-supplied
-// endpoint, keeping the rendered engine wiring byte-identical regardless of
-// who owns the cache lifecycle.
+// vLLM container in pod from the structured remote-storage binding.
 //
 // spec.integration.role maps onto LMCache's kv_role in the connector
 // config: ReadOnly → kv_consumer, WriteOnly → kv_producer, ReadWrite
 // (and unset / unknown) → kv_both.
-func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
-	// Events-only (tier-1 routing) wires NO KV connector: the engine container
-	// is left unmodified so a hybrid-attention model's KV-cache manager is not
-	// disabled by a connector it cannot load. The engine's own (operator-
-	// configured) kv-events publisher is all the observation sidecar needs, and
-	// nothing dials a cache server, so no endpoint is required either. The
-	// subscriber is still appended by the webhook via ObservationSidecar.
-	if cache != nil && cache.Spec.IsEventsOnly() {
-		return nil
-	}
-	return InjectVLLMLMCache(pod, endpoint, cache)
-}
-
-func (vllmLMCacheAdapter) SupportsRemoteBinding(binding *backendadapter.Binding) bool {
+func (vllmLMCacheAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
 	return binding == nil ||
 		binding.Protocol == backendadapter.ProtocolLMCache ||
 		binding.Protocol == backendadapter.ProtocolMooncakeStore
 }
 
-func (vllmLMCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	if cache != nil && cache.Spec.IsEventsOnly() {
 		return nil
 	}
@@ -202,9 +186,9 @@ func EngineHostNetworkRequested(cache *cachev1alpha1.CacheBackend) bool {
 // component should return nil without touching pod." Input validation is
 // intentionally skipped so a router-less backend never forces callers to
 // special-case it.
-func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	_ = pod
-	_ = endpoint
+	_ = binding
 	_ = cache
 	return nil
 }

@@ -5,7 +5,6 @@ import adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/
 type (
 	KVCacheRuntimeAdapter   = adapterruntime.KVCacheRuntimeAdapter
 	InitContainerProvider   = adapterruntime.InitContainerProvider
-	RemoteBindingAdapter    = adapterruntime.RemoteBindingAdapter
 	Options                 = adapterruntime.Options
 	Option                  = adapterruntime.Option
 	RuntimeID               = adapterruntime.RuntimeID

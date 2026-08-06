@@ -10,7 +10,7 @@
 //     externally owned storage or Status.Endpoint for managed providers.
 //     Endpoint-free adapters such
 //     as native SGLang HiCache bypass this gate; and
-//  5. calls adapter.InjectEngineConfig(pod.Spec, endpoint, cache) to merge
+//  5. calls adapter.InjectEngineConfig(pod.Spec, binding, cache) to merge
 //     the cache-server endpoint + connector env/args into the pod spec.
 //
 // The webhook fails open: any error (no matching CacheBackend, no usable

@@ -46,18 +46,10 @@ func TestHiCacheAdapterContract(t *testing.T) {
 		t.Fatal("SGLangHiCache adapter unexpectedly supports LMCache")
 	}
 
-	requirement, ok := adapter.(runtimeadapter.EndpointRequirement)
-	if !ok || requirement.RequiresEndpoint() {
-		t.Fatalf("EndpointRequirement = (%v, %v), want implemented and false", ok, requirement)
-	}
-	bindingAware, ok := adapter.(runtimeadapter.RemoteBindingAdapter)
-	if !ok {
-		t.Fatal("SGLangHiCache adapter does not implement RemoteBindingAdapter")
-	}
-	if !bindingAware.SupportsRemoteBinding(nil) {
+	if !adapter.SupportsBinding(nil) {
 		t.Fatal("SGLangHiCache adapter must accept a nil host-only binding")
 	}
-	if bindingAware.SupportsRemoteBinding(&backendadapter.Binding{Protocol: backendadapter.ProtocolRESP}) {
+	if adapter.SupportsBinding(&backendadapter.Binding{Protocol: backendadapter.ProtocolRESP}) {
 		t.Fatal("SGLangHiCache adapter unexpectedly accepts remote storage")
 	}
 }
@@ -84,7 +76,7 @@ func TestHiCacheInjectsOnlyRequestedFlags(t *testing.T) {
 	}
 	beforeNonArgs := pod.DeepCopy()
 
-	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err != nil {
+	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	args := pod.Containers[0].Args
@@ -114,7 +106,7 @@ func TestHiCacheInjectsOnlyRequestedFlags(t *testing.T) {
 func TestHiCacheOptionalFieldsStayOmitted(t *testing.T) {
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "1.5"})
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "only"}}}
-	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err != nil {
+	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	if got, ok := testArgValue(pod.Containers[0].Args, SGLangHiCacheRatioArg); !ok || got != "1.5" {
@@ -147,7 +139,7 @@ func TestHiCacheMatchingArgsArePreserved(t *testing.T) {
 		Name: SGLangEngineContainerName,
 		Args: append([]string(nil), originalArgs...),
 	}}}
-	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err != nil {
+	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	if !reflect.DeepEqual(pod.Containers[0].Args, originalArgs) {
@@ -186,7 +178,7 @@ func TestHiCacheConflictsFailAtomically(t *testing.T) {
 				Volumes: []corev1.Volume{{Name: "keep"}},
 			}
 			before := pod.DeepCopy()
-			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", base); err == nil {
+			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, base); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if !reflect.DeepEqual(pod, before) {
@@ -217,7 +209,7 @@ func TestHiCacheOmittedOptionalArgsFailAtomicallyWhenMalformedOrDuplicated(t *te
 				Env:  []corev1.EnvVar{{Name: "KEEP", Value: "yes"}},
 			}}}
 			before := pod.DeepCopy()
-			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil {
+			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if !reflect.DeepEqual(pod, before) {
@@ -278,7 +270,7 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 			cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
 			tc.mutate(cache)
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "sglang"}}}
-			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil {
+			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if len(pod.Containers[0].Args) != 0 {
@@ -294,7 +286,7 @@ func TestHiCacheMultiContainerRequiresSGLangName(t *testing.T) {
 		{Name: "engine"},
 		{Name: "metrics"},
 	}}
-	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, "", cache); err == nil ||
+	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err == nil ||
 		!strings.Contains(err.Error(), `none is named "sglang"`) {
 		t.Fatalf("InjectEngineConfig error = %v, want missing sglang container", err)
 	}

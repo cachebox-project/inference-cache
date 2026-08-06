@@ -422,10 +422,17 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	// unmanaged (no Ready/Progressing published), so the CR isn't advertised as
 	// a working routing tier the substrate can never feed.
 	if backend.Spec.IsEventsOnly() {
-		if _, err := registry.Select(runtimeID, backend); err != nil {
+		adapter, err := registry.Select(runtimeID, backend)
+		if err != nil {
 			logger.V(1).Info("no runtime adapter for events-only backend; treating as unmanaged",
 				"runtime", runtimeID, "type", backend.Spec.Type,
 				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
+		if !adapter.SupportsBinding(nil) {
+			logger.V(1).Info("runtime adapter does not support host-only events; treating as unmanaged",
+				"runtime", runtimeID, "type", backend.Spec.Type,
+				"namespace", backend.Namespace, "name", backend.Name)
 			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 		}
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
@@ -455,10 +462,10 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 		}
 		binding := backendadapter.BindingFor(storage, protocol, storage.Endpoint)
-		if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
+		if !adapter.SupportsBinding(binding) {
 			logger.V(1).Info("runtime adapter does not accept external-storage binding; treating as unmanaged",
 				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", protocol,
-				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+				"namespace", backend.Namespace, "name", backend.Name)
 			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 		}
 		// A backend switched from a managed type to External must shed its workload.
@@ -482,7 +489,7 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 			return ctrl.Result{}, err
 		}
-		if bindingAware, ok := adapter.(adapterruntime.RemoteBindingAdapter); !ok || !bindingAware.SupportsRemoteBinding(nil) {
+		if !adapter.SupportsBinding(nil) {
 			logger.V(1).Info("runtime adapter does not support host-only caching; treating as unmanaged",
 				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(),
 				"namespace", backend.Namespace, "name", backend.Name)
@@ -508,10 +515,10 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, fmt.Errorf("render remote storage for %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
 	binding := &backendadapter.Binding{Protocol: rendered.Protocol}
-	if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
+	if !adapter.SupportsBinding(binding) {
 		logger.V(1).Info("runtime adapter does not accept remote-storage binding; treating as unmanaged",
 			"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", rendered.Protocol,
-			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 

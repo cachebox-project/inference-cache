@@ -16,6 +16,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
@@ -98,7 +99,7 @@ func TestValidator_CanonicalSGLangHiCacheRejectsRemoteStorage(t *testing.T) {
 		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 	}
 	requireInvalidWithCause(t, shippingValidator(), cb, "spec.remoteStorage.provider",
-		"does not accept remote binding protocol")
+		"does not accept remote-storage protocol")
 }
 
 func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
@@ -1975,13 +1976,19 @@ func (stubVLLMLMCacheAdapter) Supports(rt adapterruntime.RuntimeID, cb *cachev1a
 	return rt == adapterruntime.RuntimeVLLM && cb.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
 }
 
+func (stubVLLMLMCacheAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
+	return binding == nil ||
+		binding.Protocol == backendadapter.ProtocolLMCache ||
+		binding.Protocol == backendadapter.ProtocolMooncakeStore
+}
+
 func (stubVLLMLMCacheAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	return nil, nil, nil
 }
-func (stubVLLMLMCacheAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+func (stubVLLMLMCacheAdapter) InjectEngineConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
 	return nil
 }
-func (stubVLLMLMCacheAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+func (stubVLLMLMCacheAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
 	return nil
 }
 func (stubVLLMLMCacheAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.Pod) (*corev1.Container, error) {

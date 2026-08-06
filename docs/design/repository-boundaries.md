@@ -1,6 +1,6 @@
 # Repository boundaries and refactor plan
 
-Status: staged migration in progress.
+Status: Phase 0 contract cleanup complete; staged structural migration in progress.
 
 This document is the single source of truth for repository ownership,
 dependency direction, and the remaining structure refactor. It is intentionally
@@ -118,6 +118,10 @@ The following work is complete at the baseline for this plan:
   contracts.
 - [x] Add `internal/enginebinding` for generic pod-binding annotations and
   parsing.
+- [x] Remove the unshipped CacheBackend legacy fields, compatibility readers,
+  conversion/defaulting branches, and canonical-versus-legacy behavior.
+- [x] Make structured remote-storage `Binding` support and injection a required
+  part of the public runtime adapter contract.
 
 The baseline passes `go test ./...` and `git diff --check`.
 
@@ -220,6 +224,47 @@ production implementation is not large enough to justify engine-specific
 subpackages. Split it only when a real dependency boundary appears, not merely
 because more files are added.
 
+## Phase 0: complete contract cleanup
+
+Phase 0 was intentionally completed before the structural file moves. These
+were visible contract changes, not refactors, and inference-cache had not been
+formally deployed, so no resource conversion or compatibility forwarding was
+added.
+
+### 0.1 Remove unshipped CacheBackend compatibility
+
+- [x] Make `spec.runtime` required and keep the served CRD on the typed runtime,
+  cache, remote-storage, observation, and provider-resource hierarchy.
+- [x] Remove `spec.integration.engine`, `spec.backendConfig`, top-level
+  `spec.resources`, and `spec.integration.firstEventTimeout` from the Go API and
+  generated CRD.
+- [x] Remove `UsesCanonicalCacheHierarchy` and all read-time legacy fallbacks,
+  conversion/defaulting branches, and canonical-versus-legacy controller and
+  adapter paths.
+- [x] Move the first-event timeout default to
+  `spec.observation.firstEventTimeout` and update samples, smoke checks, and
+  operator documentation.
+- [x] Regenerate deepcopy and CRD output and run the full Go test suite.
+
+### 0.2 Make structured binding the runtime adapter contract
+
+- [x] Require every `KVCacheRuntimeAdapter` to implement
+  `SupportsBinding(*backend.Binding)`.
+- [x] Pass `*backend.Binding` directly to `InjectEngineConfig` and
+  `InjectRouterConfig`; a nil binding has the single meaning “host-only.”
+- [x] Remove the optional `RemoteBindingAdapter` and `EndpointRequirement`
+  capabilities and the endpoint-string fallback helpers.
+- [x] Update the reference adapter, all shipping adapters, admission,
+  reconciliation, pod injection, tests, and extension documentation together.
+- [x] Keep provider lifecycle independent: backend providers render storage and
+  its protocol, while runtime adapters only accept and consume the resulting
+  binding.
+
+Phase 0 does not alter protobuf compatibility, legacy vLLM metric names,
+Kubernetes Event API reading, or the LookupRoute wire paths. Those are separate
+released or ecosystem-facing contracts and are outside this repository
+structure plan.
+
 ## Phase A: finish ownership boundaries
 
 Complete this phase before splitting large implementation files. This prevents
@@ -236,9 +281,9 @@ refactor(adapters): narrow public adapter contracts
 - [ ] Move shipping `Options`, subscriber image/server configuration, and
   subscriber sidecar rendering from `pkg/adapters/runtime` into
   `internal/adapters/builtin` or its runtime implementation package.
-- [ ] Keep the runtime interfaces, registry, runtime identifiers, optional
-  capability interfaces, supported-pair types, and required cross-component
-  wire contracts public.
+- [ ] Keep the runtime interfaces, registry, runtime identifiers,
+  supported-pair types, required structured-binding contract, and required
+  cross-component wire contracts public.
 - [ ] Convert the concrete reference adapter into a Go example or test fixture
   so it documents the extension contract without expanding the production API.
 - [ ] Keep the LMCache kernel-check implementation in
@@ -549,56 +594,10 @@ paths and should not obscure source-package reviews.
 - [ ] Preserve public targets such as `build`, `test`, `ci`, `pre-pr`, image
   targets, and verification targets.
 
-## Separate contract and behavior decisions
+## Contract decisions outside structural phases
 
-The following changes are deliberately outside the structural phases. They
-must be reviewed as contract changes and must not be hidden inside file moves.
-
-### Remove remaining CacheBackend legacy compatibility
-
-Although obsolete backend-type values were removed, the current implementation
-still contains legacy behavior, including:
-
-- `UsesCanonicalCacheHierarchy`;
-- `EffectiveRuntime` fallback to `integration.engine`;
-- `backendConfig` and deprecated resource fallbacks;
-- webhook legacy defaulting and validation;
-- canonical-versus-legacy branches in adapters and controllers.
-
-Inference-cache has not been formally deployed, so the current product decision
-is that old CacheBackend resource compatibility is unnecessary. Implement this
-as a dedicated, visible contract change:
-
-```text
-breaking(cachebackend): remove legacy resource compatibility paths
-```
-
-Before implementation:
-
-- [ ] Inventory every deprecated field and read-time fallback.
-- [ ] Decide the one canonical minimal resource shape and defaults.
-- [ ] Remove schema, defaulting, validation, controller, adapter, sample, and
-  documentation paths together.
-- [ ] Regenerate the CRD and update API tests.
-- [ ] Do not add conversion code or forwarding behavior for unshipped resource
-  versions.
-
-### Decide whether structured remote binding becomes the primary contract
-
-The runtime adapter currently exposes both the endpoint-based
-`InjectEngineConfig` method and the optional `RemoteBindingAdapter` capability.
-The helper layer contains a legacy fallback between them.
-
-Long term, the structured `Binding` is the clearer contract, but changing the
-primary interface affects build-time external adapters. Treat this as a
-separate API-design change:
-
-- [ ] Confirm the supported external adapter compatibility promise.
-- [ ] Decide whether `Binding` replaces the endpoint method or remains an
-  optional capability.
-- [ ] If replacing it, update the interface, reference example, built-ins,
-  webhook, controller, and extension documentation in one commit.
-- [ ] Do not perform this change as part of Phase A file moves.
+Contract or behavior changes that are not already recorded in Phase 0 must be
+reviewed separately and must not be hidden inside file moves.
 
 ### Do not introduce runtime plugin loading without a concrete requirement
 

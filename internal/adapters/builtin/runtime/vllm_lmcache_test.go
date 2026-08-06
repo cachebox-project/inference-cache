@@ -62,6 +62,10 @@ func newCacheBackend(backendType cachev1alpha1.CacheBackendType, engine string) 
 	return cb
 }
 
+func lmCacheBinding(endpoint string) *backendadapter.Binding {
+	return &backendadapter.Binding{Protocol: backendadapter.ProtocolLMCache, Endpoint: endpoint}
+}
+
 // resolveLMCacheServer keeps the provider-rendering assertions independent
 // from the runtime adapter now that provider lifecycle is a separate seam.
 func resolveLMCacheServer(_ KVCacheRuntimeAdapter, cb *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
@@ -486,7 +490,7 @@ func TestVLLMLMCacheInjectEngineConfig(t *testing.T) {
 		},
 	}
 
-	if err := a.InjectEngineConfig(pod, "cache.ns1.svc.cluster.local:65432", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, lmCacheBinding("cache.ns1.svc.cluster.local:65432"), cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 
@@ -544,7 +548,7 @@ func TestVLLMLMCacheInjectEngineConfigSingleContainerPodAcceptsAnyName(t *testin
 	cb := newLMCacheBackend(nil)
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}}}
 
-	if err := a.InjectEngineConfig(pod, "cache.ns1.svc.cluster.local:65432", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, lmCacheBinding("cache.ns1.svc.cluster.local:65432"), cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	if _, ok := lookupEnv(pod.Containers[0].Env, EnvLMCacheRemoteURL); !ok {
@@ -563,7 +567,7 @@ func TestVLLMLMCacheInjectEngineConfigMultiContainerWithoutVLLMNameErrors(t *tes
 		{Name: "sidecar", Env: []corev1.EnvVar{{Name: "SIDECAR_VAR", Value: "untouched"}}},
 	}}
 
-	err := a.InjectEngineConfig(pod, "cache.ns1.svc.cluster.local:65432", cb)
+	err := a.InjectEngineConfig(pod, lmCacheBinding("cache.ns1.svc.cluster.local:65432"), cb)
 	if err == nil {
 		t.Fatalf("expected an error for multi-container pod without a vllm-named container")
 	}
@@ -580,10 +584,10 @@ func TestVLLMLMCacheInjectEngineConfigIdempotent(t *testing.T) {
 	cb := newLMCacheBackend(nil)
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
 
-	if err := a.InjectEngineConfig(pod, "first.svc:65432", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, lmCacheBinding("first.svc:65432"), cb); err != nil {
 		t.Fatalf("first InjectEngineConfig: %v", err)
 	}
-	if err := a.InjectEngineConfig(pod, "second.svc:65432", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, lmCacheBinding("second.svc:65432"), cb); err != nil {
 		t.Fatalf("second InjectEngineConfig: %v", err)
 	}
 
@@ -637,7 +641,7 @@ func TestVLLMLMCacheInjectEngineConfigFailOpen(t *testing.T) {
 				FailOpen: tc.failOpen,
 			}
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
-			if err := a.InjectEngineConfig(pod, "x.svc:65432", cb); err != nil {
+			if err := a.InjectEngineConfig(pod, lmCacheBinding("x.svc:65432"), cb); err != nil {
 				t.Fatalf("InjectEngineConfig: %v", err)
 			}
 			if v, _ := lookupEnv(pod.Containers[0].Env, EnvInferenceCacheFailOpen); v != tc.want {
@@ -666,7 +670,7 @@ func TestVLLMLMCacheInjectEngineConfigRoleMapping(t *testing.T) {
 				Role: tc.role,
 			}
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
-			if err := a.InjectEngineConfig(pod, "x.svc:65432", cb); err != nil {
+			if err := a.InjectEngineConfig(pod, lmCacheBinding("x.svc:65432"), cb); err != nil {
 				t.Fatalf("InjectEngineConfig: %v", err)
 			}
 			wantValue := fmt.Sprintf(`{"kv_connector":"LMCacheConnectorV1","kv_role":%q}`, tc.wantKVRole)
@@ -686,7 +690,7 @@ func TestVLLMLMCacheInjectEngineConfigTypedOverrides(t *testing.T) {
 		"maxLocalCPU": "40",
 	})
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
-	if err := a.InjectEngineConfig(pod, "x.svc:65432", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, lmCacheBinding("x.svc:65432"), cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	checks := map[string]string{
@@ -718,9 +722,9 @@ func TestVLLMLMCacheHostOnlyEngineConfigUsesTypedConfig(t *testing.T) {
 			{Name: "KEEP_ME", Value: "preserved"},
 		},
 	}}}
-	adapter := NewVLLMLMCacheAdapter().(RemoteBindingAdapter)
-	if err := adapter.InjectEngineConfigWithBinding(pod, nil, cb); err != nil {
-		t.Fatalf("InjectEngineConfigWithBinding: %v", err)
+	adapter := NewVLLMLMCacheAdapter()
+	if err := adapter.InjectEngineConfig(pod, nil, cb); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	env := pod.Containers[0].Env
 	checks := map[string]string{
@@ -761,9 +765,9 @@ func TestVLLMLMCacheCanonicalMooncakeBindingHonorsEngineHostNetwork(t *testing.T
 				Protocol: backendadapter.ProtocolMooncakeStore,
 				Endpoint: "mooncake.engines.svc.cluster.local:50051",
 			}
-			adapter := NewVLLMLMCacheAdapter().(RemoteBindingAdapter)
-			if err := adapter.InjectEngineConfigWithBinding(pod, binding, cb); err != nil {
-				t.Fatalf("InjectEngineConfigWithBinding: %v", err)
+			adapter := NewVLLMLMCacheAdapter()
+			if err := adapter.InjectEngineConfig(pod, binding, cb); err != nil {
+				t.Fatalf("InjectEngineConfig: %v", err)
 			}
 
 			if pod.HostNetwork != optIn {
@@ -788,7 +792,7 @@ func TestVLLMLMCacheInjectEngineConfigPassesThroughLMScheme(t *testing.T) {
 	cb := newLMCacheBackend(nil)
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
 	// A caller that already prefixed lm:// must not produce lm://lm://.
-	if err := a.InjectEngineConfig(pod, "lm://already.scheme:65432", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, lmCacheBinding("lm://already.scheme:65432"), cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	url, _ := lookupEnv(pod.Containers[0].Env, EnvLMCacheRemoteURL)
@@ -808,10 +812,10 @@ func TestVLLMLMCacheInjectEngineConfigBadInput(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{"nil pod", func() error { return a.InjectEngineConfig(nil, "x.svc:65432", cb) }},
-		{"nil cache", func() error { return a.InjectEngineConfig(good, "x.svc:65432", nil) }},
-		{"empty endpoint", func() error { return a.InjectEngineConfig(good, "", cb) }},
-		{"no containers", func() error { return a.InjectEngineConfig(&corev1.PodSpec{}, "x.svc:65432", cb) }},
+		{"nil pod", func() error { return a.InjectEngineConfig(nil, lmCacheBinding("x.svc:65432"), cb) }},
+		{"nil cache", func() error { return a.InjectEngineConfig(good, lmCacheBinding("x.svc:65432"), nil) }},
+		{"empty endpoint", func() error { return a.InjectEngineConfig(good, lmCacheBinding(""), cb) }},
+		{"no containers", func() error { return a.InjectEngineConfig(&corev1.PodSpec{}, lmCacheBinding("x.svc:65432"), cb) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -826,7 +830,7 @@ func TestVLLMLMCacheInjectRouterConfigIsNoop(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "router", Env: []corev1.EnvVar{{Name: "EXISTING", Value: "x"}}}}}
-	if err := a.InjectRouterConfig(pod, "x.svc:65432", cb); err != nil {
+	if err := a.InjectRouterConfig(pod, lmCacheBinding("x.svc:65432"), cb); err != nil {
 		t.Fatalf("InjectRouterConfig: %v", err)
 	}
 	// LMCache has no router; the pod must come back untouched (existing env kept,
@@ -848,10 +852,10 @@ func TestVLLMLMCacheInjectRouterConfigTrulyNoopsOnBadInput(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{"nil pod", func() error { return a.InjectRouterConfig(nil, "x", cb) }},
-		{"nil cache", func() error { return a.InjectRouterConfig(good, "x", nil) }},
-		{"empty endpoint", func() error { return a.InjectRouterConfig(good, "", cb) }},
-		{"no containers", func() error { return a.InjectRouterConfig(&corev1.PodSpec{}, "x", cb) }},
+		{"nil pod", func() error { return a.InjectRouterConfig(nil, lmCacheBinding("x"), cb) }},
+		{"nil cache", func() error { return a.InjectRouterConfig(good, lmCacheBinding("x"), nil) }},
+		{"empty endpoint", func() error { return a.InjectRouterConfig(good, lmCacheBinding(""), cb) }},
+		{"no containers", func() error { return a.InjectRouterConfig(&corev1.PodSpec{}, lmCacheBinding("x"), cb) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1063,7 +1067,7 @@ func TestVLLMLMCacheInjectEngineConfigEventsOnlyIsNoOp(t *testing.T) {
 	// Events-only (tier-1 routing) wires NO KV connector — the engine container
 	// must be left untouched so a hybrid-attention model's KV-cache manager is
 	// not disabled — and it requires no endpoint (nothing dials a cache server),
-	// so an empty endpoint must NOT error the way the managed path does.
+	// so a nil binding must NOT error the way the managed path does.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(map[string]string{"model": "Qwen/Qwen3.6-27B"})
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
@@ -1071,8 +1075,8 @@ func TestVLLMLMCacheInjectEngineConfigEventsOnlyIsNoOp(t *testing.T) {
 	}
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName, Args: []string{"--model", "x"}}}}
 
-	if err := a.InjectEngineConfig(pod, "", cb); err != nil {
-		t.Fatalf("events-only InjectEngineConfig must be a no-op with no endpoint, got error: %v", err)
+	if err := a.InjectEngineConfig(pod, nil, cb); err != nil {
+		t.Fatalf("events-only InjectEngineConfig must be a no-op with no binding, got error: %v", err)
 	}
 	if got := len(pod.Containers[0].Args); got != 2 {
 		t.Fatalf("events-only must not add engine args; args = %v", pod.Containers[0].Args)

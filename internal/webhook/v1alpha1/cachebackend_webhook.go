@@ -898,7 +898,7 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 		)}
 	}
 	binding := backendadapter.BindingFor(storage, protocol, "")
-	if err := adapterruntime.ValidateRemoteBinding(adapter, binding, cb); err != nil {
+	if !adapter.SupportsBinding(binding) {
 		storagePath := field.NewPath("spec", "remoteStorage")
 		var rejectedValue any
 		if storage != nil {
@@ -908,8 +908,8 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 		return field.ErrorList{field.Invalid(
 			storagePath,
 			rejectedValue,
-			fmt.Sprintf("runtime %s with cache type %s does not accept this remote-storage binding: %v",
-				runtimeID, cb.Spec.EffectiveCacheType(), err),
+			fmt.Sprintf("runtime %s with cache type %s does not accept remote-storage protocol %q",
+				runtimeID, cb.Spec.EffectiveCacheType(), protocol),
 		)}
 	}
 	return nil

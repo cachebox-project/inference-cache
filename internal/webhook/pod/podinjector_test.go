@@ -1599,7 +1599,9 @@ func (sidecarErrorAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*cor
 	return nil, nil, nil
 }
 
-func (sidecarErrorAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, _ *cachev1alpha1.CacheBackend) error {
+func (sidecarErrorAdapter) SupportsBinding(*backendadapter.Binding) bool { return true }
+
+func (sidecarErrorAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ *backendadapter.Binding, _ *cachev1alpha1.CacheBackend) error {
 	if pod == nil || len(pod.Containers) == 0 {
 		return errors.New("nope")
 	}
@@ -1607,17 +1609,7 @@ func (sidecarErrorAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, _ *
 	return nil
 }
 
-func (sidecarErrorAdapter) SupportsRemoteBinding(*backendadapter.Binding) bool { return true }
-
-func (a sidecarErrorAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
-	endpoint := ""
-	if binding != nil {
-		endpoint = binding.Endpoint
-	}
-	return a.InjectEngineConfig(pod, endpoint, cache)
-}
-
-func (sidecarErrorAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+func (sidecarErrorAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
 	return nil
 }
 
@@ -1955,7 +1947,7 @@ func TestHandle_RegistryOverride_UsedInsteadOfDefault(t *testing.T) {
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	reg := adapterruntime.NewRegistry()
-	reg.Register(bindingReferenceAdapter{KVCacheRuntimeAdapter: adapterruntime.NewReferenceAdapter()})
+	reg.Register(adapterruntime.NewReferenceAdapter())
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
@@ -1966,20 +1958,6 @@ func TestHandle_RegistryOverride_UsedInsteadOfDefault(t *testing.T) {
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	mustHaveEnv(t, mutated, adapterruntime.EnvCacheEndpoint, cb.Status.Endpoint)
-}
-
-type bindingReferenceAdapter struct {
-	adapterruntime.KVCacheRuntimeAdapter
-}
-
-func (bindingReferenceAdapter) SupportsRemoteBinding(*backendadapter.Binding) bool { return true }
-
-func (a bindingReferenceAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
-	endpoint := ""
-	if binding != nil {
-		endpoint = binding.Endpoint
-	}
-	return a.InjectEngineConfig(pod, endpoint, cache)
 }
 
 func TestHandle_PodNamespaceDefaultedFromRequest(t *testing.T) {

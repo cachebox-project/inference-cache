@@ -35,7 +35,7 @@ const (
 // sglangLMCacheAdapter wires SGLang engine pods to LMCache for the (SGLang, LMCache)
 // pair. SGLang drives LMCache in MULTIPROCESS (MP) mode:
 //
-//   - InjectEngineConfigWithBinding renders a node-local MP-worker
+//   - InjectEngineConfig renders a node-local MP-worker
 //     native sidecar + a config-file (mp_host/mp_port) the engine reads via
 //     --lmcache-config-file. A nil binding is host-only; an optional RESP
 //     binding offloads to independently selected Redis storage.
@@ -95,22 +95,13 @@ func (sglangLMCacheAdapter) SupportedPairs() []runtimeadapter.SupportedPair {
 	}
 }
 
-// InjectEngineConfig renders SGLang's LMCache MP-mode launch surface, merging with
-// the pod template's existing args/env: it adds the node-local MP-worker native
-// sidecar + shared /dev/shm/config volumes, and turns the connector on via
-// --enable-lmcache + --lmcache-config-file + LMCACHE_USE_EXPERIMENTAL (no
-// VLLM_USE_V1 / PYTHONHASHSEED, and no lm:// LMCACHE_REMOTE_URL — MP mode ignores
-// it). endpoint is the managed Redis L2 address the worker offloads to. See
-// InjectSGLangLMCache for the full wire.
-func (sglangLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
-	return InjectSGLangLMCache(pod, endpoint, cache)
-}
-
-func (sglangLMCacheAdapter) SupportsRemoteBinding(binding *backendadapter.Binding) bool {
+func (sglangLMCacheAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
 	return binding == nil || binding.Protocol == backendadapter.ProtocolRESP
 }
 
-func (sglangLMCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+// InjectEngineConfig renders SGLang's LMCache MP-mode launch surface from a
+// host-only nil binding or a RESP binding for Redis L2 storage.
+func (sglangLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	endpoint := ""
 	if binding != nil {
 		if binding.Protocol != backendadapter.ProtocolRESP {
@@ -127,9 +118,9 @@ func (sglangLMCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, b
 // branching on backend type — per
 // [runtimeadapter.KVCacheRuntimeAdapter.InjectRouterConfig]: "backends without
 // a router component should return nil without touching pod."
-func (sglangLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
+func (sglangLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	_ = pod
-	_ = endpoint
+	_ = binding
 	_ = cache
 	return nil
 }
