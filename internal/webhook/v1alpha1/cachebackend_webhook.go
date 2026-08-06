@@ -37,16 +37,11 @@ import (
 // by the apiserver before this webhook runs. The webhook handles
 // context-sensitive defaults and defaults the schema cannot express:
 //
-//   - spec.integration.engine: derived from spec.runtime for canonical
-//     resources; defaults to vllm for legacy resources.
-//   - spec.resources: legacy resources only retain the historical bounded
-//     4Gi request / 8Gi limit. Canonical resources leave this deprecated field
-//     absent and configure resources under spec.remoteStorage.<provider>.
-//   - spec.integration.firstEventTimeout: the CRD-schema default only fires
-//     when spec.integration is present in the submitted object; when the
-//     operator omits integration entirely the webhook materialises it here
-//     so the persisted CR carries the readiness-gate deadline rather than
-//     relying on the controller's runtime fallback.
+//   - spec.observation.firstEventTimeout: the CRD-schema default only fires
+//     when spec.observation is present in the submitted object; when the
+//     operator omits observation entirely the webhook materialises it here so
+//     the persisted CR carries the readiness-gate deadline rather than relying
+//     on the controller's runtime fallback.
 //   - spec.autoscaling.minReplicas: cluster-context default computed from
 //     spec.replicas at admission so the HPA's floor matches the operator's
 //     baseline declaration rather than a hard-coded constant.
@@ -55,11 +50,8 @@ import (
 // is the index for the webhook-stamped defaults specifically.
 const (
 	// defaultFirstEventTimeout mirrors the +kubebuilder:default on
-	// spec.integration.firstEventTimeout. The CRD-schema default only applies
-	// when spec.integration is present in the submitted object; when the
-	// operator omits integration entirely the webhook materialises it here, so
-	// stamping the timeout too keeps the persisted CR consistent (rather than
-	// relying on the controller's runtime fallback).
+	// spec.observation.firstEventTimeout. The CRD-schema default only applies
+	// when spec.observation is present in the submitted object.
 	defaultFirstEventTimeout = 5 * time.Minute
 )
 
@@ -70,15 +62,10 @@ const (
 // markers and are stamped by the apiserver before this handler runs;
 // the webhook handles context-sensitive and schema-inexpressible defaults:
 //
-//   - Defaults spec.integration.engine from spec.runtime, or to vllm for
-//     legacy resources.
-//   - Defaults deprecated spec.resources only for legacy resources, preserving
-//     the historical bounded provider workload without polluting canonical
-//     resources with a field they do not own.
-//   - Materialises spec.integration solely to persist
-//     spec.integration.firstEventTimeout when the operator omits the
-//     integration block entirely (a CRD-schema default only applies when
-//     the parent object is present).
+//   - Materialises spec.integration so its nested schema defaults are applied.
+//   - Materialises spec.observation to persist
+//     spec.observation.firstEventTimeout when the operator omits the parent
+//     block entirely.
 //   - Computes spec.autoscaling.minReplicas from spec.replicas when
 //     autoscaling is opted into and minReplicas is left unset — the HPA
 //     floor needs to follow the workload's baseline declaration, which is
@@ -127,8 +114,7 @@ type ValidationRule func(cb *cachev1alpha1.CacheBackend) field.ErrorList
 // [CacheBackendValidator.Rules]) to extend admission; no other code in the
 // handler changes.
 var DefaultValidationRules = []ValidationRule{
-	validateCanonicalCacheHierarchy,
-	validateCanonicalProviderResources,
+	validateCacheHierarchy,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 	rejectMooncakeMasterScaleOut,
@@ -164,109 +150,37 @@ func rejectNonPositiveHostMemoryCapacity(cb *cachev1alpha1.CacheBackend) field.E
 	}
 }
 
-func validateCanonicalProviderResources(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+func selectedProviderResources(cb *cachev1alpha1.CacheBackend) (*corev1.ResourceRequirements, *field.Path) {
 	if cb == nil || cb.Spec.RemoteStorage == nil {
-		return nil
+		return nil, nil
 	}
 
-	var (
-		resources *corev1.ResourceRequirements
-		path      string
-	)
+	storagePath := field.NewPath("spec", "remoteStorage")
 	switch storage := cb.Spec.RemoteStorage; storage.Provider {
 	case cachev1alpha1.CacheBackendRemoteStorageProviderRedis:
 		if storage.Redis != nil {
-			resources = storage.Redis.Resources
-			path = "spec.remoteStorage.redis.resources"
+			return storage.Redis.Resources, storagePath.Child("redis", "resources")
 		}
 	case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
 		if storage.LMCacheServer != nil {
-			resources = storage.LMCacheServer.Resources
-			path = "spec.remoteStorage.lmCacheServer.resources"
+			return storage.LMCacheServer.Resources, storagePath.Child("lmCacheServer", "resources")
 		}
 	case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
 		if storage.Mooncake != nil {
-			resources = storage.Mooncake.Resources
-			path = "spec.remoteStorage.mooncake.resources"
+			return storage.Mooncake.Resources, storagePath.Child("mooncake", "resources")
 		}
 	}
-	if resources == nil {
-		return nil
-	}
-
-	// Reuse the mature ResourceRequirements validators by presenting the
-	// provider-owned block through their legacy input seam, then rewrite the
-	// reported field path back to the canonical owner.
-	probe := cb.DeepCopy()
-	probe.Spec.Resources = resources
-	rules := []ValidationRule{
-		rejectResourceLimitsBelowRequests,
-		rejectRequestsOnlyForNonOvercommittableResources,
-		rejectResourceClaims,
-		rejectNegativeResourceQuantities,
-		rejectInvalidResourceNames,
-		rejectFractionalExtendedResources,
-		rejectMisalignedHugepageQuantities,
-	}
-	var errs field.ErrorList
-	for _, rule := range rules {
-		for _, err := range rule(probe) {
-			err.Field = strings.Replace(err.Field, "spec.resources", path, 1)
-			err.Detail = strings.ReplaceAll(err.Detail, "spec.resources", path)
-			errs = append(errs, err)
-		}
-	}
-	return errs
+	return nil, nil
 }
 
-func validateCanonicalCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+func validateCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	var errs field.ErrorList
 	specPath := field.NewPath("spec")
-	canonical := cb.Spec.UsesCanonicalCacheHierarchy()
 
-	if cb.Spec.Runtime != "" && cb.Spec.Integration != nil && cb.Spec.Integration.Engine != "" {
-		legacySpec := cachev1alpha1.CacheBackendSpec{
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: cb.Spec.Integration.Engine},
-		}
-		legacy := legacySpec.EffectiveRuntime()
-		if legacy != cb.Spec.EffectiveRuntime() {
-			errs = append(errs, field.Invalid(
-				specPath.Child("integration", "engine"), cb.Spec.Integration.Engine,
-				"conflicts with spec.runtime; use spec.runtime as the runtime identity",
-			))
-		}
-	}
-
-	if canonical {
-		if len(cb.Spec.BackendConfig) > 0 {
-			errs = append(errs, field.Forbidden(
-				specPath.Child("backendConfig"),
-				"deprecated top-level configuration is not valid in the canonical API; use spec.lmCache, spec.remoteStorage.<provider>, or spec.observation",
-			))
-		}
-		if cb.Spec.Resources != nil {
-			errs = append(errs, field.Forbidden(
-				specPath.Child("resources"),
-				"deprecated top-level resources are not valid in the canonical API; use spec.remoteStorage.<provider>.resources",
-			))
-		}
-		if cb.Spec.RemoteStorage == nil && cb.Spec.Autoscaling != nil {
-			errs = append(errs, field.Forbidden(
-				specPath.Child("autoscaling"),
-				"canonical host-only backends omit spec.remoteStorage and provision no provider workload, so there is nothing to autoscale",
-			))
-		}
-	}
-
-	if !canonical &&
-		cb.Spec.Observation != nil &&
-		cb.Spec.Observation.ModelID != "" &&
-		cb.Spec.BackendConfig["model"] != "" &&
-		cb.Spec.Observation.ModelID != cb.Spec.BackendConfig["model"] {
-		errs = append(errs, field.Invalid(
-			specPath.Child("backendConfig").Key("model"),
-			cb.Spec.BackendConfig["model"],
-			"conflicts with spec.observation.modelID",
+	if cb.Spec.RemoteStorage == nil && cb.Spec.Autoscaling != nil {
+		errs = append(errs, field.Forbidden(
+			specPath.Child("autoscaling"),
+			"host-only backends omit spec.remoteStorage and provision no provider workload, so there is nothing to autoscale",
 		))
 	}
 
@@ -435,13 +349,9 @@ func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	}
 
 	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang {
-		value := ""
-		if cb.Spec.Integration != nil {
-			value = cb.Spec.Integration.Engine
-		}
 		errs = append(errs, field.Invalid(
-			field.NewPath("spec", "integration", "engine"), value,
-			"SGLangHiCache requires integration.engine=sglang",
+			field.NewPath("spec", "runtime"), cb.Spec.Runtime,
+			"SGLangHiCache requires runtime=SGLang",
 		))
 	}
 	if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
@@ -477,15 +387,6 @@ func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 				field.NewPath("spec", "integration", "failOpen"),
 				false,
 				[]string{"true"},
-			))
-		}
-	}
-	for key := range cb.Spec.BackendConfig {
-		if key != "model" {
-			errs = append(errs, field.NotSupported(
-				field.NewPath("spec", "backendConfig").Key(key),
-				key,
-				[]string{"model"},
 			))
 		}
 	}
@@ -662,16 +563,15 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 // Default implements [admission.Defaulter]. It applies the defaults the
 // CRD-schema markers cannot express:
 //
-//   - Materialises spec.integration when omitted so spec.integration.
-//     firstEventTimeout carries the readiness-gate deadline (the
-//     `+kubebuilder:default` only fires when the parent object is present).
-//   - Stamps the historical bounded spec.resources default on legacy
-//     resources only; canonical resources use provider-owned resource blocks.
+//   - Materialises spec.integration when omitted so its nested schema defaults
+//     are applied.
+//   - Materialises spec.observation when omitted so
+//     spec.observation.firstEventTimeout carries the readiness-gate deadline.
 //   - Computes spec.autoscaling.minReplicas from spec.replicas when
 //     autoscaling is opted in and minReplicas is left unset.
 //
 // Every other Phase-1 default (spec.type=LMCache, deploymentKind=Deployment,
-// replicas=1, integration.engine=vllm, integration.mode=Offload,
+// replicas=1, integration.mode=Offload,
 //
 //	integration.role=ReadWrite,
 //
@@ -692,40 +592,14 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 	logf.FromContext(ctx).V(1).Info("defaulting CacheBackend",
 		"namespace", cb.Namespace, "name", cb.Name)
 
-	canonical := cb.Spec.UsesCanonicalCacheHierarchy()
-	if !canonical && cb.Spec.Resources == nil {
-		cb.Spec.Resources = &corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceMemory: resource.MustParse("4Gi"),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceMemory: resource.MustParse("8Gi"),
-			},
-		}
-	}
 	if cb.Spec.Integration == nil {
 		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
 	}
-	if cb.Spec.Integration.Engine == "" {
-		if cb.Spec.Runtime != "" {
-			cb.Spec.Integration.Engine = strings.ToLower(string(cb.Spec.EffectiveRuntime()))
-		} else {
-			cb.Spec.Integration.Engine = "vllm"
-		}
+	if cb.Spec.Observation == nil {
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{}
 	}
-	if canonical {
-		if cb.Spec.Observation == nil {
-			cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{}
-		}
-		if cb.Spec.Observation.FirstEventTimeout == nil {
-			timeout := defaultFirstEventTimeout
-			if cb.Spec.Integration.FirstEventTimeout != nil {
-				timeout = cb.Spec.Integration.FirstEventTimeout.Duration
-			}
-			cb.Spec.Observation.FirstEventTimeout = &metav1.Duration{Duration: timeout}
-		}
-	} else if cb.Spec.Integration.FirstEventTimeout == nil {
-		cb.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}
+	if cb.Spec.Observation.FirstEventTimeout == nil {
+		cb.Spec.Observation.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}
 	}
 
 	// autoscaling.minReplicas defaults to spec.replicas when autoscaling is
@@ -991,7 +865,7 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 	registry := v.Registry
 	if registry == nil {
 		return field.ErrorList{field.InternalError(
-			field.NewPath("spec", "integration", "engine"),
+			field.NewPath("spec", "runtime"),
 			fmt.Errorf("runtime adapter registry is not configured"),
 		)}
 	}
@@ -1003,22 +877,13 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 			// future error class should surface as-is rather than be
 			// rewritten as an unsupported-pair message.
 			return field.ErrorList{
-				field.InternalError(field.NewPath("spec", "integration", "engine"), err),
+				field.InternalError(field.NewPath("spec", "runtime"), err),
 			}
-		}
-		// Field path points at spec.integration.engine even when the user
-		// did not set it — the offending knob is "which runtime should we
-		// wire to this backend", which the resolver answered for them
-		// using the default. Reporting the resolved value (not "") in the
-		// message gives the user the literal pair to fix.
-		shownValue := ""
-		if cb.Spec.Integration != nil {
-			shownValue = cb.Spec.Integration.Engine
 		}
 		return field.ErrorList{
 			field.Invalid(
-				field.NewPath("spec", "integration", "engine"),
-				shownValue,
+				field.NewPath("spec", "runtime"),
+				cb.Spec.Runtime,
 				unsupportedPairMessage(runtimeID, cb.Spec.Type, registry),
 			),
 		}
@@ -1468,8 +1333,8 @@ func rejectMooncakeMasterScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorLis
 	return errs
 }
 
-// rejectResourceLimitsBelowRequests rejects spec.resources where the
-// request/limit relationship is invalid for the named resource. K8s
+// rejectResourceLimitsBelowRequests rejects the selected provider resource
+// block when the request/limit relationship is invalid for the named resource. K8s
 // distinguishes two regimes:
 //
 //   - Overcommittable resources (cpu, memory, ephemeral-storage):
@@ -1488,16 +1353,17 @@ func rejectMooncakeMasterScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorLis
 // at `kubectl apply`. Missing Request OR missing Limit has no
 // comparison to make and admits.
 func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Resources == nil {
+	resources, resourcesPath := selectedProviderResources(cb)
+	if resources == nil {
 		return nil
 	}
 	var errs field.ErrorList
-	for name, req := range cb.Spec.Resources.Requests {
-		lim, ok := cb.Spec.Resources.Limits[name]
+	for name, req := range resources.Requests {
+		lim, ok := resources.Limits[name]
 		if !ok {
 			continue
 		}
-		path := field.NewPath("spec", "resources", "limits").Key(string(name))
+		path := resourcesPath.Child("limits").Key(string(name))
 		if isOvercommittableResource(name) {
 			if lim.Cmp(req) >= 0 {
 				continue
@@ -1505,7 +1371,7 @@ func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.Err
 			errs = append(errs, field.Invalid(
 				path,
 				lim.String(),
-				fmt.Sprintf("must be greater than or equal to spec.resources.requests[%s] (%s)", name, req.String()),
+				fmt.Sprintf("must be greater than or equal to %s[%s] (%s)", resourcesPath.Child("requests"), name, req.String()),
 			))
 			continue
 		}
@@ -1516,7 +1382,7 @@ func rejectResourceLimitsBelowRequests(cb *cachev1alpha1.CacheBackend) field.Err
 		errs = append(errs, field.Invalid(
 			path,
 			lim.String(),
-			fmt.Sprintf("must equal spec.resources.requests[%s] (%s) — %q is a non-overcommittable resource (hugepages and extended resources require request == limit)", name, req.String(), name),
+			fmt.Sprintf("must equal %s[%s] (%s) — %q is a non-overcommittable resource (hugepages and extended resources require request == limit)", resourcesPath.Child("requests"), name, req.String(), name),
 		))
 	}
 	return errs
@@ -1551,7 +1417,8 @@ func isOvercommittableResource(name corev1.ResourceName) bool {
 // take any kubelet-valid quantity, and vendor-prefixed extended
 // resources are integer-checked by rejectFractionalExtendedResources.
 func rejectMisalignedHugepageQuantities(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Resources == nil {
+	resources, resourcesPath := selectedProviderResources(cb)
+	if resources == nil {
 		return nil
 	}
 	const hugePagesPrefix = "hugepages-"
@@ -1580,15 +1447,15 @@ func rejectMisalignedHugepageQuantities(cb *cachev1alpha1.CacheBackend) field.Er
 			}
 			if qtyVal%pageVal != 0 {
 				errs = append(errs, field.Invalid(
-					field.NewPath("spec", "resources", kind).Key(s),
+					resourcesPath.Child(kind).Key(s),
 					qty.String(),
 					fmt.Sprintf("must be a multiple of the page size %s — the Linux kernel allocates hugepages in whole-page chunks", suffix),
 				))
 			}
 		}
 	}
-	check(cb.Spec.Resources.Requests, "requests")
-	check(cb.Spec.Resources.Limits, "limits")
+	check(resources.Requests, "requests")
+	check(resources.Limits, "limits")
 	return errs
 }
 
@@ -1607,7 +1474,8 @@ func rejectMisalignedHugepageQuantities(cb *cachev1alpha1.CacheBackend) field.Er
 // quantity is also non-fractional by construction but we don't gate
 // on quantity here.
 func rejectFractionalExtendedResources(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Resources == nil {
+	resources, resourcesPath := selectedProviderResources(cb)
+	if resources == nil {
 		return nil
 	}
 	var errs field.ErrorList
@@ -1621,20 +1489,20 @@ func rejectFractionalExtendedResources(cb *cachev1alpha1.CacheBackend) field.Err
 			}
 			if _, ok := qty.AsInt64(); !ok {
 				errs = append(errs, field.Invalid(
-					field.NewPath("spec", "resources", kind).Key(string(name)),
+					resourcesPath.Child(kind).Key(string(name)),
 					qty.String(),
 					fmt.Sprintf("%q is an extended resource and must be an integer quantity — K8s allocates extended resources by whole units", name),
 				))
 			}
 		}
 	}
-	check(cb.Spec.Resources.Requests, "requests")
-	check(cb.Spec.Resources.Limits, "limits")
+	check(resources.Requests, "requests")
+	check(resources.Limits, "limits")
 	return errs
 }
 
-// rejectInvalidResourceNames rejects any spec.resources.requests or
-// spec.resources.limits key that fails the K8s container-resource-name
+// rejectInvalidResourceNames rejects any selected provider resources.requests or
+// resources.limits key that fails the K8s container-resource-name
 // rules. The CRD schema treats ResourceList keys as opaque strings, so
 // an invalid name persists in etcd and only fails when the apiserver
 // rejects the rendered child pod. Rejecting at admission turns that
@@ -1653,7 +1521,8 @@ func rejectFractionalExtendedResources(cb *cachev1alpha1.CacheBackend) field.Err
 // apply the same rule here so the rejection is consistent with what
 // the rendered Pod would face downstream.
 func rejectInvalidResourceNames(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Resources == nil {
+	resources, resourcesPath := selectedProviderResources(cb)
+	if resources == nil {
 		return nil
 	}
 	var errs field.ErrorList
@@ -1661,15 +1530,15 @@ func rejectInvalidResourceNames(cb *cachev1alpha1.CacheBackend) field.ErrorList 
 		for name := range list {
 			if msg, ok := validateContainerResourceName(name); !ok {
 				errs = append(errs, field.Invalid(
-					field.NewPath("spec", "resources", kind).Key(string(name)),
+					resourcesPath.Child(kind).Key(string(name)),
 					string(name),
 					msg,
 				))
 			}
 		}
 	}
-	check(cb.Spec.Resources.Requests, "requests")
-	check(cb.Spec.Resources.Limits, "limits")
+	check(resources.Requests, "requests")
+	check(resources.Limits, "limits")
 	return errs
 }
 
@@ -1723,7 +1592,7 @@ func validateContainerResourceName(name corev1.ResourceName) (string, bool) {
 }
 
 // rejectNegativeResourceQuantities rejects any strictly-negative
-// quantity in spec.resources.requests or spec.resources.limits. The
+// quantity in the selected provider resources.requests or resources.limits. The
 // CRD schema serialises each entry as a resource.Quantity string, which
 // admits a leading "-" without complaint at structural validation —
 // the apiserver's Pod resource validator later rejects the pod with a
@@ -1737,7 +1606,8 @@ func validateContainerResourceName(name corev1.ResourceName) (string, bool) {
 // kubelet's default treatment of a missing request and a reasonable
 // shape to admit verbatim.
 func rejectNegativeResourceQuantities(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Resources == nil {
+	resources, resourcesPath := selectedProviderResources(cb)
+	if resources == nil {
 		return nil
 	}
 	var errs field.ErrorList
@@ -1747,21 +1617,21 @@ func rejectNegativeResourceQuantities(cb *cachev1alpha1.CacheBackend) field.Erro
 				continue
 			}
 			errs = append(errs, field.Invalid(
-				field.NewPath("spec", "resources", kind).Key(string(name)),
+				resourcesPath.Child(kind).Key(string(name)),
 				qty.String(),
 				"must be a non-negative quantity",
 			))
 		}
 	}
-	check(cb.Spec.Resources.Requests, "requests")
-	check(cb.Spec.Resources.Limits, "limits")
+	check(resources.Requests, "requests")
+	check(resources.Limits, "limits")
 	return errs
 }
 
 // rejectRequestsOnlyForNonOvercommittableResources rejects a non-
 // overcommittable resource (hugepages-*, vendor-prefixed extended
-// resource) declared in `spec.resources.requests` without a matching
-// entry in `spec.resources.limits`. K8s requires both halves for
+// resource) declared in the selected provider `resources.requests` without a
+// matching entry in `resources.limits`. K8s requires both halves for
 // non-overcommittable resources — the kubelet allocates whole pages
 // or devices, so the request and limit must be declared together and
 // be equal. Limits-only IS admitted by K8s (the apiserver auto-
@@ -1771,28 +1641,29 @@ func rejectNegativeResourceQuantities(cb *cachev1alpha1.CacheBackend) field.Erro
 // requests-only cpu / memory shape is the canonical kubelet "no upper
 // bound" pattern.
 func rejectRequestsOnlyForNonOvercommittableResources(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Resources == nil {
+	resources, resourcesPath := selectedProviderResources(cb)
+	if resources == nil {
 		return nil
 	}
 	var errs field.ErrorList
-	for name := range cb.Spec.Resources.Requests {
+	for name := range resources.Requests {
 		if isOvercommittableResource(name) {
 			continue
 		}
-		if _, ok := cb.Spec.Resources.Limits[name]; ok {
+		if _, ok := resources.Limits[name]; ok {
 			continue
 		}
-		qty := cb.Spec.Resources.Requests[name]
+		qty := resources.Requests[name]
 		errs = append(errs, field.Invalid(
-			field.NewPath("spec", "resources", "requests").Key(string(name)),
+			resourcesPath.Child("requests").Key(string(name)),
 			qty.String(),
-			fmt.Sprintf("%q is a non-overcommittable resource — it must also be set in spec.resources.limits with the same value (hugepages and extended resources require requests and limits to be declared together)", name),
+			fmt.Sprintf("%q is a non-overcommittable resource — it must also be set in %s with the same value (hugepages and extended resources require requests and limits to be declared together)", name, resourcesPath.Child("limits")),
 		))
 	}
 	return errs
 }
 
-// rejectResourceClaims rejects a non-empty spec.resources.claims slice.
+// rejectResourceClaims rejects a non-empty selected provider resources.claims slice.
 // corev1.ResourceRequirements exposes Claims for the Dynamic Resource
 // Allocation (DRA) feature, but the runtime adapter only copies
 // Container.Resources onto the rendered pod template — it does NOT
@@ -1806,13 +1677,14 @@ func rejectRequestsOnlyForNonOvercommittableResources(cb *cachev1alpha1.CacheBac
 // A nil/empty Claims slice is the absence of the field and admits
 // unchanged — the rule fires only on operator-supplied entries.
 func rejectResourceClaims(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Resources == nil || len(cb.Spec.Resources.Claims) == 0 {
+	resources, resourcesPath := selectedProviderResources(cb)
+	if resources == nil || len(resources.Claims) == 0 {
 		return nil
 	}
 	return field.ErrorList{
 		field.Forbidden(
-			field.NewPath("spec", "resources", "claims"),
-			"spec.resources.claims is not supported in v1alpha1: the runtime adapter does not plumb pod.spec.resourceClaims, so a claim-bound container.resources.claims would render a pod the apiserver rejects",
+			resourcesPath.Child("claims"),
+			resourcesPath.Child("claims").String()+" is not supported in v1alpha1: the runtime adapter does not plumb pod.spec.resourceClaims, so a claim-bound container.resources.claims would render a pod the apiserver rejects",
 		),
 	}
 }

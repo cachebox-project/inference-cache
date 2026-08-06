@@ -58,8 +58,11 @@ func newCacheBackend(t cachev1alpha1.CacheBackendType, engine string) *cachev1al
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
 		Spec:       cachev1alpha1.CacheBackendSpec{Type: t},
 	}
-	if engine != "" {
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: engine}
+	switch engine {
+	case "vllm":
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	case "sglang":
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	}
 	return cb
 }
@@ -299,26 +302,18 @@ func TestCanonicalBindingRequiresExplicitAdapterCapability(t *testing.T) {
 	binding := &backendadapter.Binding{Protocol: backendadapter.ProtocolLMCache, Endpoint: "cache:65432"}
 
 	if err := ValidateRemoteBinding(adapter, binding, canonical); err == nil ||
-		!strings.Contains(err.Error(), "canonical remote-binding contract") {
-		t.Fatalf("ValidateRemoteBinding error = %v, want missing canonical capability", err)
+		!strings.Contains(err.Error(), "remote-binding contract") {
+		t.Fatalf("ValidateRemoteBinding error = %v, want missing binding capability", err)
 	}
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}}}
 	if err := InjectEngineConfigWithBinding(adapter, pod, binding, canonical); err == nil {
-		t.Fatal("canonical injection unexpectedly used the legacy endpoint fallback")
-	}
-
-	legacy := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "")
-	if err := ValidateRemoteBinding(adapter, binding, legacy); err != nil {
-		t.Fatalf("legacy binding compatibility rejected: %v", err)
-	}
-	if err := InjectEngineConfigWithBinding(adapter, pod, binding, legacy); err != nil {
-		t.Fatalf("legacy endpoint fallback rejected: %v", err)
+		t.Fatal("injection unexpectedly used the endpoint fallback")
 	}
 }
 
 func TestResolveRuntimeID(t *testing.T) {
 	// ResolveRuntimeID is the single rule the admission validator, the
-	// reconciler, and the pod-mutating webhook all read the engine name
+	// reconciler, and the pod-mutating webhook all read the runtime identity
 	// through — pinning it here prevents a future tweak in one layer
 	// from quietly diverging from the others.
 	cases := []struct {
@@ -327,28 +322,23 @@ func TestResolveRuntimeID(t *testing.T) {
 		want RuntimeID
 	}{
 		{
-			name: "nil cache defaults to vllm",
+			name: "nil cache has no runtime",
 			in:   nil,
-			want: RuntimeVLLM,
+			want: "",
 		},
 		{
-			name: "unset integration defaults to vllm",
+			name: "unset runtime stays empty",
 			in:   &cachev1alpha1.CacheBackend{},
+			want: "",
+		},
+		{
+			name: "VLLM maps to canonical id",
+			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Runtime: cachev1alpha1.CacheBackendRuntimeVLLM}},
 			want: RuntimeVLLM,
 		},
 		{
-			name: "empty engine defaults to vllm",
-			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{}}},
-			want: RuntimeVLLM,
-		},
-		{
-			name: "case-folded vLLM routes to canonical id",
-			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vLLM"}}},
-			want: RuntimeVLLM,
-		},
-		{
-			name: "free-form engine passes through lowercased",
-			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "SGLang"}}},
+			name: "SGLang maps to canonical id",
+			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Runtime: cachev1alpha1.CacheBackendRuntimeSGLang}},
 			want: RuntimeID("sglang"),
 		},
 	}

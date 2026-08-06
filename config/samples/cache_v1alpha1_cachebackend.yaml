@@ -5,7 +5,7 @@
 # The runtime, engine cache, and remote provider are explicit so this minimum
 # sample also demonstrates the canonical API hierarchy. Admission still
 # defaults deploymentKind=Deployment, replicas=1, integration.role=ReadWrite,
-# integration.failOpen=true, and integration.firstEventTimeout=5m.
+# integration.failOpen=true, and observation.firstEventTimeout=5m.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:

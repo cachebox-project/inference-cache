@@ -754,11 +754,10 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 	})
 
-	t.Run("EngineNameCaseInsensitiveRouting", func(t *testing.T) {
+	t.Run("CanonicalRuntimeRouting", func(t *testing.T) {
 		ns := freshNS(t, k8s)
-		// Upper-case engine name still routes to the vllm adapter.
 		up := lmcacheBackend("up", ns)
-		up.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "VLLM"}
+		up.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
 		if err := k8s.Create(ctx, up); err != nil {
 			t.Fatalf("create VLLM: %v", err)
 		}
@@ -772,7 +771,8 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		// backend is managed the same way vLLM is — it renders the standalone
 		// lmcache-server Deployment.
 		sg := lmcacheBackend("sg", ns)
-		sg.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+		sg.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		sg.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
 		if err := k8s.Create(ctx, sg); err != nil {
 			t.Fatalf("create sglang: %v", err)
 		}
@@ -781,16 +781,6 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 			t.Fatalf("sglang now has a shipping adapter; expected a managed Deployment: %v", err)
 		}
 
-		// An engine with no registered adapter still falls into the unmanaged path.
-		unk := lmcacheBackend("unk", ns)
-		unk.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "no-such-engine"}
-		if err := k8s.Create(ctx, unk); err != nil {
-			t.Fatalf("create unknown-engine: %v", err)
-		}
-		reconcile(t, r, "unk", ns)
-		if _, err := getOptionalDeployment(t, r, "unk", ns); err == nil {
-			t.Fatalf("unknown engine has no adapter; expected no Deployment (unmanaged path)")
-		}
 	})
 
 	t.Run("MissingObjectIsNoError", func(t *testing.T) {
@@ -1407,10 +1397,10 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 			t.Fatalf("get CacheBackend before drain update: %v", err)
 		}
 		beforeGeneration := live.Generation
-		if live.Spec.BackendConfig == nil {
-			live.Spec.BackendConfig = map[string]string{}
+		if live.Spec.Observation == nil {
+			live.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{}
 		}
-		live.Spec.BackendConfig["testDrain"] = time.Now().Format(time.RFC3339Nano)
+		live.Spec.Observation.ModelID = "test-drain-" + time.Now().Format(time.RFC3339Nano)
 		if err := k8s.Update(context.Background(), &live); err != nil {
 			t.Fatalf("update CacheBackend to drain initial queue: %v", err)
 		}

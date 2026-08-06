@@ -54,7 +54,7 @@ const (
 const EngineContainerName = adapterruntime.EngineContainerName
 
 // Defaults the engine env carries when the operator does not override them
-// through typed LMCache config (or legacy backendConfig). The CPU-safe
+// through typed LMCache config. The CPU-safe
 // LMCACHE_REMOTE_SERDE is "naive"; "cachegen" is faster but pulls in
 // CUDA-only codepaths.
 const (
@@ -70,10 +70,6 @@ const (
 	kvRoleConsumer        = "kv_consumer"
 	kvRoleProducer        = "kv_producer"
 	kvRoleBoth            = "kv_both"
-	cfgKeyChunkSize       = "chunkSize"
-	cfgKeyRemoteSerde     = "remoteSerde"
-	cfgKeyLocalCPU        = "localCPU"
-	cfgKeyMaxLocalCPU     = "maxLocalCPU"
 )
 
 // InjectVLLMLMCache adds the LMCache connector arg and LMCACHE_* env to the
@@ -144,12 +140,11 @@ func injectLMCacheConnector(pod *corev1.PodSpec, endpoint, remoteURL string, cac
 	if remoteURL != "" && endpoint == "" {
 		return fmt.Errorf("inject engine config: endpoint is empty")
 	}
-	cfg := cache.Spec.BackendConfig
 	env := []corev1.EnvVar{
-		{Name: EnvLMCacheRemoteSerde, Value: effectiveRemoteSerde(cache, cfg)},
-		{Name: EnvLMCacheChunkSize, Value: effectiveChunkSize(cache, cfg)},
-		{Name: EnvLMCacheLocalCPU, Value: effectiveLocalCPU(cache, cfg)},
-		{Name: EnvLMCacheMaxLocalCPU, Value: effectiveHostMemoryGB(cache, cfg)},
+		{Name: EnvLMCacheRemoteSerde, Value: effectiveRemoteSerde(cache)},
+		{Name: EnvLMCacheChunkSize, Value: effectiveChunkSize(cache)},
+		{Name: EnvLMCacheLocalCPU, Value: effectiveLocalCPU(cache)},
+		{Name: EnvLMCacheMaxLocalCPU, Value: effectiveHostMemoryGB(cache)},
 		{Name: EnvVLLMUseV1, Value: defaultVLLMUseV1},
 		{Name: EnvInferenceCacheFailOpen, Value: FailOpenString(cache)},
 		{Name: EnvPythonHashSeed, Value: defaultPythonHashSeed},
@@ -212,27 +207,21 @@ func validateInjectPodCacheInputs(pod *corev1.PodSpec, cache *cachev1alpha1.Cach
 	return nil
 }
 
-func effectiveChunkSize(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+func effectiveChunkSize(cache *cachev1alpha1.CacheBackend) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.ChunkSizeTokens != nil {
 		return fmt.Sprintf("%d", *cache.Spec.LMCache.ChunkSizeTokens)
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		return defaultChunkSize
-	}
-	return ConfigOr(cfg, cfgKeyChunkSize, defaultChunkSize)
+	return defaultChunkSize
 }
 
-func effectiveRemoteSerde(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+func effectiveRemoteSerde(cache *cachev1alpha1.CacheBackend) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.RemoteSerde != "" {
 		return cache.Spec.LMCache.RemoteSerde
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		return defaultRemoteSerde
-	}
-	return ConfigOr(cfg, cfgKeyRemoteSerde, defaultRemoteSerde)
+	return defaultRemoteSerde
 }
 
-func effectiveHostMemoryGB(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+func effectiveHostMemoryGB(cache *cachev1alpha1.CacheBackend) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.HostMemory != nil &&
 		cache.Spec.LMCache.HostMemory.Capacity != nil {
 		bytes := cache.Spec.LMCache.HostMemory.Capacity.Value()
@@ -240,10 +229,7 @@ func effectiveHostMemoryGB(cache *cachev1alpha1.CacheBackend, cfg map[string]str
 			return fmt.Sprintf("%d", ceilPositiveBytesToGiB(bytes))
 		}
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		return defaultMaxLocalCPU
-	}
-	return ConfigOr(cfg, cfgKeyMaxLocalCPU, defaultMaxLocalCPU)
+	return defaultMaxLocalCPU
 }
 
 func ceilPositiveBytesToGiB(bytes int64) int64 {
@@ -255,18 +241,15 @@ func ceilPositiveBytesToGiB(bytes int64) int64 {
 	return gibibytes
 }
 
-func effectiveLocalCPU(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+func effectiveLocalCPU(cache *cachev1alpha1.CacheBackend) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.HostMemory != nil &&
 		cache.Spec.LMCache.HostMemory.Capacity != nil {
 		return "True"
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		if cache.Spec.RemoteStorage == nil {
-			return "True"
-		}
-		return defaultLocalCPU
+	if cache.Spec.RemoteStorage == nil {
+		return "True"
 	}
-	return ConfigOr(cfg, cfgKeyLocalCPU, defaultLocalCPU)
+	return defaultLocalCPU
 }
 
 // EngineContainerIndex returns the index of the vLLM engine container the

@@ -50,7 +50,7 @@ type SubscriberSidecarParams struct {
 // dials the engine over 127.0.0.1 (the ZMQ PUB endpoint on EngineZMQPortStr);
 // identity flags are derived from Cache + Pod (--replica-id from pod.Name via the
 // downward API, --tenant-id from pod.Namespace ditto, --model-id from
-// spec.observation.modelID (or legacy backendConfig.model), --hash-scheme from
+// spec.observation.modelID, --hash-scheme from
 // HashScheme) so the CR is the single source of truth.
 //
 // The flag surface here is deliberately the intersection of what the shipped

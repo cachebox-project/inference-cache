@@ -18,13 +18,8 @@ func TestEffectiveRemoteStorageUsesOnlyExplicitDeclaration(t *testing.T) {
 	}
 }
 
-func TestEffectiveRuntimePrefersCanonicalField(t *testing.T) {
-	spec := CacheBackendSpec{
-		Runtime: CacheBackendRuntimeSGLang,
-		Integration: &CacheBackendIntegrationSpec{
-			Engine: "vllm",
-		},
-	}
+func TestEffectiveRuntimeReturnsConfiguredField(t *testing.T) {
+	spec := CacheBackendSpec{Runtime: CacheBackendRuntimeSGLang}
 	if got := spec.EffectiveRuntime(); got != CacheBackendRuntimeSGLang {
 		t.Fatalf("EffectiveRuntime() = %q, want SGLang", got)
 	}
@@ -34,9 +29,6 @@ func TestObservationDoesNotSynthesizeRemoteStorage(t *testing.T) {
 	spec := CacheBackendSpec{
 		Type:        CacheBackendTypeLMCache,
 		Observation: &CacheBackendObservationSpec{ModelID: "model-a"},
-	}
-	if spec.UsesCanonicalCacheHierarchy() {
-		t.Fatal("typed observation must remain independent from cache/provider hierarchy selection")
 	}
 	if got := spec.EffectiveRemoteStorage(); got != nil {
 		t.Fatalf("EffectiveRemoteStorage() = %+v, want nil", got)

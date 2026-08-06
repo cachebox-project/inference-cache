@@ -22,18 +22,17 @@ kind: CacheBackend
 metadata:
   name: my-cache
 spec:
+  runtime: VLLM
   type: LMCache                 # backing cache implementation
-  integration:
-    engine: vllm                # optional — defaults to vllm
   engineSelector:
     matchLabels:
       app: my-engine            # must match your engine pods' labels
-  backendConfig:
-    model: Qwen/Qwen2.5-0.5B-Instruct
+  observation:
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
 ```
 
 Everything else is defaulted: `spec.replicas` becomes `1`, the readiness gate's
-`firstEventTimeout` becomes `5m`, and `integration.failOpen` is treated as `true`.
+`observation.firstEventTimeout` becomes `5m`, and `integration.failOpen` is treated as `true`.
 
 {{% alert title="One label does the binding" color="warning" %}}
 The value under `engineSelector.matchLabels` must also appear on your engine pods' template

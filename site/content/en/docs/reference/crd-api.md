@@ -37,17 +37,14 @@ contract follows its own compatibility policy for external consumers.
 | `deploymentKind` | `Deployment`, `StatefulSet` | `Deployment` | `StatefulSet` reserved/no-op. |
 | `replicas` | int32 | `1` | Min 0. |
 | `autoscaling` | object | — | `minReplicas`, `maxReplicas` (required), `targetCPUUtilizationPercent` (default 80). |
-| `integration.engine` | `vllm`, `sglang` | `vllm` | Runtime ID, not the adapter name. |
 | `integration.mode` | `Offload`, `EventsOnly` | `Offload` | Events-only = routing only. |
 | `integration.role` | `ReadOnly`, `WriteOnly`, `ReadWrite` | `ReadWrite` | Maps to LMCache `kv_role`. |
 | `integration.failOpen` | bool | `true` | `false` fails closed. |
-| `integration.firstEventTimeout` | duration | `5m` | KV-event readiness window. |
 | `integration.engineOverrides` | object | — | `args` / `suppressArgs` / `env` / `suppressEnv`. |
 | `integration.engineHostNetwork` | bool | `false` | Opt-in for Mooncake engine pods. |
 | `engineSelector.matchLabels` | map | — | Equality selector over engine pod labels. |
-| `backendConfig` | map[string]string | — | e.g. `model`, plus backend tunables. |
 | `template` | object | — | Narrow pod-level overrides (no containers). |
-| `resources` | ResourceRequirements | `requests.memory 4Gi` / `limits.memory 8Gi` | For the managed cache-server container. |
+| `remoteStorage.<provider>.resources` | ResourceRequirements | renderer default: `requests.memory 4Gi` / `limits.memory 8Gi` | Resources for the selected managed provider container. |
 | `allowCrossNamespace` | bool | `false` | Opt-in cross-namespace endpoints. |
 
 **Key `status` fields:** `endpoint`, `matchedEnginePods` (`*int32`),

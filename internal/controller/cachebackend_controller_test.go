@@ -226,7 +226,8 @@ func TestReconcileCanonicalHostOnlyCacheCreatesNoProviderWorkload(t *testing.T) 
 	cb := lmcacheBackend("host-only", "ns1")
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.RemoteStorage = nil
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
 	r := newReconciler(scheme, cb)
 
 	reconcile(t, r, cb.Name, cb.Namespace)
@@ -520,7 +521,7 @@ func TestReconcileLMCacheUpdatesImage(t *testing.T) {
 }
 
 // TestReconcileLMCacheProfileSwitchGPUToCPU is retired: the "profile"
-// backendConfig key and the all-in-one vLLM+LMCache container shape it
+// historical all-in-one vLLM+LMCache container shape it
 // switched between are gone. The CacheBackend now renders a CPU-only
 // standalone lmcache-server regardless of the engine the user runs
 // alongside it — engine choice (GPU vs CPU image) is the user's, not a
@@ -883,9 +884,8 @@ func TestReconcileSwitchToSGLangHiCacheCleansManagedState(t *testing.T) {
 	switching.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
 	switching.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
 	switching.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		Engine: "sglang",
-		Mode:   cachev1alpha1.CacheBackendIntegrationModeOffload,
-		Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+		Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
+		Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 	}
 	switching.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
 		MatchLabels: map[string]string{"app": "sglang"},
@@ -1224,8 +1224,7 @@ func TestReconcileEventsOnlyUnsupportedPairIsUnmanaged(t *testing.T) {
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Type: cachev1alpha1.CacheBackendType("unsupported"),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+				Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
 			},
 		},
 	}
@@ -1271,8 +1270,7 @@ func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
 			Type:          cachev1alpha1.CacheBackendTypeLMCache,
 			RemoteStorage: externalLMCacheStorage("external-cache.ns1.svc:8200"),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+				Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
 			},
 		},
 	}
@@ -1635,23 +1633,22 @@ func TestReconcileExternalClearsRemovedEndpoint(t *testing.T) {
 }
 
 func TestReconcileLMCacheCaseInsensitiveEngine(t *testing.T) {
-	// Common user spellings ("vLLM", "VLLM") must route to the canonical
-	// RuntimeVLLM, not silently drop the CR into the unmanaged path.
-	for _, engine := range []string{"vLLM", "VLLM", "vllm"} {
-		t.Run(engine, func(t *testing.T) {
+	// The canonical VLLM runtime must route to the managed adapter path.
+	for _, runtime := range []cachev1alpha1.CacheBackendRuntime{cachev1alpha1.CacheBackendRuntimeVLLM} {
+		t.Run(string(runtime), func(t *testing.T) {
 			scheme := newScheme(t)
 			cb := lmcacheBackend("cache", "ns1")
-			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: engine}
+			cb.Spec.Runtime = runtime
 			r := newReconciler(scheme, cb)
 
 			reconcile(t, r, "cache", "ns1")
 
 			dep, err := getOptionalDeployment(t, r, "cache", "ns1")
 			if err != nil {
-				t.Fatalf("expected a managed Deployment for engine=%q, got error: %v", engine, err)
+				t.Fatalf("expected a managed Deployment for runtime=%q, got error: %v", runtime, err)
 			}
 			if got := dep.Spec.Template.Spec.Containers[0].Name; got != "lmcache-server" {
-				t.Fatalf("container = %q, want lmcache-server (engine=%q must resolve to RuntimeVLLM)", got, engine)
+				t.Fatalf("container = %q, want lmcache-server (runtime=%q must resolve to RuntimeVLLM)", got, runtime)
 			}
 		})
 	}

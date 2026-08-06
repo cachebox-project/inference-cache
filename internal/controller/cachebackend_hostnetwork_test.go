@@ -59,15 +59,15 @@ func TestClampSingletonReplicas(t *testing.T) {
 	// host-network one.
 	sglangLMCache := func() *cachev1alpha1.CacheBackend {
 		cb := &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
-			Type:        cachev1alpha1.CacheBackendTypeLMCache,
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"},
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 		}}
 		return cb
 	}
 	vllmLMCache := func() *cachev1alpha1.CacheBackend {
 		return &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
-			Type:        cachev1alpha1.CacheBackendTypeLMCache,
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"},
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 		}}
 	}
 	for _, tc := range []struct {

@@ -48,7 +48,7 @@ func TestManagedRedisProviderOwnsTypedWorkloadConfig(t *testing.T) {
 	}
 }
 
-func TestCanonicalProviderDoesNotInheritLegacyWorkloadConfig(t *testing.T) {
+func TestCanonicalProviderUsesBoundedDefaults(t *testing.T) {
 	cache := &cachev1alpha1.CacheBackend{
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
@@ -57,10 +57,6 @@ func TestCanonicalProviderDoesNotInheritLegacyWorkloadConfig(t *testing.T) {
 				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
 				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
-			},
-			BackendConfig: map[string]string{"redisImage": "legacy.example/redis:wrong"},
-			Resources: &corev1.ResourceRequirements{
-				Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
 			},
 		},
 	}
@@ -74,18 +70,22 @@ func TestCanonicalProviderDoesNotInheritLegacyWorkloadConfig(t *testing.T) {
 		t.Fatalf("Render: %v", err)
 	}
 	container := rendered.PodSpec.Containers[0]
-	if container.Image == "legacy.example/redis:wrong" {
-		t.Fatal("canonical provider inherited legacy backendConfig.redisImage")
-	}
 	wantMemory := resource.MustParse("8Gi")
 	if got := container.Resources.Limits[corev1.ResourceMemory]; got.Cmp(wantMemory) != 0 {
 		t.Fatalf("canonical default memory limit = %s, want %s", got.String(), wantMemory.String())
 	}
 }
 
-func TestLegacyProviderRetainsBoundedResourcesWithoutDefaulter(t *testing.T) {
+func TestProviderRetainsBoundedResourcesWithoutDefaulter(t *testing.T) {
 	cache := &cachev1alpha1.CacheBackend{
-		Spec: cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendTypeLMCache},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			},
+		},
 	}
 	rendered, _, err := ResolveLMCacheServer(cache)
 	if err != nil {
@@ -95,9 +95,9 @@ func TestLegacyProviderRetainsBoundedResourcesWithoutDefaulter(t *testing.T) {
 	wantRequest := resource.MustParse("4Gi")
 	resources := rendered.Containers[0].Resources
 	if got := resources.Limits[corev1.ResourceMemory]; got.Cmp(wantLimit) != 0 {
-		t.Fatalf("legacy fallback memory limit = %s, want %s", got.String(), wantLimit.String())
+		t.Fatalf("fallback memory limit = %s, want %s", got.String(), wantLimit.String())
 	}
 	if got := resources.Requests[corev1.ResourceMemory]; got.Cmp(wantRequest) != 0 {
-		t.Fatalf("legacy fallback memory request = %s, want %s", got.String(), wantRequest.String())
+		t.Fatalf("fallback memory request = %s, want %s", got.String(), wantRequest.String())
 	}
 }

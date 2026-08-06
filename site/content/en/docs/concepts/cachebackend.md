@@ -17,7 +17,7 @@ backend and the engine-integration policy that uses it. Applying one:
 2. **Binds** to inference-engine pods by label (`spec.engineSelector`). The mutating Pod
    webhook injects the KV-connector configuration into matching pods. It also injects the
    observation sidecar when the controller has `--kvevent-subscriber-image` configured and
-   `backendConfig.model` is set.
+   `spec.observation.modelID` is set.
 3. **Makes the engine's KV cache reusable** — offloaded to the backend (tier 2) and, when
    subscriber reporting is enabled, surfaced to routing (tier 1) so a warm prefix skips
    prefill.
@@ -32,21 +32,25 @@ metadata:
   name: llama3-cache
   namespace: serving
 spec:
+  runtime: VLLM
   type: LMCache
   integration:
-    engine: vllm          # runtime ID, not the adapter name
     mode: Offload
     role: ReadWrite
   engineSelector:
     matchLabels:
       app: llama3-vllm
-  backendConfig:
-    model: meta-llama/Llama-3.1-8B-Instruct
-  resources:
-    requests:
-      memory: 4Gi
-    limits:
-      memory: 8Gi
+  observation:
+    modelID: meta-llama/Llama-3.1-8B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      resources:
+        requests:
+          memory: 4Gi
+        limits:
+          memory: 8Gi
 ```
 
 ## Backend types (`spec.type`)
@@ -87,11 +91,9 @@ affects bandwidth.
 
 | Field | Values | Meaning |
 |---|---|---|
-| `engine` | `vllm` (default), `sglang` | The **runtime ID** — not the adapter package name. Writing the adapter name (e.g. `vllm-lmcache`) is rejected. |
 | `mode` | `Offload` (default), `EventsOnly` | `Offload` = routing + tier-2 offload + a provisioned server. `EventsOnly` = routing only, no server, no KV connector. |
 | `role` | `ReadOnly`, `WriteOnly`, `ReadWrite` (default) | Maps to the LMCache `kv_role` (`kv_consumer` / `kv_producer` / `kv_both`). |
 | `failOpen` | `true` (default) | The engine falls back to local prefill when the cache is unreachable. `false` fails closed (and emits a Warning Event). |
-| `firstEventTimeout` | `5m` (default) | How long readiness waits for the first KV event before reporting degraded. |
 | `engineOverrides` | — | Fine-grained control over injected args/env (see below). |
 | `engineHostNetwork` | `false` (default) | Opt-in host networking for Mooncake engine pods. |
 

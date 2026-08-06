@@ -11,16 +11,16 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
-// TestIntegrationCacheBackendResources exercises canonical provider resources
+// TestIntegrationCacheBackendResources exercises provider resources
 // end-to-end against a real apiserver. A managed provider with no explicit
-// resource block receives bounded renderer defaults without persisting the
-// deprecated top-level spec.resources field, while an operator-supplied typed
-// resource block is threaded verbatim into the rendered Deployment container.
+// resource block receives bounded renderer defaults without persisting those
+// defaults, while an operator-supplied typed resource block is threaded verbatim
+// into the rendered Deployment container.
 //
 // The unit-level renderer test
-// (TestVLLMLMCacheResolveCacheServerHonorsSpecResources) constructs
-// CacheBackend objects directly; this test also guards the persisted canonical
-// API shape after real-apiserver admission.
+// (TestVLLMLMCacheResolveCacheServerHonorsProviderResources) constructs
+// CacheBackend objects directly; this test also guards the persisted API shape
+// after real-apiserver admission.
 func TestIntegrationCacheBackendResources(t *testing.T) {
 	skipWithoutEnvtest(t)
 	k8s, scheme, _ := startEnv(t)
@@ -38,9 +38,9 @@ func TestIntegrationCacheBackendResources(t *testing.T) {
 		return cb
 	}
 
-	t.Run("CanonicalDefaultBoundsProviderWithoutPersistingLegacyResources", func(t *testing.T) {
-		// Canonical provider defaults belong to the renderer, not deprecated
-		// spec.resources. The child container MUST still carry memory requests
+	t.Run("DefaultBoundsProviderWithoutPersistingResources", func(t *testing.T) {
+		// Provider defaults belong to the renderer, not the persisted API.
+		// The child container MUST still carry memory requests
 		// and limits so heavy T2 write load cannot leave it unbounded.
 		ns := freshNS(t, k8s)
 		if err := k8s.Create(ctx, newCanonicalBackend(ns)); err != nil {
@@ -49,9 +49,6 @@ func TestIntegrationCacheBackendResources(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		cb := getBackend(t, r, "cache", ns)
-		if cb.Spec.Resources != nil {
-			t.Fatalf("deprecated spec.resources persisted on canonical backend: %+v", cb.Spec.Resources)
-		}
 		if cb.Spec.RemoteStorage.LMCacheServer.Resources != nil {
 			t.Fatalf("renderer default leaked into spec.remoteStorage.lmCacheServer.resources: %+v",
 				cb.Spec.RemoteStorage.LMCacheServer.Resources)

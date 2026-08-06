@@ -132,10 +132,8 @@ func TestVerifySamplesAdmissionEndToEnd(t *testing.T) {
 		good := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "good", Namespace: "default"},
 			Spec: cachev1alpha1.CacheBackendSpec{
-				Type: cachev1alpha1.CacheBackendTypeLMCache,
-				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-					Engine: "vllm",
-				},
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeLMCache,
 			},
 		}
 		if err := cl.Create(ctx, good, client.DryRunAll); err != nil {
@@ -143,17 +141,15 @@ func TestVerifySamplesAdmissionEndToEnd(t *testing.T) {
 		}
 	})
 
-	// Known-BAD: an engine the adapter registry has never heard of.
+	// Known-BAD: a runtime/cache pair the adapter registry does not support.
 	// Admission MUST reject with a message that names the offending
 	// (engine, type) pair so a real operator gets an actionable error.
 	t.Run("bad_engine_is_rejected", func(t *testing.T) {
 		bad := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: "default"},
 			Spec: cachev1alpha1.CacheBackendSpec{
-				Type: cachev1alpha1.CacheBackendTypeLMCache,
-				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-					Engine: "bogus",
-				},
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
 			},
 		}
 		err := cl.Create(ctx, bad, client.DryRunAll)

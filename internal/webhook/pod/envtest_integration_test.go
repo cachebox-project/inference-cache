@@ -133,18 +133,23 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "envtest-cb", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm-test"},
 			},
-			// backendConfig.model is the source of the
+			// observation.modelID is the source of the
 			// subscriber sidecar's --model-id flag. Set it here so
 			// the auto-attach assertion below has something to match.
-			BackendConfig: map[string]string{"model": modelID},
+			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: modelID},
 		},
 	}
 	if err := mgr.GetClient().Create(ctx, cb); err != nil {

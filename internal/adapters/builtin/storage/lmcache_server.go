@@ -2,7 +2,6 @@ package storage
 
 import (
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -11,9 +10,8 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
-// LMCache standalone-server defaults. Canonical resources override them
-// through remoteStorage.lmCacheServer; deprecated BackendConfig keys remain
-// readable only for legacy resources.
+// LMCache standalone-server defaults. Resources override them through
+// remoteStorage.lmCacheServer.
 const (
 	// The server and the LMCache client compiled into the engine communicate
 	// over a versioned wire protocol, so this must never become a floating tag.
@@ -29,9 +27,6 @@ const (
 	defaultLMCacheServerHost     = "0.0.0.0"
 	defaultLMCacheServerStorage  = "cpu"
 	defaultLMCacheServerPortName = "lmcache"
-
-	cfgKeyServerImage   = "serverImage"
-	cfgKeyServerCommand = "serverCommand"
 )
 
 // ResolveLMCacheServer renders the provider-owned standalone LMCache server.
@@ -40,15 +35,13 @@ func ResolveLMCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
 	}
-	cfg := legacyProviderConfig(cache)
 	image := effectiveProviderImage(
 		cache,
 		cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-		cfgKeyServerImage,
 		defaultLMCacheServerImage,
 	)
 
-	command, args := lmCacheServerCommand(cfg)
+	command, args := lmCacheServerCommand()
 	if typed := effectiveProviderCommand(cache, cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer); len(typed) > 0 {
 		command, args = typed[:1], typed[1:]
 	}
@@ -109,13 +102,7 @@ func defaultServerResources(cache *cachev1alpha1.CacheBackend) corev1.ResourceRe
 	return out
 }
 
-func lmCacheServerCommand(cfg map[string]string) (command, args []string) {
-	if raw := configOr(cfg, cfgKeyServerCommand, ""); raw != "" {
-		fields := strings.Fields(raw)
-		if len(fields) > 0 {
-			return []string{fields[0]}, fields[1:]
-		}
-	}
+func lmCacheServerCommand() (command, args []string) {
 	return []string{"lmcache_server"}, []string{
 		defaultLMCacheServerHost,
 		fmt.Sprintf("%d", defaultLMCacheServerPort),

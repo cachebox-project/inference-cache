@@ -1,30 +1,10 @@
 package v1alpha1
 
-import (
-	"strings"
+import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-)
-
-// UsesCanonicalCacheHierarchy reports whether the resource uses the separated
-// runtime/cache/storage API. Legacy resources are detected by the absence of
-// these fields and retain their historical implicit provider mapping.
-func (s *CacheBackendSpec) UsesCanonicalCacheHierarchy() bool {
-	return s.Runtime != "" || s.LMCache != nil || s.RemoteStorage != nil
-}
-
-// EffectiveRuntime returns the canonical inference runtime while preserving
-// integration.engine as a read-time compatibility input.
+// EffectiveRuntime returns the configured inference runtime.
 func (s *CacheBackendSpec) EffectiveRuntime() CacheBackendRuntime {
-	if s.Runtime != "" {
-		return normalizeRuntime(s.Runtime)
-	}
-	if s.Integration != nil {
-		if runtime := normalizeRuntime(CacheBackendRuntime(s.Integration.Engine)); runtime != "" {
-			return runtime
-		}
-	}
-	return CacheBackendRuntimeVLLM
+	return s.Runtime
 }
 
 // EffectiveCacheType returns the engine-side cache implementation, defaulting
@@ -44,33 +24,18 @@ func (s *CacheBackendSpec) EffectiveRemoteStorage() *CacheBackendRemoteStorageSp
 }
 
 // EffectiveObservationModelID returns the independently-owned observation
-// model id while retaining backendConfig.model for legacy resources.
+// model id.
 func (s *CacheBackendSpec) EffectiveObservationModelID() string {
 	if s.Observation != nil {
 		return s.Observation.ModelID
 	}
-	return s.BackendConfig["model"]
+	return ""
 }
 
-// EffectiveFirstEventTimeout returns the observation-owned timeout, falling
-// back to the deprecated integration field for compatibility.
+// EffectiveFirstEventTimeout returns the observation-owned timeout.
 func (s *CacheBackendSpec) EffectiveFirstEventTimeout() *metav1.Duration {
 	if s.Observation != nil && s.Observation.FirstEventTimeout != nil {
 		return s.Observation.FirstEventTimeout
 	}
-	if s.Integration != nil {
-		return s.Integration.FirstEventTimeout
-	}
 	return nil
-}
-
-func normalizeRuntime(value CacheBackendRuntime) CacheBackendRuntime {
-	switch strings.ToLower(string(value)) {
-	case "vllm":
-		return CacheBackendRuntimeVLLM
-	case "sglang":
-		return CacheBackendRuntimeSGLang
-	default:
-		return value
-	}
 }

@@ -36,8 +36,8 @@ func newProbeBackend(name string) *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "team-a"},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:        cachev1alpha1.CacheBackendTypeLMCache,
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"},
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 		},
 	}
 }
@@ -574,7 +574,7 @@ func TestEvaluateFunctionalProbeRequestShape(t *testing.T) {
 	client := &ProbeClient{ProbeURL: srv.URL, HTTPClient: srv.Client()}
 
 	backend := newProbeBackend("cb-1")
-	backend.Spec.Integration.Engine = "SGLang" // mixed-case → lowercased on the wire
+	backend.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang // mixed-case → lowercased on the wire
 
 	_ = evaluateFunctionalProbe(context.Background(), backend, kvReadinessTrue,
 		client, &probeRateLimiter{}, time.Second, time.Now())
@@ -603,7 +603,6 @@ func TestProbeHashSchemeForBackendDefaults(t *testing.T) {
 	}{
 		{"nil integration", nil, "vllm"},
 		{"empty engine", stringPtr(""), "vllm"},
-		{"whitespace engine", stringPtr("   "), "vllm"},
 		{"vllm lowercase", stringPtr("vllm"), "vllm"},
 		{"VLLM uppercase", stringPtr("VLLM"), "vllm"},
 		{"sglang mixed", stringPtr("SGLang"), "sglang"},
@@ -612,9 +611,9 @@ func TestProbeHashSchemeForBackendDefaults(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			backend := newProbeBackend("cb")
 			if tc.engine == nil {
-				backend.Spec.Integration = nil
+				backend.Spec.Runtime = ""
 			} else {
-				backend.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: *tc.engine}
+				backend.Spec.Runtime = cachev1alpha1.CacheBackendRuntime(*tc.engine)
 			}
 			if got := probeHashSchemeForBackend(backend); got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)

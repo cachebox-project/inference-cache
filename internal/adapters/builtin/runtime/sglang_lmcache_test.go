@@ -4,6 +4,7 @@ import (
 	"flag"
 	"io"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -21,10 +22,35 @@ func newSGLangBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:          cachev1alpha1.CacheBackendTypeLMCache,
-			Integration:   &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"},
-			BackendConfig: cfg,
+			Runtime:     cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:        cachev1alpha1.CacheBackendTypeLMCache,
+			LMCache:     &cachev1alpha1.LMCacheEngineSpec{},
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{Image: cfg["redisImage"]},
+			},
 		},
+	}
+	if value := cfg["chunkSize"]; value != "" {
+		parsed, _ := strconv.ParseInt(value, 10, 32)
+		chunkSize := int32(parsed)
+		cb.Spec.LMCache.ChunkSizeTokens = &chunkSize
+	}
+	cb.Spec.LMCache.WorkerImage = cfg["workerImage"]
+	if value := cfg["mpPort"]; value != "" {
+		parsed, _ := strconv.ParseInt(value, 10, 32)
+		port := int32(parsed)
+		cb.Spec.LMCache.WorkerPort = &port
+	}
+	if value := cfg["l1SizeGB"]; value != "" {
+		if capacity, err := resource.ParseQuantity(value + "Gi"); err == nil {
+			cb.Spec.LMCache.HostMemory = &cachev1alpha1.CacheBackendHostMemorySpec{Capacity: &capacity}
+		}
+	}
+	if value := cfg["model"]; value != "" {
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: value}
 	}
 	return cb
 }
@@ -139,11 +165,6 @@ func TestSGLangCanonicalHostOnlyBindingDoesNotSelectRedis(t *testing.T) {
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
 			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-			BackendConfig: map[string]string{
-				"chunkSize":   "999",
-				"l1SizeGB":    "99",
-				"workerImage": "legacy.example/worker:wrong",
-			},
 			LMCache: &cachev1alpha1.LMCacheEngineSpec{
 				ChunkSizeTokens: &chunkSize,
 				HostMemory: &cachev1alpha1.CacheBackendHostMemorySpec{
@@ -170,9 +191,6 @@ func TestSGLangCanonicalHostOnlyBindingDoesNotSelectRedis(t *testing.T) {
 	}
 	if !strings.Contains(script, "--chunk-size 128") || !strings.Contains(script, "--l1-size-gb 6") {
 		t.Fatalf("worker command did not consume typed LMCache config: %q", script)
-	}
-	if worker.Image == "legacy.example/worker:wrong" {
-		t.Fatal("canonical engine config inherited legacy backendConfig.workerImage")
 	}
 }
 
@@ -1124,7 +1142,7 @@ func TestSGLangObservationSidecarSkipsWithoutModel(t *testing.T) {
 		t.Fatalf("ObservationSidecar: %v", err)
 	}
 	if c != nil {
-		t.Fatalf("expected nil sidecar when backendConfig.model is unset, got %+v", c)
+		t.Fatalf("expected nil sidecar when observation.modelID is unset, got %+v", c)
 	}
 }
 

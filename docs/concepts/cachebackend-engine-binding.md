@@ -43,7 +43,7 @@ Three actors participate in the binding:
 
 The match is evaluated **once at pod CREATE** by the mutating webhook. The wiring is sticky to the life of the pod; relabeling an existing pod does not re-evaluate it. To opt a pod out regardless of label match, set `inferencecache.io/skip-inject: "true"` on the pod template. Skipped pods are stamped with `inferencecache.io/inject-skipped: "skip-inject-annotation"` and receive a `SkippedByOperator` Event, so an intentional opt-out is distinguishable from selector drift.
 
-`*` The kvevent-subscriber sidecar is opt-in. It is appended only when the controller is started with `--kvevent-subscriber-image` set (empty by default) AND the matched CacheBackend has `spec.observation.modelID` configured; otherwise the engine is wired without it. The deprecated `backendConfig.model` remains a read fallback for legacy resources. The default install does not auto-attach the sidecar.
+`*` The kvevent-subscriber sidecar is opt-in. It is appended only when the controller is started with `--kvevent-subscriber-image` set (empty by default) AND the matched CacheBackend has `spec.observation.modelID` configured; otherwise the engine is wired without it. The default install does not auto-attach the sidecar.
 
 > **Native SGLang HiCache exception.** `type: SGLangHiCache` is engine-local:
 > the controller creates no backend workload or endpoint, and the webhook does

@@ -27,7 +27,7 @@ wiring into them. Three actors participate:
 3. **The webhook claims matching pods** — but only once `status.endpoint` is populated. It
    injects the LMCache env, the `--kv-transfer-config` arg, and stamps
    `inferencecache.io/injected-by: <ns>/<name>`. When the controller runs with
-   `--kvevent-subscriber-image` set **and** the backend has `backendConfig.model`, it also
+   `--kvevent-subscriber-image` set **and** the backend has `spec.observation.modelID`, it also
    appends the subscriber sidecar.
 4. **KV events flow** (when the sidecar is present) into the server's index and surface in
    `CacheBackend.status`.
@@ -48,15 +48,15 @@ kind: CacheBackend
 metadata:
   name: qwen-demo-cache       # CR name — must differ from the engine Deployment name
 spec:
+  runtime: VLLM
   type: LMCache
   integration:
-    engine: vllm
     role: ReadWrite
   engineSelector:
     matchLabels:
       app: qwen-demo          # selector key/value (1 of 2)
-  backendConfig:
-    model: Qwen/Qwen2.5-0.5B-Instruct
+  observation:
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -105,14 +105,8 @@ Always injected (reserved — not overridable):
 - `PYTHONHASHSEED=0` — a correctness invariant (pins the engine's hash seed so LMCache
   reloads match under tensor parallelism)
 
-Tunable via `backendConfig` (not overrides):
-
-| `backendConfig` key | Env var | Default |
-|---|---|---|
-| `chunkSize` | `LMCACHE_CHUNK_SIZE` | 256 |
-| `remoteSerde` | `LMCACHE_REMOTE_SERDE` | naive |
-| `localCPU` | `LMCACHE_LOCAL_CPU` | False |
-| `maxLocalCPU` | `LMCACHE_MAX_LOCAL_CPU_SIZE` | 20 GiB |
+Typed LMCache tunables live under `spec.lmCache`: `chunkSizeTokens`,
+`remoteSerde`, and `hostMemory.capacity`.
 
 ### SGLang + LMCache
 

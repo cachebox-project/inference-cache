@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -22,15 +21,14 @@ import (
 
 // TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted is the
 // end-to-end pin for the defaulter-sweep operator-UX win: applying a
-// CacheBackend with ONLY the three fields the substrate genuinely cannot
-// guess (engineSelector, backendConfig.model, and a name) must produce a
+// CacheBackend with the required runtime plus an engine selector and model ID
+// must produce a
 // fully-defaulted CR with every Phase-1 default stamped — Type=LMCache,
-// DeploymentKind=Deployment, Replicas=1, Integration.Engine=vllm,
+// DeploymentKind=Deployment, Replicas=1,
 // Integration.Role=ReadWrite, Integration.Mode=Offload,
-// Integration.FailOpen=true, and bounded legacy Resources.
-// Integration.FirstEventTimeout=5m. The apiserver in the loop applies
+// Integration.FailOpen=true, and Observation.FirstEventTimeout=5m. The apiserver in the loop applies
 // `+kubebuilder:default=` markers; the webhook materialises
-// spec.integration solely to persist firstEventTimeout.
+// spec.integration and spec.observation so their nested defaults persist.
 //
 // This test boots a real apiserver via envtest so the CRD-schema defaults
 // (which a raw-struct unit test cannot exercise) are part of the assertion.
@@ -118,7 +116,7 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	live := mgr.GetAPIReader()
 	mkNamespace(t, ctx, k8s, "team-a")
 
-	// --- Minimum-viable CR: engineSelector + backendConfig.model only ---
+	// --- Minimum-viable CR: runtime + engineSelector + observation.modelID ---
 	//
 	// An apply with no Type, no DeploymentKind, no Replicas, no Integration
 	// block, no Storage, no Autoscaling. Every other field must be stamped
@@ -127,12 +125,11 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	mvCR := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "minimum", Namespace: "team-a"},
 		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app.kubernetes.io/name": "vllm"},
 			},
-			BackendConfig: map[string]string{
-				"model": "meta-llama/Meta-Llama-3-8B-Instruct",
-			},
+			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "meta-llama/Meta-Llama-3-8B-Instruct"},
 		},
 	}
 	if err := k8s.Create(ctx, mvCR); err != nil {
@@ -165,9 +162,6 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	if got.Spec.Integration == nil {
 		t.Fatalf("spec.integration was not materialised by the defaulter; got nil")
 	}
-	if want := "vllm"; got.Spec.Integration.Engine != want {
-		t.Errorf("spec.integration.engine = %q, want %q (webhook default)", got.Spec.Integration.Engine, want)
-	}
 	if want := cachev1alpha1.CacheBackendIntegrationRoleReadWrite; got.Spec.Integration.Role != want {
 		t.Errorf("spec.integration.role = %q, want %q (kubebuilder default)", got.Spec.Integration.Role, want)
 	}
@@ -177,19 +171,10 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	if got.Spec.Integration.FailOpen == nil || !*got.Spec.Integration.FailOpen {
 		t.Errorf("spec.integration.failOpen = %v, want true (kubebuilder default)", got.Spec.Integration.FailOpen)
 	}
-	if got.Spec.Integration.FirstEventTimeout == nil ||
-		got.Spec.Integration.FirstEventTimeout.Duration != defaultFirstEventTimeout {
-		t.Errorf("spec.integration.firstEventTimeout = %v, want %s (defaulter-stamped)",
-			got.Spec.Integration.FirstEventTimeout, defaultFirstEventTimeout)
-	}
-	if got.Spec.Resources == nil {
-		t.Fatal("spec.resources was not materialised for the legacy resource")
-	}
-	if memory := got.Spec.Resources.Requests.Memory(); memory == nil || memory.Cmp(resource.MustParse("4Gi")) != 0 {
-		t.Errorf("spec.resources.requests.memory = %v, want 4Gi (webhook default)", memory)
-	}
-	if memory := got.Spec.Resources.Limits.Memory(); memory == nil || memory.Cmp(resource.MustParse("8Gi")) != 0 {
-		t.Errorf("spec.resources.limits.memory = %v, want 8Gi (webhook default)", memory)
+	if got.Spec.Observation == nil || got.Spec.Observation.FirstEventTimeout == nil ||
+		got.Spec.Observation.FirstEventTimeout.Duration != defaultFirstEventTimeout {
+		t.Errorf("spec.observation.firstEventTimeout = %v, want %s (defaulter-stamped)",
+			got.Spec.Observation, defaultFirstEventTimeout)
 	}
 
 	// --- Canonical resources do not inherit legacy provider configuration ---
@@ -213,14 +198,11 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	if err := live.Get(ctx, client.ObjectKey{Name: "canonical-host-only", Namespace: "team-a"}, &canonical); err != nil {
 		t.Fatalf("get back canonical host-only CR: %v", err)
 	}
-	if canonical.Spec.Resources != nil {
-		t.Errorf("canonical spec.resources = %+v, want nil", canonical.Spec.Resources)
-	}
 	if canonical.Spec.RemoteStorage != nil {
 		t.Errorf("canonical spec.remoteStorage = %+v, want nil host-only hierarchy", canonical.Spec.RemoteStorage)
 	}
-	if canonical.Spec.Integration == nil || canonical.Spec.Integration.Engine != "sglang" {
-		t.Errorf("canonical integration.engine = %v, want derived sglang compatibility value", canonical.Spec.Integration)
+	if canonical.Spec.Integration == nil {
+		t.Errorf("canonical integration = nil, want materialised defaults parent")
 	}
 
 	// --- Non-clobber pin: an explicit CR overrides every default ---
@@ -241,8 +223,7 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 				MatchLabels: map[string]string{"app.kubernetes.io/name": "sglang"},
 			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "sglang",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 		},
 	}
@@ -272,11 +253,15 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	hpaCR := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "hpa", Namespace: "team-a"},
 		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app.kubernetes.io/name": "vllm"},
 			},
-			BackendConfig: map[string]string{
-				"model": "meta-llama/Meta-Llama-3-8B-Instruct",
+			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "meta-llama/Meta-Llama-3-8B-Instruct"},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
 			},
 			Autoscaling: &cachev1alpha1.CacheBackendAutoscalingSpec{
 				MaxReplicas: 10,
@@ -395,12 +380,16 @@ func TestDefaulter_AutoscalingMinReplicasNotRecomputedOnReplicasUpdate(t *testin
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "minfloor", Namespace: "team-a"},
 		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime:  cachev1alpha1.CacheBackendRuntimeVLLM,
 			Replicas: i32p(3),
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app.kubernetes.io/name": "vllm"},
 			},
-			BackendConfig: map[string]string{
-				"model": "meta-llama/Meta-Llama-3-8B-Instruct",
+			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "meta-llama/Meta-Llama-3-8B-Instruct"},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
 			},
 			Autoscaling: &cachev1alpha1.CacheBackendAutoscalingSpec{
 				MaxReplicas: 10,

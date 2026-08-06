@@ -242,7 +242,7 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 			cachev1alpha1.CacheBackendTypeSGLangHiCache)
 	}
 	if runtimeadapter.ResolveRuntimeID(cache) != runtimeadapter.RuntimeSGLang {
-		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.engine must be sglang")
+		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: spec.runtime must be SGLang")
 	}
 	if cachev1alpha1.IntegrationMode(cache.Spec.Integration) != cachev1alpha1.CacheBackendIntegrationModeOffload {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.mode must be Offload")
@@ -261,11 +261,6 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 	}
 	if cache.Spec.EngineSelector == nil || len(cache.Spec.EngineSelector.MatchLabels) == 0 {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: spec.engineSelector.matchLabels is required")
-	}
-	for key := range cache.Spec.BackendConfig {
-		if key != "model" {
-			return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: backendConfig key %q is unsupported; only model is allowed", key)
-		}
 	}
 	if cache.Spec.Integration != nil && cache.Spec.Integration.EngineOverrides != nil {
 		overrides := cache.Spec.Integration.EngineOverrides

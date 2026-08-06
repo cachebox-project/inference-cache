@@ -191,7 +191,7 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 	t.Run("TimeoutBreachedIsDegradedNoKVEventsObserved", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		cb := gatedLMCacheBackend("cache", ns)
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{
 			FirstEventTimeout: &metav1.Duration{Duration: time.Second},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
@@ -221,7 +221,7 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		// anchor (not the flappable live Available condition) guarantees this.
 		ns := freshNS(t, k8s)
 		cb := gatedLMCacheBackend("cache", ns)
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{
 			FirstEventTimeout: &metav1.Duration{Duration: time.Second},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
@@ -254,7 +254,7 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		// Degraded it stays Degraded until an event arrives.
 		ns := freshNS(t, k8s)
 		cb := gatedLMCacheBackend("cache", ns)
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{
 			FirstEventTimeout: &metav1.Duration{Duration: time.Second},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
@@ -270,7 +270,7 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 
 		// Operator increases the timeout to well beyond the elapsed window.
 		live := getBackend(t, r, "cache", ns)
-		live.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: time.Hour}
+		live.Spec.Observation.FirstEventTimeout = &metav1.Duration{Duration: time.Hour}
 		if err := k8s.Update(ctx, live); err != nil {
 			t.Fatalf("update firstEventTimeout: %v", err)
 		}
@@ -358,14 +358,13 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 	t.Run("BackwardCompatDefaultsTimeoutTo5m", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		cb := gatedLMCacheBackend("cache", ns)
-		// Provide integration but omit firstEventTimeout: the apiserver applies
-		// the +kubebuilder:default of 5m.
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vllm"}
+		// Omit observation: the defaulter materialises the parent and applies 5m.
+		cb.Spec.Observation = nil
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
 		}
 		got := getBackend(t, r, "cache", ns)
-		ft := got.Spec.Integration.FirstEventTimeout
+		ft := got.Spec.Observation.FirstEventTimeout
 		if ft == nil || ft.Duration != 5*time.Minute {
 			t.Fatalf("firstEventTimeout = %v, want defaulted 5m", ft)
 		}
@@ -457,7 +456,7 @@ func TestKVEventGateEmitsTransitionEvents(t *testing.T) {
 // fires when the first-event window elapses with no event.
 func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
 	cb := gatedLMCacheBackend("cache", "ns1")
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{
 		FirstEventTimeout: &metav1.Duration{Duration: time.Second},
 	}
 	r, rec := newReconcilerWithRecorder(t, cb)

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -18,7 +19,32 @@ import (
 
 func newLMCacheBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
 	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "vllm")
-	cb.Spec.BackendConfig = cfg
+	cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{}
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+	}
+	if value := cfg["chunkSize"]; value != "" {
+		parsed, _ := strconv.ParseInt(value, 10, 32)
+		chunkSize := int32(parsed)
+		cb.Spec.LMCache.ChunkSizeTokens = &chunkSize
+	}
+	cb.Spec.LMCache.RemoteSerde = cfg["remoteSerde"]
+	if value := cfg["maxLocalCPU"]; value != "" {
+		capacity := resource.MustParse(value + "Gi")
+		cb.Spec.LMCache.HostMemory = &cachev1alpha1.CacheBackendHostMemorySpec{Capacity: &capacity}
+	} else if cfg["localCPU"] == "True" {
+		capacity := resource.MustParse("20Gi")
+		cb.Spec.LMCache.HostMemory = &cachev1alpha1.CacheBackendHostMemorySpec{Capacity: &capacity}
+	}
+	cb.Spec.RemoteStorage.LMCacheServer.Image = cfg["serverImage"]
+	if value := cfg["serverCommand"]; value != "" {
+		cb.Spec.RemoteStorage.LMCacheServer.Command = strings.Fields(value)
+	}
+	if value := cfg["model"]; value != "" {
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: value}
+	}
 	return cb
 }
 
@@ -27,8 +53,11 @@ func newCacheBackend(backendType cachev1alpha1.CacheBackendType, engine string) 
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
 		Spec:       cachev1alpha1.CacheBackendSpec{Type: backendType},
 	}
-	if engine != "" {
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: engine}
+	switch engine {
+	case "vllm":
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	case "sglang":
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	}
 	return cb
 }
@@ -215,7 +244,7 @@ func TestVLLMLMCacheResolveCacheServerHasCPURequestWhenAutoscaled(t *testing.T) 
 }
 
 func TestVLLMLMCacheResolveCacheServerAutoscalingPreservesLimitsOnlyResources(t *testing.T) {
-	// Operator-supplied limits-only spec.resources combined with
+	// Operator-supplied limits-only spec.remoteStorage.lmCacheServer.resources combined with
 	// autoscaling MUST surface as: limits intact, requests carry only
 	// the HPA CPU fallback (no synthesised memory request). The
 	// previous behavior synthesised a 1Gi memory request whenever
@@ -225,7 +254,7 @@ func TestVLLMLMCacheResolveCacheServerAutoscalingPreservesLimitsOnlyResources(t 
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-	cb.Spec.Resources = &corev1.ResourceRequirements{
+	cb.Spec.RemoteStorage.LMCacheServer.Resources = &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{
 			corev1.ResourceMemory: resource.MustParse("8Gi"),
 		},
@@ -245,8 +274,8 @@ func TestVLLMLMCacheResolveCacheServerAutoscalingPreservesLimitsOnlyResources(t 
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerHonorsSpecResources(t *testing.T) {
-	// spec.resources is the operator-owned knob for the lmcache-server
+func TestVLLMLMCacheResolveCacheServerHonorsProviderResources(t *testing.T) {
+	// spec.remoteStorage.lmCacheServer.resources is the operator-owned knob for the lmcache-server
 	// container's Resources. When set the adapter MUST pass it through
 	// verbatim (modulo the autoscaling CPU fallback covered in a separate
 	// test) — the CRD-schema default supplies memory limits to every
@@ -254,7 +283,7 @@ func TestVLLMLMCacheResolveCacheServerHonorsSpecResources(t *testing.T) {
 	// rather than OOM-killed by the kubelet under T2 load.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
-	cb.Spec.Resources = &corev1.ResourceRequirements{
+	cb.Spec.RemoteStorage.LMCacheServer.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		},
@@ -278,28 +307,28 @@ func TestVLLMLMCacheResolveCacheServerHonorsSpecResources(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerSpecResourcesNotMutated(t *testing.T) {
-	// The adapter must not mutate the CacheBackend's spec.resources in
+func TestVLLMLMCacheResolveCacheServerProviderResourcesNotMutated(t *testing.T) {
+	// The adapter must not mutate the CacheBackend's spec.remoteStorage.lmCacheServer.resources in
 	// place — controllers reconcile against an informer-cached object,
 	// and a write through the pointer would propagate back to every
 	// subsequent reader on the same shared cache.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-	cb.Spec.Resources = &corev1.ResourceRequirements{
+	cb.Spec.RemoteStorage.LMCacheServer.Resources = &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{
 			corev1.ResourceMemory: resource.MustParse("8Gi"),
 		},
 	}
 	_ = resolvePod(t, a, cb)
 
-	if cb.Spec.Resources.Requests != nil {
-		t.Fatalf("spec.resources.requests = %v, want nil (adapter mutated the spec)", cb.Spec.Resources.Requests)
+	if cb.Spec.RemoteStorage.LMCacheServer.Resources.Requests != nil {
+		t.Fatalf("spec.remoteStorage.lmCacheServer.resources.requests = %v, want nil (adapter mutated the spec)", cb.Spec.RemoteStorage.LMCacheServer.Resources.Requests)
 	}
 }
 
-func TestVLLMLMCacheResolveCacheServerEmptySpecResourcesIsRespected(t *testing.T) {
-	// An operator who explicitly supplies `spec.resources: {}` is
+func TestVLLMLMCacheResolveCacheServerEmptyProviderResourcesIsRespected(t *testing.T) {
+	// An operator who explicitly supplies `spec.remoteStorage.lmCacheServer.resources: {}` is
 	// suppressing the CRD-default memory budget. The adapter MUST honor
 	// the empty struct as "no Resources" rather than synthesising a
 	// fallback — otherwise the documented suppress-the-default workflow
@@ -308,27 +337,27 @@ func TestVLLMLMCacheResolveCacheServerEmptySpecResourcesIsRespected(t *testing.T
 	// the orthogonal HPA-CPU behavior.)
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
-	cb.Spec.Resources = &corev1.ResourceRequirements{}
+	cb.Spec.RemoteStorage.LMCacheServer.Resources = &corev1.ResourceRequirements{}
 	pod := resolvePod(t, a, cb)
 	got := pod.Containers[0].Resources
 	if len(got.Requests) != 0 {
-		t.Fatalf("Requests = %v, want empty when spec.resources is {} (operator suppressed default)", got.Requests)
+		t.Fatalf("Requests = %v, want empty when spec.remoteStorage.lmCacheServer.resources is {} (operator suppressed default)", got.Requests)
 	}
 	if len(got.Limits) != 0 {
-		t.Fatalf("Limits = %v, want empty when spec.resources is {} (operator suppressed default)", got.Limits)
+		t.Fatalf("Limits = %v, want empty when spec.remoteStorage.lmCacheServer.resources is {} (operator suppressed default)", got.Limits)
 	}
 }
 
 func TestVLLMLMCacheResolveCacheServerAutoscalingFillsMissingCPU(t *testing.T) {
-	// When spec.resources is set but omits a CPU request, autoscaling
+	// When spec.remoteStorage.lmCacheServer.resources is set but omits a CPU request, autoscaling
 	// must still get a CPU-request denominator filled in by the adapter
-	// — otherwise the operator's memory-only spec.resources silently
+	// — otherwise the operator's memory-only spec.remoteStorage.lmCacheServer.resources silently
 	// breaks the HPA metric path. The adapter MUST NOT overwrite a
 	// CPU request the operator did supply.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-	cb.Spec.Resources = &corev1.ResourceRequirements{
+	cb.Spec.RemoteStorage.LMCacheServer.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceMemory: resource.MustParse("4Gi"),
 		},
@@ -363,7 +392,7 @@ func TestVLLMLMCacheResolveCacheServerAutoscalingReplacesZeroCPU(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-	cb.Spec.Resources = &corev1.ResourceRequirements{
+	cb.Spec.RemoteStorage.LMCacheServer.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")},
 	}
 	pod := resolvePod(t, a, cb)
@@ -381,7 +410,7 @@ func TestVLLMLMCacheResolveCacheServerAutoscalingRespectsOperatorCPU(t *testing.
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(nil)
 	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-	cb.Spec.Resources = &corev1.ResourceRequirements{
+	cb.Spec.RemoteStorage.LMCacheServer.Resources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU: resource.MustParse("750m"),
 		},
@@ -605,7 +634,6 @@ func TestVLLMLMCacheInjectEngineConfigFailOpen(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cb := newLMCacheBackend(nil)
 			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine:   "vllm",
 				FailOpen: tc.failOpen,
 			}
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
@@ -635,8 +663,7 @@ func TestVLLMLMCacheInjectEngineConfigRoleMapping(t *testing.T) {
 		t.Run(tc.description, func(t *testing.T) {
 			cb := newLMCacheBackend(nil)
 			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   tc.role,
+				Role: tc.role,
 			}
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName}}}
 			if err := a.InjectEngineConfig(pod, "x.svc:65432", cb); err != nil {
@@ -650,7 +677,7 @@ func TestVLLMLMCacheInjectEngineConfigRoleMapping(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheInjectEngineConfigConfigOverrides(t *testing.T) {
+func TestVLLMLMCacheInjectEngineConfigTypedOverrides(t *testing.T) {
 	a := NewVLLMLMCacheAdapter()
 	cb := newLMCacheBackend(map[string]string{
 		"chunkSize":   "512",
@@ -670,24 +697,18 @@ func TestVLLMLMCacheInjectEngineConfigConfigOverrides(t *testing.T) {
 	}
 	for name, want := range checks {
 		if v, _ := lookupEnv(pod.Containers[0].Env, name); v != want {
-			t.Fatalf("%s = %q, want %q (BackendConfig override)", name, v, want)
+			t.Fatalf("%s = %q, want %q (typed LMCache override)", name, v, want)
 		}
 	}
 }
 
-func TestVLLMLMCacheCanonicalEngineConfigIgnoresLegacyMap(t *testing.T) {
+func TestVLLMLMCacheHostOnlyEngineConfigUsesTypedConfig(t *testing.T) {
 	chunkSize := int32(128)
 	cb := &cachev1alpha1.CacheBackend{
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 			LMCache: &cachev1alpha1.LMCacheEngineSpec{ChunkSizeTokens: &chunkSize},
-			BackendConfig: map[string]string{
-				"chunkSize":   "999",
-				"remoteSerde": "legacy-serde",
-				"localCPU":    "True",
-				"maxLocalCPU": "99",
-			},
 		},
 	}
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{
@@ -1120,8 +1141,8 @@ func TestVLLMLMCacheObservationSidecarHonoursOptions(t *testing.T) {
 }
 
 func TestVLLMLMCacheObservationSidecarSkipsWithoutModel(t *testing.T) {
-	// BackendConfig["model"] is the documented source of --model-id. Without
-	// it the subscriber binary would refuse to start (model-id is a required
+	// observation.modelID is the source of --model-id. Without it the
+	// subscriber binary would refuse to start (model-id is a required
 	// flag), so the adapter returns (nil, nil) to skip the append. The next
 	// admission picks up the sidecar once the operator sets the field.
 	a := NewVLLMLMCacheAdapter(WithSubscriberImage(DefaultSubscriberImage))
@@ -1133,14 +1154,14 @@ func TestVLLMLMCacheObservationSidecarSkipsWithoutModel(t *testing.T) {
 		t.Fatalf("ObservationSidecar: %v", err)
 	}
 	if c != nil {
-		t.Fatalf("expected nil sidecar when backendConfig.model is unset, got %+v", c)
+		t.Fatalf("expected nil sidecar when observation.modelID is unset, got %+v", c)
 	}
 }
 
 func TestVLLMLMCacheObservationSidecarSkipsWithoutImage(t *testing.T) {
 	// Default install opts OUT of auto-attach: when the controller flag
 	// --kvevent-subscriber-image is unset, the adapter returns no sidecar
-	// at all — even when backendConfig.model is set — so an operator that
+	// at all — even when observation.modelID is set — so an operator that
 	// hasn't yet shipped a subscriber image can't end up with engine pods
 	// stuck in ImagePullBackOff. Opt-in by passing WithSubscriberImage.
 	a := NewVLLMLMCacheAdapter() // no image configured

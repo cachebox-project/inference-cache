@@ -24,15 +24,15 @@ func eventsOnlyBackend(name, ns string) *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Generation: 1},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+				Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
 			},
-			BackendConfig: map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"},
+			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"},
 		},
 	}
 }
@@ -151,7 +151,7 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		// Degraded=True — exactly like a managed backend, but with no Deployment.
 		ns := freshNS(t, k8s)
 		cb := eventsOnlyBackend("cache", ns)
-		cb.Spec.Integration.FirstEventTimeout = &metav1.Duration{Duration: time.Second}
+		cb.Spec.Observation.FirstEventTimeout = &metav1.Duration{Duration: time.Second}
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -201,8 +201,7 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 			Spec: cachev1alpha1.CacheBackendSpec{
 				Type: cachev1alpha1.CacheBackendTypeLMCache,
 				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-					Engine: "vllm",
-					Mode:   cachev1alpha1.CacheBackendIntegrationModeOffload,
+					Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
 				},
 			},
 		}

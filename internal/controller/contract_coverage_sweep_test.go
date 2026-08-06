@@ -319,8 +319,7 @@ func readyCacheBackendForSweep(name, namespace string, selector map[string]strin
 				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
 			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
 		},

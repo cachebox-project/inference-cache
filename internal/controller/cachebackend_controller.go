@@ -61,7 +61,7 @@ const (
 	annotationRequireKVEvents = "inferencecache.io/require-kv-events"
 
 	// defaultFirstEventTimeout is the fallback when
-	// spec.integration.firstEventTimeout is unset and the API-server default
+	// spec.observation.firstEventTimeout is unset and the API-server default
 	// ("5m") was not applied (e.g. fake-client unit tests). Mirrors the
 	// +kubebuilder:default on the field.
 	defaultFirstEventTimeout = 5 * time.Minute
@@ -609,11 +609,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 			// apply.
 			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, endpoint); err != nil {
 				readyReason = conditionReasonExternalEndpointInvalid
-				fieldPrefix := "spec."
-				if backend.Spec.UsesCanonicalCacheHierarchy() {
-					fieldPrefix = "spec.remoteStorage."
-				}
-				readyMsg = fieldPrefix + err.Error()
+				readyMsg = "spec.remoteStorage." + err.Error()
 				break
 			}
 			readyStatus = metav1.ConditionTrue
@@ -1862,7 +1858,7 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 	// Sticky Degraded: once the timeout has been breached
 	// (Conditions[Ready].Reason == NoKVEventsObserved), stay Degraded until an
 	// event arrives — never recompute the window. This guards the case where an
-	// operator INCREASES spec.integration.firstEventTimeout after the window
+	// operator INCREASES spec.observation.firstEventTimeout after the window
 	// already elapsed, which would otherwise move the backend back to
 	// AwaitingFirstKVEvent (hiding a known publisher outage for another window),
 	// contradicting the documented "once Degraded, stays Degraded until an

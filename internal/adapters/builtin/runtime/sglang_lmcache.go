@@ -82,8 +82,7 @@ func (sglangLMCacheAdapter) Supports(runtime runtimeadapter.RuntimeID, cache *ca
 		return false
 	}
 	return runtime == runtimeadapter.RuntimeSGLang &&
-		cache.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache &&
-		(cache.Spec.UsesCanonicalCacheHierarchy() || cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache)
+		cache.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache
 }
 
 // SupportedPairs lets the registry surface this adapter's canonical pair in the

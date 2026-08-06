@@ -74,8 +74,7 @@ func (vllmLMCacheAdapter) Supports(runtime adapterruntime.RuntimeID, cache *cach
 		return false
 	}
 	return runtime == adapterruntime.RuntimeVLLM &&
-		cache.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache &&
-		(cache.Spec.UsesCanonicalCacheHierarchy() || cache.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache)
+		cache.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache
 }
 
 // SupportedPairs lets the registry expose this adapter's canonical pair to
@@ -94,7 +93,7 @@ func (vllmLMCacheAdapter) SupportedPairs() []adapterruntime.SupportedPair {
 //     reads at startup; suppressing it means no LMCache wiring at all.
 //
 // Other tunables the operator may legitimately want to change (e.g. perf
-// knobs surfaced as backendConfig keys) are deliberately NOT reserved.
+// connector-tuning knobs are deliberately NOT reserved.
 func (vllmLMCacheAdapter) ReservedArgs() []string {
 	return []string{defaultEngineKVTransferConfigArg}
 }

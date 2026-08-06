@@ -2,7 +2,6 @@ package storage
 
 import (
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -10,9 +9,8 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
-// Mooncake provider defaults. Canonical resources override them through the
-// typed remoteStorage.mooncake fields; deprecated BackendConfig keys remain
-// readable only for legacy resources.
+// Mooncake provider defaults. Resources override them through the typed
+// remoteStorage.mooncake fields.
 const (
 	// This reference is fully qualified for CRI-O nodes without short-name
 	// resolution and pinned to the release validated with the matching
@@ -37,15 +35,13 @@ func ResolveMooncakeServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, 
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
 	}
-	cfg := legacyProviderConfig(cache)
 	image := effectiveProviderImage(
 		cache,
 		cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-		cfgKeyServerImage,
 		defaultMooncakeMasterImage,
 	)
 
-	command, args := mooncakeMasterCommand(cfg)
+	command, args := mooncakeMasterCommand()
 	if typed := effectiveProviderCommand(cache, cachev1alpha1.CacheBackendRemoteStorageProviderMooncake); len(typed) > 0 {
 		command, args = typed[:1], typed[1:]
 	}
@@ -103,16 +99,7 @@ func ResolveMooncakeServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, 
 	return pod, service, nil
 }
 
-func mooncakeMasterCommand(cfg map[string]string) (command, args []string) {
-	// Command overrides must retain the fixed RPC and metadata ports rendered
-	// into the container, readiness probe, Service, status endpoint, and engine
-	// URL. Free-form command text cannot safely drive those structured fields.
-	if raw := configOr(cfg, cfgKeyServerCommand, ""); raw != "" {
-		fields := strings.Fields(raw)
-		if len(fields) > 0 {
-			return []string{fields[0]}, fields[1:]
-		}
-	}
+func mooncakeMasterCommand() (command, args []string) {
 	return []string{"mooncake_master"}, []string{
 		fmt.Sprintf("--rpc_port=%d", defaultMooncakeMasterRPCPort),
 		fmt.Sprintf("--metrics_port=%d", defaultMooncakeMetricsPort),

@@ -209,9 +209,6 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		extra := ""
 		if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
 			missingField = "spec.remoteStorage.endpoint"
-			if !cache.Spec.UsesCanonicalCacheHierarchy() {
-				missingField = "spec.endpoint"
-			}
 			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 				extra = ": " + err.Error()
 			}
@@ -380,7 +377,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// pod. For Offload the connector is always injected by InjectEngineConfig, so
 	// the pod is always wired. For events-only InjectEngineConfig is a no-op, so
 	// the ONLY wiring the webhook performs is APPENDING the observation sidecar —
-	// which is skipped when the subscriber image / backendConfig.model is unset
+	// which is skipped when the subscriber image / observation.modelID is unset
 	// (nothing injected) OR when a same-named container already exists (operator-
 	// authored, unverified). In those cases the webhook added/verified no wiring,
 	// so stamping injected-by/injected-by-uid would trip the downstream

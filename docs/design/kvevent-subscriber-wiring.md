@@ -62,8 +62,7 @@ Concretely:
 * Sidecar identity flags are derived from the CR + pod: `--replica-id` ← `pod.Name`
   (via the downward API so `generateName` pods work), `--tenant-id` ← `pod.Namespace`
   (downward API likewise), `--model-id` ← canonical `spec.observation.modelID`
-  (with deprecated `spec.backendConfig.model` as a legacy read fallback; when
-  unset, the adapter returns no sidecar — the binary requires the flag, and the next
+  (when unset, the adapter returns no sidecar — the binary requires the flag, and the next
   admission picks it up once the operator sets the field), `--hash-scheme` ← the
   adapter's runtime convention (`"vllm"` or `"sglang"`), `--server` ← the policy-server
   in-cluster Service DNS (operator-configurable via a controller flag),

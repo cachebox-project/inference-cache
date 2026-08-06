@@ -17,11 +17,11 @@ func newHiCacheBackend(spec *cachev1alpha1.SGLangHiCacheSpec) *cachev1alpha1.Cac
 	return &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "hicache", Namespace: "ns1"},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "sglang",
-				Mode:   cachev1alpha1.CacheBackendIntegrationModeOffload,
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "sglang"},
@@ -243,7 +243,7 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 			cache.Spec.HiCache.SizeGB = &zero
 		}},
 		{"invalid ratio", func(cache *cachev1alpha1.CacheBackend) { cache.Spec.HiCache.Ratio = "NaN" }},
-		{"wrong engine", func(cache *cachev1alpha1.CacheBackend) { cache.Spec.Integration.Engine = "vllm" }},
+		{"wrong engine", func(cache *cachev1alpha1.CacheBackend) { cache.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM }},
 		{"events only", func(cache *cachev1alpha1.CacheBackend) {
 			cache.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
 		}},
@@ -258,9 +258,6 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 		}},
 		{"missing selector", func(cache *cachev1alpha1.CacheBackend) {
 			cache.Spec.EngineSelector = nil
-		}},
-		{"unknown backendConfig", func(cache *cachev1alpha1.CacheBackend) {
-			cache.Spec.BackendConfig = map[string]string{"l1SizeGB": "8"}
 		}},
 		{"reserved arg override", func(cache *cachev1alpha1.CacheBackend) {
 			cache.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
@@ -323,7 +320,7 @@ func TestHiCacheReservedArgs(t *testing.T) {
 
 func TestHiCacheObservationSidecarReusesSGLangRenderer(t *testing.T) {
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
-	cache.Spec.BackendConfig = map[string]string{"model": "model-a"}
+	cache.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
 	adapter := NewSGLangHiCacheAdapter(
 		runtimeadapter.WithSubscriberImage("subscriber:test"),
 		runtimeadapter.WithPolicyServerGRPCAddress("policy:50051"),

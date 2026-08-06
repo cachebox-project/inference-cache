@@ -102,7 +102,7 @@ func TestEffectiveHostMemoryGBRoundsWithoutOverflow(t *testing.T) {
 					},
 				},
 			}
-			if got := effectiveHostMemoryGB(cache, nil); got != tt.want {
+			if got := effectiveHostMemoryGB(cache); got != tt.want {
 				t.Fatalf("effectiveHostMemoryGB(%d) = %q, want %q", tt.bytes, got, tt.want)
 			}
 		})

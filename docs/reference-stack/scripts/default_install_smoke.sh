@@ -58,11 +58,11 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   8b. Canonical provider resource fallback: the paired sample leaves both
-#      deprecated spec.resources and remoteStorage.lmCacheServer.resources
-#      unset, while the provider renderer gives the cache-server container a
-#      4Gi request / 8Gi limit. The smoke asserts the CR remains canonical and
-#      the rendered pod is still bounded against the T2-write OOM failure mode.
+#   8b. Provider resource fallback: the paired sample leaves
+#      remoteStorage.lmCacheServer.resources unset, while the provider renderer
+#      gives the cache-server container a 4Gi request / 8Gi limit. The smoke
+#      asserts the CR remains unchanged and the rendered pod is still bounded
+#      against the T2-write OOM failure mode.
 #   8c. The canonical cache hierarchy keeps engine wiring and provider
 #      lifecycle independent: the committed SGLang host-only sample creates no
 #      Deployment/Service/HPA and publishes no endpoint, while the committed
@@ -1646,19 +1646,12 @@ if [ "$matched" != "1" ]; then
 fi
 log "status.matchedEnginePods=1"
 
-# --- canonical provider resource fallback ---------------------------------
-# The paired sample uses canonical remoteStorage.lmCacheServer and omits its
-# resources. Canonical defaulting stays renderer-local: admission must not
-# repopulate deprecated spec.resources, while the provider renderer still puts
-# a bounded 4Gi request / 8Gi limit on the lmcache-server container. This keeps
-# the cgroup OOM guard without reviving the retired top-level API field.
-log "asserting canonical provider resources stay out of the CR and default onto the rendered Deployment"
-cb_legacy_resources="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
-  -o jsonpath='{.spec.resources}' 2>/dev/null || true)"
-if [ -n "$cb_legacy_resources" ]; then
-  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
-  fail "cb.spec.resources=$cb_legacy_resources, want absent for a canonical CacheBackend"
-fi
+# --- provider resource fallback --------------------------------------------
+# The paired sample uses remoteStorage.lmCacheServer and omits its resources.
+# Defaulting stays renderer-local: the provider renderer puts a bounded 4Gi
+# request / 8Gi limit on the lmcache-server container without persisting it in
+# the CacheBackend.
+log "asserting provider resources stay out of the CR and default onto the rendered Deployment"
 cb_provider_resources="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
   -o jsonpath='{.spec.remoteStorage.lmCacheServer.resources}' 2>/dev/null || true)"
 if [ -n "$cb_provider_resources" ]; then
@@ -1679,7 +1672,7 @@ if [ "$dep_req_mem" != "4Gi" ]; then
   kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache -o yaml || true
   fail "deploy.lmcache-server.resources.requests.memory=$dep_req_mem, want 4Gi (canonical provider fallback not applied)"
 fi
-log "canonical provider resources defaulted on the workload only: requests.memory=4Gi limits.memory=8Gi"
+log "provider resources defaulted on the workload only: requests.memory=4Gi limits.memory=8Gi"
 
 # --- KV-event readiness gate assertion (operator-facing) --------------------
 # The managed backend has an engine pod attached (matchedEnginePods=1), but the
@@ -1688,7 +1681,7 @@ log "canonical provider resources defaulted on the workload only: requests.memor
 # exact demo-day failure mode the gate exists to surface (engine present,
 # KV-event stream silent). We assert the gate's operator-visible surfaces end to
 # end on the real install:
-#   - spec.integration.firstEventTimeout defaulted to 5m (new CRD field +
+#   - spec.observation.firstEventTimeout defaulted to 5m (CRD field +
 #     admission defaulting);
 #   - once the managed cache-server reaches Available, the gate holds the
 #     backend at Ready=False / reason AwaitingFirstKVEvent — the deterministic
@@ -1698,13 +1691,13 @@ log "canonical provider resources defaulted on the workload only: requests.memor
 #     the instant a KV event is observed, so its absence is the gate-specific
 #     "nothing observed" signal.
 fet="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
-  -o jsonpath='{.spec.integration.firstEventTimeout}' 2>/dev/null || true)"
-# Accept both "5m" (CRD-schema default, applied when the integration block is
+  -o jsonpath='{.spec.observation.firstEventTimeout}' 2>/dev/null || true)"
+# Accept both "5m" (CRD-schema default, applied when the observation block is
 # present) and "5m0s" (Go Duration.String(), the webhook-materialized form) —
 # both decode to the same 5m duration.
 if [ "$fet" != "5m" ] && [ "$fet" != "5m0s" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
-  fail "spec.integration.firstEventTimeout=$fet, want 5m (CRD default / webhook defaulter not applied)"
+  fail "spec.observation.firstEventTimeout=$fet, want 5m (CRD default / webhook defaulter not applied)"
 fi
 
 # The gate only evaluates once the managed cache-server Deployment is Available,
@@ -1789,7 +1782,7 @@ log "T2Degraded absent until tier-2 is exercised (no-traffic steady state)"
 # injected engine to reach CrashLoopBackOff + 120s for the advisory condition to
 # publish). It MUST run AFTER the KV-event-gate AwaitingFirstKVEvent assertion
 # above, NOT between matchedEnginePods=1 and that gate. The gate's
-# AwaitingFirstKVEvent window is bounded by spec.integration.firstEventTimeout
+# AwaitingFirstKVEvent window is bounded by spec.observation.firstEventTimeout
 # (defaulted to 5m and asserted as 5m above), anchored at the cache-server
 # Deployment becoming Available; the busybox engine never emits KV events, so the
 # backend deterministically flips AwaitingFirstKVEvent -> NoKVEventsObserved once
@@ -2158,17 +2151,15 @@ while [ -z "$host_observed_generation" ] && [ "$(date +%s)" -lt "$deadline" ]; d
 done
 host_runtime="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
   -o jsonpath='{.spec.runtime}' 2>/dev/null || true)"
-host_compat_engine="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
-  -o jsonpath='{.spec.integration.engine}' 2>/dev/null || true)"
 host_remote_provider="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
   -o jsonpath='{.spec.remoteStorage.provider}' 2>/dev/null || true)"
 host_endpoint="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
   -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
 if [ -z "$host_observed_generation" ] || [ "$host_runtime" != "SGLang" ] || \
-   [ "$host_compat_engine" != "sglang" ] || [ -n "$host_remote_provider" ] || \
+   [ -n "$host_remote_provider" ] || \
    [ -n "$host_endpoint" ]; then
   kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" -o yaml || true
-  fail "canonical host-only state is wrong: observedGeneration=$host_observed_generation runtime=$host_runtime integration.engine=$host_compat_engine provider=$host_remote_provider endpoint=$host_endpoint"
+  fail "canonical host-only state is wrong: observedGeneration=$host_observed_generation runtime=$host_runtime provider=$host_remote_provider endpoint=$host_endpoint"
 fi
 for resource in deployment service horizontalpodautoscaler; do
   if kubectl -n "$CANONICAL_SMOKE_NS" get "$resource" "$CANONICAL_HOST_ONLY_CB" >/dev/null 2>&1; then
@@ -2584,8 +2575,8 @@ kubectl create namespace "$EVENTSONLY_SMOKE_NS" --dry-run=client -o yaml | kubec
 # $EVENTSONLY_SMOKE_CB_NAME; pin the name via a tmp copy so an overridden
 # tunable still resolves, and set the namespace with -n (the sample is
 # namespace-less, like the other samples). type=LMCache, integration.mode=
-# EventsOnly, backendConfig.model set, no spec.endpoint (rejected on
-# non-External) and no spec.autoscaling (rejected for events-only). The
+# EventsOnly, observation.modelID set, no remoteStorage, and no spec.autoscaling
+# (rejected for events-only). The
 # sample's engineSelector is irrelevant here: events-only provisions no
 # workload and the assertions below are all about the CR's own reconcile, so
 # no matched engine pod is required.
@@ -3382,12 +3373,16 @@ metadata:
   name: $KC_INJECT_CB
   namespace: $KERNEL_CHECK_SMOKE_NS
 spec:
+  runtime: VLLM
   type: LMCache
   engineSelector:
     matchLabels:
       app: kc-inject-engine
-  backendConfig:
-    serverImage: $SAMPLE_CACHE_SERVER_IMAGE
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      image: $SAMPLE_CACHE_SERVER_IMAGE
 EOF
 
 # Wait for the controller to publish status.endpoint before admitting the engine
@@ -3486,12 +3481,16 @@ metadata:
   annotations:
     inferencecache.io/lmcache-kernel-check: "report-only"
 spec:
+  runtime: VLLM
   type: LMCache
   engineSelector:
     matchLabels:
       app: kc-cond-engine
-  backendConfig:
-    serverImage: $SAMPLE_CACHE_SERVER_IMAGE
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      image: $SAMPLE_CACHE_SERVER_IMAGE
 EOF
 
 # Wait for status.endpoint before admitting the engine pod. The webhook
@@ -4034,4 +4033,4 @@ log "Mooncake engine pod: hostNetwork=true, dnsPolicy=ClusterFirstWithHostNet, w
 
 kubectl delete namespace "$MOONCAKE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), adapter (LoRA) index partitioning on LookupRoute, CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, Events-only + native SGLang HiCache engine-local lifecycles, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), adapter (LoRA) index partitioning on LookupRoute, CacheBackend ↔ engine-pod binding signals + drift cadence, provider resource defaults + thread-through, External backend end-to-end, Events-only + native SGLang HiCache engine-local lifecycles, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"

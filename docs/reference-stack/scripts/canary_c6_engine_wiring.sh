@@ -136,15 +136,19 @@ metadata:
     # dedicated canary; here Ready is workload-availability driven.
     inferencecache.io/require-kv-events: "false"
 spec:
+  runtime: VLLM
   type: LMCache
   deploymentKind: Deployment
   replicas: 1
   integration:
-    engine: vllm
     role: ReadWrite
   engineSelector:
     matchLabels:
       app: vllm-engine
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer: {}
 EOF
 
 log "waiting up to ${READY_TIMEOUT}s for the lmcache-server CacheBackend to reach Ready"

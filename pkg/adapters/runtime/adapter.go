@@ -12,10 +12,9 @@ import (
 )
 
 // RuntimeID identifies an inference-engine family that a runtime adapter
-// handles. Values mirror the free-form string carried in
-// CacheBackend.Spec.Integration.Engine — this project deliberately does not
-// model a ServingRuntime CRD (cf. OEP-0010's *v1beta1.ServingRuntimeSpec), so
-// engine identity flows as a plain identifier the reconciler can pass through.
+// handles. Values are resolved from CacheBackend.Spec.Runtime; this project
+// deliberately does not model a ServingRuntime CRD (cf. OEP-0010's
+// *v1beta1.ServingRuntimeSpec).
 type RuntimeID string
 
 // Canonical runtime identifiers. Adapters are free to support additional
@@ -133,16 +132,11 @@ func AdapterRequiresEndpointFor(adapter KVCacheRuntimeAdapter, binding *backenda
 	return AdapterRequiresEndpoint(adapter)
 }
 
-// ValidateRemoteBinding verifies that adapter explicitly accepts binding for a
-// canonical cache hierarchy. Legacy resources retain the endpoint-based
-// fallback while out-of-tree adapters migrate to [RemoteBindingAdapter].
+// ValidateRemoteBinding verifies that adapter explicitly accepts binding.
 func ValidateRemoteBinding(adapter KVCacheRuntimeAdapter, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	bindingAware, ok := adapter.(RemoteBindingAdapter)
 	if !ok {
-		if cache != nil && cache.Spec.UsesCanonicalCacheHierarchy() {
-			return fmt.Errorf("runtime adapter does not implement the canonical remote-binding contract")
-		}
-		return nil
+		return fmt.Errorf("runtime adapter does not implement the remote-binding contract")
 	}
 	if !bindingAware.SupportsRemoteBinding(binding) {
 		return fmt.Errorf("runtime adapter does not accept remote binding protocol %q", bindingProtocol(binding))
@@ -151,9 +145,7 @@ func ValidateRemoteBinding(adapter KVCacheRuntimeAdapter, binding *backendadapte
 }
 
 // InjectEngineConfigWithBinding routes canonical resources through the
-// structured binding contract and falls back to the legacy endpoint method for
-// adapters that have not migrated yet only when the resource itself uses the
-// legacy hierarchy.
+// structured binding contract.
 func InjectEngineConfigWithBinding(adapter KVCacheRuntimeAdapter, pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	if err := ValidateRemoteBinding(adapter, binding, cache); err != nil {
 		return err
@@ -280,18 +272,13 @@ func (r *Registry) SupportedPairs() []SupportedPair {
 // renders and the pod webhook injects, so the three callers must read the
 // CR identically.
 //
-// The CR carries the engine name in Spec.Integration.Engine. When it is
-// unset, vLLM is the Phase-1 default — the only engine the shipping
-// adapters target — so a CacheBackend that omits the field is treated the
-// same way the reconciler used to treat it before C7 landed. Engine values
-// are normalised to lower case so common spellings ("vLLM", "VLLM",
-// "SGLang") route to the canonical [RuntimeID] constants ([RuntimeVLLM]
-// etc.).
+// The CR carries the runtime identity in spec.runtime. The schema restricts
+// persisted values to the supported case-sensitive enum.
 func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 	if cache == nil {
-		return RuntimeVLLM
+		return ""
 	}
-	return RuntimeID(strings.ToLower(string(cache.Spec.EffectiveRuntime())))
+	return RuntimeID(strings.ToLower(string(cache.Spec.Runtime)))
 }
 
 // Options configures runtime adapters and is passed through by the built-in

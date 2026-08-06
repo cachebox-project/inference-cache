@@ -483,7 +483,7 @@ data plane), different resolution because the data planes differ:
   silently falls back to slow pickle serialization. The shared `emptyDir` must be
   `medium: Memory` and sized ≥ the L1.
 - **L2 durability/HA** — a single managed Redis is a simple default, not an HA
-  store. A planned `backendConfig` knob (not yet implemented) will let operators
+  store. A future typed remote-storage option will let operators
   who need durability select an `s3` or `mooncake_store` `--l2-adapter` instead,
   mirroring the LMCache-vs-Mooncake durability-is-a-backend-choice decision.
 - **Bleeding edge** — SGLang's LMCache integration is new (early 2026); the working
