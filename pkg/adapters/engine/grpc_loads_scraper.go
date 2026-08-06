@@ -1,0 +1,180 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	vpb "github.com/cachebox-project/inference-cache/pkg/adapters/engine/vllmengine"
+	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
+)
+
+// GRPCLoadsScraperConfig tunes the gRPC GetLoads scraper. Addr is required.
+type GRPCLoadsScraperConfig struct {
+	// Addr is the engine's VllmEngine gRPC address (host:port), e.g.
+	// 127.0.0.1:50051.
+	Addr string
+	// CacheSizeBytes is the engine's total KV-cache capacity, used to map
+	// token_usage (0..1) to cache_memory_bytes. When zero, cache_memory_bytes is
+	// emitted as 0 (an honest "unknown" rather than a fabricated number).
+	CacheSizeBytes int64
+	// MaxConcurrencyCeiling is the pressure denominator:
+	//   pressure = clamp01((num_running_reqs + num_waiting_reqs) / ceiling).
+	// 0 disables pressure (it stays 0).
+	MaxConcurrencyCeiling int
+	// Timeout bounds each GetLoads call; defaults to defaultScrapeTimeout when <= 0.
+	Timeout time.Duration
+}
+
+// GRPCLoadsScraper reads engine load via the vLLM engine's GetLoads gRPC RPC and
+// projects it into a ReplicaStats — the gRPC-native alternative to scraping the
+// engine's HTTP /metrics. A vLLM engine served over gRPC (vllm.entrypoints.grpc_server)
+// exposes no HTTP metrics endpoint; live load is available only over GetLoads.
+// It implements the same statsScraper interface as MetricsScraper, so the
+// StatsReporter uses whichever is configured, unchanged.
+//
+// Note: GetLoads carries no external-tier (T2/LMCache) token counters, so
+// T2HitTokens/T2QueryTokens are left 0 here — those remain HTTP `/metrics`-only.
+// The signals the ranker consumes (pressure and hit-rate) are both provided;
+// cache_memory_bytes is emitted too but is observational (snapshot / CR status),
+// not a ranking input.
+type GRPCLoadsScraper struct {
+	client vpb.VllmEngineClient
+	cfg    GRPCLoadsScraperConfig
+	closer func() error
+}
+
+// NewGRPCLoadsScraper dials the engine (lazily — grpc.NewClient does not connect
+// until the first RPC, so a down engine doesn't fail construction) and returns a
+// scraper. Call Close to release the connection.
+func NewGRPCLoadsScraper(cfg GRPCLoadsScraperConfig) (*GRPCLoadsScraper, error) {
+	if cfg.Addr == "" {
+		return nil, fmt.Errorf("grpc loads scraper: Addr is required")
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultScrapeTimeout
+	}
+	conn, err := grpc.NewClient(cfg.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("grpc loads scraper: dial %s: %w", cfg.Addr, err)
+	}
+	return &GRPCLoadsScraper{client: vpb.NewVllmEngineClient(conn), cfg: cfg, closer: conn.Close}, nil
+}
+
+// newGRPCLoadsScraperWithClient injects a client (tests) and never owns a conn.
+func newGRPCLoadsScraperWithClient(c vpb.VllmEngineClient, cfg GRPCLoadsScraperConfig) *GRPCLoadsScraper {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultScrapeTimeout
+	}
+	return &GRPCLoadsScraper{client: c, cfg: cfg, closer: func() error { return nil }}
+}
+
+// Close releases the underlying gRPC connection.
+func (s *GRPCLoadsScraper) Close() error { return s.closer() }
+
+// Scrape calls GetLoads once and projects the per-DP-rank SchedulerLoad into a
+// ReplicaStats. On error a zero-valued *icpb.ReplicaStats is returned alongside
+// the error — the StatsReporter logs and skips the tick, same as the HTTP path.
+func (s *GRPCLoadsScraper) Scrape(ctx context.Context) (*icpb.ReplicaStats, error) {
+	rctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+	defer cancel()
+
+	resp, err := s.client.GetLoads(rctx, &vpb.GetLoadsRequest{})
+	if err != nil {
+		return &icpb.ReplicaStats{}, fmt.Errorf("getloads %s: %w", s.cfg.Addr, err)
+	}
+	// An empty/nil loads slice carries no per-rank sample. Treat it as a scrape
+	// failure (return an error) rather than projecting it into an all-zero "idle"
+	// ReplicaStats — delivering fabricated idle would overwrite the replica's last
+	// good pressure/hit-rate with zeros and make the ranker route TOWARD a replica
+	// whose data is merely missing. The StatsReporter skips the tick instead.
+	if len(resp.GetLoads()) == 0 {
+		return &icpb.ReplicaStats{}, fmt.Errorf("getloads %s: empty response (no per-rank loads)", s.cfg.Addr)
+	}
+
+	// Aggregate across DP ranks: request counts SUM (total in-flight across the
+	// engine), KV-cache usage is the MEAN, hit-rate is the mean over ranks that report
+	// a finite value. Usage is a mean, not a max, because CacheSizeBytes is the engine's
+	// *total* capacity and each of the N DP ranks owns ~1/N of it — so the average
+	// per-rank fill maps to true total bytes, whereas a max would overstate a multi-rank
+	// engine (two ranks at 30%/70% use 50% of total, not 70%). For the single-rank case
+	// the two are identical.
+	//
+	// Values from the external engine are sanitized. Request counts are clamped to >= 0
+	// so a malformed negative rank can't cancel healthy ranks' pressure. token_usage and
+	// cache_hit_rate are contractually ratios in [0,1]: token_usage feeds the usage mean,
+	// so a non-finite value maps to 0 (finite01) and reads as an empty rank; cache_hit_rate
+	// feeds its own mean, so a non-finite (unavailable) rank is EXCLUDED rather than counted
+	// as 0 — otherwise one garbage sample would drag the average down; finite-but-out-of-range
+	// values are clamped and kept.
+	//
+	// The hit-rate mean is UNWEIGHTED: GetLoads exposes only a per-rank ratio, not the raw
+	// hit/query counts the HTTP path aggregates, so this cannot reproduce that path's
+	// query-weighted rate. With uneven per-rank request volume the two can differ; treat this
+	// as a coarse soft signal (identical for the single-rank case, the common one), not a
+	// precise engine-wide hit rate.
+	var running, waiting int64
+	var usageSum, hitRateSum float64
+	var hitRateN int
+	ranks := len(resp.GetLoads())
+	for _, l := range resp.GetLoads() {
+		if r := l.GetNumRunningReqs(); r > 0 {
+			running += int64(r)
+		}
+		if w := l.GetNumWaitingReqs(); w > 0 {
+			waiting += int64(w)
+		}
+		usageSum += finite01(l.GetTokenUsage())
+		if hr := l.GetCacheHitRate(); !math.IsNaN(hr) && !math.IsInf(hr, 0) {
+			hitRateSum += clamp01(hr)
+			hitRateN++
+		}
+	}
+	usage := 0.0
+	if ranks > 0 {
+		usage = usageSum / float64(ranks)
+	}
+	hitRate := 0.0
+	if hitRateN > 0 {
+		hitRate = hitRateSum / float64(hitRateN)
+	}
+
+	pressure := pressureFrom(float64(running+waiting), s.cfg.MaxConcurrencyCeiling)
+	var cacheBytes int64
+	if s.cfg.CacheSizeBytes > 0 {
+		// usage ∈ [0,1] ⇒ bytes ∈ [0, CacheSizeBytes]. Clamp in float space BEFORE
+		// the int64 conversion: float64(CacheSizeBytes) can round above the int64
+		// range at extreme capacities, so int64(usage*float64(CacheSizeBytes)) could
+		// overflow to a negative. Returning the exact int64 capacity at the top end
+		// sidesteps the lossy conversion.
+		switch b := usage * float64(s.cfg.CacheSizeBytes); {
+		case b <= 0:
+			cacheBytes = 0
+		case b >= float64(s.cfg.CacheSizeBytes):
+			cacheBytes = s.cfg.CacheSizeBytes
+		default:
+			cacheBytes = int64(b)
+		}
+	}
+	return &icpb.ReplicaStats{
+		CacheMemoryBytes: cacheBytes,
+		HitRate:          float32(hitRate),
+		Pressure:         float32(pressure),
+	}, nil
+}
+
+// finite01 clamps a raw engine-reported ratio into [0,1], mapping non-finite
+// (NaN / ±Inf) values to 0. clamp01 alone would pass NaN through (NaN compares
+// false against both bounds), so this guards the external token_usage value that
+// feeds cache_memory_bytes. (hit_rate is sanitized separately: a non-finite rank
+// is excluded from its mean rather than mapped to 0.)
+func finite01(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return clamp01(v)
+}

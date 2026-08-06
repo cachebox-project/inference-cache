@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+// Minimal vendored subset of the vLLM engine gRPC contract (the
+// `vllm.grpc.engine.VllmEngine` service exposed by vLLM's
+// `vllm.entrypoints.grpc_server`) — ONLY the GetLoads RPC and its messages. The
+// kvevent-subscriber uses this to read engine load over gRPC as an alternative to
+// scraping HTTP /metrics (which a vLLM engine served over gRPC does not expose).
+//
+// The package name MUST stay `vllm.grpc.engine` to match the upstream service
+// so the wire method path `/vllm.grpc.engine.VllmEngine/GetLoads` lines up; the
+// message names, field numbers, and types below are copied verbatim from the
+// upstream contract so the wire encoding is byte-compatible. Kept out of the
+// `proto/` module on purpose — it is a vendored external contract, not part of
+// IC's own gRPC API, so it is exempt from IC's buf-lint conventions.
+//
+// Provenance & license: this file mirrors the `vllm.grpc.engine.VllmEngine` wire
+// contract that vLLM's Apache-2.0 `vllm.entrypoints.grpc_server` serves, and is carried
+// in the Inference Cache repo under its own Apache-2.0 license (see repo LICENSE). There
+// is no standalone upstream .proto to pin a commit against: the messages ship inside the
+// engine's Python gRPC package as generated `*_pb2` stubs, so the authoritative source is
+// the ENGINE IMAGE this deployment pins. The GetLoads RPC and the GetLoadsRequest /
+// GetLoadsResponse / SchedulerLoad messages below were verified field-for-field (numbers
+// and types) against that image's contract; when bumping the pinned engine, re-verify them
+// against the new image. The bufconn test (grpc_loads_scraper_test.go) only proves this
+// file round-trips against its own generated stubs — NOT that it matches the deployed engine.
+//
+// Regenerate the .pb.go stubs with `make proto-gen-vendored` (also run by `make
+// proto-gen`); CI diffs pkg/adapters/engine/vllmengine to catch drift, so the
+// two committed stubs stay reproducible from this file.
+package vllm.grpc.engine;
+
+option go_package = "github.com/cachebox-project/inference-cache/pkg/adapters/engine/vllmengine;vllmengine";
+
+service VllmEngine {
+  // Scheduler load metrics, per DP rank.
+  rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
+}
+
+message GetLoadsRequest {
+  optional int32 dp_rank = 1;
+  repeated string include = 2;
+}
+
+message GetLoadsResponse {
+  string timestamp = 1;
+  string version = 2;
+  int32 dp_rank_count = 3;
+  repeated SchedulerLoad loads = 4;
+}
+
+// Per-DP-rank scheduler load snapshot. Mirrors upstream field numbers; unset
+// fields are 0.
+message SchedulerLoad {
+  int32 dp_rank = 1;
+  int32 num_running_reqs = 2;
+  int32 num_waiting_reqs = 3;
+  int32 num_total_reqs = 4;
+  int32 num_used_tokens = 5;
+  int32 max_total_num_tokens = 6;
+  double token_usage = 7;  // KV-cache utilization in [0,1)
+  double gen_throughput = 8;
+  double cache_hit_rate = 9;
+  double utilization = 10;
+  int32 max_running_requests = 11;
+}
