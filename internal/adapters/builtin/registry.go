@@ -1,8 +1,8 @@
 package builtin
 
 import (
+	builtinstorage "github.com/cachebox-project/inference-cache/internal/adapters/builtin/storage"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
-	backendprovider "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
@@ -23,6 +23,6 @@ func New(opts ...adapterruntime.Option) Registries {
 
 	return Registries{
 		Runtime: runtimeRegistry,
-		Storage: backendprovider.DefaultRegistry(),
+		Storage: builtinstorage.DefaultRegistry(),
 	}
 }

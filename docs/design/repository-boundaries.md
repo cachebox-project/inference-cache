@@ -59,7 +59,7 @@ behavior-preserving change.
 | Current package | Classification | Owner / rationale | Planned target |
 |---|---|---|---|
 | `pkg/adapters/backend` | Supported | Remote-storage provider and binding extension contracts | Keep |
-| `pkg/adapters/backend/provider` | Internalize | Shipping provider implementations | `internal/adapters/builtin/storage` |
+| `internal/adapters/builtin/storage` | Internal | Shipping provider implementations | Keep |
 | `pkg/adapters/runtime` | Split | Runtime extension contracts mixed with shipping vLLM implementations | Contracts stay; implementations move under `internal/adapters/builtin/runtime` |
 | `pkg/adapters/runtime/sglang` | Internalize | Shipping SGLang implementations | `internal/adapters/builtin/runtime` |
 | `pkg/adapters/runtime/internal/enginewire` | Internalize | Shared implementation detail of built-in runtime adapters | `internal/enginebinding` or built-in runtime subtree |

@@ -12,8 +12,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	provideradapter "github.com/cachebox-project/inference-cache/internal/adapters/builtin/storage"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
-	provideradapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend/provider"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )

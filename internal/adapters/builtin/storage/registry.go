@@ -1,5 +1,5 @@
 // Package provider contains the shipping remote-storage provider adapters.
-package provider
+package storage
 
 import (
 	"fmt"

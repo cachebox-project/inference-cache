@@ -13,7 +13,7 @@ is **not** byte-for-byte adapter output.
 
 > **Validation status.** This manifest is **derived from the GPU-validated adapter
 > render** (`pkg/adapters/runtime/internal/enginewire/sglang_mp.go` +
-> `pkg/adapters/backend/provider/redis_l2.go`; the controller-rendered managed path was
+> `internal/adapters/builtin/storage/redis_l2.go`; the controller-rendered managed path was
 > validated store→flush→retrieve end-to-end in the MP-mode increment) and is
 > **structurally checked** (`kubectl apply --dry-run=client`). It has **not** been
 > independently re-run end-to-end on a GPU in this exact hand shape — run it on a GPU
