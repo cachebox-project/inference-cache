@@ -49,14 +49,17 @@ while this gate enforces the runtime-image shape.
 
 ## Release Signatures and Provenance
 
-The `Release Supply Chain` workflow publishes or resolves the controller,
-server, and subscriber images by immutable digest. It signs each digest with
-keyless Cosign, generates signed SLSA v1 build provenance, pushes the
-provenance to GHCR, and verifies both the signature and provenance before
-attaching release artifacts. The Sigstore provenance bundles are also attached
-to the corresponding GitHub Release alongside the SPDX SBOMs. Manual runs must
-select the release tag in GitHub's `Use workflow from` control so the attested
-source revision is the release revision.
+The `Release Supply Chain` workflow checks out the release tag and
+unconditionally builds and publishes the controller, server, and subscriber
+images from that source. It captures each immutable digest directly from
+Buildx, verifies the published tag resolves to the same digest, and only then
+signs and attests that digest. The workflow uses keyless Cosign, generates
+signed SLSA v1 build provenance, pushes the provenance to GHCR, and verifies
+both the signature and provenance before attaching release artifacts. The
+Sigstore provenance bundles are also attached to the corresponding GitHub
+Release alongside the SPDX SBOMs. Manual runs must select the release tag in
+GitHub's `Use workflow from` control so the built and attested source revision
+is the release revision.
 
 Verify a released image after resolving its tag to a digest:
 
