@@ -95,10 +95,12 @@
 #      Also exercises the validating webhook's EventsOnly+External rejection.
 #   9c. Native SGLang HiCache end-to-end: applying the committed HiCache sample
 #      is observed by the controller without rendering a Deployment, Service, or
-#      HPA; status.endpoint stays empty and no synthetic Ready condition is
-#      published. A matching engine Pod sent through real server-side dry-run
-#      admission receives the complete native --hicache-* argument contract,
-#      proving the endpoint-free Pod webhook path without starting SGLang.
+#      HPA; status.endpoint stays empty and the CR waits at
+#      Ready=False/AwaitingEnginePods. A matching lightweight Pod receives the
+#      complete native --hicache-* argument contract plus the current generation
+#      receipt, becomes Kubernetes Ready, and drives the CR to
+#      Ready=True/EnginePodsReady. This proves the endpoint-free admission and
+#      controller contract without claiming a real SGLang or KV data-plane test.
 #  10. The /snapshot endpoint rejects unauthenticated callers AT THE NETWORK
 #      LAYER: a side curl pod outside the controller's SA identity (and outside
 #      the NetworkPolicy allowlist) has its connection to :8081 DROPPED by the
@@ -245,6 +247,7 @@
 #           EXTERNAL_INJECT_TIMEOUT, EVENTSONLY_BACKEND_TIMEOUT,
 #           EVENTSONLY_SMOKE_NS, EVENTSONLY_SMOKE_CB_NAME, SAMPLE_APPLY_NS,
 #           HICACHE_SMOKE_TIMEOUT, HICACHE_SMOKE_NS, HICACHE_SMOKE_CB_NAME,
+#           HICACHE_SMOKE_POD_NAME,
 #           KERNEL_CHECK_SMOKE_NS, KERNEL_CHECK_POD_TIMEOUT,
 #           KERNEL_CHECK_COND_TIMEOUT, MOONCAKE_SMOKE_NS, MOONCAKE_MASTER_IMAGE.
 
@@ -367,10 +370,11 @@ EVENTSONLY_SMOKE_NS="${EVENTSONLY_SMOKE_NS:-ic-smoke-events-only}"
 EVENTSONLY_SMOKE_CB_NAME="${EVENTSONLY_SMOKE_CB_NAME:-cachebackend-events-only}"
 
 # Native SGLang HiCache fixture identifiers. This engine-local backend has no
-# endpoint or controller-owned workload, so its dedicated namespace should
-# contain only the persisted CacheBackend used by the smoke.
+# endpoint or controller-owned workload; the smoke adds one user-owned
+# lightweight engine fixture to drive Kubernetes readiness.
 HICACHE_SMOKE_NS="${HICACHE_SMOKE_NS:-ic-smoke-sglang-hicache}"
 HICACHE_SMOKE_CB_NAME="${HICACHE_SMOKE_CB_NAME:-sglang-hicache}"
+HICACHE_SMOKE_POD_NAME="${HICACHE_SMOKE_POD_NAME:-sglang-hicache-engine}"
 
 KIND="${KIND:-$([ -x ./bin/kind ] && echo ./bin/kind || echo kind)}"
 pf_pid=""
@@ -459,6 +463,8 @@ collect_diagnostics() {
   # if the smoke aborted before that section.
   kubectl get cb -n "$HICACHE_SMOKE_NS" "$HICACHE_SMOKE_CB_NAME" -o yaml \
     >"$LOG_DIR/sglang-hicache-cb.yaml" 2>&1 || true
+  kubectl get pod -n "$HICACHE_SMOKE_NS" "$HICACHE_SMOKE_POD_NAME" -o yaml \
+    >"$LOG_DIR/sglang-hicache-engine-pod.yaml" 2>&1 || true
   kubectl get deploy,svc,hpa -n "$HICACHE_SMOKE_NS" \
     >"$LOG_DIR/sglang-hicache-ns-workloads.txt" 2>&1 || true
   # Kernel-check smoke artefacts. Best-effort — the objects may not
@@ -2677,10 +2683,10 @@ kubectl delete namespace "$EVENTSONLY_SMOKE_NS" --ignore-not-found --wait=false 
 # --- Native SGLang HiCache end-to-end --------------------------------------
 # This phase drives the new operator-facing surface through the real installed
 # CRD, validating webhook, controller, and Pod mutating webhook. HiCache is
-# engine-local, so the observable controller contract is deliberately negative:
-# no cache-server workload, no endpoint, and no synthetic Ready condition. The
-# Pod is server-side dry-run only; its admitted shape proves native argument
-# injection without pulling or starting a real SGLang image.
+# engine-local, so the controller observes user-owned engine Pods rather than a
+# cache-server workload. A lightweight busybox Pod exercises admission +
+# Kubernetes readiness without claiming SGLang runtime or KV data-plane
+# coverage.
 log "exercising native SGLang HiCache end-to-end in namespace $HICACHE_SMOKE_NS"
 kubectl create namespace "$HICACHE_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
@@ -2693,31 +2699,44 @@ sed "s|^  name: sglang-hicache\$|  name: $HICACHE_SMOKE_CB_NAME|" \
 kubectl -n "$HICACHE_SMOKE_NS" apply -f "$hc_sample_tmp" >/dev/null \
   || fail "kubectl apply native SGLang HiCache sample failed"
 
-# Wait until the controller has taken the engine-local path. observedGeneration
-# is the positive acknowledgement; endpoint/Ready/workload assertions below pin
-# what that path intentionally does not publish or provision.
+# Wait until the controller has taken the engine-local path. With no engine Pod
+# yet, the contract is Ready=False/AwaitingEnginePods and Progressing=True.
 hc_generation="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
   -o jsonpath='{.metadata.generation}')"
 deadline=$(($(date +%s) + HICACHE_SMOKE_TIMEOUT))
 hc_observed_generation=""
-until [ "$hc_observed_generation" = "$hc_generation" ]; do
+hc_ready_status=""
+hc_ready_reason=""
+until [ "$hc_observed_generation" = "$hc_generation" ] && \
+      [ "$hc_ready_status" = "False" ] && \
+      [ "$hc_ready_reason" = "AwaitingEnginePods" ]; do
   hc_observed_generation="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
     -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)"
+  hc_ready_status="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  hc_ready_reason="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
   if [ "$(date +%s)" -ge "$deadline" ]; then
     kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
-    fail "native HiCache CR was not observed within ${HICACHE_SMOKE_TIMEOUT}s: generation=$hc_generation observedGeneration=$hc_observed_generation"
+    fail "native HiCache CR did not reach False/AwaitingEnginePods within ${HICACHE_SMOKE_TIMEOUT}s: generation=$hc_generation observedGeneration=$hc_observed_generation Ready=$hc_ready_status/$hc_ready_reason"
   fi
   sleep 1
 done
-log "native HiCache CR observed at generation $hc_observed_generation"
+hc_progressing_status="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' 2>/dev/null || true)"
+hc_degraded_status="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}' 2>/dev/null || true)"
+if [ "$hc_progressing_status" != "True" ] || [ "$hc_degraded_status" != "False" ]; then
+  kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
+  fail "native HiCache no-Pod conditions Progressing=$hc_progressing_status Degraded=$hc_degraded_status, want True/False"
+fi
+log "native HiCache CR observed at generation $hc_observed_generation and awaits engine Pods"
 
 hc_endpoint="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
   -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
-hc_ready="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
-  -o jsonpath='{.status.conditions[?(@.type=="Ready")].type}' 2>/dev/null || true)"
-if [ -n "$hc_endpoint" ] || [ -n "$hc_ready" ]; then
+if [ -n "$hc_endpoint" ]; then
   kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
-  fail "native HiCache published server-backed status (endpoint=$hc_endpoint Ready=$hc_ready, want both absent)"
+  fail "native HiCache published server-backed endpoint=$hc_endpoint, want empty"
 fi
 
 hc_dep_count="$(kubectl -n "$HICACHE_SMOKE_NS" get deploy -o name 2>/dev/null | wc -l | tr -d ' ')"
@@ -2727,7 +2746,7 @@ if [ "$hc_dep_count" != "0" ] || [ "$hc_svc_count" != "0" ] || [ "$hc_hpa_count"
   kubectl -n "$HICACHE_SMOKE_NS" get deploy,svc,hpa || true
   fail "native HiCache rendered controller-owned workload (deploy=$hc_dep_count svc=$hc_svc_count hpa=$hc_hpa_count, want 0/0/0)"
 fi
-log "native HiCache rendered no Deployment, Service, or HPA and published no endpoint/Ready condition"
+log "native HiCache rendered no Deployment, Service, or HPA and published no endpoint"
 
 # Exercise the installed Pod mutating webhook with a matching, single-container
 # engine Pod. The dry-run response is the fully admitted Pod, including webhook
@@ -2737,7 +2756,7 @@ cat > "$hc_engine_fixture" <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
-  name: sglang-hicache-engine
+  name: $HICACHE_SMOKE_POD_NAME
   namespace: $HICACHE_SMOKE_NS
   labels:
     app: sglang
@@ -2745,9 +2764,11 @@ spec:
   containers:
     - name: sglang
       image: busybox:1.36
+      command:
+        - /bin/sh
+        - -c
       args:
-        - sleep
-        - "3600"
+        - "sleep 3600"
 EOF
 
 if ! hc_pod_args="$(kubectl create --dry-run=server --request-timeout=30s \
@@ -2755,7 +2776,7 @@ if ! hc_pod_args="$(kubectl create --dry-run=server --request-timeout=30s \
   -o go-template='{{range (index .spec.containers 0).args}}{{println .}}{{end}}' 2>/dev/null)"; then
   fail "matching SGLang Pod did not pass server-side dry-run admission"
 fi
-hc_expected_args=$'sleep\n3600\n--enable-hierarchical-cache\n--hicache-ratio\n2.0\n--hicache-write-policy\nwrite_through\n--hicache-io-backend\nkernel\n--hicache-mem-layout\nlayer_first'
+hc_expected_args=$'sleep 3600\n--enable-hierarchical-cache\n--hicache-ratio\n2.0\n--hicache-write-policy\nwrite_through\n--hicache-io-backend\nkernel\n--hicache-mem-layout\nlayer_first'
 if [ "$hc_pod_args" != "$hc_expected_args" ]; then
   printf '[install-smoke] admitted SGLang args:\n%s\n' "$hc_pod_args" >&2
   fail "native HiCache Pod mutation did not produce the expected complete argument contract"
@@ -2768,7 +2789,57 @@ hc_injected_by="$(kubectl create --dry-run=server --request-timeout=30s \
 if [ "$hc_injected_by" != "$HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME" ]; then
   fail "native HiCache dry-run Pod injected-by=$hc_injected_by, want $HICACHE_SMOKE_NS/$HICACHE_SMOKE_CB_NAME"
 fi
-log "native HiCache Pod webhook injected the complete CLI contract and backend identity"
+hc_cb_uid="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.metadata.uid}')"
+hc_injected_uid="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_engine_fixture" \
+  -o go-template='{{index .metadata.annotations "inferencecache.io/injected-by-uid"}}' 2>/dev/null)" \
+  || fail "could not read native HiCache injected-by-uid annotation from dry-run Pod"
+hc_injected_generation="$(kubectl create --dry-run=server --request-timeout=30s \
+  -f "$hc_engine_fixture" \
+  -o go-template='{{index .metadata.annotations "inferencecache.io/injected-generation"}}' 2>/dev/null)" \
+  || fail "could not read native HiCache injected-generation annotation from dry-run Pod"
+if [ "$hc_injected_uid" != "$hc_cb_uid" ] || [ "$hc_injected_generation" != "$hc_generation" ]; then
+  fail "native HiCache dry-run Pod receipt uid=$hc_injected_uid generation=$hc_injected_generation, want uid=$hc_cb_uid generation=$hc_generation"
+fi
+log "native HiCache Pod webhook injected the complete CLI contract and current CacheBackend receipt"
+
+# Persist the same lightweight Pod. /bin/sh -c consumes only the first arg as
+# its script, so the appended SGLang flags become unused positional parameters
+# and busybox can reach Kubernetes Ready without pretending to be SGLang.
+kubectl apply -f "$hc_engine_fixture" >/dev/null \
+  || fail "could not create native HiCache readiness fixture Pod"
+kubectl -n "$HICACHE_SMOKE_NS" wait --for=condition=Ready "pod/$HICACHE_SMOKE_POD_NAME" \
+  --timeout="${HICACHE_SMOKE_TIMEOUT}s" >/dev/null \
+  || fail "native HiCache readiness fixture Pod did not become Kubernetes Ready"
+
+deadline=$(($(date +%s) + HICACHE_SMOKE_TIMEOUT))
+hc_ready_status=""
+hc_ready_reason=""
+until [ "$hc_ready_status" = "True" ] && [ "$hc_ready_reason" = "EnginePodsReady" ]; do
+  hc_ready_status="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  hc_ready_reason="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
+    kubectl -n "$HICACHE_SMOKE_NS" get pod "$HICACHE_SMOKE_POD_NAME" -o yaml || true
+    fail "native HiCache CR did not reach True/EnginePodsReady within ${HICACHE_SMOKE_TIMEOUT}s: Ready=$hc_ready_status/$hc_ready_reason"
+  fi
+  sleep 1
+done
+
+hc_progressing_status="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}' 2>/dev/null || true)"
+hc_degraded_status="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}' 2>/dev/null || true)"
+hc_matched="$(kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" \
+  -o jsonpath='{.status.matchedEnginePods}' 2>/dev/null || true)"
+if [ "$hc_progressing_status" != "False" ] || [ "$hc_degraded_status" != "False" ] || [ "$hc_matched" != "1" ]; then
+  kubectl -n "$HICACHE_SMOKE_NS" get cb "$HICACHE_SMOKE_CB_NAME" -o yaml || true
+  fail "native HiCache converged conditions Progressing=$hc_progressing_status Degraded=$hc_degraded_status Matched=$hc_matched, want False/False/1"
+fi
+log "native HiCache CR reached Ready=True/EnginePodsReady from one current-generation Kubernetes Ready engine Pod"
 
 kubectl delete cb -n "$HICACHE_SMOKE_NS" "$HICACHE_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
 kubectl delete namespace "$HICACHE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null || true

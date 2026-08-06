@@ -193,6 +193,10 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("annotation %s: got %q want %q (live CacheBackend UID)",
 			AnnotationInjectedByUID, got.Annotations[AnnotationInjectedByUID], string(cb.UID))
 	}
+	if got.Annotations[AnnotationInjectedGeneration] != fmt.Sprint(cb.Generation) {
+		t.Fatalf("annotation %s: got %q want %q (live CacheBackend generation)",
+			AnnotationInjectedGeneration, got.Annotations[AnnotationInjectedGeneration], fmt.Sprint(cb.Generation))
+	}
 	if !containsArgFlag(got.Spec.Containers[0].Args, "--kv-transfer-config") {
 		t.Fatalf("--kv-transfer-config flag not injected; args = %v", got.Spec.Containers[0].Args)
 	}
@@ -228,6 +232,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	// the apiserver would actually see it.
 	delete(pod2.Annotations, AnnotationInjectedBy)
 	delete(pod2.Annotations, AnnotationInjectedByUID)
+	delete(pod2.Annotations, AnnotationInjectedGeneration)
 	if err := mgr.GetClient().Create(ctx, pod2); err != nil {
 		t.Fatalf("create second Pod: %v", err)
 	}

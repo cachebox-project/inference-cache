@@ -394,10 +394,13 @@ args/env only.
 
 The `(sglang, SGLangHiCache)` pair configures the selected SGLang engine Pods
 directly. It does not create a cache-server Deployment, Service, HPA, or
-endpoint. The first implementation intentionally publishes no `Ready`
-condition: Kubernetes Pod readiness proves that SGLang is serving, but does not
-prove a HiCache host-tier write/read round trip. A dedicated readiness contract
-is a separate follow-up.
+endpoint. Its `Ready` condition reports configuration rollout and serving
+availability, not a HiCache data-plane probe: `Ready=True` means every
+participating engine Pod carries the current CacheBackend name, UID, and
+generation receipt, already contains the configuration that the current
+HiCache adapter would inject, and has Kubernetes `Ready=True`. It does not
+prove a host-tier write/read round trip or distinguish a GPU hit from a
+host-tier read.
 
 The required integration shape is:
 
@@ -440,6 +443,40 @@ Changing or deleting the CacheBackend does not mutate live Pods. Roll the
 SGLang workload to apply a new configuration or switch between LMCache and
 HiCache. The webhook does not inspect image tags: the chosen image must support
 these SGLang arguments.
+
+The controller evaluates selector-matched Pods with this contract:
+
+| Pod set | `Ready` | `Progressing` | `Degraded` | Reason |
+|---|---|---|---|---|
+| No active matching Pods | `False` | `True` | `False` | `AwaitingEnginePods` |
+| Every active matching Pod explicitly opts out with `inferencecache.io/skip-inject` | `True` | `False` | `False` | `AllEnginePodsSkipped` |
+| Any participating Pod lacks a complete injection receipt | `False` | `False` | `True` | `EnginePodsNotInjected` |
+| Any receipt names another CacheBackend identity or a future generation | `False` | `False` | `True` | `EnginePodsInjectionMismatch` |
+| At least one receipt carries an older generation | `False` | `True` | `False` | `EnginePodsRolloutInProgress` |
+| All receipts are current, but at least one Pod does not contain the engine configuration the HiCache adapter would inject | `False` | `False` | `True` | `EnginePodsNotInjected` |
+| All receipts are current, but at least one Pod is not Kubernetes Ready | `False` | `False` | `True` | `EnginePodsUnavailable` |
+| All participating Pods carry the current receipt, contain the current adapter configuration, and are Kubernetes Ready | `True` | `False` | `False` | `EnginePodsReady` |
+
+Terminating Pods and terminal `Succeeded`/`Failed` Pods are excluded. A Pod
+with a truthy `inferencecache.io/skip-inject` explicitly opts out and does not
+block the remaining participants; this is a public operator control, not a
+webhook-authenticated decision. Readiness deliberately does not require the
+`inferencecache.io/inject-skipped` audit marker because both annotations are
+user-writable and the marker is not an authentication boundary. For every
+participant with a current receipt, the controller runs the complete webhook
+engine mutation pipeline — canonical HiCache adapter injection followed by
+`spec.integration.engineOverrides` — against an in-memory PodSpec copy and
+requires it to produce no change. The receipt remains operational metadata
+rather than a security boundary: actual configuration convergence prevents a
+forged current receipt from proving that absent or conflicting HiCache
+configuration was injected.
+
+The controller does not restart user-owned engine workloads. After a
+CacheBackend spec update, old-generation Pods keep the backend at
+`EnginePodsRolloutInProgress` until the workload owner rolls them. The
+controller polls every 5 seconds while not Ready and uses the existing
+30-second matched-Pod cadence after convergence; it does not add a
+cluster-wide Pod watch.
 
 HiCache host memory is charged to the engine container's cgroup. The operator
 must size the engine's memory request/limit and node capacity accordingly.
@@ -910,7 +947,7 @@ A separate mutating admission webhook on `corev1/v1.Pod` (`name: mpod.inferencec
 |---|---|
 | Selection | Lists `CacheBackend`s in the pod's namespace via the manager's **APIReader** (uncached live client; an informer-cache miss on a freshly-Ready backend would leave the pod permanently unwired since pod CREATE is a one-shot), then matches `pod.Labels` against each `Spec.EngineSelector.MatchLabels`. The first matching `CacheBackend` wins; one with a nil or empty `EngineSelector` is skipped (a "match-everything" selector would silently claim every pod in the namespace). |
 | Injection | Resolves the runtime adapter via `runtime.Registry.Select(runtimeID, cache)`, resolves `spec.EffectiveRemoteStorage()` independently, and constructs a structured provider `Binding{Protocol, Endpoint}`. Managed ownership uses `status.endpoint` from the live Service; External ownership uses the trimmed, provider-validated `spec.remoteStorage.endpoint` (or legacy `spec.endpoint`) with no fallback to stale status; omitted canonical `remoteStorage` produces a nil host-only binding. The webhook calls `runtime.InjectEngineConfigWithBinding`, so the adapter selects the LMCache, RESP, or Mooncake engine wire from the binding protocol instead of inferring storage from `spec.type`. A missing endpoint fails open only when the selected adapter and binding require one. Events-only skips engine injection because it wires no KV connector and appends only the kvevent-subscriber sidecar. Adapters preserve existing user args/env and make repeat injection idempotent. |
-| Annotations | Stamps TWO annotations on every successfully mutated pod: `inferencecache.io/injected-by: <namespace>/<name>` (operator-readable identity, shows in `kubectl describe pod`) AND `inferencecache.io/injected-by-uid: <cache.UID>` (the matched CR's metadata.uid). Successful injection also clears any stale `inferencecache.io/inject-skipped` marker. Reads `inferencecache.io/skip-inject: <truthy>` as an opt-out: the webhook returns Allowed, skips engine wiring, clears any stale injected-by/injected-by-uid pair, and stamps `inferencecache.io/inject-skipped: skip-inject-annotation` so explicit operator opt-out is distinguishable from selector drift. On all other fail-open returns after the pod is decoded (list/no match/missing endpoint/adapter errors), the webhook strips stale injected-by/injected-by-uid and inject-skipped annotations so a user cannot trick the events controller by pre-stamping a pod template. Decode failures fail open before a Pod exists to patch, so stale annotations cannot be cleared on that path. |
+| Annotations | Stamps three annotations on every successfully mutated pod: `inferencecache.io/injected-by: <namespace>/<name>` (operator-readable identity), `inferencecache.io/injected-by-uid: <cache.UID>` (the matched CR's metadata.uid), and `inferencecache.io/injected-generation: <cache.metadata.generation>` (the spec generation validated and rendered at admission time). Successful injection also clears any stale `inferencecache.io/inject-skipped` marker. Reads `inferencecache.io/skip-inject: <truthy>` as an opt-out: the webhook returns Allowed, skips engine wiring, clears the complete injection receipt, and stamps `inferencecache.io/inject-skipped: skip-inject-annotation` so explicit operator opt-out is distinguishable from selector drift. On all other fail-open returns after the pod is decoded (list/no match/missing endpoint/adapter errors), the webhook strips stale injection and skip-decision annotations so a user cannot trick downstream controllers by pre-stamping a pod template. Decode failures fail open before a Pod exists to patch, so stale annotations cannot be cleared on that path. |
 | Events | The webhook itself does NOT record events (the apiserver assigns `metadata.uid` after mutating admission, so a webhook-recorded event would carry `involvedObject.uid=""` and be invisible to `kubectl describe pod`). Instead, the pod-watching `engine-pod-events` controller reads the persisted decision annotations after CREATE. For injected pods, it validates `inferencecache.io/injected-by-uid` against the live CR's `metadata.uid` and records a `Normal InjectedByCacheBackend` event on the now-persisted pod. For explicitly skipped pods carrying both a truthy `inferencecache.io/skip-inject` and `inferencecache.io/inject-skipped: skip-inject-annotation`, it records a `Normal SkippedByOperator` event on that pod. The skip marker is not authenticated, and `skipInjection` treats a pre-existing correct marker as already converged; `SkippedByOperator` therefore means the persisted pod carries the explicit opt-out plus skipped marker, not proof that the webhook authored the marker. The UID match REDUCES — but does NOT eliminate — the failurePolicy=Ignore forgery surface for injected pods: a casual copy-paste of an injected pod's annotations into a fresh template won't match the live CR's UID, but `metadata.uid` is not secret, so a pod creator with `get` RBAC on CacheBackends can read it and stamp the pair correctly. The injected Event signals "the webhook claims this pod was injected and the claim is consistent with the live CR," not "the webhook was cryptographically authenticated." The controller skips the injected event when the CR is missing, the UID annotation is absent, or the UID does not match — see the controller godoc for the full skip table. controller-runtime's EventBroadcaster aggregates duplicates on the apiserver side, so a re-enqueue across controller restarts upserts the existing event rather than spamming. |
 | Idempotency | The handler calls the adapter unconditionally on every admission and trusts the adapter to converge the full injected contract. For LMCache this is env plus the engine-specific required surface — `--kv-transfer-config` for vLLM; for SGLang `--enable-lmcache` + `--lmcache-config-file` **plus** the MP-worker native sidecar and the shared config / `/dev/shm` volumes + mounts. Its merge primitives (`upsertEnv` / `upsertArgPair` / `upsertFlag`, and for SGLang `adoptContainer` / `adoptVolume` / `upsertMountByName`) converge on the desired value rather than appending a duplicate. The SGLang `adopt*` pair additionally distinguishes the adapter's own prior injection (converge) from an operator's object squatting a reserved name (reject → fail-open admit) — see [Names the MP wire reserves](#sglang-engine-support). Native HiCache validates all reserved arguments against the original pod before mutation, preserves one matching or well-formed operator-supplied value, appends each missing canonical argument once, and rejects conflicts, malformed values, or duplicates without partially changing the pod. Re-admission of a fully-injected pod therefore produces an empty JSON-patch set. Trusting the adapter rather than a handler-side env-presence shortcut avoids the trap where a partially-injected pod is admitted permanently missing the rest of the contract. |
 | Fail-open | Every error path (decode failure, list error, no matching backend, missing `status.endpoint`, no registered adapter, adapter rejection, re-encode failure) returns `admission.Allowed(...)` with a reason — webhook errors MUST NOT block engine admission. `MutatingWebhookConfiguration.failurePolicy` is also pinned to `Ignore` as a belt-and-suspenders second layer. |

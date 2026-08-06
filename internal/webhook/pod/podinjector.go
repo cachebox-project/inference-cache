@@ -66,6 +66,14 @@ const AnnotationInjectedBy = enginebinding.AnnotationInjectedBy
 // the event.
 const AnnotationInjectedByUID = enginebinding.AnnotationInjectedByUID
 
+// AnnotationInjectedGeneration is stamped alongside [AnnotationInjectedBy]
+// and [AnnotationInjectedByUID] on every successful injection. It records the
+// CacheBackend metadata.generation whose spec the runtime adapter validated
+// and rendered into the pod. Engine-local readiness uses the complete
+// name/UID/generation receipt to distinguish current pods from pods that still
+// carry an older CacheBackend configuration.
+const AnnotationInjectedGeneration = "inferencecache.io/injected-generation"
+
 // AnnotationInjectSkipped is stamped when the webhook intentionally skips
 // injection because the operator set [AnnotationSkip]. It lets a persisted pod
 // distinguish an explicit opt-out from selector drift or fail-open admission.
@@ -235,65 +243,14 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// free at the apiserver.
 	mutated := pod.DeepCopy()
 
-	// Snapshot the engine container's pre-injection args/env so the
-	// override merge below can scope itself to the adapter-owned set. The
-	// override surface mutates only what InjectEngineConfig contributes;
-	// user pod-template args/env that the adapter does not touch stay
-	// protected. We snapshot before the adapter call (rather than re-deriving
-	// the canonical set afterwards) so this works for any adapter without
-	// changing the [adapterruntime.KVCacheRuntimeAdapter] contract.
-	overrides := engineOverridesFor(cache)
-	overrideIdx := -1
-	var preArgs []string
-	var preEnv []corev1.EnvVar
-	if overrides != nil {
-		if idx, ok := overrideTargetIndex(mutated.Spec.Containers, adapter.EngineContainerName()); ok {
-			overrideIdx = idx
-			preArgs = append([]string(nil), mutated.Spec.Containers[idx].Args...)
-			preEnv = append([]corev1.EnvVar(nil), mutated.Spec.Containers[idx].Env...)
-		}
-	}
-
-	// Events-only (tier-1 routing) wires NO KV connector regardless of
-	// spec.type: the engine container is left untouched so a hybrid-attention
-	// model's KV-cache manager is not disabled by a connector it cannot load.
-	// Skip InjectEngineConfig here, at the webhook, rather than relying on each
-	// adapter's own no-op: the connector no-op currently lives ONLY in the
-	// vLLM+LMCache adapter, so an admission-bypassed spec.type=External +
-	// mode=EventsOnly object would otherwise select the External adapter and
-	// inject the LMCache connector — violating the events-only "no connector"
-	// contract. Gating here makes the no-connector guarantee adapter-independent.
-	// The observation-sidecar append and the wired/injected-by logic below stay
-	// as-is (events-only's only wiring is the subscriber sidecar).
-	if !cache.Spec.IsEventsOnly() {
-		if err := adapterruntime.InjectEngineConfigWithBinding(adapter, &mutated.Spec, binding, cache); err != nil {
-			log.V(1).Info("fail-open: adapter rejected pod",
-				"runtime", string(runtimeID), "error", err.Error())
-			return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
-		}
-	}
-
-	// Apply spec.integration.engineOverrides scoped to the adapter-owned
-	// args/env derived from the pre/post diff. Admission has already
-	// hard-rejected overrides that overlap the adapter's reserved
-	// declarations, so the entries surviving to this point are safe to
-	// merge. Adapters with no canonical engine container (the reference
-	// adapter) return EngineContainerName() == "" and overrideIdx stays
-	// -1, so the merge is skipped — the override surface is for production
-	// adapters that target a specific engine container.
-	//
-	// Skip the merge entirely for events-only: InjectEngineConfig injected
-	// nothing in this mode (it is a no-op), so the engine container is left
-	// untouched by contract. Running the override merge here would let the
-	// override surface append non-adapter-owned args/env to the engine
-	// container even though the canonical injection contributed none —
-	// contradicting "the engine container is left otherwise untouched".
-	if overrides != nil && overrideIdx >= 0 && !cache.Spec.IsEventsOnly() {
-		mutated.Spec.Containers[overrideIdx].Args, mutated.Spec.Containers[overrideIdx].Env = applyEngineInjectionOverrides(
-			preArgs, mutated.Spec.Containers[overrideIdx].Args,
-			preEnv, mutated.Spec.Containers[overrideIdx].Env,
-			overrides,
-		)
+	// Apply the same complete engine-container mutation pipeline that the
+	// readiness controller later replays as an idempotence check. The helper
+	// keeps canonical adapter injection and engineOverrides inseparable and
+	// preserves the EventsOnly no-connector/no-override contract.
+	if err := ApplyEngineConfigWithOverrides(adapter, &mutated.Spec, binding, cache); err != nil {
+		log.V(1).Info("fail-open: adapter rejected pod",
+			"runtime", string(runtimeID), "error", err.Error())
+		return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
 	}
 
 	// Inject the kernel-check init container (adapters that opt in via the
@@ -385,7 +342,8 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// which is skipped when the subscriber image / backendConfig.model is unset
 	// (nothing injected) OR when a same-named container already exists (operator-
 	// authored, unverified). In those cases the webhook added/verified no wiring,
-	// so stamping injected-by/injected-by-uid would trip the downstream
+	// so stamping the injected-by/injected-by-uid/injected-generation receipt
+	// would trip the downstream
 	// InjectedByCacheBackend event controller on a non-existent injection and
 	// report "wired" while no usable events may flow. Route that case through the
 	// fail-open no-injection path (which strips any forged injection annotations
@@ -403,6 +361,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	delete(mutated.Annotations, AnnotationInjectSkipped)
 	mutated.Annotations[AnnotationInjectedBy] = cache.Namespace + "/" + cache.Name
 	mutated.Annotations[AnnotationInjectedByUID] = string(cache.UID)
+	mutated.Annotations[AnnotationInjectedGeneration] = strconv.FormatInt(cache.Generation, 10)
 
 	mutatedRaw, err := json.Marshal(mutated)
 	if err != nil {
@@ -487,31 +446,33 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 }
 
 // failOpen builds the admission response for any fail-open return path
-// AFTER the pod has been decoded. The webhook's contract is that
-// AnnotationInjectedBy and AnnotationInjectSkipped on the persisted pod mean
-// "the webhook successfully made this decision" — those are what the
-// engine-pod-events controller keys `InjectedByCacheBackend` and
+// AFTER the pod has been decoded. The webhook's contract is that the complete
+// name/UID/generation injection receipt, or AnnotationInjectSkipped, on the
+// persisted pod means "the webhook successfully made this decision" — those
+// are what the engine-pod-events controller keys `InjectedByCacheBackend` and
 // `SkippedByOperator` off of. The annotations are user-controllable (anyone
 // with pod-create RBAC can set them) and the webhook does not overwrite them
 // on fail-open paths, so a copy/paste from a mutated pod's metadata, or an
 // attacker forging the annotations, would otherwise trip the controller into
 // emitting an event for a pod the webhook never touched.
 //
-// Fix: on every fail-open return, strip the annotation if it was
-// preset. Steady-state cost stays at zero patches per pod for the common
-// no-match case (the vast majority of pods cluster-wide), because the
-// helper short-circuits to admission.Allowed when the annotation is
-// absent.
+// Fix: on every fail-open return, strip any injection-receipt or verified-skip
+// annotations that were preset. Steady-state cost stays at zero patches per
+// pod for the common no-match case (the vast majority of pods cluster-wide),
+// because the helper short-circuits to admission.Allowed when the annotations
+// are absent.
 func failOpen(req admission.Request, pod *corev1.Pod, reason string) admission.Response {
 	hasInjectedBy := pod.Annotations[AnnotationInjectedBy] != ""
 	hasInjectedByUID := pod.Annotations[AnnotationInjectedByUID] != ""
+	hasInjectedGeneration := pod.Annotations[AnnotationInjectedGeneration] != ""
 	hasInjectSkipped := pod.Annotations[AnnotationInjectSkipped] != ""
-	if !hasInjectedBy && !hasInjectedByUID && !hasInjectSkipped {
+	if !hasInjectedBy && !hasInjectedByUID && !hasInjectedGeneration && !hasInjectSkipped {
 		return admission.Allowed(reason)
 	}
 	cleared := pod.DeepCopy()
 	delete(cleared.Annotations, AnnotationInjectedBy)
 	delete(cleared.Annotations, AnnotationInjectedByUID)
+	delete(cleared.Annotations, AnnotationInjectedGeneration)
 	delete(cleared.Annotations, AnnotationInjectSkipped)
 	if len(cleared.Annotations) == 0 {
 		// Avoid emitting an empty-map annotations field; absent is the
@@ -537,11 +498,13 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 	}
 	delete(mutated.Annotations, AnnotationInjectedBy)
 	delete(mutated.Annotations, AnnotationInjectedByUID)
+	delete(mutated.Annotations, AnnotationInjectedGeneration)
 	mutated.Annotations[AnnotationInjectSkipped] = InjectSkippedReasonSkipAnnotation
 
 	if pod.Annotations[AnnotationInjectSkipped] == InjectSkippedReasonSkipAnnotation &&
 		pod.Annotations[AnnotationInjectedBy] == "" &&
-		pod.Annotations[AnnotationInjectedByUID] == "" {
+		pod.Annotations[AnnotationInjectedByUID] == "" &&
+		pod.Annotations[AnnotationInjectedGeneration] == "" {
 		return admission.Allowed("skipped via " + AnnotationSkip)
 	}
 	raw, err := json.Marshal(mutated)
