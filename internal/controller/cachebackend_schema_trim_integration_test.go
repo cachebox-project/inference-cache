@@ -38,7 +38,8 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 	trimmed := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "trimmed", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
 				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
@@ -64,6 +65,9 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 		u.SetKind("CacheBackend")
 		u.SetNamespace(ns)
 		u.SetName(name)
+		if err := unstructured.SetNestedField(u.Object, "VLLM", "spec", "runtime"); err != nil {
+			t.Fatalf("set spec.runtime: %v", err)
+		}
 		if err := unstructured.SetNestedField(u.Object, "LMCache", "spec", "type"); err != nil {
 			t.Fatalf("set spec.type: %v", err)
 		}

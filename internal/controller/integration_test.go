@@ -682,13 +682,17 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 	})
 
-	t.Run("UnmanagedTypeNoWorkload", func(t *testing.T) {
+	t.Run("UnsupportedPairNoWorkload", func(t *testing.T) {
 		ns := freshNS(t, k8s)
-		// An arbitrary unsupported value has no registered adapter and follows
-		// the unmanaged defense-in-depth path when admission is bypassed.
+		// Both values satisfy the CRD enums, but the built-in registry has no
+		// vLLM+SGLangHiCache adapter. This exercises the reconciler's unmanaged
+		// defense-in-depth path when the validating webhook is bypassed.
 		cb := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns},
-			Spec:       cachev1alpha1.CacheBackendSpec{Type: cachev1alpha1.CacheBackendType("unsupported")},
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
@@ -766,12 +770,16 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 			t.Fatalf("VLLM (uppercase) should match the vllm adapter and produce a Deployment: %v", err)
 		}
 
-		// sglang now has a shipping adapter (the SGLang+LMCache adapter is in
-		// the reconciler's nil-registry fallback), so a (sglang, LMCache)
-		// backend is managed the same way vLLM is — it renders the standalone
-		// lmcache-server Deployment.
+		// SGLang+LMCache is a shipping adapter. Pair it with managed Redis,
+		// the remote-storage protocol that the adapter accepts, and verify the
+		// composed registries render its managed storage Deployment.
 		sg := lmcacheBackend("sg", ns)
 		sg.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		sg.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+		}
 		sg.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
 		if err := k8s.Create(ctx, sg); err != nil {
 			t.Fatalf("create sglang: %v", err)
@@ -835,7 +843,8 @@ func TestIntegrationEnginePodEvents(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 		},
 	}
 	if err := k8s.Create(context.Background(), cb); err != nil {
@@ -978,13 +987,13 @@ func TestIntegrationCacheBackendMatchedEnginePodsRequeueCadence(t *testing.T) {
 	// without a Pod watch.
 	const steadyRequeueInterval = 30 * time.Second
 	const churnRequeueInterval = 250 * time.Millisecond
-	if err := (&CacheBackendReconciler{
+	if err := setupTestCacheBackendReconciler(mgr, &CacheBackendReconciler{
 		Client:                                mgr.GetClient(),
 		Scheme:                                mgr.GetScheme(),
 		Log:                                   logr.Discard(),
 		MatchedEnginePodsRequeueInterval:      steadyRequeueInterval,
 		MatchedEnginePodsChurnRequeueInterval: churnRequeueInterval,
-	}).SetupWithManager(mgr); err != nil {
+	}); err != nil {
 		t.Fatalf("setup with manager: %v", err)
 	}
 
@@ -1084,11 +1093,11 @@ func TestIntegrationCacheBackendEngineSelectorUnmatchedDiagnostics(t *testing.T)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	if err := (&CacheBackendReconciler{
+	if err := setupTestCacheBackendReconciler(mgr, &CacheBackendReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 		Log:    logr.Discard(),
-	}).SetupWithManager(mgr); err != nil {
+	}); err != nil {
 		t.Fatalf("setup with manager: %v", err)
 	}
 
@@ -1258,11 +1267,11 @@ func TestIntegrationCacheBackendWatch(t *testing.T) {
 			}
 		},
 	}
-	if err := (&CacheBackendReconciler{
+	if err := setupTestCacheBackendReconciler(mgr, &CacheBackendReconciler{
 		Client: observedClient,
 		Scheme: mgr.GetScheme(),
 		Log:    logr.Discard(),
-	}).SetupWithManager(mgr); err != nil {
+	}); err != nil {
 		t.Fatalf("setup with manager: %v", err)
 	}
 
@@ -1732,11 +1741,11 @@ func TestIntegrationCacheBackendEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	if err := (&CacheBackendReconciler{
+	if err := setupTestCacheBackendReconciler(mgr, &CacheBackendReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 		Log:    logr.Discard(),
-	}).SetupWithManager(mgr); err != nil {
+	}); err != nil {
 		t.Fatalf("setup with manager: %v", err)
 	}
 

@@ -74,9 +74,21 @@ func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendR
 }
 
 func configureTestRegistries(r *CacheBackendReconciler) {
+	if r.Registry != nil && r.BackendRegistry != nil {
+		return
+	}
 	registries := builtinadapters.New()
-	r.Registry = registries.Runtime
-	r.BackendRegistry = registries.Storage
+	if r.Registry == nil {
+		r.Registry = registries.Runtime
+	}
+	if r.BackendRegistry == nil {
+		r.BackendRegistry = registries.Storage
+	}
+}
+
+func setupTestCacheBackendReconciler(mgr ctrl.Manager, r *CacheBackendReconciler) error {
+	configureTestRegistries(r)
+	return r.SetupWithManager(mgr)
 }
 
 func TestDispatchRequiresAdapterRegistries(t *testing.T) {
@@ -97,6 +109,7 @@ func externalLMCacheStorage(endpoint string) *cachev1alpha1.CacheBackendRemoteSt
 
 func reconcile(t *testing.T, r *CacheBackendReconciler, name, namespace string) {
 	t.Helper()
+	configureTestRegistries(r)
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
 	}); err != nil {

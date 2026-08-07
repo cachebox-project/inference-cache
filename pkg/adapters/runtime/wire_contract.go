@@ -102,11 +102,11 @@ func ValidateExternalEndpoint(provider cachev1alpha1.CacheBackendRemoteStoragePr
 		}
 		_, port, err := net.SplitHostPort(trimmed)
 		if err != nil {
-			return fmt.Errorf("Redis endpoint must be a bare host:port: %w", err)
+			return fmt.Errorf("redis endpoint must be a bare host:port: %w", err)
 		}
 		n, err := strconv.Atoi(port)
 		if err != nil || n < 1 || n > 65535 {
-			return fmt.Errorf("Redis endpoint port %q must be an integer in 1-65535", port)
+			return fmt.Errorf("redis endpoint port %q must be an integer in 1-65535", port)
 		}
 		return nil
 	case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:

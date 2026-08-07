@@ -141,8 +141,13 @@ func TestIntegrationMooncakeHostNetworkAndHeadlessService(t *testing.T) {
 
 		cb := getBackend(t, r, "cache", ns)
 		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+			Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+		}
 		if err := k8s.Update(ctx, cb); err != nil {
-			t.Fatalf("switch backend type to LMCache: %v", err)
+			t.Fatalf("switch backend from Mooncake to LMCache server: %v", err)
 		}
 		reconcile(t, r, "cache", ns)
 

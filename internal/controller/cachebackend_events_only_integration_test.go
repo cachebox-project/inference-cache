@@ -199,7 +199,13 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		cb := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: ns, Generation: 1},
 			Spec: cachev1alpha1.CacheBackendSpec{
-				Type: cachev1alpha1.CacheBackendTypeLMCache,
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeLMCache,
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+					Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+					LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+				},
 				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
 					Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
 				},

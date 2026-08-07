@@ -355,11 +355,13 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		}
 	})
 
-	t.Run("BackwardCompatDefaultsTimeoutTo5m", func(t *testing.T) {
+	t.Run("ObservationDefaultsTimeoutTo5m", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		cb := gatedLMCacheBackend("cache", ns)
-		// Omit observation: the defaulter materialises the parent and applies 5m.
-		cb.Spec.Observation = nil
+		// The CRD defaults firstEventTimeout when the canonical observation
+		// block is present. Webhook materialization of an omitted parent is
+		// covered by cachebackend_defaulter_envtest_test.go.
+		cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{}
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -389,11 +391,11 @@ func TestIntegrationKVEventGateAutoReconcileOnPollerWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	if err := (&CacheBackendReconciler{
+	if err := setupTestCacheBackendReconciler(mgr, &CacheBackendReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 		Log:    logr.Discard(),
-	}).SetupWithManager(mgr); err != nil {
+	}); err != nil {
 		t.Fatalf("setup with manager: %v", err)
 	}
 

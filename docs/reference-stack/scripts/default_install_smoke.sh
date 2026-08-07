@@ -2482,13 +2482,16 @@ spec:
   type: SGLangHiCache
   hiCache:
     ratio: "2"
+  engineSelector:
+    matchLabels:
+      app: sglang-hicache
   remoteStorage:
     provider: Redis
     ownership: Managed
     redis: {}
 EOF
 )"
-if ! grep -q 'does not accept remote binding protocol "resp"' <<<"$reject_output"; then
+if ! grep -q 'does not accept remote-storage protocol "resp"' <<<"$reject_output"; then
   fail "admission did not reject canonical SGLangHiCache + Redis as expected; got: $reject_output"
 fi
 log "admission rejected invalid canonical endpoint shapes and SGLangHiCache + Redis"

@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
 )
 
@@ -95,7 +96,8 @@ func TestVerifySamplesAdmissionEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ctrl.NewManager: %v", err)
 	}
-	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
+	registries := builtinadapters.New()
+	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, registries.Runtime); err != nil {
 		t.Fatalf("register CacheBackend webhook: %v", err)
 	}
 	if err := cachewebhookv1alpha1.SetupCachePolicyWebhookWithManager(mgr); err != nil {

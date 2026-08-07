@@ -67,6 +67,7 @@ func TestDoctorEnvtest(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "mismatched", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "nonexistent-engine"},
 			},
