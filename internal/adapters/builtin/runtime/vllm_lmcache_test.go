@@ -920,13 +920,21 @@ func TestValidateExternalEndpointProviderSchemes(t *testing.T) {
 		{name: "redis bare", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:6379"},
 		{name: "redis rejects lm", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "lm://redis.example:6379", wantErr: true},
 		{name: "redis rejects named port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:redis", wantErr: true},
+		{name: "redis rejects zero port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:0", wantErr: true},
+		{name: "redis rejects out-of-range port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:70000", wantErr: true},
 		{name: "lmcache bare", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:8200"},
 		{name: "lmcache explicit", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "lm://cache.example:8200"},
 		{name: "lmcache rejects mooncake", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "mooncakestore://cache.example:50051", wantErr: true},
+		{name: "lmcache rejects named port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:not-a-port", wantErr: true},
+		{name: "lmcache rejects zero port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:0", wantErr: true},
+		{name: "lmcache rejects out-of-range port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:70000", wantErr: true},
 		{name: "mooncake bare", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "cache.example:50051"},
 		{name: "mooncake explicit", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://cache.example:50051"},
 		{name: "mooncake rejects lm", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "lm://cache.example:50051", wantErr: true},
 		{name: "mooncake rejects nested scheme", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://lm://cache.example:50051", wantErr: true},
+		{name: "mooncake rejects named port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://cache.example:not-a-port", wantErr: true},
+		{name: "mooncake rejects zero port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://cache.example:0", wantErr: true},
+		{name: "mooncake rejects out-of-range port", provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://cache.example:70000", wantErr: true},
 	}
 
 	for _, tt := range tests {

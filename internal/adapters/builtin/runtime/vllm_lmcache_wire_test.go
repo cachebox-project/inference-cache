@@ -285,6 +285,8 @@ func TestValidateLMCacheEndpoint(t *testing.T) {
 		{name: "ipv4-host-port", input: "10.0.0.1:8200"},
 		{name: "bracketed-ipv6", input: "[2001:db8::1]:8200"},
 		{name: "bracketed-ipv6-loopback", input: "[::1]:8200"},
+		{name: "minimum-port", input: "cache.example:1"},
+		{name: "maximum-port", input: "cache.example:65535"},
 		{name: "leading-trailing-whitespace-trimmed", input: "  cache.example:8200  "},
 
 		// Invalid shapes — empty.
@@ -308,6 +310,13 @@ func TestValidateLMCacheEndpoint(t *testing.T) {
 		{name: "host-only-no-port", input: "cache.example", wantErr: true, wantMatch: "non-empty host AND port"},
 		{name: "trailing-colon-empty-port", input: "cache.example:", wantErr: true, wantMatch: "non-empty host AND port"},
 		{name: "bracketed-ipv6-no-port", input: "[::1]", wantErr: true, wantMatch: "non-empty host AND port"},
+
+		// Invalid shapes — port must be a decimal integer in the TCP range.
+		{name: "named-port", input: "cache.example:not-a-port", wantErr: true, wantMatch: "integer in 1-65535"},
+		{name: "signed-port", input: "cache.example:+8200", wantErr: true, wantMatch: "integer in 1-65535"},
+		{name: "zero-port", input: "cache.example:0", wantErr: true, wantMatch: "integer in 1-65535"},
+		{name: "out-of-range-port", input: "cache.example:70000", wantErr: true, wantMatch: "integer in 1-65535"},
+		{name: "ipv6-named-port", input: "[2001:db8::1]:not-a-port", wantErr: true, wantMatch: "integer in 1-65535"},
 
 		// Invalid shapes — unbracketed IPv6.
 		{name: "unbracketed-ipv6", input: "2001:db8::1", wantErr: true, wantMatch: "non-empty host AND port"},

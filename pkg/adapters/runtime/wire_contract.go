@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 	"unicode"
@@ -31,7 +30,8 @@ func EngineHostNetworkRequested(cache *cachev1alpha1.CacheBackend) bool {
 	return cache != nil && cache.Spec.Integration != nil && cache.Spec.Integration.EngineHostNetwork
 }
 
-// ValidateLMCacheEndpoint validates a bare host:port or lm://host:port.
+// ValidateLMCacheEndpoint validates a bare host:port or lm://host:port. The
+// port must be a decimal integer in the TCP range 1-65535.
 func ValidateLMCacheEndpoint(value string) error {
 	raw := strings.TrimSpace(value)
 	if raw == "" {
@@ -54,6 +54,13 @@ func ValidateLMCacheEndpoint(value string) error {
 	host, port, ok := splitLMCacheHostPort(rest)
 	if !ok || host == "" || port == "" {
 		return fmt.Errorf("endpoint must be a non-empty host AND port (e.g. cache.example.com:8200 or lm://cache.example.com:8200); a scheme alone, a host with no port, an empty port, or a port with no host is not a valid LMCache endpoint")
+	}
+	if strings.IndexFunc(port, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+		return fmt.Errorf("endpoint port %q must be an integer in 1-65535", port)
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || n == 0 {
+		return fmt.Errorf("endpoint port %q must be an integer in 1-65535", port)
 	}
 	return nil
 }
@@ -97,18 +104,7 @@ func ValidateExternalEndpoint(provider cachev1alpha1.CacheBackendRemoteStoragePr
 		if scheme, _, ok := strings.Cut(trimmed, "://"); ok {
 			return fmt.Errorf("scheme %q is not supported for remoteStorage.provider=%s; use bare host:port", scheme, provider)
 		}
-		if err := ValidateLMCacheEndpoint(trimmed); err != nil {
-			return err
-		}
-		_, port, err := net.SplitHostPort(trimmed)
-		if err != nil {
-			return fmt.Errorf("redis endpoint must be a bare host:port: %w", err)
-		}
-		n, err := strconv.Atoi(port)
-		if err != nil || n < 1 || n > 65535 {
-			return fmt.Errorf("redis endpoint port %q must be an integer in 1-65535", port)
-		}
-		return nil
+		return ValidateLMCacheEndpoint(trimmed)
 	case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
 		if scheme, address, ok := strings.Cut(trimmed, "://"); ok {
 			if !strings.EqualFold(scheme, "mooncakestore") {

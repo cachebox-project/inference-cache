@@ -1162,6 +1162,9 @@ func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
 	}{
 		{"bad-scheme", "https://cache.example.com:443/api"},
 		{"portless-host", "cache.example.com"},
+		{"non-numeric-port", "cache.example.com:not-a-port"},
+		{"zero-port", "cache.example.com:0"},
+		{"out-of-range-port", "cache.example.com:70000"},
 		{"embedded-whitespace", "cache example:8200"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

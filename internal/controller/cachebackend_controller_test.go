@@ -1446,6 +1446,9 @@ func TestReconcileExternalInvalidEndpointSetsReadyFalse(t *testing.T) {
 	}{
 		{"bad-scheme", "https://cache.example.com:443/api"},
 		{"portless-host", "cache.example.com"},
+		{"non-numeric-port", "cache.example.com:not-a-port"},
+		{"zero-port", "cache.example.com:0"},
+		{"out-of-range-port", "cache.example.com:70000"},
 		{"unbracketed-ipv6", "2001:db8::1"},
 		{"embedded-whitespace", "cache example:8200"},
 	} {

@@ -198,12 +198,20 @@ func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 			{name: "redis bare", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:6379"},
 			{name: "redis rejects lm scheme", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "lm://redis.example:6379", wantErr: true},
 			{name: "redis rejects named port", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:redis", wantErr: true},
+			{name: "redis rejects zero port", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:0", wantErr: true},
+			{name: "redis rejects out-of-range port", runtime: cachev1alpha1.CacheBackendRuntimeSGLang, provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, endpoint: "redis.example:70000", wantErr: true},
 			{name: "lmcache bare", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:8200"},
 			{name: "lmcache explicit scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "lm://cache.example:8200"},
 			{name: "lmcache rejects mooncake scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "mooncakestore://cache.example:50051", wantErr: true},
+			{name: "lmcache rejects named port", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:not-a-port", wantErr: true},
+			{name: "lmcache rejects zero port", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:0", wantErr: true},
+			{name: "lmcache rejects out-of-range port", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, endpoint: "cache.example:70000", wantErr: true},
 			{name: "mooncake bare", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncake.example:50051"},
 			{name: "mooncake explicit scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://mooncake.example:50051"},
 			{name: "mooncake rejects lm scheme", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "lm://mooncake.example:50051", wantErr: true},
+			{name: "mooncake rejects named port", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://mooncake.example:not-a-port", wantErr: true},
+			{name: "mooncake rejects zero port", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://mooncake.example:0", wantErr: true},
+			{name: "mooncake rejects out-of-range port", runtime: cachev1alpha1.CacheBackendRuntimeVLLM, provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, endpoint: "mooncakestore://mooncake.example:70000", wantErr: true},
 		}
 
 		for _, tt := range tests {
