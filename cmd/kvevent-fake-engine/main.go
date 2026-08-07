@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Command kvevent-fake-engine is a TEST-ONLY stand-in for a vLLM engine's KV-event
 // ZMQ publisher, used by the fingerprint-routing e2e in this package (and runnable
 // standalone against a live install). It binds a ZMQ PUB socket and repeatedly

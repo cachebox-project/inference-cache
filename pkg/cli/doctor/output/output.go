@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package output renders a doctor [doctor.Report] in the three operator-facing
 // formats the `inferencecache doctor` command supports: human (default,
 // color-coded when writing to a TTY), json (a documented, stable schema for

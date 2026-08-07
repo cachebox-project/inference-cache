@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Paired sample: a CacheBackend and a matching engine Deployment.
 #
 # The label `app: qwen-demo` appears in TWO places — `CacheBackend.spec.

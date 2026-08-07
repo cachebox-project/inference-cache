@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 #
 # Pre-commit guards (see CONTRIBUTING.md):
 #   1. Vendor-neutral naming — no OCI/Oracle tokens in core-identity files.

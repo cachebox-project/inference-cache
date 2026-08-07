@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Build the documentation site (site/) and publish it to GitHub Pages.
 # Free for public repositories. No Node/npm toolchain is required — the CSS
 # pipeline uses Hugo Extended's built-in SCSS support (see site/layouts/partials/head-css.html).

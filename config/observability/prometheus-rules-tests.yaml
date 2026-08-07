@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Unit tests for the alerting rules in alerting-rules.yaml. Each Stage 1
 # alert has both a "should fire" and a "should not fire" case; together they
 # pin the threshold and confirm the alert is not spuriously firing on healthy

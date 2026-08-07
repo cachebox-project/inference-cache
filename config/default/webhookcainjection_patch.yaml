@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Annotate the generated webhook configurations so cert-manager injects the
 # CA bundle from the serving Certificate's Secret into clientConfig.caBundle.
 # The CERTIFICATE_NAMESPACE/CERTIFICATE_NAME placeholders are rewritten by

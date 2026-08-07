@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package inferencecachev1alpha1pb_test
 
 // Wire-level backward-compat coverage for the ReplicaStats.client_version

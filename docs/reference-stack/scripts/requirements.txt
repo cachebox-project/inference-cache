@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # For kv_events_subscriber.py / kv_events_synthetic_publisher.py / test_kv_events.py
 pyzmq>=26
 msgspec>=0.18

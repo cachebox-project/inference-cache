@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Paired CacheBackend + matching engine Deployment that exercises a small
 # `spec.integration.engineOverrides` block. Shows how to tune chunk size
 # and add a debug env WITHOUT losing the rest of the LMCache integration

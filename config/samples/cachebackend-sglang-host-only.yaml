@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # SGLang with LMCache's node-local host-memory tier and no remote provider.
 # Omitting spec.remoteStorage is intentional: the controller creates no
 # Deployment or Service, and the runtime adapter injects an LMCache MP worker

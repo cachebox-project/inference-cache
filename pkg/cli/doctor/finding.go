@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package doctor defines the diagnostic result vocabulary shared by the
 // `inferencecache doctor` pre-flight checks and their output formatters.
 //

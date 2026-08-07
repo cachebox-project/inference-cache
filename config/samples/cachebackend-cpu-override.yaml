@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # CacheBackend for a CPU-vLLM dev cluster (no GPU) that uses
 # spec.integration.engineOverrides to tune the engine container the pod
 # webhook injects.

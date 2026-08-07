@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Opt-in gRPC Service TLS for the policy server (:9090).
 #
 # This is NOT part of the default install — config/default serves :9090

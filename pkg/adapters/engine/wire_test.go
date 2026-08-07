@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package engine_test
 
 // End-to-end wire test: the StatsReporter scrapes a synthetic /metrics endpoint,

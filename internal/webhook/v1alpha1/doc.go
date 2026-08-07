@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package v1alpha1 hosts the admission webhooks (defaulting + validating) for
 // the operator-facing v1alpha1 CRDs: CacheBackend, CachePolicy, and
 // CacheTenant. Each webhook keeps "obviously broken" or operator-trust-eroding

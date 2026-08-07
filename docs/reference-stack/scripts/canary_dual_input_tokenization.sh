@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # By-construction canary for server-side tokenization: prove a vLLM engine
 # prefix-caches exactly the token-ID prompt it is handed, so a routing
 # fingerprint computed over those same tokens is guaranteed to match the engine's

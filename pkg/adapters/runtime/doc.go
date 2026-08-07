@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package runtime is the controller-owned runtime-adapter seam: the plug-point
 // that keeps engine-specific cache wiring out of the core CacheBackend
 // reconciler. Adapters implement [KVCacheRuntimeAdapter] (lifted from

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # CPU canary for the C6 mutating Pod webhook + cross-pod cache reuse.
 #
 # Proves the engine-wiring webhook injects the LMCache connector env onto

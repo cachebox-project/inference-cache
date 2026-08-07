@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Pure-function unit tests for the drift helper. The `make verify-prometheus`
 // target exercises the happy path against the live rules files; these tests
 // pin the failure-path behavior (first-divergence detection and bounded

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package main is the verify-prometheus-drift CI helper. It asserts that the
 // `spec.groups` body of the PrometheusRule CR YAML file is byte-equivalent
 // (after canonical JSON normalization) to the `groups` body of the flat

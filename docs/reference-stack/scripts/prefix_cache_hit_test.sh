@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Demonstrate a prefix-cache hit: fire the same long (~8K-token) system prefix
 # twice and show the second request is faster (prefill skipped) and the cache
 # counters move (a second identical-prefix request hits the cache).

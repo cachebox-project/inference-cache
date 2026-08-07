@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package pod is the controller-owned mutating admission webhook that auto-
 // wires user-provided inference engine pods to a matching cache backend —
 // either a managed provider or an externally owned remote binding.

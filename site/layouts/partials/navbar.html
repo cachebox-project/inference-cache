@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 The inference-cache Authors
+
+SPDX-License-Identifier: Apache-2.0
+-->
+
 {{ $cover := and (.HasShortcode "blocks/cover") (not .Site.Params.ui.navbar_translucent_over_cover_disable) }}
 <nav class="js-navbar-scroll navbar navbar-expand-md navbar-dark {{ if $cover}} td-navbar-cover {{ end }} td-navbar">
         <a class="navbar-brand" href="{{ .Site.Home.RelPermalink }}">

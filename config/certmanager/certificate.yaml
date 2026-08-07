@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Self-signed Issuer used to mint the webhook serving certificate. Using a
 # self-signed Issuer keeps the install dependency minimal — cert-manager
 # itself is required, but no external CA — and matches the kubebuilder-default

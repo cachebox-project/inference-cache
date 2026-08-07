@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # kind cluster for the vLLM + LMCache reference substrate.
 #
 # kind nodes are containers on the host's Docker daemon. kind does NOT expose

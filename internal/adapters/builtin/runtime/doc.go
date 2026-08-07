@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package runtime contains the runtime-adapter implementations shipped by the
 // controller binary. Public extension contracts remain in pkg/adapters/runtime;
 // this internal package owns the concrete vLLM+LMCache, SGLang+LMCache, and

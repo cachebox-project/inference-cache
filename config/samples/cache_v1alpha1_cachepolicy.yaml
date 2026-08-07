@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # CachePolicy sample used by the default-install smoke to exercise the
 # operator-facing columns and the controller -> server policy push.
 apiVersion: inferencecache.io/v1alpha1

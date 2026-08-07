@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # SGLang + LMCache (MP mode) reference deployment — the second-engine sibling of
 # the top-level vLLM + LMCache reference (manifests/deployment.yaml).
 #

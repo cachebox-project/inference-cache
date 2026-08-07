@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # vLLM + LMCache reference backend (GPU).
 #
 # A minimal, explicit Deployment you can apply directly or use as a template for

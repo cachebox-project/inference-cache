@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 #
 # Verify that every non-merge, non-bot commit in a revision range carries a
 # valid DCO Signed-off-by trailer. A trailer is valid when its name and email

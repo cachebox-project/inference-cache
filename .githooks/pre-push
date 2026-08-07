@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 #
 # Local CI gate — runs the CI-equivalent checks before a push is allowed.
 # Installed via: make install-hooks   (core.hooksPath=.githooks)

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Subscribe to a vLLM KV-cache event stream over ZMQ and print/capture events.
 
 Shows how a cache-aware consumer connects to the engine's ZMQ PUB endpoint,

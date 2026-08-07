@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 PROJECT_DIR := $(shell dirname $(abspath $(lastword $(MAKEFILE_LIST))))
 MAKEFILE_SELF := $(abspath $(lastword $(MAKEFILE_LIST)))
 LOCALBIN ?= $(PROJECT_DIR)/bin
@@ -52,6 +56,7 @@ GOVULNCHECK_VERSION ?= v1.3.0
 PROMTOOL_VERSION ?= 3.0.1
 KUSTOMIZE_VERSION ?= v5.7.0
 RUFF_VERSION ?= 0.16.1
+REUSE_VERSION ?= 5.1.1
 # SHA256 checksums of the upstream Prometheus release tarballs we extract
 # `promtool` from. Sourced from
 # https://github.com/prometheus/prometheus/releases/download/v$(PROMTOOL_VERSION)/sha256sums.txt
@@ -75,6 +80,8 @@ LOCAL_KUSTOMIZE := $(LOCALBIN)/kustomize
 GOVULNCHECK := $(LOCALBIN)/govulncheck
 RUFF_VENV := $(LOCALBIN)/ruff-venv
 RUFF := $(RUFF_VENV)/bin/ruff
+REUSE_VENV := $(LOCALBIN)/reuse-venv
+REUSE := $(REUSE_VENV)/bin/reuse
 BUF ?= $(shell command -v buf 2>/dev/null || echo $(LOCAL_BUF))
 # PROMTOOL is resolved AT RECIPE TIME, not parse time — so the version
 # check in the `promtool` target above can replace a stale local binary
@@ -115,6 +122,14 @@ ruff: $(LOCALBIN) ## Install Ruff in an isolated local virtual environment.
 		rm -rf $(RUFF_VENV); \
 		$(PYTHON) -m venv $(RUFF_VENV); \
 		$(RUFF_VENV)/bin/python -m pip install --disable-pip-version-check --quiet "ruff==$(RUFF_VERSION)"; \
+	fi
+
+.PHONY: reuse
+reuse: $(LOCALBIN) ## Install the REUSE compliance tool in an isolated local virtual environment.
+	@if ! { [ -x $(REUSE) ] && $(REUSE) --version 2>/dev/null | grep -qF "$(REUSE_VERSION)"; }; then \
+		rm -rf $(REUSE_VENV); \
+		$(PYTHON) -m venv $(REUSE_VENV); \
+		$(REUSE_VENV)/bin/python -m pip install --disable-pip-version-check --quiet "reuse==$(REUSE_VERSION)"; \
 	fi
 
 .PHONY: protoc-gen-go
@@ -224,6 +239,10 @@ ci-lint: golangci-lint ## Run golangci-lint.
 .PHONY: python-lint
 python-lint: ruff ## Lint the reference-stack Python scripts with Ruff.
 	$(RUFF) check docs/reference-stack/scripts
+
+.PHONY: reuse-lint
+reuse-lint: reuse ## Verify REUSE specification compliance and SPDX licensing metadata.
+	$(REUSE) lint
 
 .PHONY: tidy
 tidy: ## Tidy Go modules.
@@ -600,7 +619,7 @@ verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alertin
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs verify-dco test-dco verify-syft-pin verify-minimal-base test-minimal-images fmt-check vet ci-lint python-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + DCO + Syft/minimal-image policy + Go/Python lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs verify-dco test-dco reuse-lint verify-syft-pin verify-minimal-base test-minimal-images fmt-check vet ci-lint python-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + DCO/REUSE compliance + Syft/minimal-image policy + Go/Python lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.

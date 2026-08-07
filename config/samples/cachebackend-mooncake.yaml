@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # A managed Mooncake backend the controller reconciles into a standalone
 # mooncake_master Deployment + Service. Mooncake is the durable / shared cache
 # path (vs. the in-memory lmcache-server in cachebackend-lmcache.yaml) —

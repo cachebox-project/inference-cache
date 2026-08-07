@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 name: CodeQL
 
 # GitHub-native static analysis for Go. Runs on every PR + push to main, plus a

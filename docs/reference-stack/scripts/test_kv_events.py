@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Reproducible checks for the KV-event decode + token redaction.
 
 No broker, no pytest — just run it:

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 : "${RELEASE_TAG:?RELEASE_TAG is required}"

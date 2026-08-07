@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Opt-in gRPC Service TLS for the policy server, packaged as a kustomize
 # Component so an overlay can layer it on top of config/default without the
 # default install paying for TLS. It (1) adds the cert-manager Issuer +

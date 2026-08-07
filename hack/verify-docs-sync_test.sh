@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 #
 # Tests for verify-docs-sync.sh. Self-contained: each case builds a throwaway
 # git repo in a temp dir, so it needs no network and touches nothing tracked.

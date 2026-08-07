@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // GPU-free, per-PR end-to-end gate for the content-fingerprint routing path:

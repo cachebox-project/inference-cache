@@ -18,6 +18,7 @@
 
 ### Quality
 - [ ] Every human-authored commit includes a matching DCO `Signed-off-by:` trailer (`git commit --signoff`).
+- [ ] `make reuse-lint` passes (SPDX headers and licensing metadata are complete).
 - [ ] `make build` and `make test` pass locally.
 - [ ] `make lint` clean (gofmt + go vet).
 - [ ] `make manifests generate` produces **no drift** (generated code committed).

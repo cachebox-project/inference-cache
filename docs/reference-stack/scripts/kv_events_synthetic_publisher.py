@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Emit synthetic vLLM-shaped KV-cache events over ZMQ.
 
 Local fallback when the real engine can't start (e.g. no GPU / amd64 image under

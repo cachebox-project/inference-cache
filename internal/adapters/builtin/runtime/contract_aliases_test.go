@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package runtime
 
 import adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"

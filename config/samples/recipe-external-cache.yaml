@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Recipe: External cache — point the operator at a cache you manage yourself.
 #
 # Scenario: you already run an lmcache-server (or share one across clusters)

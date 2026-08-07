@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Per-PR install smoke for `kubectl apply -k config/default`.
 #
 # Builds controller + server images at a deterministic tag, loads them into a
