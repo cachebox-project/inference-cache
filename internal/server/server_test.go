@@ -26,8 +26,8 @@ import (
 
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
-	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	"github.com/cachebox-project/inference-cache/internal/index"
+	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 
