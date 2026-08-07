@@ -15,7 +15,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
@@ -97,10 +96,8 @@ type EngineInjector struct {
 	Reader client.Reader
 
 	// Registry resolves the runtime adapter for a (runtime, backend) pair.
-	// nil falls back to the complete internal/adapters/builtin composition.
-	// Mirrors the production cmd/controller wiring so a bare `EngineInjector{}`
-	// doesn't silently fail-open on External CRs that the running webhook
-	// would have wired.
+	// The composition root injects the complete shipping registry. A nil value
+	// is treated as a webhook misconfiguration and fails open.
 	Registry *adapterruntime.Registry
 
 	// Log is the handler's logger. nil falls back to logf.FromContext at
@@ -161,7 +158,8 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	runtimeID := adapterruntime.ResolveRuntimeID(cache)
 	registry := h.Registry
 	if registry == nil {
-		registry = builtinadapters.New().Runtime
+		log.Error(fmt.Errorf("runtime adapter registry is not configured"), "fail-open: webhook is not configured")
+		return failOpen(req, &pod, "runtime adapter registry is not configured (fail-open)")
 	}
 	adapter, err := registry.Select(runtimeID, cache)
 	if err != nil {
@@ -179,25 +177,30 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		return failOpen(req, &pod, fmt.Sprintf("unsupported remote-storage provider (fail-open): %v", protocolErr))
 	}
 	binding := backendadapter.BindingFor(storage, protocol, endpoint)
+	if !adapter.SupportsBinding(binding) {
+		log.V(1).Info("fail-open: runtime adapter rejected remote-storage binding",
+			"runtime", string(runtimeID), "protocol", string(protocol))
+		return failOpen(req, &pod, fmt.Sprintf("adapter does not support remote-storage protocol %q (fail-open)", protocol))
+	}
 	// Events-only (tier-1 routing) backends provision no server, so they publish
 	// no endpoint — and they wire no KV connector, so they need none. The
 	// endpoint gate exists ONLY because the connector requires a dial target
 	// (an empty/malformed LMCACHE_REMOTE_URL crashes the engine at startup); an
 	// events-only pod injects only the observation sidecar (InjectEngineConfig
 	// is a no-op in this mode), so bypass the gate and inject without one.
-	// Engine-local adapters such as native SGLang HiCache also bypass this
-	// gate through the optional EndpointRequirement capability.
-	if endpoint == "" && !cache.Spec.IsEventsOnly() && adapterruntime.AdapterRequiresEndpointFor(adapter, binding) {
-		// The endpoint source is type-scoped (see effectiveEndpoint).
+	// Engine-local adapters such as native SGLang HiCache have a nil binding and
+	// therefore bypass this network-endpoint gate.
+	if binding != nil && binding.Endpoint == "" && !cache.Spec.IsEventsOnly() {
+		// The endpoint source is ownership-scoped (see effectiveEndpoint).
 		// Three reasons we can land here:
 		//   - managed CR: reconciler hasn't published status.endpoint
 		//     yet (steady-state during initial rollout).
-		//   - External CR: its spec endpoint is empty (admission rejects
-		//     this on fresh CRs; only reachable from a pre-existing
-		//     stored value).
-		//   - External CR: its endpoint fails the selected provider's
-		//     shared shape check (also pre-existing-only; current admission
-		//     rejects malformed values). effectiveEndpoint deliberately
+		//   - externally owned CR: spec.remoteStorage.endpoint is empty
+		//     (current admission rejects this; reachable only for objects that
+		//     bypassed admission).
+		//   - externally owned CR: its endpoint fails the selected provider's
+		//     shared shape check (current admission rejects malformed values).
+		//     effectiveEndpoint deliberately
 		//     returns "" for this case so the engine pod admits
 		//     un-wired rather than receiving an endpoint its connector
 		//     refuses at startup.
@@ -211,9 +214,6 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		extra := ""
 		if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
 			missingField = "spec.remoteStorage.endpoint"
-			if !cache.Spec.UsesCanonicalCacheHierarchy() {
-				missingField = "spec.endpoint"
-			}
 			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 				extra = ": " + err.Error()
 			}
@@ -259,14 +259,14 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// model's KV-cache manager is not disabled by a connector it cannot load.
 	// Skip InjectEngineConfig here, at the webhook, rather than relying on each
 	// adapter's own no-op: the connector no-op currently lives ONLY in the
-	// vLLM+LMCache adapter, so an admission-bypassed spec.type=External +
-	// mode=EventsOnly object would otherwise select the External adapter and
-	// inject the LMCache connector — violating the events-only "no connector"
+	// vLLM+LMCache adapter, so an admission-bypassed external remote-storage +
+	// mode=EventsOnly object could otherwise inject the LMCache connector —
+	// violating the events-only "no connector"
 	// contract. Gating here makes the no-connector guarantee adapter-independent.
 	// The observation-sidecar append and the wired/injected-by logic below stay
 	// as-is (events-only's only wiring is the subscriber sidecar).
 	if !cache.Spec.IsEventsOnly() {
-		if err := adapterruntime.InjectEngineConfigWithBinding(adapter, &mutated.Spec, binding, cache); err != nil {
+		if err := adapter.InjectEngineConfig(&mutated.Spec, binding, cache); err != nil {
 			log.V(1).Info("fail-open: adapter rejected pod",
 				"runtime", string(runtimeID), "error", err.Error())
 			return failOpen(req, &pod, fmt.Sprintf("adapter rejected pod (fail-open): %v", err))
@@ -382,7 +382,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// pod. For Offload the connector is always injected by InjectEngineConfig, so
 	// the pod is always wired. For events-only InjectEngineConfig is a no-op, so
 	// the ONLY wiring the webhook performs is APPENDING the observation sidecar —
-	// which is skipped when the subscriber image / backendConfig.model is unset
+	// which is skipped when the subscriber image / observation.modelID is unset
 	// (nothing injected) OR when a same-named container already exists (operator-
 	// authored, unverified). In those cases the webhook added/verified no wiring,
 	// so stamping injected-by/injected-by-uid would trip the downstream
@@ -552,25 +552,24 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 }
 
 // effectiveEndpoint returns the address the engine pod should be wired
-// to for the given CacheBackend. The source is type-scoped:
+// to for the given CacheBackend. The source is ownership-scoped:
 //
-//   - External: spec.endpoint is authoritative — the operator owns it,
+//   - External ownership: spec.remoteStorage.endpoint is authoritative — the operator owns it,
 //     admission validates it, status.endpoint is just a reconciler
 //     mirror that may briefly lag during an update. If a new pod
-//     admits between an operator's spec.endpoint update and the
+//     admits between an operator's spec.remoteStorage.endpoint update and the
 //     status patch, status would still hold the OLD value and the
 //     pod would boot wired to the stale address; pod admission is
-//     CREATE-only so that bad wiring is permanent. Preferring
-//     trimmed spec.endpoint over status here avoids that race and is
+//     CREATE-only so that bad wiring is permanent. Preferring the trimmed
+//     remoteStorage endpoint over status here avoids that race and is
 //     consistent with admission's view of the truth.
-//   - Managed types (LMCache, Mooncake): status.endpoint is the only
+//   - Managed storage: status.endpoint is the only
 //     source — the reconciler builds it from the live Service it
-//     provisions, and spec.endpoint is admission-rejected for these
-//     types (see rejectEndpointOnNonExternal), so there's nothing
-//     else to fall back on. The webhook must wait for status.
-//   - Engine-local types (SGLangHiCache): no endpoint is required. The
-//     selected adapter's EndpointRequirement capability bypasses the gate
-//     before this empty result is consumed.
+//     provisions, and spec.remoteStorage.endpoint is admission-rejected for
+//     managed ownership, so there's nothing else to fall back on. The webhook
+//     must wait for status.
+//   - Engine-local caches: no endpoint is required. They carry a nil binding,
+//     which bypasses the endpoint gate before this empty result is consumed.
 //
 // Returns "" when no endpoint is currently usable; callers fail-open.
 //
@@ -584,7 +583,7 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 // race against an old controller build can't leak whitespace to the
 // engine wire.
 //
-// For External CRs with an empty/whitespace spec.endpoint there is NO
+// For external storage with an empty/whitespace spec.remoteStorage.endpoint there is NO
 // fallback to status. The reconciler treats that state as
 // Ready=False/ExternalEndpointMissing — falling back here would wire
 // new pods to a stale status the reconciler considers unusable, which
@@ -597,8 +596,9 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	}
 	if storage := cache.Spec.EffectiveRemoteStorage(); storage != nil &&
 		storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
-		// For External, re-apply the provider-specific admission-time shape
-		// check on the stored spec endpoint. The validating webhook already
+		// For external ownership, re-apply the provider-specific admission-time
+		// shape check on the stored spec.remoteStorage.endpoint. The validating
+		// webhook already
 		// rejects malformed values at write time, but a pre-existing
 		// CR in etcd from before the shape rule shipped (or stored
 		// when an earlier, laxer rule set was in effect) can still

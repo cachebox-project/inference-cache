@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"errors"
-	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -20,10 +19,6 @@ type stubAdapter struct {
 	supportsFn func(runtime RuntimeID, cache *cachev1alpha1.CacheBackend) bool
 }
 
-type endpointFreeStub struct{ stubAdapter }
-
-func (endpointFreeStub) RequiresEndpoint() bool { return false }
-
 func (s stubAdapter) Supports(r RuntimeID, c *cachev1alpha1.CacheBackend) bool {
 	if s.supportsFn == nil {
 		return false
@@ -31,15 +26,17 @@ func (s stubAdapter) Supports(r RuntimeID, c *cachev1alpha1.CacheBackend) bool {
 	return s.supportsFn(r, c)
 }
 
+func (stubAdapter) SupportsBinding(*backendadapter.Binding) bool { return true }
+
 func (stubAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	return nil, nil, nil
 }
 
-func (stubAdapter) InjectEngineConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+func (stubAdapter) InjectEngineConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
 	return nil
 }
 
-func (stubAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+func (stubAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
 	return nil
 }
 
@@ -58,10 +55,17 @@ func newCacheBackend(t cachev1alpha1.CacheBackendType, engine string) *cachev1al
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
 		Spec:       cachev1alpha1.CacheBackendSpec{Type: t},
 	}
-	if engine != "" {
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: engine}
+	switch engine {
+	case "vllm":
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	case "sglang":
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	}
 	return cb
+}
+
+func referenceBinding(endpoint string) *backendadapter.Binding {
+	return &backendadapter.Binding{Protocol: backendadapter.ProtocolLMCache, Endpoint: endpoint}
 }
 
 func TestRegistrySelectFirstMatchWins(t *testing.T) {
@@ -151,18 +155,11 @@ func TestReferenceAdapterSupports(t *testing.T) {
 	if a.Supports(RuntimeReference, nil) {
 		t.Fatalf("Supports(reference, nil) = true, want false")
 	}
-}
-
-func TestReferenceAdapterResolveCacheServerIsNil(t *testing.T) {
-	a := NewReferenceAdapter()
-	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeExternal, "")
-
-	pod, svc, err := ResolveLegacyCacheServer(a, cb)
-	if err != nil {
-		t.Fatalf("ResolveCacheServer: %v", err)
+	if a.SupportsBinding(nil) {
+		t.Fatal("SupportsBinding(nil) = true, want false")
 	}
-	if pod != nil || svc != nil {
-		t.Fatalf("ResolveCacheServer = (%v, %v), want (nil, nil) — reference adapter renders no cache-server", pod, svc)
+	if !a.SupportsBinding(referenceBinding("cache:65432")) {
+		t.Fatal("SupportsBinding(remote binding) = false, want true")
 	}
 }
 
@@ -185,7 +182,7 @@ func TestReferenceAdapterInjectEngineConfigMerges(t *testing.T) {
 		},
 	}
 
-	if err := a.InjectEngineConfig(pod, "cache.ns1.svc.cluster.local:8000", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, referenceBinding("cache.ns1.svc.cluster.local:8000"), cb); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 
@@ -215,11 +212,11 @@ func TestReferenceAdapterInjectEngineConfigIsIdempotent(t *testing.T) {
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}}}
 
 	// First call writes the endpoint env.
-	if err := a.InjectEngineConfig(pod, "first.svc:9090", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, referenceBinding("first.svc:9090"), cb); err != nil {
 		t.Fatalf("first InjectEngineConfig: %v", err)
 	}
 	// Second call updates the value in place — must not duplicate the entry.
-	if err := a.InjectEngineConfig(pod, "second.svc:9090", cb); err != nil {
+	if err := a.InjectEngineConfig(pod, referenceBinding("second.svc:9090"), cb); err != nil {
 		t.Fatalf("second InjectEngineConfig: %v", err)
 	}
 
@@ -247,14 +244,22 @@ func TestReferenceAdapterInjectRejectsBadInput(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{"nil pod", func() error { return a.InjectEngineConfig(nil, "x", cb) }},
-		{"nil cache", func() error { return a.InjectEngineConfig(good, "x", nil) }},
-		{"empty endpoint", func() error { return a.InjectEngineConfig(good, "", cb) }},
-		{"no containers", func() error { return a.InjectEngineConfig(&corev1.PodSpec{}, "x", cb) }},
-		{"router nil pod", func() error { return a.InjectRouterConfig(nil, "x", cb) }},
-		{"router nil cache", func() error { return a.InjectRouterConfig(good, "x", nil) }},
-		{"router empty endpoint", func() error { return a.InjectRouterConfig(good, "", cb) }},
-		{"router no containers", func() error { return a.InjectRouterConfig(&corev1.PodSpec{}, "x", cb) }},
+		{"nil pod", func() error { return a.InjectEngineConfig(nil, referenceBinding("x"), cb) }},
+		{"nil cache", func() error { return a.InjectEngineConfig(good, referenceBinding("x"), nil) }},
+		{"nil binding", func() error { return a.InjectEngineConfig(good, nil, cb) }},
+		{"empty protocol", func() error {
+			return a.InjectEngineConfig(good, &backendadapter.Binding{Endpoint: "x"}, cb)
+		}},
+		{"empty endpoint", func() error { return a.InjectEngineConfig(good, referenceBinding(""), cb) }},
+		{"no containers", func() error { return a.InjectEngineConfig(&corev1.PodSpec{}, referenceBinding("x"), cb) }},
+		{"router nil pod", func() error { return a.InjectRouterConfig(nil, referenceBinding("x"), cb) }},
+		{"router nil cache", func() error { return a.InjectRouterConfig(good, referenceBinding("x"), nil) }},
+		{"router nil binding", func() error { return a.InjectRouterConfig(good, nil, cb) }},
+		{"router empty protocol", func() error {
+			return a.InjectRouterConfig(good, &backendadapter.Binding{Endpoint: "x"}, cb)
+		}},
+		{"router empty endpoint", func() error { return a.InjectRouterConfig(good, referenceBinding(""), cb) }},
+		{"router no containers", func() error { return a.InjectRouterConfig(&corev1.PodSpec{}, referenceBinding("x"), cb) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -270,7 +275,7 @@ func TestReferenceAdapterInjectRouterConfig(t *testing.T) {
 	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "")
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "router"}}}
 
-	if err := a.InjectRouterConfig(pod, "router.svc:9000", cb); err != nil {
+	if err := a.InjectRouterConfig(pod, referenceBinding("router.svc:9000"), cb); err != nil {
 		t.Fatalf("InjectRouterConfig: %v", err)
 	}
 	v, ok := lookupEnv(pod.Containers[0].Env, EnvRouterEndpoint)
@@ -295,43 +300,9 @@ func TestRegistryResolvesReferenceAdapterByRuntime(t *testing.T) {
 	}
 }
 
-func TestAdapterRequiresEndpointDefaultsTrue(t *testing.T) {
-	base := stubAdapter{}
-	if !AdapterRequiresEndpoint(base) {
-		t.Fatal("adapter without EndpointRequirement must require an endpoint")
-	}
-	if AdapterRequiresEndpoint(endpointFreeStub{stubAdapter: base}) {
-		t.Fatal("endpoint-free adapter was treated as endpoint-bearing")
-	}
-}
-
-func TestCanonicalBindingRequiresExplicitAdapterCapability(t *testing.T) {
-	adapter := endpointFreeStub{stubAdapter: stubAdapter{}}
-	canonical := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "")
-	canonical.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
-	binding := &backendadapter.Binding{Protocol: backendadapter.ProtocolLMCache, Endpoint: "cache:65432"}
-
-	if err := ValidateRemoteBinding(adapter, binding, canonical); err == nil ||
-		!strings.Contains(err.Error(), "canonical remote-binding contract") {
-		t.Fatalf("ValidateRemoteBinding error = %v, want missing canonical capability", err)
-	}
-	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}}}
-	if err := InjectEngineConfigWithBinding(adapter, pod, binding, canonical); err == nil {
-		t.Fatal("canonical injection unexpectedly used the legacy endpoint fallback")
-	}
-
-	legacy := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "")
-	if err := ValidateRemoteBinding(adapter, binding, legacy); err != nil {
-		t.Fatalf("legacy binding compatibility rejected: %v", err)
-	}
-	if err := InjectEngineConfigWithBinding(adapter, pod, binding, legacy); err != nil {
-		t.Fatalf("legacy endpoint fallback rejected: %v", err)
-	}
-}
-
 func TestResolveRuntimeID(t *testing.T) {
 	// ResolveRuntimeID is the single rule the admission validator, the
-	// reconciler, and the pod-mutating webhook all read the engine name
+	// reconciler, and the pod-mutating webhook all read the runtime identity
 	// through — pinning it here prevents a future tweak in one layer
 	// from quietly diverging from the others.
 	cases := []struct {
@@ -340,28 +311,23 @@ func TestResolveRuntimeID(t *testing.T) {
 		want RuntimeID
 	}{
 		{
-			name: "nil cache defaults to vllm",
+			name: "nil cache has no runtime",
 			in:   nil,
-			want: RuntimeVLLM,
+			want: "",
 		},
 		{
-			name: "unset integration defaults to vllm",
+			name: "unset runtime stays empty",
 			in:   &cachev1alpha1.CacheBackend{},
+			want: "",
+		},
+		{
+			name: "VLLM maps to canonical id",
+			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Runtime: cachev1alpha1.CacheBackendRuntimeVLLM}},
 			want: RuntimeVLLM,
 		},
 		{
-			name: "empty engine defaults to vllm",
-			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{}}},
-			want: RuntimeVLLM,
-		},
-		{
-			name: "case-folded vLLM routes to canonical id",
-			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "vLLM"}}},
-			want: RuntimeVLLM,
-		},
-		{
-			name: "free-form engine passes through lowercased",
-			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "SGLang"}}},
+			name: "SGLang maps to canonical id",
+			in:   &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{Runtime: cachev1alpha1.CacheBackendRuntimeSGLang}},
 			want: RuntimeID("sglang"),
 		},
 	}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CPU canary for the C2 CacheBackend reconciler. Proves the controller stands up a
+# Canary for the C2 CacheBackend reconciler. Proves the controller stands up a
 # healthy, serving backend from a CR on a GPU-free cluster (kind):
 #
 #   kubectl apply CacheBackend(profile=cpu) --> controller --> Deployment + Service
@@ -15,23 +15,18 @@
 # the children via owner refs.
 #
 # This exercises the reconciler end to end against real pods — the gap envtest
-# can't cover. It uses the CPU profile (no GPU, no LMCache offload); real LMCache
-# offload needs a GPU (default profile).
+# can't cover. The managed standalone server uses CPU storage and does not need
+# an inference engine or GPU for this controller lifecycle check.
 #
 # On-demand canary (NOT a per-PR gate): needs Docker + kind + kubectl, pulls the
-# multi-GB vLLM CPU image, and a Docker VM with ~10+ GiB RAM (CPU runtime baseline
-# ~5 GiB + KV cache). See docs/reference-stack/VERSIONS.md.
+# standalone LMCache server image. See docs/reference-stack/VERSIONS.md.
 #
 # Usage:  docs/reference-stack/scripts/canary_c2_reconcile.sh
-# Tunables via env: IMAGE, MODEL, KIND_CLUSTER, NAMESPACE, READY_TIMEOUT, SKIP_TRAFFIC.
+# Tunables via env: CACHE_SERVER_IMAGE, MODEL, KIND_CLUSTER, NAMESPACE,
+# READY_TIMEOUT, SKIP_TRAFFIC.
 set -euo pipefail
 
-arch="$(uname -m)"
-case "$arch" in
-  arm64 | aarch64) IMAGE_TAG="${IMAGE_TAG:-latest-arm64}" ;;
-  *) IMAGE_TAG="${IMAGE_TAG:-latest-x86_64}" ;;
-esac
-IMAGE="${IMAGE:-vllm/vllm-openai-cpu:$IMAGE_TAG}"
+CACHE_SERVER_IMAGE="${CACHE_SERVER_IMAGE:-lmcache/standalone:v0.4.7}"
 MODEL="${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
 KIND_CLUSTER="${KIND_CLUSTER:-ic-c2-canary}"
 NAMESPACE="${NAMESPACE:-c2-canary}"
@@ -72,9 +67,9 @@ log "creating kind cluster $KIND_CLUSTER"
 "$KIND" create cluster --name "$KIND_CLUSTER" --wait 120s
 KUBECONFIG_ARGS=(--context "kind-$KIND_CLUSTER")
 
-log "pulling CPU image and loading it into the node ($IMAGE)"
-docker pull "$IMAGE"
-"$KIND" load docker-image "$IMAGE" --name "$KIND_CLUSTER"
+log "pulling LMCache server image and loading it into the node ($CACHE_SERVER_IMAGE)"
+docker pull "$CACHE_SERVER_IMAGE"
+"$KIND" load docker-image "$CACHE_SERVER_IMAGE" --name "$KIND_CLUSTER"
 
 # --- controller -------------------------------------------------------------
 log "installing CRD"
@@ -103,8 +98,8 @@ controller_pid=$!
 
 kubectl "${KUBECONFIG_ARGS[@]}" create namespace "$NAMESPACE"
 
-# --- apply the CacheBackend (CPU profile) -----------------------------------
-log "applying CacheBackend $NAMESPACE/$CR_NAME (profile=cpu, image=$IMAGE)"
+# --- apply the CacheBackend --------------------------------------------------
+log "applying CacheBackend $NAMESPACE/$CR_NAME (image=$CACHE_SERVER_IMAGE)"
 kubectl "${KUBECONFIG_ARGS[@]}" apply -f - <<EOF
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
@@ -118,17 +113,21 @@ metadata:
     # default-on AwaitingFirstKVEvent state. A separate canary covers the gate.
     inferencecache.io/require-kv-events: "false"
 spec:
+  runtime: VLLM
   type: LMCache
   deploymentKind: Deployment
   replicas: 1
-  backendConfig:
-    profile: cpu
-    image: $IMAGE
-    model: $MODEL
+  observation:
+    modelID: $MODEL
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      image: $CACHE_SERVER_IMAGE
 EOF
 
 # --- wait for the reconciler to report Ready --------------------------------
-log "waiting up to ${READY_TIMEOUT}s for the Ready condition to be True (CPU model load is slow)"
+log "waiting up to ${READY_TIMEOUT}s for the Ready condition to be True"
 deadline=$(($(date +%s) + READY_TIMEOUT))
 ready=""
 until [ "$ready" = "True" ]; do
@@ -182,4 +181,4 @@ until [ "$(kubectl "${KUBECONFIG_ARGS[@]}" -n "$NAMESPACE" get deploy,svc -o nam
   sleep 2
 done
 
-log "PASS — reconciler stood up a healthy CPU backend, published its endpoint, and cleaned up on delete"
+log "PASS — reconciler stood up a healthy backend, published its endpoint, and cleaned up on delete"

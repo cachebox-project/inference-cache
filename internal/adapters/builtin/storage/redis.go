@@ -1,4 +1,4 @@
-package provider
+package storage
 
 import (
 	"fmt"
@@ -32,8 +32,7 @@ const (
 	// pins. A major.minor-alpine tag is more stable than :7 / :latest but still
 	// mutable within its patch line, so it is a sane default, NOT a reproducible
 	// pin: production MUST pin an exact release or @sha256 digest via
-	// remoteStorage.redis.image (or deprecated backendConfig.redisImage on a
-	// legacy resource), per the image-pin policy in
+	// remoteStorage.redis.image, per the image-pin policy in
 	// docs/design/sglang-lmcache-mp-mode.md. This redis:7 line is what
 	// validation exercised against the pinned lmcache MP worker. Redis needs no
 	// lmcache version alignment (the MP worker speaks RESP), so this pin moves
@@ -47,11 +46,9 @@ const (
 
 	// redisMaxmemoryDefaultBytes is the memory sizing assumed when provider
 	// resources carry no limit; the derived --maxmemory is a fraction of it.
-	// It matches the provider/legacy 8Gi memory default.
+	// It matches the provider's 8Gi memory default.
 	redisMaxmemoryDefaultBytes = int64(8) * 1024 * 1024 * 1024 // 8Gi
 
-	// cfgKeyRedisImage overrides the Redis image (production should pin a digest).
-	cfgKeyRedisImage = "redisImage"
 )
 
 // ResolveRedisL2Server renders the managed Redis L2 store's container set and the
@@ -78,7 +75,7 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve redis L2: cache is nil")
 	}
-	image := effectiveProviderImage(cache, cachev1alpha1.CacheBackendRemoteStorageProviderRedis, cfgKeyRedisImage, defaultRedisImage)
+	image := effectiveProviderImage(cache, cachev1alpha1.CacheBackendRemoteStorageProviderRedis, defaultRedisImage)
 
 	container := corev1.Container{
 		Name:            "redis-l2",

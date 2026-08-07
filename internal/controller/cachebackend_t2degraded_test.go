@@ -108,8 +108,9 @@ func TestIntegrationT2DegradedCondition(t *testing.T) {
 		if err := k8s.Get(ctx, types.NamespacedName{Name: "cache", Namespace: ns}, &cb); err != nil {
 			t.Fatalf("get: %v", err)
 		}
-		cb.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-		cb.Spec.Endpoint = "shared.svc.cluster.local:9000"
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+		cb.Spec.RemoteStorage = externalLMCacheStorage("shared.svc.cluster.local:9000")
 		if err := k8s.Update(ctx, &cb); err != nil {
 			t.Fatalf("flip to External: %v", err)
 		}

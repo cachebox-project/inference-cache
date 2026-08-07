@@ -58,11 +58,11 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
-#   8b. Canonical provider resource fallback: the paired sample leaves both
-#      deprecated spec.resources and remoteStorage.lmCacheServer.resources
-#      unset, while the provider renderer gives the cache-server container a
-#      4Gi request / 8Gi limit. The smoke asserts the CR remains canonical and
-#      the rendered pod is still bounded against the T2-write OOM failure mode.
+#   8b. Provider resource fallback: the paired sample leaves
+#      remoteStorage.lmCacheServer.resources unset, while the provider renderer
+#      gives the cache-server container a 4Gi request / 8Gi limit. The smoke
+#      asserts the CR remains unchanged and the rendered pod is still bounded
+#      against the T2-write OOM failure mode.
 #   8c. The canonical cache hierarchy keeps engine wiring and provider
 #      lifecycle independent: the committed SGLang host-only sample creates no
 #      Deployment/Service/HPA and publishes no endpoint, while the committed
@@ -203,10 +203,11 @@
 #  18. The managed Mooncake backend reconciles end-to-end: a busybox
 #      `mooncake_master` stand-in (accepts TCP on the RPC port so the rendered
 #      readiness probe passes — the real kvcacheai/mooncake image is NOT pulled)
-#      lets `CacheBackend{type: Mooncake}` reach an Available Deployment, with
+#      lets `CacheBackend{type: LMCache, remoteStorage.provider: Mooncake}`
+#      reach an Available Deployment, with
 #      `status.endpoint=<svc>:50051` and the Service's first port = the RPC port.
-#      Proves the real installed controller selects the vLLM/Mooncake adapter and
-#      renders the mooncake_master workload via ResolveCacheServer; the real
+#      Proves the real installed controller selects the vLLM/LMCache adapter with
+#      a Mooncake binding and renders the mooncake_master provider workload; the real
 #      engine-over-mooncakestore:// path stays for the Mooncake reference stack.
 #
 # Distinct from the C2/C6 canaries: those exercise real engine pods + cross-pod
@@ -1645,19 +1646,12 @@ if [ "$matched" != "1" ]; then
 fi
 log "status.matchedEnginePods=1"
 
-# --- canonical provider resource fallback ---------------------------------
-# The paired sample uses canonical remoteStorage.lmCacheServer and omits its
-# resources. Canonical defaulting stays renderer-local: admission must not
-# repopulate deprecated spec.resources, while the provider renderer still puts
-# a bounded 4Gi request / 8Gi limit on the lmcache-server container. This keeps
-# the cgroup OOM guard without reviving the retired top-level API field.
-log "asserting canonical provider resources stay out of the CR and default onto the rendered Deployment"
-cb_legacy_resources="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
-  -o jsonpath='{.spec.resources}' 2>/dev/null || true)"
-if [ -n "$cb_legacy_resources" ]; then
-  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
-  fail "cb.spec.resources=$cb_legacy_resources, want absent for a canonical CacheBackend"
-fi
+# --- provider resource fallback --------------------------------------------
+# The paired sample uses remoteStorage.lmCacheServer and omits its resources.
+# Defaulting stays renderer-local: the provider renderer puts a bounded 4Gi
+# request / 8Gi limit on the lmcache-server container without persisting it in
+# the CacheBackend.
+log "asserting provider resources stay out of the CR and default onto the rendered Deployment"
 cb_provider_resources="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
   -o jsonpath='{.spec.remoteStorage.lmCacheServer.resources}' 2>/dev/null || true)"
 if [ -n "$cb_provider_resources" ]; then
@@ -1678,7 +1672,7 @@ if [ "$dep_req_mem" != "4Gi" ]; then
   kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache -o yaml || true
   fail "deploy.lmcache-server.resources.requests.memory=$dep_req_mem, want 4Gi (canonical provider fallback not applied)"
 fi
-log "canonical provider resources defaulted on the workload only: requests.memory=4Gi limits.memory=8Gi"
+log "provider resources defaulted on the workload only: requests.memory=4Gi limits.memory=8Gi"
 
 # --- KV-event readiness gate assertion (operator-facing) --------------------
 # The managed backend has an engine pod attached (matchedEnginePods=1), but the
@@ -1687,7 +1681,7 @@ log "canonical provider resources defaulted on the workload only: requests.memor
 # exact demo-day failure mode the gate exists to surface (engine present,
 # KV-event stream silent). We assert the gate's operator-visible surfaces end to
 # end on the real install:
-#   - spec.integration.firstEventTimeout defaulted to 5m (new CRD field +
+#   - spec.observation.firstEventTimeout defaulted to 5m (CRD field +
 #     admission defaulting);
 #   - once the managed cache-server reaches Available, the gate holds the
 #     backend at Ready=False / reason AwaitingFirstKVEvent — the deterministic
@@ -1697,13 +1691,13 @@ log "canonical provider resources defaulted on the workload only: requests.memor
 #     the instant a KV event is observed, so its absence is the gate-specific
 #     "nothing observed" signal.
 fet="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
-  -o jsonpath='{.spec.integration.firstEventTimeout}' 2>/dev/null || true)"
-# Accept both "5m" (CRD-schema default, applied when the integration block is
+  -o jsonpath='{.spec.observation.firstEventTimeout}' 2>/dev/null || true)"
+# Accept both "5m" (CRD-schema default, applied when the observation block is
 # present) and "5m0s" (Go Duration.String(), the webhook-materialized form) —
 # both decode to the same 5m duration.
 if [ "$fet" != "5m" ] && [ "$fet" != "5m0s" ]; then
   kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
-  fail "spec.integration.firstEventTimeout=$fet, want 5m (CRD default / webhook defaulter not applied)"
+  fail "spec.observation.firstEventTimeout=$fet, want 5m (CRD default / webhook defaulter not applied)"
 fi
 
 # The gate only evaluates once the managed cache-server Deployment is Available,
@@ -1788,7 +1782,7 @@ log "T2Degraded absent until tier-2 is exercised (no-traffic steady state)"
 # injected engine to reach CrashLoopBackOff + 120s for the advisory condition to
 # publish). It MUST run AFTER the KV-event-gate AwaitingFirstKVEvent assertion
 # above, NOT between matchedEnginePods=1 and that gate. The gate's
-# AwaitingFirstKVEvent window is bounded by spec.integration.firstEventTimeout
+# AwaitingFirstKVEvent window is bounded by spec.observation.firstEventTimeout
 # (defaulted to 5m and asserted as 5m above), anchored at the cache-server
 # Deployment becoming Available; the busybox engine never emits KV events, so the
 # backend deterministically flips AwaitingFirstKVEvent -> NoKVEventsObserved once
@@ -1904,8 +1898,12 @@ kind: CacheBackend
 metadata:
   name: unmatched-cache
 spec:
-  type: External
-  endpoint: unmatched-cache.example.com:8200
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    endpoint: unmatched-cache.example.com:8200
   engineSelector:
     matchLabels:
       app: definitely-not-qwen
@@ -2153,17 +2151,15 @@ while [ -z "$host_observed_generation" ] && [ "$(date +%s)" -lt "$deadline" ]; d
 done
 host_runtime="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
   -o jsonpath='{.spec.runtime}' 2>/dev/null || true)"
-host_compat_engine="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
-  -o jsonpath='{.spec.integration.engine}' 2>/dev/null || true)"
 host_remote_provider="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
   -o jsonpath='{.spec.remoteStorage.provider}' 2>/dev/null || true)"
 host_endpoint="$(kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" \
   -o jsonpath='{.status.endpoint}' 2>/dev/null || true)"
 if [ -z "$host_observed_generation" ] || [ "$host_runtime" != "SGLang" ] || \
-   [ "$host_compat_engine" != "sglang" ] || [ -n "$host_remote_provider" ] || \
+   [ -n "$host_remote_provider" ] || \
    [ -n "$host_endpoint" ]; then
   kubectl -n "$CANONICAL_SMOKE_NS" get cb "$CANONICAL_HOST_ONLY_CB" -o yaml || true
-  fail "canonical host-only state is wrong: observedGeneration=$host_observed_generation runtime=$host_runtime integration.engine=$host_compat_engine provider=$host_remote_provider endpoint=$host_endpoint"
+  fail "canonical host-only state is wrong: observedGeneration=$host_observed_generation runtime=$host_runtime provider=$host_remote_provider endpoint=$host_endpoint"
 fi
 for resource in deployment service horizontalpodautoscaler; do
   if kubectl -n "$CANONICAL_SMOKE_NS" get "$resource" "$CANONICAL_HOST_ONLY_CB" >/dev/null 2>&1; then
@@ -2403,12 +2399,15 @@ metadata:
   name: smoke-reject-no-endpoint
   namespace: $EXT_SMOKE_NS
 spec:
-  type: External
-  integration: { engine: vllm }
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
 EOF
 )"
-if ! grep -q "requires spec.endpoint" <<<"$reject_output"; then
-  fail "admission did not reject External with no endpoint as expected; got: $reject_output"
+if ! grep -q "required when remoteStorage.ownership=External" <<<"$reject_output"; then
+  fail "admission did not reject external ownership with no endpoint as expected; got: $reject_output"
 fi
 
 reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
@@ -2418,13 +2417,16 @@ metadata:
   name: smoke-reject-https
   namespace: $EXT_SMOKE_NS
 spec:
-  type: External
-  endpoint: https://cache.example.com:443/api
-  integration: { engine: vllm }
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    endpoint: https://cache.example.com:443/api
 EOF
 )"
 if ! grep -q 'scheme "https" is not supported' <<<"$reject_output"; then
-  fail "admission did not reject External+https scheme as expected; got: $reject_output"
+  fail "admission did not reject external LMCacheServer+https scheme as expected; got: $reject_output"
 fi
 
 reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
@@ -2434,13 +2436,16 @@ metadata:
   name: smoke-reject-no-host
   namespace: $EXT_SMOKE_NS
 spec:
-  type: External
-  endpoint: "lm://"
-  integration: { engine: vllm }
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    endpoint: "lm://"
 EOF
 )"
 if ! grep -q "must be a non-empty host AND port" <<<"$reject_output"; then
-  fail "admission did not reject External+lm:// (no host) as expected; got: $reject_output"
+  fail "admission did not reject external LMCacheServer+lm:// (no host) as expected; got: $reject_output"
 fi
 
 reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
@@ -2450,13 +2455,16 @@ metadata:
   name: smoke-reject-managed-endpoint
   namespace: $EXT_SMOKE_NS
 spec:
+  runtime: VLLM
   type: LMCache
-  endpoint: user-supplied.example:8080
-  integration: { engine: vllm }
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    endpoint: user-supplied.example:8080
 EOF
 )"
-if ! grep -q "spec.endpoint is only valid when spec.type=External" <<<"$reject_output"; then
-  fail "admission did not reject non-External + endpoint as expected; got: $reject_output"
+if ! grep -q "managed providers publish their observed endpoint" <<<"$reject_output"; then
+  fail "admission did not reject managed remote storage + endpoint as expected; got: $reject_output"
 fi
 
 # Canonical runtime/cache adapters must explicitly accept their remote binding.
@@ -2474,16 +2482,19 @@ spec:
   type: SGLangHiCache
   hiCache:
     ratio: "2"
+  engineSelector:
+    matchLabels:
+      app: sglang-hicache
   remoteStorage:
     provider: Redis
     ownership: Managed
     redis: {}
 EOF
 )"
-if ! grep -q 'does not accept remote binding protocol "resp"' <<<"$reject_output"; then
+if ! grep -q 'does not accept remote-storage protocol "resp"' <<<"$reject_output"; then
   fail "admission did not reject canonical SGLangHiCache + Redis as expected; got: $reject_output"
 fi
-log "admission rejected invalid legacy endpoint shapes and canonical SGLangHiCache + Redis"
+log "admission rejected invalid canonical endpoint shapes and SGLangHiCache + Redis"
 
 # --- CacheBackend admission: scale-to-zero + autoscaling + nil minReplicas ---
 # The installed validating webhook must reject the combination
@@ -2567,8 +2578,8 @@ kubectl create namespace "$EVENTSONLY_SMOKE_NS" --dry-run=client -o yaml | kubec
 # $EVENTSONLY_SMOKE_CB_NAME; pin the name via a tmp copy so an overridden
 # tunable still resolves, and set the namespace with -n (the sample is
 # namespace-less, like the other samples). type=LMCache, integration.mode=
-# EventsOnly, backendConfig.model set, no spec.endpoint (rejected on
-# non-External) and no spec.autoscaling (rejected for events-only). The
+# EventsOnly, observation.modelID set, no remoteStorage, and no spec.autoscaling
+# (rejected for events-only). The
 # sample's engineSelector is irrelevant here: events-only provisions no
 # workload and the assertions below are all about the CR's own reconcile, so
 # no matched engine pod is required.
@@ -2649,8 +2660,8 @@ done
 log "events-only CR publishes only Ready/Degraded/Progressing (FunctionalProbeOK/EngineKernelsHealthy/T2Degraded/EngineCompatibility absent)"
 
 # Negative-path admission: the misconfiguration the events-only validator
-# guards. An EventsOnly + spec.type=External pair must be rejected at admission
-# (events-only wires no connector; External provisions a server one would dial).
+# guards. EventsOnly plus externally owned remote storage must be rejected at
+# admission because events-only wires no connector that could dial it.
 eo_reject_output="$(kubectl apply -f - <<EOF 2>&1 || true
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
@@ -2658,17 +2669,20 @@ metadata:
   name: smoke-reject-events-only-external
   namespace: $EVENTSONLY_SMOKE_NS
 spec:
-  type: External
-  endpoint: external-cache.example:8200
+  runtime: VLLM
+  type: LMCache
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    endpoint: external-cache.example:8200
   integration:
-    engine: vllm
     mode: EventsOnly
 EOF
 )"
-if ! grep -q "is incompatible with spec.type" <<<"$eo_reject_output"; then
-  fail "admission did not reject EventsOnly+External as expected; got: $eo_reject_output"
+if ! grep -q "provision no remote-storage provider" <<<"$eo_reject_output"; then
+  fail "admission did not reject EventsOnly+external remote storage as expected; got: $eo_reject_output"
 fi
-log "admission rejected EventsOnly+External misconfiguration"
+log "admission rejected EventsOnly+external remote-storage misconfiguration"
 
 # Clean up — keeps the cluster reusable for KEEP_CLUSTER=1 reruns.
 kubectl delete cb -n "$EVENTSONLY_SMOKE_NS" "$EVENTSONLY_SMOKE_CB_NAME" --ignore-not-found --wait=false >/dev/null || true
@@ -3362,12 +3376,16 @@ metadata:
   name: $KC_INJECT_CB
   namespace: $KERNEL_CHECK_SMOKE_NS
 spec:
+  runtime: VLLM
   type: LMCache
   engineSelector:
     matchLabels:
       app: kc-inject-engine
-  backendConfig:
-    serverImage: $SAMPLE_CACHE_SERVER_IMAGE
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      image: $SAMPLE_CACHE_SERVER_IMAGE
 EOF
 
 # Wait for the controller to publish status.endpoint before admitting the engine
@@ -3466,12 +3484,16 @@ metadata:
   annotations:
     inferencecache.io/lmcache-kernel-check: "report-only"
 spec:
+  runtime: VLLM
   type: LMCache
   engineSelector:
     matchLabels:
       app: kc-cond-engine
-  backendConfig:
-    serverImage: $SAMPLE_CACHE_SERVER_IMAGE
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      image: $SAMPLE_CACHE_SERVER_IMAGE
 EOF
 
 # Wait for status.endpoint before admitting the engine pod. The webhook
@@ -3571,6 +3593,7 @@ metadata:
   annotations:
     inferencecache.io/lmcache-kernel-check: "strcit"
 spec:
+  runtime: VLLM
   type: LMCache
   engineSelector:
     matchLabels:
@@ -3874,8 +3897,7 @@ case "$mc_apply_out" in
     log "Mooncake with the opt-in applies without the engine-hostNetwork warning" ;;
 esac
 
-# Pin the fixture to the canonical hierarchy. This keeps the real-install smoke
-# from silently falling back to the legacy spec.type=Mooncake adapter path.
+# Pin the fixture to the canonical hierarchy.
 mc_runtime="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.runtime}')"
 mc_type="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.type}')"
 mc_provider="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.remoteStorage.provider}')"
@@ -4015,4 +4037,4 @@ log "Mooncake engine pod: hostNetwork=true, dnsPolicy=ClusterFirstWithHostNet, w
 
 kubectl delete namespace "$MOONCAKE_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), adapter (LoRA) index partitioning on LookupRoute, CacheBackend ↔ engine-pod binding signals + drift cadence, spec.resources defaults + thread-through, External backend end-to-end, Events-only + native SGLang HiCache engine-local lifecycles, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"
+log "PASS — install bundle came up, CacheIndex + CacheTenant status writing, PromptTemplate + PDTopology schema-only surfaces, server HTTP surface, CachePolicy push adoption, gRPC fail-open (plaintext default), adapter (LoRA) index partitioning on LookupRoute, CacheBackend ↔ engine-pod binding signals + drift cadence, provider resource defaults + thread-through, External backend end-to-end, Events-only + native SGLang HiCache engine-local lifecycles, /snapshot + /policy + /probe unauth rejection, audience binding on all three endpoints, the opt-in gRPC TLS overlay (incl. the existing LookupRoute call pattern over TLS), kernel-check injection shape + report-only FAIL condition path (EngineKernelsHealthy=False/KernelLoadFailed), the operator 'inferencecache doctor' CLI against the live install, the managed Mooncake backend provisioning contract (stand-in master reaches Available on hostNetwork behind a headless Service, Recreate strategy, mooncakestore:// RPC endpoint in status) plus the engineHostNetwork opt-in end-to-end (warning fires only without it; a matched engine pod is admitted onto hostNetwork with ClusterFirstWithHostNet and the mooncakestore:// connector, while a non-Mooncake engine pod stays on the pod network; real engine KV transfer is NOT exercised here), and every config/samples/ manifest applies cleanly — all work"

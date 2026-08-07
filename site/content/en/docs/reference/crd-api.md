@@ -17,11 +17,10 @@ All CRDs are in the API group **`inferencecache.io`**, version **`v1alpha1`**.
 | `PromptTemplate` | Namespaced | `pt` | Declarative | Cache-aware prompt template + stable/mutable slots. |
 | `PDTopology` | Namespaced | `pdt` | Declarative | Prefill/decode topology for disaggregated serving. |
 
-{{% alert title="v1alpha1 compatibility" color="info" %}}
-Although the API is still evolving, existing `v1alpha1` objects must remain valid. Schema
-changes are additive or otherwise backward-compatible; removals and incompatible validation
-changes require a new version and migration path. The gRPC/proto contract follows the same
-backward-compatibility rule for its external consumers.
+{{% alert title="v1alpha1 stability" color="info" %}}
+`v1alpha1` is not compatibility-frozen before the first production deployment. The CRD may
+make breaking schema corrections while the API shape is being finalized. The gRPC/proto
+contract follows its own compatibility policy for external consumers.
 {{% /alert %}}
 
 ## CacheBackend
@@ -30,22 +29,22 @@ backward-compatibility rule for its external consumers.
 
 | Field | Type / values | Default | Notes |
 |---|---|---|---|
-| `type` | `LMCache`, `Mooncake`, `External`, … | `LMCache` | Backing implementation. |
+| `runtime` | `VLLM`, `SGLang` | — | Inference runtime identity. |
+| `type` | `LMCache`, `SGLangHiCache` | `LMCache` | Engine-side cache implementation. |
+| `lmCache` | object | — | Engine-side LMCache configuration. |
+| `remoteStorage` | object | — | Optional provider (`Redis`, `LMCacheServer`, `Mooncake`), ownership (`Managed`, `External`), and external endpoint. |
+| `observation` | object | — | Model identity and first-event timeout. |
 | `deploymentKind` | `Deployment`, `StatefulSet` | `Deployment` | `StatefulSet` reserved/no-op. |
 | `replicas` | int32 | `1` | Min 0. |
 | `autoscaling` | object | — | `minReplicas`, `maxReplicas` (required), `targetCPUUtilizationPercent` (default 80). |
-| `integration.engine` | `vllm`, `sglang` | `vllm` | Runtime ID, not the adapter name. |
 | `integration.mode` | `Offload`, `EventsOnly` | `Offload` | Events-only = routing only. |
 | `integration.role` | `ReadOnly`, `WriteOnly`, `ReadWrite` | `ReadWrite` | Maps to LMCache `kv_role`. |
 | `integration.failOpen` | bool | `true` | `false` fails closed. |
-| `integration.firstEventTimeout` | duration | `5m` | KV-event readiness window. |
 | `integration.engineOverrides` | object | — | `args` / `suppressArgs` / `env` / `suppressEnv`. |
 | `integration.engineHostNetwork` | bool | `false` | Opt-in for Mooncake engine pods. |
 | `engineSelector.matchLabels` | map | — | Equality selector over engine pod labels. |
-| `backendConfig` | map[string]string | — | e.g. `model`, plus backend tunables. |
 | `template` | object | — | Narrow pod-level overrides (no containers). |
-| `resources` | ResourceRequirements | `requests.memory 4Gi` / `limits.memory 8Gi` | For the managed cache-server container. |
-| `endpoint` | string | — | Required for `External`, rejected otherwise. |
+| `remoteStorage.<provider>.resources` | ResourceRequirements | renderer default: `requests.memory 4Gi` / `limits.memory 8Gi` | Resources for the selected managed provider container. |
 | `allowCrossNamespace` | bool | `false` | Opt-in cross-namespace endpoints. |
 
 **Key `status` fields:** `endpoint`, `matchedEnginePods` (`*int32`),

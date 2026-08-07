@@ -28,8 +28,9 @@ The controller-runtime manager. It:
   does both engine-config injection and sidecar injection.
 - **Runs the bridge** to the server (see below).
 
-Owns the `pkg/adapters/runtime` adapters that render the cache-server pod/Service and the
-engine-side pod configuration.
+Composes the shipping adapters under `internal/adapters/builtin`: storage providers
+render managed backend workloads, while runtime adapters inject engine-side pod
+configuration. The supported build-time extension contracts remain under `pkg/adapters`.
 
 ### `inferencecache-server`
 

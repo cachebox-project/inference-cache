@@ -1,4 +1,4 @@
-package provider
+package storage
 
 import (
 	corev1 "k8s.io/api/core/v1"
@@ -7,7 +7,7 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
-func defaultCanonicalProviderResources() *corev1.ResourceRequirements {
+func defaultProviderResources() *corev1.ResourceRequirements {
 	return &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceMemory: resource.MustParse("4Gi"),
@@ -39,16 +39,10 @@ func effectiveProviderResources(cache *cachev1alpha1.CacheBackend) *corev1.Resou
 			}
 		}
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		return defaultCanonicalProviderResources()
-	}
-	if cache.Spec.Resources != nil {
-		return cache.Spec.Resources
-	}
-	return defaultCanonicalProviderResources()
+	return defaultProviderResources()
 }
 
-func effectiveProviderImage(cache *cachev1alpha1.CacheBackend, provider cachev1alpha1.CacheBackendRemoteStorageProvider, legacyKey, fallback string) string {
+func effectiveProviderImage(cache *cachev1alpha1.CacheBackend, provider cachev1alpha1.CacheBackendRemoteStorageProvider, fallback string) string {
 	if cache == nil {
 		return fallback
 	}
@@ -69,10 +63,7 @@ func effectiveProviderImage(cache *cachev1alpha1.CacheBackend, provider cachev1a
 			}
 		}
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		return fallback
-	}
-	return configOr(cache.Spec.BackendConfig, legacyKey, fallback)
+	return fallback
 }
 
 func effectiveProviderCommand(cache *cachev1alpha1.CacheBackend, provider cachev1alpha1.CacheBackendRemoteStorageProvider) []string {
@@ -94,18 +85,4 @@ func effectiveProviderCommand(cache *cachev1alpha1.CacheBackend, provider cachev
 		}
 	}
 	return nil
-}
-
-func legacyProviderConfig(cache *cachev1alpha1.CacheBackend) map[string]string {
-	if cache == nil || cache.Spec.UsesCanonicalCacheHierarchy() {
-		return nil
-	}
-	return cache.Spec.BackendConfig
-}
-
-func configOr(cfg map[string]string, key, fallback string) string {
-	if value := cfg[key]; value != "" {
-		return value
-	}
-	return fallback
 }

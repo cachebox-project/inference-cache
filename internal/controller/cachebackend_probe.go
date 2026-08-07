@@ -359,7 +359,7 @@ func evaluateFunctionalProbe(
 	}
 
 	// Call the probe. Note: backend = <namespace>/<name> per the wire
-	// contract; hashScheme is derived from spec.integration.engine so the
+	// contract; hashScheme is derived from spec.runtime so the
 	// probe lands under the same engine domain a real KV event from this
 	// backend would; backendType is spec.type so the server's Stage C gate
 	// fires correctly (T2 runs only for LMCache).
@@ -585,18 +585,15 @@ func isProbeBypassed(backend *cachev1alpha1.CacheBackend) bool {
 }
 
 // probeHashSchemeForBackend derives the probe's hashScheme from a backend's
-// engine setting so the synthesized probe state lives under the same engine
-// domain real KV events from this backend would. The CacheBackend CRD's
-// spec.integration.engine carries the runtime ID (canonical: "vllm" |
-// "sglang"); an empty value falls back to "vllm" matching the CRD
-// defaulter. Kept here next to the probe gate rather than in the runtime
+// runtime so the synthesized probe state lives under the same engine domain
+// real KV events from this backend would. Kept here next to the probe gate rather than in the runtime
 // adapter package because the probe's identifier scheme is server-contract
 // (not adapter behavior).
 func probeHashSchemeForBackend(backend *cachev1alpha1.CacheBackend) string {
-	if backend == nil || backend.Spec.Integration == nil || strings.TrimSpace(backend.Spec.Integration.Engine) == "" {
+	if backend == nil || backend.Spec.Runtime == "" {
 		return "vllm"
 	}
-	return strings.ToLower(strings.TrimSpace(backend.Spec.Integration.Engine))
+	return strings.ToLower(string(backend.Spec.Runtime))
 }
 
 // truncateMessage caps a diagnostic string at a length that fits cleanly in

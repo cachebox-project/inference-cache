@@ -26,7 +26,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
@@ -62,7 +61,7 @@ const (
 	annotationRequireKVEvents = "inferencecache.io/require-kv-events"
 
 	// defaultFirstEventTimeout is the fallback when
-	// spec.integration.firstEventTimeout is unset and the API-server default
+	// spec.observation.firstEventTimeout is unset and the API-server default
 	// ("5m") was not applied (e.g. fake-client unit tests). Mirrors the
 	// +kubebuilder:default on the field.
 	defaultFirstEventTimeout = 5 * time.Minute
@@ -156,28 +155,27 @@ const (
 // that watches lastEventAt, operator dashboards) can switch on reason
 // instead of regexing the message.
 const (
-	// conditionReasonExternalEndpointAccepted is set when an External
-	// CacheBackend's spec.endpoint is non-empty: admission accepted the
-	// operator-supplied endpoint and we trust it without probing
-	// reachability. A future enhancement could degrade Ready on a
-	// connection-probe failure, but that's out of scope for the
-	// passthrough adapter today (fail-soft, trust the operator).
+	// conditionReasonExternalEndpointAccepted is set when a CacheBackend uses
+	// external remote-storage ownership and spec.remoteStorage.endpoint is
+	// non-empty: admission accepted the operator-supplied endpoint and we trust
+	// it without probing reachability. A future enhancement could degrade Ready
+	// on a connection-probe failure, but that's out of scope for the structured
+	// external binding path today (fail-soft, trust the operator).
 	conditionReasonExternalEndpointAccepted = "ExternalEndpointAccepted"
 	// conditionReasonExternalEndpointMissing is set defensively when an
-	// External CacheBackend has spec.endpoint empty. Admission rejects
-	// this at the validating webhook, so reaching this branch means a CR
-	// already in etcd from before the webhook was installed.
+	// externally owned CacheBackend has spec.remoteStorage.endpoint empty.
+	// Admission rejects this at the validating webhook, so this branch covers
+	// objects that bypassed current admission.
 	conditionReasonExternalEndpointMissing = "ExternalEndpointMissing"
 	// conditionReasonExternalEndpointInvalid is set defensively when an
-	// External CacheBackend has a non-empty spec.endpoint that fails the
-	// shared shape check (bad scheme, no port, embedded whitespace,
-	// unbracketed IPv6, …). Current admission rejects all of these at
-	// the validating webhook; the reason is reachable only for a CR
-	// stored before the relevant shape rule shipped. Status reflects
-	// the gap loudly rather than advertising the malformed value as
-	// Ready=True (which would let the pod webhook then inject an
-	// LMCACHE_REMOTE_URL the engine connector refuses at startup —
-	// turning a cache misconfiguration into a serving outage).
+	// externally owned CacheBackend has a non-empty
+	// spec.remoteStorage.endpoint that fails the shared shape check (bad scheme,
+	// no port, embedded whitespace, unbracketed IPv6, …). Current admission
+	// rejects all of these; this defensive reason covers objects that bypassed
+	// admission. Status reflects the gap loudly rather than advertising the
+	// malformed value as Ready=True (which would let the pod webhook then inject
+	// an LMCACHE_REMOTE_URL the engine connector refuses at startup — turning a
+	// cache misconfiguration into a serving outage).
 	conditionReasonExternalEndpointInvalid = "ExternalEndpointInvalid"
 )
 
@@ -198,13 +196,11 @@ type CacheBackendReconciler struct {
 	// refreshMatchedEnginePods fall through to the embedded
 	// client.Client so existing fake-client tests still work).
 	APIReader client.Reader
-	// Registry resolves the runtime adapter to use for a CacheBackend. Nil
-	// falls back to the complete built-in runtime registry assembled by
-	// internal/adapters/builtin, matching the shipping controller. Set
-	// explicitly only in tests that need a custom adapter set.
+	// Registry resolves the runtime adapter to use for a CacheBackend. The
+	// composition root must inject it before reconciliation starts.
 	Registry *adapterruntime.Registry
 	// BackendRegistry resolves remote provider lifecycle independently from
-	// engine/runtime wiring. Nil uses the shipping provider registry.
+	// engine/runtime wiring. The composition root must inject it.
 	BackendRegistry *backendadapter.Registry
 	// MatchedEnginePodsRequeueInterval overrides the self-requeue cadence
 	// that keeps status.matchedEnginePods fresh between unrelated reconcile
@@ -394,14 +390,10 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // the selected runtime/provider adapter. Unsupported combinations also shed any
 // previously managed workload.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
-	var shippingRegistries builtinadapters.Registries
 	if r.Registry == nil || r.BackendRegistry == nil {
-		shippingRegistries = builtinadapters.New()
+		return ctrl.Result{}, fmt.Errorf("adapter registries are not configured")
 	}
 	registry := r.Registry
-	if registry == nil {
-		registry = shippingRegistries.Runtime
-	}
 	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 	storage := backend.Spec.EffectiveRemoteStorage()
 
@@ -413,15 +405,12 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	// StatefulSet routing because the mode decides provisioning regardless of
 	// deploymentKind (a server-less backend ignores deploymentKind).
 	//
-	// EventsOnly is checked BEFORE the External branch so it takes precedence
-	// over spec.type. Admission's rejectEventsOnlyMisconfiguration rejects a
-	// spec.type=External + mode=EventsOnly pair, but an admission-bypassed /
-	// pre-existing stored object with both set must NOT reconcile as External
-	// (which would publish an endpoint and let the pod webhook inject the KV
-	// connector via the External adapter) — that violates the events-only "no
-	// connector, no server" contract. Letting EventsOnly win here mirrors the
+	// EventsOnly is checked before external remote-storage ownership so it takes
+	// precedence over provider lifecycle. An admission-bypassed object carrying
+	// both must not publish an external endpoint or inject a KV connector. Letting
+	// EventsOnly win here mirrors the
 	// webhook's adapter-independent connector skip, so both layers agree on the
-	// mode's precedence over type.
+	// mode's precedence over remote storage.
 	//
 	// First confirm an adapter is selectable for this (runtime, backend) pair.
 	// A stored / admission-bypassed EventsOnly CR with an unsupported (engine,
@@ -432,10 +421,17 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	// unmanaged (no Ready/Progressing published), so the CR isn't advertised as
 	// a working routing tier the substrate can never feed.
 	if backend.Spec.IsEventsOnly() {
-		if _, err := registry.Select(runtimeID, backend); err != nil {
+		adapter, err := registry.Select(runtimeID, backend)
+		if err != nil {
 			logger.V(1).Info("no runtime adapter for events-only backend; treating as unmanaged",
 				"runtime", runtimeID, "type", backend.Spec.Type,
 				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+		}
+		if !adapter.SupportsBinding(nil) {
+			logger.V(1).Info("runtime adapter does not support host-only events; treating as unmanaged",
+				"runtime", runtimeID, "type", backend.Spec.Type,
+				"namespace", backend.Namespace, "name", backend.Name)
 			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 		}
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
@@ -465,10 +461,10 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 		}
 		binding := backendadapter.BindingFor(storage, protocol, storage.Endpoint)
-		if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
+		if !adapter.SupportsBinding(binding) {
 			logger.V(1).Info("runtime adapter does not accept external-storage binding; treating as unmanaged",
 				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", protocol,
-				"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+				"namespace", backend.Namespace, "name", backend.Name)
 			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 		}
 		// A backend switched from a managed type to External must shed its workload.
@@ -492,7 +488,7 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 			return ctrl.Result{}, err
 		}
-		if bindingAware, ok := adapter.(adapterruntime.RemoteBindingAdapter); !ok || !bindingAware.SupportsRemoteBinding(nil) {
+		if !adapter.SupportsBinding(nil) {
 			logger.V(1).Info("runtime adapter does not support host-only caching; treating as unmanaged",
 				"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(),
 				"namespace", backend.Namespace, "name", backend.Name)
@@ -506,11 +502,7 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return r.reconcileHostOnly(ctx, backend)
 	}
 
-	backendRegistry := r.BackendRegistry
-	if backendRegistry == nil {
-		backendRegistry = shippingRegistries.Storage
-	}
-	provider, err := backendRegistry.Select(storage)
+	provider, err := r.BackendRegistry.Select(storage)
 	if err != nil {
 		logger.V(1).Info("no remote-storage provider for backend; treating as unmanaged",
 			"provider", storage.Provider, "ownership", storage.Ownership,
@@ -522,22 +514,22 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		return ctrl.Result{}, fmt.Errorf("render remote storage for %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
 	binding := &backendadapter.Binding{Protocol: rendered.Protocol}
-	if err := adapterruntime.ValidateRemoteBinding(adapter, binding, backend); err != nil {
+	if !adapter.SupportsBinding(binding) {
 		logger.V(1).Info("runtime adapter does not accept remote-storage binding; treating as unmanaged",
 			"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", rendered.Protocol,
-			"namespace", backend.Namespace, "name", backend.Name, "error", err.Error())
+			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
 	return r.reconcileManaged(ctx, logger, backend, rendered)
 }
 
-// reconcileExternal mirrors a pre-existing backend's configured endpoint to
-// status and marks the backend Ready: there is no Service to wait on, so
-// admission acceptance of spec.endpoint is the only readiness signal the
-// controller has. The Ready condition flips to True in lock step so the
-// Ready printcolumn (kubectl get cb) reflects the accepted endpoint for
-// External CRs that admission has already accepted.
+// reconcileExternal mirrors an externally owned backend's configured endpoint
+// to status and marks the backend Ready: there is no Service to wait on, so
+// admission acceptance of spec.remoteStorage.endpoint is the only readiness
+// signal the controller has. The Ready condition flips to True in lock step so
+// the Ready printcolumn (kubectl get cb) reflects the accepted endpoint for
+// externally owned resources that admission has already accepted.
 //
 // Three terminal states, each driven by the SAME shape rule the
 // validating webhook applies on CREATE/UPDATE — so the reconciler is
@@ -623,11 +615,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 			// apply.
 			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, endpoint); err != nil {
 				readyReason = conditionReasonExternalEndpointInvalid
-				fieldPrefix := "spec."
-				if backend.Spec.UsesCanonicalCacheHierarchy() {
-					fieldPrefix = "spec.remoteStorage."
-				}
-				readyMsg = fieldPrefix + err.Error()
+				readyMsg = "spec.remoteStorage." + err.Error()
 				break
 			}
 			readyStatus = metav1.ConditionTrue
@@ -1876,7 +1864,7 @@ func evaluateKVEventReadiness(backend *cachev1alpha1.CacheBackend, readyStatus m
 	// Sticky Degraded: once the timeout has been breached
 	// (Conditions[Ready].Reason == NoKVEventsObserved), stay Degraded until an
 	// event arrives — never recompute the window. This guards the case where an
-	// operator INCREASES spec.integration.firstEventTimeout after the window
+	// operator INCREASES spec.observation.firstEventTimeout after the window
 	// already elapsed, which would otherwise move the backend back to
 	// AwaitingFirstKVEvent (hiding a known publisher outage for another window),
 	// contradicting the documented "once Degraded, stays Degraded until an

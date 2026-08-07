@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/cachebox-project/inference-cache/pkg/index"
@@ -310,10 +311,15 @@ func readyCacheBackendForSweep(name, namespace string, selector map[string]strin
 			UID:       types.UID("cb-" + namespace + "-" + name + "-uid"),
 		},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
 		},
@@ -340,7 +346,8 @@ func runPodWebhookAndCaptureInjectedBy(t *testing.T, namespace string,
 		t.Fatalf("cachev1alpha1.AddToScheme: %v", err)
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cb1, cb2).Build()
-	h := &podwebhook.EngineInjector{Reader: c, Log: logr.Discard()}
+	registries := builtinadapters.New()
+	h := &podwebhook.EngineInjector{Reader: c, Registry: registries.Runtime, Log: logr.Discard()}
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "engine-a", Labels: podLabels},

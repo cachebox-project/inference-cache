@@ -43,7 +43,9 @@ func newReconcilerWithRecorder(t *testing.T, objs ...client.Object) (*CacheBacke
 		WithObjects(objs...).
 		Build()
 	rec := events.NewFakeRecorder(16)
-	return &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard(), Recorder: rec}, rec
+	r := &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard(), Recorder: rec}
+	configureTestRegistries(r)
+	return r, rec
 }
 
 // drainEvents pulls every event currently on the recorder channel. The channel
@@ -206,6 +208,7 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 		Build()
 	rec := events.NewFakeRecorder(16)
 	r := &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard(), Recorder: rec}
+	configureTestRegistries(r)
 
 	// First pass establishes the Deployment + drives Ready (no events; only
 	// Degraded transitions are loud by design).
@@ -220,7 +223,7 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 	// drives the readiness transition.
 	blockUpdate.Store(true)
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.BackendConfig = map[string]string{"serverImage": "example.com/lmcache-server:v9"}
+	live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v9"
 	live.Generation = 2
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update CR: %v", err)
@@ -278,6 +281,7 @@ func TestReconcileNoPhantomEventOnStatusPatchFailure(t *testing.T) {
 		Build()
 	rec := events.NewFakeRecorder(16)
 	r := &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard(), Recorder: rec}
+	configureTestRegistries(r)
 
 	// Drive to Ready first. Pending → Ready emits no event by design (only
 	// Degraded entry/exit are loud).

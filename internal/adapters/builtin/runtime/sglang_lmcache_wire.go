@@ -1,4 +1,4 @@
-package enginewire
+package runtime
 
 import (
 	"fmt"
@@ -64,7 +64,8 @@ const (
 	sglangMaxTCPPort   = 65535 // a valid TCP port
 	sglangMaxL1SizeGB  = 1024  // 1 TiB — bounded so ParseQuantity always sizes /dev/shm
 
-	// BackendConfig override keys.
+	// Typed LMCache configuration keys used by the renderer.
+	cfgKeyChunkSize   = "chunkSize"
 	cfgKeyWorkerImage = "workerImage"
 	cfgKeyL1SizeGB    = "l1SizeGB"
 	cfgKeyMPPort      = "mpPort"
@@ -100,8 +101,7 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 	if err := validateInjectPodCacheInputs(pod, cache, "engine"); err != nil {
 		return err
 	}
-	if endpoint == "" &&
-		(!cache.Spec.UsesCanonicalCacheHierarchy() || cache.Spec.EffectiveRemoteStorage() != nil) {
+	if endpoint == "" && cache.Spec.EffectiveRemoteStorage() != nil {
 		return fmt.Errorf("inject engine config: endpoint is empty")
 	}
 	i, err := EngineContainerIndexNamed(pod, SGLangEngineContainerName)
@@ -235,7 +235,7 @@ func mountAtPath(ms []corev1.VolumeMount, path string) *corev1.VolumeMount {
 // and the server listens before the engine starts. The worker image defaults to
 // the engine image (guaranteeing the same lmcache version — the two speak the MP
 // wire) and is overridable via lmCache.workerImage (or legacy
-// backendConfig.workerImage).
+// spec.lmCache.workerImage).
 func sglangMPWorkerContainer(engineImage string, engineSC *corev1.SecurityContext, cfg map[string]string, chunkSize, mpPort, l1SizeGB, l2Adapter string, shmMount corev1.VolumeMount) corev1.Container {
 	image := ConfigOr(cfg, cfgKeyWorkerImage, engineImage)
 	configPath := sglangConfigMountPath + "/" + sglangConfigFileName
@@ -457,12 +457,7 @@ func sglangIntInRangeOr(cfg map[string]string, key, fallback string, max int) st
 }
 
 func effectiveSGLangLMCacheConfig(cache *cachev1alpha1.CacheBackend) map[string]string {
-	cfg := make(map[string]string, len(cache.Spec.BackendConfig)+4)
-	if !cache.Spec.UsesCanonicalCacheHierarchy() {
-		for key, value := range cache.Spec.BackendConfig {
-			cfg[key] = value
-		}
-	}
+	cfg := make(map[string]string, 4)
 	if cache.Spec.LMCache == nil {
 		return cfg
 	}

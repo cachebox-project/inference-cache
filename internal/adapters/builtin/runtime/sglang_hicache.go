@@ -1,4 +1,4 @@
-package sglang
+package runtime
 
 import (
 	"fmt"
@@ -11,7 +11,6 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	runtimeadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
 )
 
 const (
@@ -23,58 +22,45 @@ const (
 	SGLangHiCacheMemoryLayoutArg = "--hicache-mem-layout"
 )
 
-type hiCacheAdapter struct {
+type sglangHiCacheAdapter struct {
 	subscriberImage         string
 	policyServerGRPCAddress string
 }
 
-// NewHiCacheAdapter returns the endpoint-free adapter for SGLang's native
+// NewSGLangHiCacheAdapter returns the endpoint-free adapter for SGLang's native
 // host-memory hierarchical cache.
-func NewHiCacheAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdapter {
+func NewSGLangHiCacheAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdapter {
 	var cfg runtimeadapter.Options
 	for _, option := range opts {
 		option(&cfg)
 	}
-	return hiCacheAdapter{
+	return sglangHiCacheAdapter{
 		subscriberImage:         cfg.SubscriberImage,
 		policyServerGRPCAddress: cfg.PolicyServerGRPCAddress,
 	}
 }
 
-func (hiCacheAdapter) Supports(runtime runtimeadapter.RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
+func (sglangHiCacheAdapter) Supports(runtime runtimeadapter.RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
 	return cache != nil &&
 		runtime == runtimeadapter.RuntimeSGLang &&
 		cache.Spec.Type == cachev1alpha1.CacheBackendTypeSGLangHiCache
 }
 
-func (hiCacheAdapter) SupportedPairs() []runtimeadapter.SupportedPair {
+func (sglangHiCacheAdapter) SupportedPairs() []runtimeadapter.SupportedPair {
 	return []runtimeadapter.SupportedPair{{
 		Runtime: runtimeadapter.RuntimeSGLang,
 		Backend: cachev1alpha1.CacheBackendTypeSGLangHiCache,
 	}}
 }
 
-func (hiCacheAdapter) RequiresEndpoint() bool { return false }
-
-func (hiCacheAdapter) SupportsRemoteBinding(binding *backendadapter.Binding) bool {
+func (sglangHiCacheAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
 	return binding == nil
 }
 
-func (a hiCacheAdapter) InjectEngineConfigWithBinding(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+func (sglangHiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	if binding != nil {
 		return fmt.Errorf("SGLang HiCache adapter does not support remote binding protocol %q", binding.Protocol)
 	}
-	return a.InjectEngineConfig(pod, "", cache)
-}
-
-func (hiCacheAdapter) ResolveCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	if err := ValidateHiCacheBackend(cache); err != nil {
-		return nil, nil, err
-	}
-	return nil, nil, nil
-}
-
-func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *cachev1alpha1.CacheBackend) error {
 	cfg, err := resolveHiCacheConfig(cache)
 	if err != nil {
 		return err
@@ -85,7 +71,7 @@ func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *c
 	if len(pod.Containers) == 0 {
 		return fmt.Errorf("inject SGLang HiCache config: pod has no containers")
 	}
-	engineIndex, err := enginewire.EngineContainerIndexNamed(pod, enginewire.SGLangEngineContainerName)
+	engineIndex, err := EngineContainerIndexNamed(pod, SGLangEngineContainerName)
 	if err != nil {
 		return err
 	}
@@ -94,7 +80,7 @@ func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *c
 	// copy. The pod webhook fail-opens on an error, so injection must be
 	// all-or-nothing.
 	args := pod.Containers[engineIndex].Args
-	if hasArg(args, enginewire.SGLangEnableLMCacheArg) || hasArg(args, enginewire.SGLangConfigFileArg) {
+	if hasArg(args, SGLangEnableLMCacheArg) || hasArg(args, SGLangConfigFileArg) {
 		return fmt.Errorf("inject SGLang HiCache config: native HiCache conflicts with SGLang LMCache arguments")
 	}
 	if err := validateEnableArg(args); err != nil {
@@ -189,22 +175,22 @@ func (hiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, cache *c
 	return nil
 }
 
-func (hiCacheAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+func (sglangHiCacheAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
 	return nil
 }
 
-func (a hiCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
+func (a sglangHiCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
 	return runtimeadapter.RenderSubscriberSidecar(runtimeadapter.SubscriberSidecarParams{
 		Image:            a.subscriberImage,
 		ServerAddr:       a.policyServerGRPCAddress,
 		Cache:            cache,
 		Pod:              pod,
-		HashScheme:       subscriberHashScheme,
-		EngineZMQPortStr: defaultEngineZMQPortStr,
+		HashScheme:       sglangSubscriberHashScheme,
+		EngineZMQPortStr: sglangDefaultEngineZMQPortStr,
 	})
 }
 
-func (hiCacheAdapter) ReservedArgs() []string {
+func (sglangHiCacheAdapter) ReservedArgs() []string {
 	return hiCacheReservedArgs()
 }
 
@@ -219,10 +205,10 @@ func hiCacheReservedArgs() []string {
 	}
 }
 
-func (hiCacheAdapter) ReservedEnv() []string { return nil }
+func (sglangHiCacheAdapter) ReservedEnv() []string { return nil }
 
-func (hiCacheAdapter) EngineContainerName() string {
-	return enginewire.SGLangEngineContainerName
+func (sglangHiCacheAdapter) EngineContainerName() string {
+	return SGLangEngineContainerName
 }
 
 type resolvedHiCacheConfig struct {
@@ -250,7 +236,7 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 			cachev1alpha1.CacheBackendTypeSGLangHiCache)
 	}
 	if runtimeadapter.ResolveRuntimeID(cache) != runtimeadapter.RuntimeSGLang {
-		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.engine must be sglang")
+		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: spec.runtime must be SGLang")
 	}
 	if cachev1alpha1.IntegrationMode(cache.Spec.Integration) != cachev1alpha1.CacheBackendIntegrationModeOffload {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.mode must be Offload")
@@ -267,16 +253,8 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 	if cache.Spec.Autoscaling != nil {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: autoscaling is unsupported for an engine-local backend")
 	}
-	if strings.TrimSpace(cache.Spec.Endpoint) != "" {
-		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: spec.endpoint is unsupported for an engine-local backend")
-	}
 	if cache.Spec.EngineSelector == nil || len(cache.Spec.EngineSelector.MatchLabels) == 0 {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: spec.engineSelector.matchLabels is required")
-	}
-	for key := range cache.Spec.BackendConfig {
-		if key != "model" {
-			return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: backendConfig key %q is unsupported; only model is allowed", key)
-		}
 	}
 	if cache.Spec.Integration != nil && cache.Spec.Integration.EngineOverrides != nil {
 		overrides := cache.Spec.Integration.EngineOverrides
@@ -467,7 +445,4 @@ func equivalentNumber(actual, desired string) bool {
 		actualValue == desiredValue
 }
 
-var (
-	_ runtimeadapter.KVCacheRuntimeAdapter = hiCacheAdapter{}
-	_ runtimeadapter.EndpointRequirement   = hiCacheAdapter{}
-)
+var _ runtimeadapter.KVCacheRuntimeAdapter = sglangHiCacheAdapter{}

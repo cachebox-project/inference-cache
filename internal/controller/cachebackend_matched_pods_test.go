@@ -291,6 +291,7 @@ func TestReconcileSchedulesRequeueWhenSelectorRemovedButStatusStillSet(t *testin
 		WithInterceptorFuncs(funcs).
 		Build()
 	r := &CacheBackendReconciler{Client: fc, Scheme: scheme, Log: logr.Discard()}
+	configureTestRegistries(r)
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
@@ -349,6 +350,7 @@ func TestReconcileMatchedEnginePodsWriteOnlyOnChange(t *testing.T) {
 		WithInterceptorFuncs(funcs).
 		Build()
 	r := &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}
+	configureTestRegistries(r)
 
 	// First reconcile establishes status (Endpoint, Conditions, FailOpen) AND
 	// the matchedEnginePods count — both go through SubResourcePatch.
@@ -406,6 +408,7 @@ func TestReconcileMatchedEnginePodsFailSoftOnListError(t *testing.T) {
 		WithInterceptorFuncs(funcs).
 		Build()
 	r := &CacheBackendReconciler{Client: fc, Scheme: scheme, Log: logr.Discard()}
+	configureTestRegistries(r)
 
 	reconcile(t, r, "cache", "ns1") // no Fatal because reconcile must not surface the list error
 
@@ -459,6 +462,7 @@ func TestReconcileMatchedEnginePodsNoUnmatchedDiagnosticOnDeploymentListError(t 
 		Build()
 	rec := events.NewFakeRecorder(16)
 	r := &CacheBackendReconciler{Client: fc, Scheme: scheme, Log: logr.Discard(), Recorder: rec}
+	configureTestRegistries(r)
 
 	reconcile(t, r, "cache", "ns1")
 
@@ -530,6 +534,7 @@ func TestReconcileMatchedEnginePodsFailSoftOnStatusPatchError(t *testing.T) {
 		WithInterceptorFuncs(funcs).
 		Build()
 	r := &CacheBackendReconciler{Client: fc, Scheme: scheme, Log: logr.Discard()}
+	configureTestRegistries(r)
 
 	// reconcile() t.Fatal's on any reconcile error → if we get here, the
 	// reconciler swallowed the patch error as designed.
@@ -617,6 +622,7 @@ func TestReconcileMatchedEnginePodsUsesAPIReaderForPods(t *testing.T) {
 		Log:       logr.Discard(),
 		APIReader: apireader,
 	}
+	configureTestRegistries(r)
 
 	reconcile(t, r, "cache", "ns1")
 

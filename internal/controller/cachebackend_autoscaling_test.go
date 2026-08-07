@@ -140,8 +140,9 @@ func TestReconcileHPACleanedUpOnSwitchToExternal(t *testing.T) {
 	_ = getHPA(t, r, "cache", "ns1")
 
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.Type = cachev1alpha1.CacheBackendTypeExternal
-	live.Spec.Endpoint = "external.ns1.svc:8080"
+	live.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	live.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
+	live.Spec.RemoteStorage = externalLMCacheStorage("external.ns1.svc:8080")
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("switch to external: %v", err)
 	}
@@ -435,7 +436,14 @@ func TestDesiredReplicasReflectsSingletonClamp(t *testing.T) {
 	// expects three and reports RolloutInProgress forever.
 	t.Run("sglang Redis L2 (pair-driven) clamps to 1", func(t *testing.T) {
 		cb := lmcacheBackend("cache", "ns1")
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+		}
 		cb.Spec.Replicas = ptrInt32(3)
 		if got := desiredReplicas(cb, newDep(3)); got != 1 {
 			t.Fatalf("desiredReplicas = %d, want 1 (singleton readiness must match the clamp)", got)
@@ -452,7 +460,8 @@ func TestDesiredReplicasReflectsSingletonClamp(t *testing.T) {
 	})
 	t.Run("disabled (0) is preserved, not clamped up", func(t *testing.T) {
 		cb := lmcacheBackend("cache", "ns1")
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: "sglang"}
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
 		cb.Spec.Replicas = ptrInt32(0)
 		if got := desiredReplicas(cb, newDep(0)); got != 0 {
 			t.Fatalf("desiredReplicas = %d, want 0 (disabled preserved)", got)
@@ -461,8 +470,7 @@ func TestDesiredReplicasReflectsSingletonClamp(t *testing.T) {
 	t.Run("EventsOnly is NOT a singleton — no cache-server is rendered", func(t *testing.T) {
 		cb := lmcacheBackend("cache", "ns1")
 		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-			Engine: "sglang",
-			Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+			Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
 		}
 		cb.Spec.Replicas = ptrInt32(3)
 		if got := desiredReplicas(cb, newDep(3)); got != 3 {

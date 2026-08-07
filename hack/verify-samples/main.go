@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
 )
 
@@ -145,12 +146,13 @@ func run() error {
 	}
 
 	// Register the CacheBackend defaulting + validating webhooks with the
-	// shipping adapter registry (nil → defaultShippingRegistry, the same
-	// wiring the controller uses in production). The Pod injector is
+	// shipping adapter registry, matching the controller's production wiring.
+	// The Pod injector is
 	// intentionally NOT registered: its MutatingWebhookConfiguration uses
 	// failurePolicy=Ignore, so Pod creates (none in this suite anyway)
 	// would just bypass it; CacheBackend is what we need to exercise.
-	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, nil); err != nil {
+	registries := builtinadapters.New()
+	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, registries.Runtime); err != nil {
 		return fmt.Errorf("register CacheBackend webhook: %w", err)
 	}
 	// The CachePolicy + CacheTenant webhooks are now part of the shipped

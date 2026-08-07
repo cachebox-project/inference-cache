@@ -6,7 +6,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/runtime/internal/enginewire"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 )
 
 // RuntimeReference is the [RuntimeID] the in-tree reference adapter matches.
@@ -16,7 +16,7 @@ import (
 const RuntimeReference RuntimeID = "reference"
 
 // EnvCacheEndpoint is the environment variable the reference adapter writes
-// to every container in an engine pod, set to the endpoint argument of
+// to every container in an engine pod, set to the binding endpoint passed to
 // InjectEngineConfig. It is exported so tests in this package and downstream
 // callers (admission validation, future adapter authors taking the reference
 // as a template) can assert on it.
@@ -51,11 +51,11 @@ func (referenceAdapter) Supports(runtime RuntimeID, cache *cachev1alpha1.CacheBa
 	return runtime == RuntimeReference
 }
 
-// ResolveCacheServer renders no cache-server: the reference adapter wires
-// engine/router pods directly to whatever endpoint the reconciler discovered,
-// matching backends (such as LMCache) that colocate the cache with the engine.
-func (referenceAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return nil, nil, nil
+// SupportsBinding accepts any remote binding with a non-empty protocol. The
+// reference adapter is protocol-neutral, but it is endpoint-backed rather than
+// host-only, so nil is not accepted.
+func (referenceAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
+	return binding != nil && binding.Protocol != ""
 }
 
 // InjectEngineConfig sets [EnvCacheEndpoint] on every container in pod,
@@ -63,14 +63,14 @@ func (referenceAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1
 // updated in place (no duplicates), and unrelated entries are left untouched.
 // A nil or container-less pod is reported as an error so callers notice
 // caller-side bugs instead of silently producing a no-op.
-func (referenceAdapter) InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
-	return injectEndpointEnv(pod, endpoint, cache, EnvCacheEndpoint, "engine")
+func (referenceAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	return injectBindingEndpointEnv(pod, binding, cache, EnvCacheEndpoint, "engine")
 }
 
 // InjectRouterConfig sets [EnvRouterEndpoint] on every container in pod with
 // the same merge semantics as [referenceAdapter.InjectEngineConfig].
-func (referenceAdapter) InjectRouterConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
-	return injectEndpointEnv(pod, endpoint, cache, EnvRouterEndpoint, "router")
+func (referenceAdapter) InjectRouterConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	return injectBindingEndpointEnv(pod, binding, cache, EnvRouterEndpoint, "router")
 }
 
 // ObservationSidecar returns (nil, nil): the reference adapter is the
@@ -103,25 +103,41 @@ func (referenceAdapter) ReservedEnv() []string { return nil }
 // integration.
 func (referenceAdapter) EngineContainerName() string { return "" }
 
-// injectEndpointEnv is the shared implementation behind the reference
+// injectBindingEndpointEnv is the shared implementation behind the reference
 // adapter's two inject paths. It is the worked example future adapters
 // should mirror: validate inputs, locate the role-specific containers, and
 // upsert (never blindly append) the env var that names the cache endpoint.
-func injectEndpointEnv(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend, envName, role string) error {
+func injectBindingEndpointEnv(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend, envName, role string) error {
 	if pod == nil {
 		return fmt.Errorf("inject %s config: pod is nil", role)
 	}
 	if cache == nil {
 		return fmt.Errorf("inject %s config: cache is nil", role)
 	}
-	if endpoint == "" {
+	if binding == nil {
+		return fmt.Errorf("inject %s config: binding is nil", role)
+	}
+	if binding.Protocol == "" {
+		return fmt.Errorf("inject %s config: binding protocol is empty", role)
+	}
+	if binding.Endpoint == "" {
 		return fmt.Errorf("inject %s config: endpoint is empty", role)
 	}
 	if len(pod.Containers) == 0 {
 		return fmt.Errorf("inject %s config: pod has no containers", role)
 	}
 	for i := range pod.Containers {
-		pod.Containers[i].Env = enginewire.UpsertEnv(pod.Containers[i].Env, corev1.EnvVar{Name: envName, Value: endpoint})
+		pod.Containers[i].Env = upsertEnv(pod.Containers[i].Env, corev1.EnvVar{Name: envName, Value: binding.Endpoint})
 	}
 	return nil
+}
+
+func upsertEnv(env []corev1.EnvVar, want corev1.EnvVar) []corev1.EnvVar {
+	for i := range env {
+		if env[i].Name == want.Name {
+			env[i] = want
+			return env
+		}
+	}
+	return append(env, want)
 }

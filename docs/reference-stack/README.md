@@ -151,8 +151,7 @@ run it after changing the subscriber.
 
 [`scripts/canary_c2_reconcile.sh`](scripts/canary_c2_reconcile.sh) is a GPU-free,
 on-demand canary for the **C2 reconciler**: it brings up a kind cluster, runs the
-controller, applies a legacy compatibility `CacheBackend` with
-`backendConfig.profile: cpu`, and asserts
+controller, applies a typed `CacheBackend` with a managed LMCacheServer, and asserts
 the controller stands up a healthy serving backend (Ready condition True, endpoint
 published) and owner-ref garbage collection when the CR is deleted. It exercises
 the reconciler against real pods — the gap the envtest unit tests can't cover.
@@ -166,9 +165,9 @@ docs/reference-stack/scripts/canary_c2_reconcile.sh
 ```
 
 Like the full-chain canary it is **on-demand**, not a blocking gate: it needs
-Docker + kind, pulls the vLLM CPU image, and wants ~10+ GiB of Docker VM RAM. The
-`cpu` profile runs a GPU-free vLLM engine (prefix caching + KV events, no LMCache
-offload); real LMCache offload still needs a GPU (the default `gpu` profile).
+Docker + kind and pulls the standalone LMCache server image. The default path
+checks only the managed backend lifecycle, so it does not need an inference
+engine or GPU.
 
 ## In-cluster auto-attach (production path)
 
@@ -178,7 +177,7 @@ When the controller is installed in a cluster **and the operator passes
 digest in production), the pod-mutating webhook auto-attaches the
 `kvevent-subscriber` as a sidecar to every engine pod whose labels match a
 `CacheBackend.spec.engineSelector` and whose backend sets
-`spec.observation.modelID` (or the deprecated `backendConfig.model` fallback).
+`spec.observation.modelID`.
 The subscriber's identity flags (`--replica-id`,
 `--tenant-id`, `--model-id`, `--hash-scheme`) are derived from the CR + pod
 — no operator-supplied flags, no out-of-band `kubectl port-forward` + manual

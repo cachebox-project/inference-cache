@@ -18,16 +18,14 @@ const (
 	CacheBackendRuntimeSGLang CacheBackendRuntime = "SGLang"
 )
 
+// +kubebuilder:validation:Enum=LMCache;SGLangHiCache
+
 // CacheBackendType identifies the backing cache implementation.
 type CacheBackendType string
 
 const (
 	CacheBackendTypeLMCache       CacheBackendType = "LMCache"
 	CacheBackendTypeSGLangHiCache CacheBackendType = "SGLangHiCache"
-	CacheBackendTypeAIBrix        CacheBackendType = "AIBrix"
-	CacheBackendTypeMooncake      CacheBackendType = "Mooncake"
-	CacheBackendTypeNIXL          CacheBackendType = "NIXL"
-	CacheBackendTypeExternal      CacheBackendType = "External"
 )
 
 // +kubebuilder:validation:Enum=Redis;LMCacheServer;Mooncake
@@ -286,6 +284,7 @@ type CacheBackendObservationSpec struct {
 
 	// FirstEventTimeout bounds how long readiness waits for the first KV event.
 	// +optional
+	// +kubebuilder:default="5m"
 	FirstEventTimeout *metav1.Duration `json:"firstEventTimeout,omitempty"`
 }
 
@@ -294,20 +293,14 @@ type CacheBackendObservationSpec struct {
 // The autoscaling spec (spec.autoscaling) is reconciled into a
 // HorizontalPodAutoscaler for managed backends.
 type CacheBackendSpec struct {
-	// Runtime identifies the inference runtime. New resources should use this
-	// field; integration.engine remains as a deprecated compatibility input.
-	// Values are case-sensitive: use VLLM or SGLang. Lowercase normalization
-	// applies only to the deprecated integration.engine field.
-	// +optional
-	Runtime CacheBackendRuntime `json:"runtime,omitempty"`
+	// Runtime identifies the inference runtime. Values are case-sensitive: use
+	// VLLM or SGLang.
+	Runtime CacheBackendRuntime `json:"runtime"`
 
 	// Type identifies the engine-side cache implementation and defaults to
-	// LMCache. Canonical resources select provider technology and ownership
-	// independently through remoteStorage; omitting remoteStorage requests a
-	// host-only hierarchy. Legacy Mooncake and External values remain readable
-	// as compatibility inputs. The CRD does not constrain Type to an enum
-	// today; admission is the authoritative reject for unsupported pairs and
-	// for legacy provider values used in canonical resources.
+	// LMCache. Supported values are LMCache and SGLangHiCache. Provider
+	// technology and ownership are selected independently through remoteStorage;
+	// omitting remoteStorage requests a host-only hierarchy.
 	// +optional
 	// +kubebuilder:default=LMCache
 	Type CacheBackendType `json:"type,omitempty"`
@@ -417,98 +410,9 @@ type CacheBackendSpec struct {
 	// +optional
 	HiCache *SGLangHiCacheSpec `json:"hiCache,omitempty"`
 
-	// BackendConfig contains deprecated compatibility settings. Canonical
-	// resources use the typed LMCache, RemoteStorage, and Observation blocks.
-	// +optional
-	BackendConfig map[string]string `json:"backendConfig,omitempty"`
-
 	// Template provides pod-level overrides for managed backend workloads.
 	// +optional
 	Template *CacheBackendPodSpecOverride `json:"template,omitempty"`
-
-	// Resources are the deprecated compatibility resources requested + limited
-	// on a legacy managed backend workload. Canonical resources configure this
-	// under remoteStorage.<provider>.resources. The provider adapter passes
-	// the admitted Requests/Limits maps through to Container.Resources;
-	// the mutating webhook stamps a conservative 4Gi request / 8Gi memory
-	// limit on the legacy minimal-YAML path (when the field is OMITTED) so
-	// the cache server is bounded by the cgroup rather than
-	// node-pressure OOM-killed by the kubelet under heavy T2 write load —
-	// a cache-stress benchmark against an unlimited lmcache-server
-	// repeatedly OOM-killed the pod within minutes of T2 traffic, which
-	// the default limit eliminates. Operators tune per-deployment by
-	// overriding the field; an explicit empty `spec.resources: {}` is
-	// honored as suppression of the webhook-stamped memory request/limit
-	// (no memory request, no memory limit rendered). When spec.autoscaling
-	// is set the runtime adapter still fills in a CPU request fallback
-	// (the HPA-utilization denominator) on top of the empty struct —
-	// that fallback is orthogonal to the memory default this field
-	// controls.
-	//
-	// Admission narrows the surface relative to the upstream
-	// ResourceRequirements shape: a non-empty `resources.claims` slice
-	// is rejected (the runtime adapter does not yet plumb pod-level
-	// `spec.resourceClaims`); strictly-negative `requests` / `limits`
-	// quantities are rejected (the CRD schema admits a leading "-" but
-	// the kubelet would later reject the pod); `requests` / `limits`
-	// keys that are not valid container resource names are rejected
-	// (standard names cpu/memory/ephemeral-storage admit; a
-	// `hugepages-<size>` name admits only when the size suffix parses
-	// as a strictly-positive quantity, e.g. "hugepages-2Mi"; any other
-	// name must be third-party vendor-prefixed like "nvidia.com/gpu" —
-	// the K8s-reserved `kubernetes.io/` and `requests.kubernetes.io/`
-	// prefixes are rejected); and the request/limit relationship is
-	// resource-aware — overcommittable resources (cpu, memory,
-	// ephemeral-storage) admit `limits[X] >= requests[X]`, while
-	// non-overcommittable resources (hugepages-*, vendor-prefixed
-	// extended resources) require `limits[X] == requests[X]` when both
-	// are set. Vendor-prefixed extended-resource quantities (e.g.
-	// nvidia.com/gpu) must be integer values — K8s allocates extended
-	// resources by whole units. See
-	// docs/design/cachebackend-api.md#resources for the full validator
-	// table.
-	//
-	// When spec.autoscaling is set, the adapter additionally fills in a
-	// CPU request fallback (250m) if this field omits one — a
-	// CPU-utilization HPA needs a *positive* CPU request as its
-	// denominator. The fallback never overwrites a positive
-	// operator-supplied value; a non-positive value (e.g.
-	// `requests.cpu: "0"`, which the admission validator admits as a
-	// valid kubelet shape for non-autoscaled pods) is treated as
-	// absent and replaced, because the HPA cannot use 0 as a
-	// denominator.
-	//
-	// This deprecated field is accepted only by legacy resource shapes.
-	// Canonical resources must configure resources under the selected
-	// remoteStorage provider; admission rejects this field when runtime,
-	// lmCache, or remoteStorage selects the canonical API.
-	// External and SGLangHiCache legacy backends provision no workload of
-	// their own, so the field remains inert for those legacy types.
-	//
-	// +optional
-	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
-
-	// Endpoint is the operator-supplied network address for an
-	// External backend the controller does NOT provision. The field
-	// is type-scoped: it is REQUIRED when spec.type is External and
-	// REJECTED at admission for every other type (managed backends
-	// learn their endpoint from the controller-rendered Service and
-	// would silently overwrite a user-supplied value, so admission
-	// surfaces the misconfiguration loudly at write time).
-	//
-	// Allowed shapes for External (both forms require a non-empty
-	// port — the LMCache connector dials TCP, so admission rejects
-	// portless hosts):
-	//   - bare host:port (canonical; the LMCache engine adapter
-	//     prepends the lm:// scheme on injection)
-	//   - lm://host:port (operators who prefer to be explicit)
-	// IPv6 literals must be bracketed: [::1]:8200. Other schemes
-	// (https://, http://, ...) and path/query/fragment components
-	// are rejected at admission — they would produce an invalid
-	// LMCACHE_REMOTE_URL when concatenated with the lm:// prefix at
-	// injection time.
-	// +optional
-	Endpoint string `json:"endpoint,omitempty"`
 
 	// AllowCrossNamespace opts the CacheBackend into referencing an Endpoint
 	// that resolves into a Kubernetes Service in a different namespace from
@@ -563,19 +467,6 @@ type CacheBackendAutoscalingSpec struct {
 // CachePolicy.spec.lookupTimeoutMs and CachePolicy.spec.minimumPrefixTokens,
 // which are the surfaces actually wired into the server's ResolvedPolicy.
 type CacheBackendIntegrationSpec struct {
-	// Engine is the deprecated inference-runtime identity retained for legacy
-	// manifests. The mutating webhook derives it from spec.runtime for
-	// canonical resources and defaults it to vllm for legacy resources. Both
-	// vllm and sglang have shipping adapters
-	// (vllm+LMCache and sglang+LMCache); the supported (engine, type) pairs
-	// are whatever the installed runtime adapters accept, and admission lists
-	// them in its rejection message for an unsupported pair. Keeping this
-	// default in the webhook instead of the CRD schema prevents a canonical
-	// runtime=SGLang object with a partially populated integration block from
-	// being schema-defaulted into a conflicting engine=vllm value.
-	// +optional
-	Engine string `json:"engine,omitempty"`
-
 	// Mode selects which cache tiers the engine is wired for. Defaults to
 	// Offload — cache-aware routing (tier-1) PLUS the KV-offload connector
 	// (tier-2), with a controller-provisioned backend server. EventsOnly wires
@@ -596,10 +487,9 @@ type CacheBackendIntegrationSpec struct {
 	Mode CacheBackendIntegrationMode `json:"mode,omitempty"`
 
 	// Role controls whether the engine reads from, writes to, or fully
-	// participates in the cache. Defaults to ReadWrite — full participation,
-	// matching the [enginewire.IntegrationRole] read-time fallback for an
-	// omitted integration block. ReadOnly / WriteOnly are specialised
-	// producer/consumer roles operators opt into explicitly.
+	// participates in the cache. Defaults to ReadWrite — full participation.
+	// ReadOnly / WriteOnly are specialised producer/consumer roles operators
+	// opt into explicitly.
 	//
 	// Engine support is per-adapter: vLLM maps the role onto its LMCache
 	// connector's kv_role (ReadOnly→kv_consumer, WriteOnly→kv_producer,
@@ -610,52 +500,6 @@ type CacheBackendIntegrationSpec struct {
 	// +optional
 	// +kubebuilder:default=ReadWrite
 	Role CacheBackendIntegrationRole `json:"role,omitempty"`
-
-	// FirstEventTimeout bounds how long a backend may sit
-	// Ready=False with reason AwaitingFirstKVEvent — the backend is up (a
-	// managed workload is Available, or an events-only backend is wired) but no
-	// KV event has been observed yet — before the controller flips it to
-	// Ready=False/Degraded=True with reason NoKVEventsObserved. It applies to
-	// both Offload-managed and EventsOnly backends.
-	//
-	// The KV-event readiness gate holds Ready until at least one KV event
-	// has been observed for this backend's replicas
-	// (status.indexParticipation.lastEventAt, projected from engine-pod
-	// reports). That proves the engine's ZMQ KV-event publisher is actually
-	// publishing — not merely that the managed workload rolled out. An engine
-	// can be serving HTTP while its publisher is silent (mis-configured
-	// --kv-events-config, ZMQ bind failure, in-process publisher crash), or no
-	// engine pods may be attached to the backend at all; either way the cache
-	// plane silently degrades to NO_HINT on every lookup, and this gate makes
-	// that loud.
-	//
-	// The timeout clock starts when the backend becomes "up": for an
-	// Offload-managed backend, when its workload first reports Available; for an
-	// events-only backend (which provisions no workload), on the first reconcile
-	// it is wired — including a re-anchor to the flip moment when a backend
-	// transitions into events-only from a server-bearing mode. The gate is on by
-	// default and opt-out per CacheBackend via the annotation
-	// inferencecache.io/require-kv-events: "false". Backends of spec.type
-	// External are always exempt (their readiness is determined by admission
-	// accepting the endpoint, and they never enter this gate).
-	//
-	// A zero or negative value is treated as unset and falls back to the 5m
-	// default — the field carries no meaningful "wait forever" or "fail
-	// immediately" semantics.
-	//
-	// The first SGLangHiCache implementation publishes no Ready condition, so
-	// this field is inert for that engine-local backend until its separate
-	// readiness contract is implemented.
-	//
-	// The value is a Go duration string (e.g. "90s", "5m", "1h"). The CRD
-	// schema types it as a string; a malformed value is rejected when
-	// admission decodes the object into this typed field, and if admission is
-	// bypassed the controller's typed read fails loudly (it never silently
-	// mis-parses). This matches how the API treats every metav1.Duration
-	// field; no extra CRD-level format constraint is imposed.
-	// +optional
-	// +kubebuilder:default="5m"
-	FirstEventTimeout *metav1.Duration `json:"firstEventTimeout,omitempty"`
 
 	// FailOpen controls whether the engine treats cache lookups as a soft
 	// dependency. When true (the default), an unreachable or degraded cache

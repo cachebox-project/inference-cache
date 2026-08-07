@@ -3,7 +3,7 @@
 # webhook injects.
 #
 # The override surface is engine-agnostic K8s vocabulary (args + env), so it
-# also extends to future SGLang / Mooncake adapters with no CRD churn.
+# also extends to future runtime adapters and remote bindings with no CRD churn.
 #
 # Admission HARD-REJECTS overrides that overlap the adapter's reserved
 # args/env — for the vLLM+LMCache adapter today: `--kv-transfer-config`,

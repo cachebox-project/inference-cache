@@ -26,10 +26,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
+	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	externaladapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/external"
-	sglangadapter "github.com/cachebox-project/inference-cache/pkg/adapters/runtime/sglang"
 )
+
+func newVLLMRegistry(opts ...adapterruntime.Option) *adapterruntime.Registry {
+	registry := adapterruntime.NewRegistry()
+	registry.Register(builtinruntime.NewVLLMLMCacheAdapter(opts...))
+	return registry
+}
+
+func externalLMCacheStorage(endpoint string) *cachev1alpha1.CacheBackendRemoteStorageSpec {
+	return &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		Endpoint:  endpoint,
+	}
+}
 
 // newScheme returns a scheme with corev1 + the CRD types registered so a
 // fake client can list CacheBackends and the handler can json-unmarshal Pods.
@@ -160,10 +175,15 @@ func readyCacheBackend(name, namespace string, selector map[string]string) *cach
 			UID:       types.UID("cb-" + namespace + "-" + name + "-uid"),
 		},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
 		},
@@ -178,8 +198,9 @@ func newHandler(t *testing.T, objs ...client.Object) *EngineInjector {
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
 	return &EngineInjector{
-		Reader: c,
-		Log:    logr.Discard(),
+		Reader:   c,
+		Registry: builtinadapters.New().Runtime,
+		Log:      logr.Discard(),
 	}
 }
 
@@ -192,7 +213,7 @@ func newHandlerWithSubscriber(t *testing.T, objs ...client.Object) *EngineInject
 	t.Helper()
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
-	reg := adapterruntime.NewCoreRegistry(
+	reg := newVLLMRegistry(
 		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
 	)
 	return &EngineInjector{
@@ -247,8 +268,14 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	// and the pod would boot unwired.
 	const ns = "engines"
 	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
-	cb.Spec.Integration.Engine = "sglang" // override the readyCacheBackend vLLM default
-	h := newHandler(t, cb)                // nil registry uses the complete built-in composition
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang // override the readyCacheBackend vLLM default
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+	}
+	h := newHandler(t, cb) // helper explicitly injects the complete built-in composition
 	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
 	req := newRequest(t, pod, ns)
 
@@ -301,8 +328,10 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 func TestHandle_MatchAndInject_SGLangHiCacheWithoutEndpoint(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("hicache", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
-	cb.Spec.Integration.Engine = "sglang"
+	cb.Spec.RemoteStorage = nil
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{
 		Ratio:        "2.0",
 		WritePolicy:  cachev1alpha1.SGLangHiCacheWriteThrough,
@@ -344,7 +373,7 @@ func TestHandle_CanonicalSGLangHiCacheWithRemoteStorageFailsOpen(t *testing.T) {
 	cb := readyCacheBackend("hicache-remote", ns, map[string]string{"app": "sglang"})
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
-	cb.Spec.Integration.Engine = ""
+	cb.Spec.Runtime = ""
 	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
 	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
 		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
@@ -366,8 +395,10 @@ func TestHandle_CanonicalSGLangHiCacheWithRemoteStorageFailsOpen(t *testing.T) {
 func TestHandle_SGLangHiCacheConflictFailsOpenWithoutPartialInjection(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("hicache", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
-	cb.Spec.Integration.Engine = "sglang"
+	cb.Spec.RemoteStorage = nil
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{
 		Ratio:       "2",
 		WritePolicy: cachev1alpha1.SGLangHiCacheWriteThrough,
@@ -389,7 +420,7 @@ func TestHandle_SGLangHiCacheConflictFailsOpenWithoutPartialInjection(t *testing
 func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
 	// End-to-end pod-webhook path for a managed Mooncake backend: the handler
 	// lists the CacheBackend, the built-in shipping registry selects the
-	// vLLM+Mooncake adapter, and the engine container comes out wired to the
+	// vLLM+LMCache adapter with a Mooncake binding, and the engine container is wired to the
 	// Mooncake master via the LMCache connector with the mooncakestore://
 	// scheme (the lm:// analog) — plus the kvevent-subscriber sidecar. This is
 	// the advertised integration path; the adapter-level tests don't exercise
@@ -402,15 +433,19 @@ func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
 			UID:       types.UID("cb-mc-uid"),
 		},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeMooncake,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
 			},
-			BackendConfig: map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"},
+			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"},
 		},
 		// Mooncake status.endpoint is the master's RPC host:port (the
 		// reconciler publishes the Service's first port, 50051).
@@ -449,7 +484,7 @@ func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
 		t.Fatalf("subscriber must tag events hash-scheme=vllm; args = %v", sub.Args)
 	}
 	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
-		t.Fatalf("subscriber --model-id derived from backendConfig.model missing; args = %v", sub.Args)
+		t.Fatalf("subscriber --model-id derived from observation.modelID missing; args = %v", sub.Args)
 	}
 }
 
@@ -594,10 +629,10 @@ func TestHandle_LMCacheBackend_NeverMovesEnginePodOntoHostNetwork(t *testing.T) 
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "lm", Namespace: ns, UID: types.UID("cb-lm-uid")},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
@@ -631,7 +666,7 @@ func TestHandle_AppendsObservationSidecar(t *testing.T) {
 	// wiring.
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.BackendConfig = map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"}
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"}
 	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
@@ -649,7 +684,7 @@ func TestHandle_AppendsObservationSidecar(t *testing.T) {
 		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
 	}
 	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
-		t.Fatalf("--model-id derived from cb.spec.backendConfig.model missing; args = %v", sub.Args)
+		t.Fatalf("--model-id derived from cb.spec.observation.modelID missing; args = %v", sub.Args)
 	}
 	if !argPresent(sub.Args, "--replica-id=$(POD_NAME)") {
 		t.Fatalf("--replica-id MUST use downward-API POD_NAME; args = %v", sub.Args)
@@ -667,18 +702,23 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 	// SGLang engine pod must get the kvevent-subscriber sidecar tagged
 	// --hash-scheme=sglang (the load-bearing scheme tag) + --ignore-block-removed
 	// (LMCache is an L2 tier). Builds the relevant adapters with the subscriber
-	// image option used by cmd/controller because the no-arg nil fallback
+	// image option used by cmd/controller because the no-option registry
 	// renders no sidecar (auto-attach opt-in).
 	const ns = "engines"
 	cb := readyCacheBackend("sg-primary", ns, map[string]string{"app": "sglang"})
-	cb.Spec.Integration.Engine = "sglang"
-	cb.Spec.BackendConfig = map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"}
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+	}
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"}
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.NewCoreRegistry(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage))
-	reg.Register(externaladapter.NewAdapter())
-	reg.Register(sglangadapter.NewAdapter(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage)))
+	reg := newVLLMRegistry(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage))
+	reg.Register(builtinruntime.NewSGLangLMCacheAdapter(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage)))
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
@@ -700,7 +740,7 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 		t.Fatalf("SGLang subscriber MUST tag --hash-scheme=sglang; args = %v", sub.Args)
 	}
 	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
-		t.Fatalf("--model-id derived from cb.spec.backendConfig.model missing; args = %v", sub.Args)
+		t.Fatalf("--model-id derived from cb.spec.observation.modelID missing; args = %v", sub.Args)
 	}
 	if !argPresent(sub.Args, "--ignore-block-removed=true") {
 		t.Fatalf("SGLang+LMCache subscriber MUST set --ignore-block-removed=true (L2 tier); args = %v", sub.Args)
@@ -712,7 +752,7 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 func TestHandle_SidecarAppendIsIdempotent(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "MyOrg/MyModel"}
 	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 
@@ -744,14 +784,14 @@ func eventsOnlyCacheBackend(name, namespace string, selector map[string]string) 
 			UID:       types.UID("cb-" + namespace + "-" + name + "-uid"),
 		},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
-			BackendConfig:  map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"},
+			Observation:    &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"},
 		},
 		// No Status.Endpoint — events-only provisions no server, so the
 		// reconciler leaves it empty. The webhook MUST inject anyway.
@@ -792,7 +832,7 @@ func TestHandle_EventsOnly_EmptyEndpoint_InjectsSubscriberWithoutConnector(t *te
 		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
 	}
 	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
-		t.Fatalf("--model-id derived from cb.spec.backendConfig.model missing; args = %v", sub.Args)
+		t.Fatalf("--model-id derived from cb.spec.observation.modelID missing; args = %v", sub.Args)
 	}
 
 	// The injected-by + injected-by-uid annotations are stamped — proving the
@@ -836,7 +876,7 @@ func TestHandle_OffloadManagedBackend_EmptyEndpoint_FailsOpen(t *testing.T) {
 	// "inject on empty endpoint".
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.BackendConfig = map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"}
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"}
 	cb.Status.Endpoint = "" // Offload mode, reconciler hasn't published yet.
 	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
@@ -1046,11 +1086,11 @@ func TestHandle_EventsOnly_EngineOverrides_DoNotTouchEngineContainer(t *testing.
 }
 
 func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
-	// A pod that matches an External CR's engine selector must come out
+	// A pod that matches an externally owned CR's engine selector must come out
 	// of admission wired to the operator-supplied endpoint via the
 	// LMCache engine wire format — the controller doesn't render a
 	// Service for the cache, so the only source of truth for the
-	// address is spec.endpoint (mirrored to status.endpoint by
+	// address is spec.remoteStorage.endpoint (mirrored to status.endpoint by
 	// reconcileExternal).
 	const (
 		ns       = "engines"
@@ -1059,11 +1099,11 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: endpoint,
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage(endpoint),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
@@ -1074,12 +1114,7 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	// Build the relevant subset of the built-in composition: the core registry
-	// plus External. Without External in the registry the
-	// webhook would fail-open with "no adapter" and leave the engine
-	// unwired — that's the very gap the External adapter closes.
-	reg := adapterruntime.NewCoreRegistry()
-	reg.Register(externaladapter.NewAdapter())
+	reg := newVLLMRegistry()
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
@@ -1101,8 +1136,8 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	if !containsArgPairLocal(mutated.Spec.Containers[0].Args, "--model", "Qwen/Qwen2.5-0.5B-Instruct") {
 		t.Fatalf("user --model arg was lost; args = %v", mutated.Spec.Containers[0].Args)
 	}
-	// External path attaches no observation sidecar — the controller has
-	// no observability seam into an operator-managed cache.
+	// The external-ownership path attaches no observation sidecar — the
+	// controller has no observability seam into an operator-managed cache.
 	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
 		t.Fatalf("External backend must NOT get a subscriber sidecar; found %+v", c)
 	}
@@ -1113,8 +1148,8 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 }
 
 func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
-	// A pre-existing External CR carrying a malformed spec.endpoint
-	// (stored before the shape rule shipped) must not be wired —
+	// An externally owned CR carrying a malformed spec.remoteStorage.endpoint
+	// must not be wired —
 	// injecting LMCACHE_REMOTE_URL=lm://https://... or lm://2001:db8::1
 	// would crash the engine at startup. effectiveEndpoint applies the
 	// same shape check the admission webhook uses and returns "" for
@@ -1127,17 +1162,20 @@ func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
 	}{
 		{"bad-scheme", "https://cache.example.com:443/api"},
 		{"portless-host", "cache.example.com"},
+		{"non-numeric-port", "cache.example.com:not-a-port"},
+		{"zero-port", "cache.example.com:0"},
+		{"out-of-range-port", "cache.example.com:70000"},
 		{"embedded-whitespace", "cache example:8200"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cb := &cachev1alpha1.CacheBackend{
 				ObjectMeta: metav1.ObjectMeta{Name: "ext-bad", Namespace: ns},
 				Spec: cachev1alpha1.CacheBackendSpec{
-					Type:     cachev1alpha1.CacheBackendTypeExternal,
-					Endpoint: tc.endpoint,
+					Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+					Type:          cachev1alpha1.CacheBackendTypeLMCache,
+					RemoteStorage: externalLMCacheStorage(tc.endpoint),
 					Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-						Engine: "vllm",
-						Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+						Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 					},
 					EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 						MatchLabels: map[string]string{"app": "vllm"},
@@ -1146,8 +1184,7 @@ func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
 			}
 			s := newScheme(t)
 			c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-			reg := adapterruntime.NewCoreRegistry()
-			reg.Register(externaladapter.NewAdapter())
+			reg := newVLLMRegistry()
 			h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 			pod := vllmEnginePod("engine", map[string]string{"app": "vllm"})
@@ -1160,9 +1197,9 @@ func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
 			if len(resp.Patches) != 0 {
 				t.Fatalf("expected no patches on invalid endpoint; got %d: %v", len(resp.Patches), resp.Patches)
 			}
-			// Response message must name spec.endpoint, not status.endpoint.
-			if msg := resp.Result.Message; !strings.Contains(msg, "spec.endpoint") {
-				t.Fatalf("fail-open reason should mention spec.endpoint for External; got %q", msg)
+			// Response message must name the canonical spec field, not status.endpoint.
+			if msg := resp.Result.Message; !strings.Contains(msg, "spec.remoteStorage.endpoint") {
+				t.Fatalf("fail-open reason should mention spec.remoteStorage.endpoint for External; got %q", msg)
 			}
 		})
 	}
@@ -1194,14 +1231,14 @@ func TestEffectiveEndpointCanonicalExternalUsesProviderProtocol(t *testing.T) {
 
 func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 	// Pod admission is CREATE-only — if an engine pod admits before the
-	// controller has mirrored spec.endpoint into status.endpoint, the
-	// webhook would fail-open and leave the pod unwired *forever* (no
-	// re-admission on subsequent status updates). For External CRs the
-	// webhook sources the endpoint from spec.endpoint directly (NOT
-	// "falling back" — effectiveEndpoint type-scopes the source so
-	// External never reads status.endpoint, preventing wiring against a
+	// controller has mirrored spec.remoteStorage.endpoint into status.endpoint,
+	// the webhook would fail-open and leave the pod unwired *forever* (no
+	// re-admission on subsequent status updates). For externally owned CRs the
+	// webhook sources the endpoint from spec.remoteStorage.endpoint directly
+	// (NOT "falling back" — effectiveEndpoint ownership-scopes the source so
+	// external ownership never reads status.endpoint, preventing wiring against a
 	// stale mirror during an endpoint update). Without this, applying
-	// the External CacheBackend and the engine Deployment in the same
+	// the externally owned CacheBackend and the engine Deployment in the same
 	// kubectl apply silently produces unwired engine pods.
 	const (
 		ns       = "engines"
@@ -1210,11 +1247,11 @@ func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: endpoint,
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage(endpoint),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
@@ -1226,8 +1263,7 @@ func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.NewCoreRegistry()
-	reg.Register(externaladapter.NewAdapter())
+	reg := newVLLMRegistry()
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-race", map[string]string{"app": "vllm"})
@@ -1242,9 +1278,10 @@ func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 }
 
 func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
-	// When the operator updates spec.endpoint for an External CR but a
-	// new engine pod admits before the reconciler patches status, the
-	// pod must be wired to the NEW spec.endpoint — not the stale
+	// When the operator updates spec.remoteStorage.endpoint for an externally
+	// owned CR but a new engine pod admits before the reconciler patches status,
+	// the
+	// pod must be wired to the NEW spec.remoteStorage.endpoint — not the stale
 	// status.endpoint. Pod admission is CREATE-only, so a pod wired to
 	// the old address on admission stays misrouted forever.
 	const (
@@ -1255,11 +1292,11 @@ func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: freshSpec,
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage(freshSpec),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
@@ -1270,8 +1307,7 @@ func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.NewCoreRegistry()
-	reg.Register(externaladapter.NewAdapter())
+	reg := newVLLMRegistry()
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-stale", map[string]string{"app": "vllm"})
@@ -1282,11 +1318,11 @@ func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
 		t.Fatalf("expected Allowed, got %+v", resp.Result)
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	// Must use spec.endpoint, NOT the stale status.endpoint.
+	// Must use spec.remoteStorage.endpoint, NOT the stale status.endpoint.
 	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+freshSpec)
 	for _, e := range mutated.Spec.Containers[0].Env {
 		if e.Name == adapterruntime.EnvLMCacheRemoteURL && e.Value == "lm://"+staleStatus {
-			t.Fatalf("pod wired to stale status.endpoint %q; should be spec.endpoint %q", staleStatus, freshSpec)
+			t.Fatalf("pod wired to stale status.endpoint %q; should be spec.remoteStorage.endpoint %q", staleStatus, freshSpec)
 		}
 	}
 }
@@ -1305,11 +1341,11 @@ func TestHandle_ExternalBackend_UpperCaseSchemeNormalised(t *testing.T) {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "ext-up", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: operatorTyped,
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage(operatorTyped),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
@@ -1319,8 +1355,7 @@ func TestHandle_ExternalBackend_UpperCaseSchemeNormalised(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := adapterruntime.NewCoreRegistry()
-	reg.Register(externaladapter.NewAdapter())
+	reg := newVLLMRegistry()
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-up", map[string]string{"app": "vllm"})
@@ -1342,16 +1377,15 @@ func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
 	// missing rather than injecting `LMCACHE_REMOTE_URL=lm://   ` which
 	// the engine connector would reject at runtime. The defensive trim
 	// applies to whichever field effectiveEndpoint reads for the CR's
-	// type — spec.endpoint for External (which never reads status), and
-	// status.endpoint for managed.
+	// ownership — spec.remoteStorage.endpoint for external ownership (which
+	// never reads status), and status.endpoint for managed ownership.
 	const ns = "engines"
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "managed-ws", Namespace: ns},
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Type: cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
@@ -1377,10 +1411,10 @@ func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
 }
 
 func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
-	// Counterpart to the External fallback: managed backends MUST wait
+	// Counterpart to the external-ownership path: managed backends MUST wait
 	// for status.endpoint (the reconciler builds it from the rendered
-	// Service). spec.endpoint is admission-rejected on managed types,
-	// so there's nothing else to fall back on — the webhook must
+	// Service). spec.remoteStorage.endpoint is admission-rejected for managed
+	// ownership, so there's nothing else to fall back on — the webhook must
 	// fail-open without injecting until status catches up.
 	const ns = "engines"
 	cb := &cachev1alpha1.CacheBackend{
@@ -1388,8 +1422,7 @@ func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Type: cachev1alpha1.CacheBackendTypeLMCache,
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
@@ -1438,7 +1471,7 @@ func TestHandle_ExternalBackend_NoSidecar(t *testing.T) {
 	// without appending a kvevent-subscriber container.
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.Integration.Engine = string(adapterruntime.RuntimeReference)
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime(adapterruntime.RuntimeReference)
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	reg := adapterruntime.NewRegistry()
@@ -1465,8 +1498,8 @@ func TestHandle_SidecarOptInDefaultsToNoSidecar(t *testing.T) {
 	// single-container and the cache is purely opt-in for now.
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
-	h := newHandler(t, cb) // built-in nil fallback, with no subscriber image
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "MyOrg/MyModel"}
+	h := newHandler(t, cb) // built-in registry, with no subscriber image
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
 
@@ -1484,7 +1517,7 @@ func TestHandle_SidecarOptInDefaultsToNoSidecar(t *testing.T) {
 func TestHandle_SidecarSkippedWithoutModel(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	// Sidecar opt-in via the configured handler, but no backendConfig.model
+	// Sidecar opt-in via the configured handler, but no observation.modelID
 	// — adapter returns (nil, nil) so the engine wiring still happens
 	// while the sidecar append is skipped.
 	h := newHandlerWithSubscriber(t, cb)
@@ -1508,7 +1541,8 @@ func TestHandle_SidecarErrorIsFailOpen(t *testing.T) {
 	// is an optimisation, never a serving dependency.
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.Integration.Engine = "stub-fail"
+	cb.Spec.Runtime = ""
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime("stub-fail")
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	reg := adapterruntime.NewRegistry()
@@ -1531,7 +1565,7 @@ func TestHandle_SidecarErrorIsFailOpen(t *testing.T) {
 func TestHandle_PreExistingSidecar_NotDuplicated(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.BackendConfig = map[string]string{"model": "MyOrg/MyModel"}
+	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "MyOrg/MyModel"}
 	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
@@ -1569,7 +1603,9 @@ func (sidecarErrorAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*cor
 	return nil, nil, nil
 }
 
-func (sidecarErrorAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, _ *cachev1alpha1.CacheBackend) error {
+func (sidecarErrorAdapter) SupportsBinding(*backendadapter.Binding) bool { return true }
+
+func (sidecarErrorAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ *backendadapter.Binding, _ *cachev1alpha1.CacheBackend) error {
 	if pod == nil || len(pod.Containers) == 0 {
 		return errors.New("nope")
 	}
@@ -1577,7 +1613,7 @@ func (sidecarErrorAdapter) InjectEngineConfig(pod *corev1.PodSpec, _ string, _ *
 	return nil
 }
 
-func (sidecarErrorAdapter) InjectRouterConfig(*corev1.PodSpec, string, *cachev1alpha1.CacheBackend) error {
+func (sidecarErrorAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
 	return nil
 }
 
@@ -1826,6 +1862,23 @@ func TestHandle_ListError_FailOpen(t *testing.T) {
 	}
 }
 
+func TestHandle_NilRegistry_FailsOpen(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
+	h := &EngineInjector{Reader: c, Log: logr.Discard()}
+
+	resp := h.Handle(context.Background(), newRequest(t,
+		vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns))
+	if !resp.Allowed || len(resp.Patches) != 0 {
+		t.Fatalf("nil registry must fail open without patches: Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
+	}
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "registry is not configured") {
+		t.Fatalf("response message = %v, want missing-registry diagnostic", resp.Result)
+	}
+}
+
 func TestHandle_AdapterError_FailOpen(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
@@ -1872,7 +1925,7 @@ func TestHandle_DecodeError_FailOpen(t *testing.T) {
 func TestHandle_NoBackendForRuntime_FailOpen(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeAIBrix // no built-in adapter
+	cb.Spec.Type = cachev1alpha1.CacheBackendType("unsupported") // no built-in adapter
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
@@ -1893,7 +1946,8 @@ func TestHandle_RegistryOverride_UsedInsteadOfDefault(t *testing.T) {
 	// with the reference env on the container proves the override wins.
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.Integration.Engine = string(adapterruntime.RuntimeReference)
+	cb.Spec.Runtime = ""
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime(adapterruntime.RuntimeReference)
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	reg := adapterruntime.NewRegistry()
@@ -2577,11 +2631,11 @@ func TestHandle_KernelCheckInitContainer_AppendedOnOffloadStrict(t *testing.T) {
 }
 
 // TestHandle_EventsOnlyExternal_NoConnectorWiring verifies that an
-// admission-bypassed spec.type=External + mode=EventsOnly object gets NO KV
+// admission-bypassed external-storage + mode=EventsOnly object gets NO KV
 // connector wiring. Admission's rejectEventsOnlyMisconfiguration rejects this
 // pair, so it can only reach the webhook via a stored / bypassed object — but if
-// it does, events-only's "no connector" contract must win over spec.type. The
-// External adapter's InjectEngineConfig would otherwise inject the LMCache
+// it does, events-only's "no connector" contract must win over remote storage. The
+// vLLM+LMCache adapter would otherwise inject the LMCache
 // connector; the webhook skips InjectEngineConfig for events-only regardless of
 // the selected adapter.
 func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
@@ -2596,29 +2650,28 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 			UID:       types.UID("cb-ext-eo-uid"),
 		},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Type:     cachev1alpha1.CacheBackendTypeExternal,
-			Endpoint: endpoint,
+			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:          cachev1alpha1.CacheBackendTypeLMCache,
+			RemoteStorage: externalLMCacheStorage(endpoint),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Engine: "vllm",
-				Mode:   cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
-				Role:   cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+				Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app": "vllm"},
 			},
-			BackendConfig: map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"},
+			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"},
 		},
 		Status: cachev1alpha1.CacheBackendStatus{Endpoint: endpoint},
 	}
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	// Build the relevant subset of the built-in composition with External and
-	// the subscriber image configured, so the events-only sidecar path is live.
-	reg := adapterruntime.NewCoreRegistry(
+	// Configure the shipping vLLM adapter's subscriber image so the events-only
+	// sidecar path is live.
+	reg := newVLLMRegistry(
 		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
 	)
-	reg.Register(externaladapter.NewAdapter())
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
@@ -2634,7 +2687,7 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 	if engine == nil {
 		t.Fatalf("engine container missing; containers = %v", containerNames(mutated))
 	}
-	// No LMCACHE_* env (the External adapter would have set LMCACHE_REMOTE_URL).
+	// No LMCACHE_* env (the external remote binding would otherwise set LMCACHE_REMOTE_URL).
 	for _, e := range engine.Env {
 		if strings.HasPrefix(e.Name, "LMCACHE_") {
 			t.Fatalf("events-only+External engine container must carry NO LMCACHE_* env; found %s=%q", e.Name, e.Value)
@@ -2646,8 +2699,7 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 			t.Fatalf("events-only+External engine container must carry NO --kv-transfer-config; args = %v", engine.Args)
 		}
 	}
-	// No kernel-check init container either (External adapter has none, but assert
-	// the contract holds end-to-end).
+	// No kernel-check init container either; assert the contract end-to-end.
 	for _, ic := range mutated.Spec.InitContainers {
 		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
 			t.Fatalf("events-only+External pod must NOT get the kernel-check init container; init containers = %v",

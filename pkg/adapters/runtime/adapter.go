@@ -12,10 +12,9 @@ import (
 )
 
 // RuntimeID identifies an inference-engine family that a runtime adapter
-// handles. Values mirror the free-form string carried in
-// CacheBackend.Spec.Integration.Engine — this project deliberately does not
-// model a ServingRuntime CRD (cf. OEP-0010's *v1beta1.ServingRuntimeSpec), so
-// engine identity flows as a plain identifier the reconciler can pass through.
+// handles. Values are resolved from CacheBackend.Spec.Runtime; this project
+// deliberately does not model a ServingRuntime CRD (cf. OEP-0010's
+// *v1beta1.ServingRuntimeSpec).
 type RuntimeID string
 
 // Canonical runtime identifiers. Adapters are free to support additional
@@ -41,23 +40,29 @@ type KVCacheRuntimeAdapter interface {
 	// (runtime, backend) pair; cache is never nil at the call site.
 	Supports(runtime RuntimeID, cache *cachev1alpha1.CacheBackend) bool
 
-	// InjectEngineConfig mutates pod so the engine talks to the cache at
-	// endpoint. Implementations MUST merge: preserve existing containers,
-	// env, args, and volumes; only add or update what they own. Safe to call
-	// repeatedly on the same pod.
-	InjectEngineConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error
+	// SupportsBinding reports whether the adapter accepts the structured remote
+	// storage binding. A nil binding means host-only operation. Admission and
+	// reconciliation call this before injection so unsupported runtime/provider
+	// combinations fail at the contract boundary.
+	SupportsBinding(binding *backendadapter.Binding) bool
+
+	// InjectEngineConfig mutates pod so the engine uses binding. Implementations
+	// MUST merge: preserve existing containers, env, args, and volumes; only add
+	// or update what they own. Safe to call repeatedly on the same pod. A nil
+	// binding means host-only operation.
+	InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error
 
 	// InjectRouterConfig mutates a router pod so it can route cache-aware
-	// requests through endpoint. Same merge contract as InjectEngineConfig.
+	// requests through binding. Same merge contract as InjectEngineConfig.
 	// Backends without a router component should return nil without
 	// touching pod.
-	InjectRouterConfig(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error
+	InjectRouterConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error
 
 	// ObservationSidecar returns the container that observes the engine pod
 	// for the cache plane (the KV-event subscriber for vLLM/LMCache), or
 	// (nil, nil) when no sidecar is needed for this (engine, backend) pair
-	// — for example, the deprecated legacy External adapter, or a future
-	// backend that exports observation data some other way. Returning a
+	// — for example, a future backend that exports observation data some other
+	// way. Returning a
 	// container does not by itself mutate pod;
 	// the Pod webhook appends it after [InjectEngineConfig] (idempotent: if
 	// a container with the same Name is already present, the caller skips
@@ -100,97 +105,6 @@ type KVCacheRuntimeAdapter interface {
 	// name (e.g. the reference adapter writes to every container) — the
 	// webhook skips override application in that case.
 	EngineContainerName() string
-}
-
-// LegacyCacheServerRenderer is the pre-separation provider-rendering seam.
-// Shipping provider adapters call the standalone Resolve*Server functions
-// directly; this interface remains only so legacy tests and out-of-tree
-// adapters can migrate without keeping provider lifecycle on
-// KVCacheRuntimeAdapter.
-type LegacyCacheServerRenderer interface {
-	ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error)
-}
-
-// ResolveLegacyCacheServer invokes the pre-separation rendering seam.
-func ResolveLegacyCacheServer(adapter KVCacheRuntimeAdapter, cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	renderer, ok := adapter.(LegacyCacheServerRenderer)
-	if !ok {
-		return nil, nil, fmt.Errorf("runtime adapter has no legacy cache-server renderer")
-	}
-	return renderer.ResolveCacheServer(cache)
-}
-
-// EndpointRequirement is an optional adapter capability for engine-local
-// integrations that do not dial a separate cache server. Adapters that do not
-// implement it require an endpoint by default, preserving the existing
-// LMCache, Mooncake, and External behavior.
-type EndpointRequirement interface {
-	RequiresEndpoint() bool
-}
-
-// RemoteBindingAdapter is the canonical engine-side capability. It accepts an
-// optional structured remote binding and owns no provider lifecycle.
-type RemoteBindingAdapter interface {
-	SupportsRemoteBinding(*backendadapter.Binding) bool
-	InjectEngineConfigWithBinding(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error
-}
-
-// AdapterRequiresEndpoint returns the endpoint requirement declared by
-// adapter, defaulting to true for adapters that predate EndpointRequirement.
-func AdapterRequiresEndpoint(adapter KVCacheRuntimeAdapter) bool {
-	requirement, ok := adapter.(EndpointRequirement)
-	return !ok || requirement.RequiresEndpoint()
-}
-
-// AdapterRequiresEndpointFor evaluates endpoint need for a concrete cache
-// hierarchy. Binding-aware adapters accept nil for host-only operation.
-func AdapterRequiresEndpointFor(adapter KVCacheRuntimeAdapter, binding *backendadapter.Binding) bool {
-	if bindingAware, ok := adapter.(RemoteBindingAdapter); ok {
-		return !bindingAware.SupportsRemoteBinding(binding) || binding != nil
-	}
-	return AdapterRequiresEndpoint(adapter)
-}
-
-// ValidateRemoteBinding verifies that adapter explicitly accepts binding for a
-// canonical cache hierarchy. Legacy resources retain the endpoint-based
-// fallback while out-of-tree adapters migrate to [RemoteBindingAdapter].
-func ValidateRemoteBinding(adapter KVCacheRuntimeAdapter, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
-	bindingAware, ok := adapter.(RemoteBindingAdapter)
-	if !ok {
-		if cache != nil && cache.Spec.UsesCanonicalCacheHierarchy() {
-			return fmt.Errorf("runtime adapter does not implement the canonical remote-binding contract")
-		}
-		return nil
-	}
-	if !bindingAware.SupportsRemoteBinding(binding) {
-		return fmt.Errorf("runtime adapter does not accept remote binding protocol %q", bindingProtocol(binding))
-	}
-	return nil
-}
-
-// InjectEngineConfigWithBinding routes canonical resources through the
-// structured binding contract and falls back to the legacy endpoint method for
-// adapters that have not migrated yet only when the resource itself uses the
-// legacy hierarchy.
-func InjectEngineConfigWithBinding(adapter KVCacheRuntimeAdapter, pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
-	if err := ValidateRemoteBinding(adapter, binding, cache); err != nil {
-		return err
-	}
-	if bindingAware, ok := adapter.(RemoteBindingAdapter); ok {
-		return bindingAware.InjectEngineConfigWithBinding(pod, binding, cache)
-	}
-	endpoint := ""
-	if binding != nil {
-		endpoint = binding.Endpoint
-	}
-	return adapter.InjectEngineConfig(pod, endpoint, cache)
-}
-
-func bindingProtocol(binding *backendadapter.Binding) backendadapter.Protocol {
-	if binding == nil {
-		return ""
-	}
-	return binding.Protocol
 }
 
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter
@@ -298,29 +212,24 @@ func (r *Registry) SupportedPairs() []SupportedPair {
 // renders and the pod webhook injects, so the three callers must read the
 // CR identically.
 //
-// The CR carries the engine name in Spec.Integration.Engine. When it is
-// unset, vLLM is the Phase-1 default — the only engine the shipping
-// adapters target — so a CacheBackend that omits the field is treated the
-// same way the reconciler used to treat it before C7 landed. Engine values
-// are normalised to lower case so common spellings ("vLLM", "VLLM",
-// "SGLang") route to the canonical [RuntimeID] constants ([RuntimeVLLM]
-// etc.).
+// The CR carries the runtime identity in spec.runtime. The schema restricts
+// persisted values to the supported case-sensitive enum.
 func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 	if cache == nil {
-		return RuntimeVLLM
+		return ""
 	}
-	return RuntimeID(strings.ToLower(string(cache.Spec.EffectiveRuntime())))
+	return RuntimeID(strings.ToLower(string(cache.Spec.Runtime)))
 }
 
-// Options configures the runtime adapters [NewCoreRegistry] constructs and is
-// passed through by the built-in production composition. Zero values are
+// Options configures runtime adapters and is passed through by the built-in
+// production composition. Zero values are
 // valid: empty PolicyServerGRPCAddress falls back to the package default, and
 // empty SubscriberImage disables sidecar auto-attach (see the field doc for
 // why).
 type Options struct {
-	// SubscriberImage is the image reference the vLLM/LMCache and
-	// vLLM/Mooncake adapters use for the kvevent-subscriber sidecar (both
-	// share the same builder — the KV-event stream is engine-side, not
+	// SubscriberImage is the image reference the vLLM/LMCache adapter uses for
+	// the kvevent-subscriber sidecar across remote bindings (the KV-event stream
+	// is engine-side, not
 	// store-specific). Empty (the zero value)
 	// **disables** sidecar auto-attach — the adapter returns no sidecar
 	// at all. Auto-attach is opt-in by design: a nonexistent default
@@ -351,41 +260,4 @@ func WithSubscriberImage(image string) Option {
 // WithPolicyServerGRPCAddress sets [Options.PolicyServerGRPCAddress].
 func WithPolicyServerGRPCAddress(addr string) Option {
 	return func(o *Options) { o.PolicyServerGRPCAddress = addr }
-}
-
-// NewCoreRegistry returns a Registry containing only the runtime adapters
-// implemented in this package — currently vLLM+LMCache and vLLM+Mooncake. It
-// deliberately does NOT include
-// the External passthrough adapter under pkg/adapters/runtime/external/: that
-// package imports this one (for the [KVCacheRuntimeAdapter] interface and the
-// [RuntimeID] constants), so registering it here would cycle. The
-// complete shipping composition lives in internal/adapters/builtin, so
-// production and nil-fallback paths agree on one supported set. Direct uses of
-// NewCoreRegistry or the deprecated DefaultRegistry intentionally see only the
-// in-package view (LMCache + Mooncake).
-//
-// Adapter order does not affect selection — [Registry.Select] matches on the
-// (runtime, spec.type) pair and the in-package adapters cover disjoint pairs
-// (vllm/LMCache, vllm/Mooncake) — so registering Mooncake alongside LMCache
-// here is a pure addition.
-//
-// Options the controller cares about (subscriber sidecar image, policy-server
-// address) are passed in via the variadic [Option] helpers and shared by both
-// adapters (the kvevent-subscriber sidecar is identical for either L2 store);
-// the no-arg form preserves the original Phase-1 behavior.
-func NewCoreRegistry(opts ...Option) *Registry {
-	r := NewRegistry()
-	r.Register(NewVLLMLMCacheAdapter(opts...))
-	r.Register(NewVLLMMooncakeAdapter(opts...))
-	return r
-}
-
-// DefaultRegistry is retained for source compatibility with existing
-// extension tests. In-repository binaries and nil fallbacks use the complete
-// composition root in internal/adapters/builtin.
-//
-// Deprecated: use NewCoreRegistry when intentionally testing only adapters
-// implemented by this package.
-func DefaultRegistry(opts ...Option) *Registry {
-	return NewCoreRegistry(opts...)
 }

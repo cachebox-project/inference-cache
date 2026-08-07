@@ -3,7 +3,7 @@
 The second-engine sibling of the top-level [vLLM + LMCache reference](../../README.md):
 a **SGLang** deployment that publishes **KV-cache events over ZMQ** and **offloads
 KV to a shared Redis L2** via LMCache **multiprocess (MP) mode**. It is the hand-built
-reference the `(sglang, LMCache)` runtime adapter (`pkg/adapters/runtime/sglang`)
+reference the `(sglang, LMCache)` runtime adapter (`internal/adapters/builtin/runtime`)
 mirrors: [`deployment.yaml`](deployment.yaml) stands up the same shape the adapter
 auto-injects — a Redis L2 store, the engine with `--enable-lmcache` +
 `--lmcache-config-file`, and a **node-local MP-worker native sidecar** that offloads
@@ -12,8 +12,8 @@ are operator-owned scaffolding the adapter assumes is present, so the file as a 
 is **not** byte-for-byte adapter output.
 
 > **Validation status.** This manifest is **derived from the GPU-validated adapter
-> render** (`pkg/adapters/runtime/internal/enginewire/sglang_mp.go` +
-> `pkg/adapters/backend/provider/redis_l2.go`; the controller-rendered managed path was
+> render** (`internal/adapters/builtin/runtime/sglang_lmcache_wire.go` +
+> `internal/adapters/builtin/storage/redis.go`; the controller-rendered managed path was
 > validated store→flush→retrieve end-to-end in the MP-mode increment) and is
 > **structurally checked** (`kubectl apply --dry-run=client`). It has **not** been
 > independently re-run end-to-end on a GPU in this exact hand shape — run it on a GPU

@@ -48,7 +48,8 @@ pin an lmcache-server — SGLang never dials one.
 > `manifests/sglang-lmcache/deployment.yaml` renders the MP topology: a **Redis L2** +
 > the **MP-worker native sidecar** + the derived engine image (still a non-applyable
 > placeholder digest — substitute your own build). It is **derived from the
-> GPU-validated adapter render** (`redis_l2.go` + the SGLang adapter) and structurally
+> GPU-validated adapter render** (`internal/adapters/builtin/storage/redis.go` +
+> the SGLang adapter) and structurally
 > checked (`kubectl apply --dry-run=client`); re-run it on a GPU before treating it as golden.
 > The pins below are authoritative for **both** the manifest and the controller-rendered
 > managed path.

@@ -33,15 +33,17 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"integration",
 		"engineSelector",
 		"hiCache",
-		"backendConfig",
 		"template",
-		"endpoint",
 		"allowCrossNamespace",
 	} {
 		if !hasProperty(specSchema, field) {
 			t.Fatalf("spec.%s is missing from CRD schema", field)
 		}
 	}
+	requireNoProperty(t, specSchema, "endpoint")
+	requireNoProperty(t, specSchema, "backendConfig")
+	requireNoProperty(t, specSchema, "resources")
+	requireRequired(t, specSchema, "runtime")
 
 	// indexEntries was removed in #57 (it duplicated status.indexParticipation.prefixCount);
 	// health was removed in an earlier change; capacity is removed in this PR.
@@ -69,7 +71,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		t.Fatalf("status.capacity is present in CRD schema; it was retired alongside spec.storage")
 	}
 
-	requireNoEnum(t, mustProperty(t, specSchema, "type"))
+	requireEnum(t, mustProperty(t, specSchema, "type"), []string{"LMCache", "SGLangHiCache"})
 	requireEnum(t, mustProperty(t, specSchema, "runtime"), []string{"VLLM", "SGLang"})
 	requireEnum(t, mustProperty(t, specSchema, "deploymentKind"), []string{
 		"Deployment",
@@ -141,9 +143,9 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"page_first_kv_split",
 		"page_head",
 	})
-	firstEventTimeoutSchema := mustPath[map[string]any](t, integrationSchema, "properties", "firstEventTimeout")
+	firstEventTimeoutSchema := mustPath[map[string]any](t, observationSchema, "properties", "firstEventTimeout")
 	if got, ok := firstEventTimeoutSchema["default"].(string); !ok || got != "5m" {
-		t.Fatalf("integration.firstEventTimeout default = %v, want \"5m\"", firstEventTimeoutSchema["default"])
+		t.Fatalf("observation.firstEventTimeout default = %v, want \"5m\"", firstEventTimeoutSchema["default"])
 	}
 	requireMinimum(t, mustProperty(t, templateSchema, "terminationGracePeriodSeconds"), 0)
 
@@ -160,12 +162,8 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	if got, ok := mustProperty(t, specSchema, "replicas")["default"]; !ok || !reflect.DeepEqual(got, float64(1)) {
 		t.Fatalf("spec.replicas default = %v (type %T), want 1", mustProperty(t, specSchema, "replicas")["default"], mustProperty(t, specSchema, "replicas")["default"])
 	}
-	if got, ok := mustProperty(t, integrationSchema, "engine")["default"]; ok {
-		t.Fatalf("spec.integration.engine has schema default %v; runtime-aware defaulting belongs to the webhook", got)
-	}
-	if got, ok := mustProperty(t, specSchema, "resources")["default"]; ok {
-		t.Fatalf("spec.resources has schema default %v; the legacy-only default belongs to the webhook", got)
-	}
+	requireNoProperty(t, integrationSchema, "engine")
+	requireNoProperty(t, integrationSchema, "firstEventTimeout")
 	if got, ok := mustProperty(t, integrationSchema, "role")["default"].(string); !ok || got != "ReadWrite" {
 		t.Fatalf("spec.integration.role default = %v, want \"ReadWrite\"", mustProperty(t, integrationSchema, "role")["default"])
 	}
@@ -232,7 +230,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	hitRate := "0.50"
 	t2HitRate := "0.66"
 	matchedEnginePods := int32(7)
-	firstEventTimeout := metav1.Duration{Duration: 5 * time.Minute}
 	firstKVEventAt := metav1.NewTime(time.Unix(1_700_000_000, 0).UTC())
 	firstAvailableAt := metav1.NewTime(time.Unix(1_700_000_500, 0).UTC())
 	runAsNonRoot := true
@@ -278,9 +275,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 				TargetCPUUtilizationPercent: &autoscalingTargetCPU,
 			},
 			Integration: &CacheBackendIntegrationSpec{
-				Engine:            "SGLang",
-				Role:              CacheBackendIntegrationRoleReadWrite,
-				FirstEventTimeout: &firstEventTimeout,
+				Role: CacheBackendIntegrationRoleReadWrite,
 			},
 			EngineSelector: &CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"inferencecache.io/cache-enabled": "true"},
@@ -289,7 +284,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 				SizeGB:      &hiCacheSize,
 				WritePolicy: SGLangHiCacheWriteThrough,
 			},
-			BackendConfig: map[string]string{"evictionPolicy": "LRU"},
 			Template: &CacheBackendPodSpecOverride{
 				NodeSelector: map[string]string{"pool": "cache"},
 				Tolerations: []corev1.Toleration{{
@@ -302,7 +296,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 				RuntimeClassName:              &runtimeClassName,
 				TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
 			},
-			Endpoint: "external-cache.default.svc:8080",
 		},
 		Status: CacheBackendStatus{
 			Endpoint: "cache.default.svc:8080",
@@ -338,9 +331,7 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	backend.Spec.RemoteStorage.LMCacheServer.Resources.Limits[corev1.ResourceMemory] = resource.MustParse("4Gi")
 	backend.Spec.Observation.ModelID = "changed"
 	backend.Spec.Observation.FirstEventTimeout.Duration = time.Hour
-	backend.Spec.Integration.FirstEventTimeout.Duration = time.Hour
 	*backend.Spec.HiCache.SizeGB = 128
-	backend.Spec.BackendConfig["evictionPolicy"] = "FIFO"
 	backend.Spec.EngineSelector.MatchLabels["inferencecache.io/cache-enabled"] = "false"
 	backend.Spec.Template.NodeSelector["pool"] = "general"
 	backend.Spec.Template.Tolerations[0].Key = "general"
@@ -399,14 +390,8 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	if copied.Spec.Integration == nil {
 		t.Fatalf("integration was not deep-copied")
 	}
-	if copied.Spec.Integration.Engine != "SGLang" {
-		t.Fatalf("integration.engine was not deep-copied")
-	}
 	if copied.Spec.HiCache == nil || copied.Spec.HiCache.SizeGB == nil || *copied.Spec.HiCache.SizeGB != 64 {
 		t.Fatalf("hiCache.sizeGB was not deep-copied")
-	}
-	if copied.Spec.BackendConfig["evictionPolicy"] != "LRU" {
-		t.Fatalf("backendConfig was not deep-copied")
 	}
 	if copied.Spec.EngineSelector == nil {
 		t.Fatalf("engineSelector was not deep-copied")
@@ -453,9 +438,6 @@ func TestCacheBackendDeepCopyCopiesNestedFields(t *testing.T) {
 	if copied.Status.EngineSelectorMessage != "spec.engineSelector.matchLabels={app:engine}; no Pods in namespace match" {
 		t.Fatalf("status.engineSelectorMessage was not deep-copied")
 	}
-	if copied.Spec.Integration.FirstEventTimeout == nil || copied.Spec.Integration.FirstEventTimeout.Duration != 5*time.Minute {
-		t.Fatalf("integration.firstEventTimeout was not deep-copied")
-	}
 	if copied.Status.FirstKVEventObservedAt == nil || !copied.Status.FirstKVEventObservedAt.Time.Equal(time.Unix(1_700_000_000, 0).UTC()) {
 		t.Fatalf("status.firstKVEventObservedAt was not deep-copied")
 	}
@@ -472,8 +454,8 @@ func TestCacheBackendJSONOmitEmptySpecPointers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal empty spec: %v", err)
 	}
-	if string(data) != "{}" {
-		t.Fatalf("empty spec JSON = %s, want {}", data)
+	if string(data) != `{"runtime":""}` {
+		t.Fatalf("empty spec JSON = %s, want required runtime field", data)
 	}
 }
 

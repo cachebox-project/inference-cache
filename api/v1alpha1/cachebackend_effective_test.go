@@ -2,68 +2,35 @@ package v1alpha1
 
 import "testing"
 
-func TestEffectiveRemoteStorageSeparatesCanonicalAndLegacyHierarchy(t *testing.T) {
-	t.Run("canonical omission is host-only", func(t *testing.T) {
-		spec := CacheBackendSpec{
-			Runtime: CacheBackendRuntimeSGLang,
-			Type:    CacheBackendTypeLMCache,
-		}
-		if got := spec.EffectiveRemoteStorage(); got != nil {
-			t.Fatalf("EffectiveRemoteStorage() = %+v, want nil", got)
-		}
-	})
+func TestEffectiveRemoteStorageUsesOnlyExplicitDeclaration(t *testing.T) {
+	spec := CacheBackendSpec{Type: CacheBackendTypeLMCache}
+	if got := spec.EffectiveRemoteStorage(); got != nil {
+		t.Fatalf("EffectiveRemoteStorage() = %+v, want nil", got)
+	}
 
-	t.Run("legacy sglang lmcache keeps redis compatibility", func(t *testing.T) {
-		spec := CacheBackendSpec{
-			Type: CacheBackendTypeLMCache,
-			Integration: &CacheBackendIntegrationSpec{
-				Engine: "sglang",
-			},
-		}
-		got := spec.EffectiveRemoteStorage()
-		if got == nil ||
-			got.Provider != CacheBackendRemoteStorageProviderRedis ||
-			got.Ownership != CacheBackendRemoteStorageOwnershipManaged {
-			t.Fatalf("EffectiveRemoteStorage() = %+v, want Managed Redis", got)
-		}
-	})
-
-	t.Run("legacy mooncake normalizes engine cache separately", func(t *testing.T) {
-		spec := CacheBackendSpec{Type: CacheBackendTypeMooncake}
-		if got := spec.EffectiveCacheType(); got != CacheBackendTypeLMCache {
-			t.Fatalf("EffectiveCacheType() = %q, want LMCache", got)
-		}
-		storage := spec.EffectiveRemoteStorage()
-		if storage == nil || storage.Provider != CacheBackendRemoteStorageProviderMooncake {
-			t.Fatalf("EffectiveRemoteStorage() = %+v, want Mooncake", storage)
-		}
-	})
+	want := &CacheBackendRemoteStorageSpec{
+		Provider:  CacheBackendRemoteStorageProviderMooncake,
+		Ownership: CacheBackendRemoteStorageOwnershipManaged,
+	}
+	spec.RemoteStorage = want
+	if got := spec.EffectiveRemoteStorage(); got != want {
+		t.Fatalf("EffectiveRemoteStorage() = %+v, want explicit declaration %+v", got, want)
+	}
 }
 
-func TestEffectiveRuntimePrefersCanonicalField(t *testing.T) {
-	spec := CacheBackendSpec{
-		Runtime: CacheBackendRuntimeSGLang,
-		Integration: &CacheBackendIntegrationSpec{
-			Engine: "vllm",
-		},
-	}
+func TestEffectiveRuntimeReturnsConfiguredField(t *testing.T) {
+	spec := CacheBackendSpec{Runtime: CacheBackendRuntimeSGLang}
 	if got := spec.EffectiveRuntime(); got != CacheBackendRuntimeSGLang {
 		t.Fatalf("EffectiveRuntime() = %q, want SGLang", got)
 	}
 }
 
-func TestObservationDoesNotSelectCanonicalHierarchy(t *testing.T) {
+func TestObservationDoesNotSynthesizeRemoteStorage(t *testing.T) {
 	spec := CacheBackendSpec{
 		Type:        CacheBackendTypeLMCache,
 		Observation: &CacheBackendObservationSpec{ModelID: "model-a"},
 	}
-	if spec.UsesCanonicalCacheHierarchy() {
-		t.Fatal("typed observation must remain independent from cache/provider hierarchy selection")
-	}
-	got := spec.EffectiveRemoteStorage()
-	if got == nil ||
-		got.Provider != CacheBackendRemoteStorageProviderLMCacheServer ||
-		got.Ownership != CacheBackendRemoteStorageOwnershipManaged {
-		t.Fatalf("EffectiveRemoteStorage() = %+v, want legacy Managed LMCacheServer", got)
+	if got := spec.EffectiveRemoteStorage(); got != nil {
+		t.Fatalf("EffectiveRemoteStorage() = %+v, want nil", got)
 	}
 }

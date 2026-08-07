@@ -30,7 +30,8 @@ The repository is one operator split across two binaries plus the CRDs. In short
 | gRPC handlers, server wiring | `pkg/server/` |
 | Cache-state index logic | `pkg/index/` |
 | Mutable-slot rendering | `pkg/render/` |
-| Engine / runtime adapters | `pkg/adapters/{engine,runtime}/` |
+| Built-in runtime / storage adapters | `internal/adapters/builtin/{runtime,storage}/` |
+| Public adapter extension contracts | `pkg/adapters/{runtime,backend}/` |
 | The gRPC contract | `proto/` → `make proto-gen` |
 
 Generated code (`config/crd/`, `config/rbac/role.yaml`, `zz_generated*.go`,

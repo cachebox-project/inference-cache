@@ -1,6 +1,6 @@
 # Design: LMCache MP mode — the converged worker model (SGLang now, vLLM migration)
 
-Status: **implemented and GPU-validated** for SGLang (Phase 2, increments 1–2); increment 3 (operator surface + the remaining SPOF containment) is open — see [Phased delivery](#phased-delivery). Facts below are live-validated unless marked otherwise. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Adapters: `pkg/adapters/runtime/sglang`, `pkg/adapters/runtime` (vLLM)
+Status: **implemented and GPU-validated** for SGLang (Phase 2, increments 1–2); increment 3 (operator surface + the remaining SPOF containment) is open — see [Phased delivery](#phased-delivery). Facts below are live-validated unless marked otherwise. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Built-in adapters: `internal/adapters/builtin/runtime`; public contract: `pkg/adapters/runtime`
 
 **LMCache upstream now recommends multiprocess (MP) mode for *both* vLLM and
 SGLang** (its quickstart: MP is *"recommended"* for vLLM via `LMCacheMPConnector`,
@@ -412,7 +412,8 @@ data plane), different resolution because the data planes differ:
 
 - **Phase 1 (this doc).** Record the design, and — **comment-only, no behavior
   change** — resolve the stale `TODO(wire-test before production)` in
-  `enginewire.go` and align its godoc to the validated MP reality. The engine wire
+  `internal/adapters/builtin/runtime/sglang_lmcache_wire.go` and align its godoc
+  to the validated MP reality. The engine wire
   is unchanged: dropping the MP-ignored `LMCACHE_*` env is deferred to Phase 2,
   where `InjectSGLangLMCache` is rewritten wholesale (so it is edited once, not
   twice). The advisory admission warning stays (no working data plane yet), so no
@@ -483,7 +484,7 @@ data plane), different resolution because the data planes differ:
   silently falls back to slow pickle serialization. The shared `emptyDir` must be
   `medium: Memory` and sized ≥ the L1.
 - **L2 durability/HA** — a single managed Redis is a simple default, not an HA
-  store. A planned `backendConfig` knob (not yet implemented) will let operators
+  store. A future typed remote-storage option will let operators
   who need durability select an `s3` or `mooncake_store` `--l2-adapter` instead,
   mirroring the LMCache-vs-Mooncake durability-is-a-backend-choice decision.
 - **Bleeding edge** — SGLang's LMCache integration is new (early 2026); the working

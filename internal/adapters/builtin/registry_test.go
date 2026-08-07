@@ -18,8 +18,6 @@ func TestNewIncludesEveryShippingRuntimeAdapter(t *testing.T) {
 		integration *cachev1alpha1.CacheBackendIntegrationSpec
 	}{
 		{name: "vllm lmcache", runtime: adapterruntime.RuntimeVLLM, backend: cachev1alpha1.CacheBackendTypeLMCache},
-		{name: "vllm mooncake legacy", runtime: adapterruntime.RuntimeVLLM, backend: cachev1alpha1.CacheBackendTypeMooncake},
-		{name: "vllm external legacy", runtime: adapterruntime.RuntimeVLLM, backend: cachev1alpha1.CacheBackendTypeExternal},
 		{name: "sglang lmcache", runtime: adapterruntime.RuntimeSGLang, backend: cachev1alpha1.CacheBackendTypeLMCache},
 		{name: "sglang hicache", runtime: adapterruntime.RuntimeSGLang, backend: cachev1alpha1.CacheBackendTypeSGLangHiCache},
 	} {

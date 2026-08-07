@@ -1,4 +1,4 @@
-package provider
+package storage
 
 import (
 	"strconv"
@@ -14,10 +14,20 @@ import (
 func newCacheBackend(t cachev1alpha1.CacheBackendType, engine string) *cachev1alpha1.CacheBackend {
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
-		Spec:       cachev1alpha1.CacheBackendSpec{Type: t},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Type: t,
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+			},
+		},
 	}
-	if engine != "" {
-		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Engine: engine}
+	switch engine {
+	case "vllm":
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	case "sglang":
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	}
 	return cb
 }
@@ -44,7 +54,7 @@ func withMemory(cb *cachev1alpha1.CacheBackend, limit, request string) *cachev1a
 	if request != "" {
 		rr.Requests = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(request)}
 	}
-	cb.Spec.Resources = rr
+	cb.Spec.RemoteStorage.Redis.Resources = rr
 	return cb
 }
 
@@ -126,12 +136,12 @@ func TestResolveRedisL2Server(t *testing.T) {
 
 func TestResolveRedisL2ServerResourceContract(t *testing.T) {
 	// The renderer's resource contract, asserted on the surface its consumer uses
-	// (the rendered container) rather than only on the shared helper: spec.resources
+	// (the rendered container) rather than only on the shared helper: spec.remoteStorage.redis.resources
 	// is the operator-owned baseline and passes through; autoscaling adds the
 	// CPU-request fallback the HPA needs as a utilization denominator; and the
 	// rendered resources must not ALIAS the CR — a caller mutating the pod it got
 	// back would otherwise be writing into the CacheBackend's spec.
-	t.Run("spec.resources passes through", func(t *testing.T) {
+	t.Run("spec.remoteStorage.redis.resources passes through", func(t *testing.T) {
 		cb := withMemory(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"), "3Gi", "1Gi")
 		pod, _, err := ResolveRedisL2Server(cb)
 		if err != nil {
@@ -167,21 +177,21 @@ func TestResolveRedisL2ServerResourceContract(t *testing.T) {
 		}
 		// Mutate what the renderer handed back; the CR must be untouched.
 		pod.Containers[0].Resources.Limits[corev1.ResourceMemory] = resource.MustParse("99Gi")
-		if q := cb.Spec.Resources.Limits[corev1.ResourceMemory]; q.String() != "3Gi" {
-			t.Fatalf("mutating the rendered pod wrote through to the CacheBackend: spec.resources.limits.memory = %q, want 3Gi", q.String())
+		if q := cb.Spec.RemoteStorage.Redis.Resources.Limits[corev1.ResourceMemory]; q.String() != "3Gi" {
+			t.Fatalf("mutating the rendered pod wrote through to the CacheBackend: remoteStorage.redis.resources.limits.memory = %q, want 3Gi", q.String())
 		}
 	})
 }
 
 func TestResolveRedisL2ServerImageOverride(t *testing.T) {
 	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang")
-	cb.Spec.BackendConfig = map[string]string{cfgKeyRedisImage: "registry.example/redis@sha256:deadbeef"}
+	cb.Spec.RemoteStorage.Redis.Image = "registry.example/redis@sha256:deadbeef"
 	pod, _, err := ResolveRedisL2Server(cb)
 	if err != nil {
 		t.Fatalf("ResolveRedisL2Server: %v", err)
 	}
 	if got := pod.Containers[0].Image; got != "registry.example/redis@sha256:deadbeef" {
-		t.Errorf("image = %q, want the backendConfig override", got)
+		t.Errorf("image = %q, want the typed Redis override", got)
 	}
 }
 

@@ -21,8 +21,7 @@ const checkCacheBackendHealth = "CacheBackendHealth"
 // axis emits its own finding so the operator sees exactly what is wrong; a
 // backend that passes every applicable axis emits a single OK.
 //
-// Three health models coexist, derived from EffectiveRemoteStorage so canonical
-// and legacy resources are classified identically:
+// Three health models coexist, derived from EffectiveRemoteStorage:
 //   - Managed remote storage: every axis applies.
 //   - External remote storage: only Ready + endpoint reachability apply.
 //   - Host-only caching: engine/index axes apply, but endpoint checks do not.

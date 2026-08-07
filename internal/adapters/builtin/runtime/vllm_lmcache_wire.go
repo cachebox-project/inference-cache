@@ -1,42 +1,40 @@
-// Package enginewire holds the engine-side wire format shared by every
-// runtime adapter that fronts an LMCache-compatible cache (the in-tree
-// vLLM+LMCache adapter, the vLLM+Mooncake adapter, and the External
-// passthrough adapter today; future adapters that also speak the LMCache
-// connector protocol can import it the same way).
+// This file holds the engine-side wire format used by built-in runtime
+// adapters that front an LMCache-compatible cache. The in-tree
+// vLLM+LMCache adapter uses it for LMCacheServer, Mooncake, and externally
+// owned remote bindings; future adapters that speak the protocol can share it.
 //
 // Centralising the wire keeps the adapters from drifting: an external cache
 // the operator manages themselves still presents the same lm:// endpoint
 // and the engine still parses the same --kv-transfer-config / LMCACHE_*
 // env, so the injection logic is identical and only the endpoint source
-// differs. The Mooncake adapter reuses the same connector wire — vLLM runs
+// differs. The Mooncake binding reuses the same connector wire — vLLM runs
 // the LMCache connector pointed at a mooncakestore:// remote store instead
 // of an lm:// one — so it differs from the LMCache path in nothing but the
-// remote-URL scheme (see [InjectVLLMMooncake]). The package lives under
-// internal/ so it stays import-scoped to adapter authors and is never
-// confused with a public API the engine team can rely on.
-package enginewire
+// remote-URL scheme (see [InjectVLLMMooncake]). It lives with the concrete
+// adapters and is not part of the public extension contract.
+package runtime
 
 import (
 	"fmt"
 	"strings"
-	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 // Engine env var names. The cache plane's contract with the engine: an
 // engine pod that carries these variables (plus the --kv-transfer-config
 // arg below) is wired to an LMCache-compatible cache.
 const (
-	EnvLMCacheRemoteURL       = "LMCACHE_REMOTE_URL"
-	EnvLMCacheRemoteSerde     = "LMCACHE_REMOTE_SERDE"
-	EnvLMCacheChunkSize       = "LMCACHE_CHUNK_SIZE"
-	EnvLMCacheLocalCPU        = "LMCACHE_LOCAL_CPU"
-	EnvLMCacheMaxLocalCPU     = "LMCACHE_MAX_LOCAL_CPU_SIZE"
-	EnvVLLMUseV1              = "VLLM_USE_V1"
-	EnvInferenceCacheFailOpen = "INFERENCECACHE_FAIL_OPEN"
+	EnvLMCacheRemoteURL       = adapterruntime.EnvLMCacheRemoteURL
+	EnvLMCacheRemoteSerde     = adapterruntime.EnvLMCacheRemoteSerde
+	EnvLMCacheChunkSize       = adapterruntime.EnvLMCacheChunkSize
+	EnvLMCacheLocalCPU        = adapterruntime.EnvLMCacheLocalCPU
+	EnvLMCacheMaxLocalCPU     = adapterruntime.EnvLMCacheMaxLocalCPU
+	EnvVLLMUseV1              = adapterruntime.EnvVLLMUseV1
+	EnvInferenceCacheFailOpen = adapterruntime.EnvInferenceCacheFailOpen
 	// EnvPythonHashSeed pins Python's hash seed so the NONE_HASH that seeds
 	// vLLM's prefix-cache block-hash chain is deterministic across the
 	// scheduler and the TP worker processes. Under TP>1 those are separate
@@ -45,7 +43,7 @@ const (
 	// stored hashes — LMCache reload silently 0-hits and the engine fully
 	// recomputes with no crash and no error. A correctness invariant, not a
 	// tunable.
-	EnvPythonHashSeed = "PYTHONHASHSEED"
+	EnvPythonHashSeed = adapterruntime.EnvPythonHashSeed
 )
 
 // EngineContainerName is the conventional name of the vLLM container in an
@@ -53,10 +51,10 @@ const (
 // pod is treated as the engine; a multi-container pod is rejected — silently
 // mutating every container would inject vLLM-only flags onto sidecars and
 // crash them.
-const EngineContainerName = "vllm"
+const EngineContainerName = adapterruntime.EngineContainerName
 
 // Defaults the engine env carries when the operator does not override them
-// through typed LMCache config (or legacy backendConfig). The CPU-safe
+// through typed LMCache config. The CPU-safe
 // LMCACHE_REMOTE_SERDE is "naive"; "cachegen" is faster but pulls in
 // CUDA-only codepaths.
 const (
@@ -72,10 +70,6 @@ const (
 	kvRoleConsumer        = "kv_consumer"
 	kvRoleProducer        = "kv_producer"
 	kvRoleBoth            = "kv_both"
-	cfgKeyChunkSize       = "chunkSize"
-	cfgKeyRemoteSerde     = "remoteSerde"
-	cfgKeyLocalCPU        = "localCPU"
-	cfgKeyMaxLocalCPU     = "maxLocalCPU"
 )
 
 // InjectVLLMLMCache adds the LMCache connector arg and LMCACHE_* env to the
@@ -90,10 +84,10 @@ const (
 // lone container is treated as the engine); a multi-container pod with
 // no `vllm` container is rejected.
 //
-// Both the in-tree vLLM+LMCache adapter (managed backend) and the External
-// passthrough adapter call this — same wire shape, the only difference is
-// the source of endpoint (controller-resolved Service DNS vs operator-
-// supplied address in spec.endpoint).
+// The in-tree vLLM+LMCache adapter calls this for both managed and externally
+// owned bindings. The wire shape is identical; only the endpoint source differs
+// (controller-resolved Service DNS vs the operator-supplied
+// spec.remoteStorage.endpoint).
 func InjectVLLMLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
 	return injectLMCacheConnector(pod, endpoint, LMCacheRemoteURL(endpoint), cache)
 }
@@ -146,12 +140,11 @@ func injectLMCacheConnector(pod *corev1.PodSpec, endpoint, remoteURL string, cac
 	if remoteURL != "" && endpoint == "" {
 		return fmt.Errorf("inject engine config: endpoint is empty")
 	}
-	cfg := cache.Spec.BackendConfig
 	env := []corev1.EnvVar{
-		{Name: EnvLMCacheRemoteSerde, Value: effectiveRemoteSerde(cache, cfg)},
-		{Name: EnvLMCacheChunkSize, Value: effectiveChunkSize(cache, cfg)},
-		{Name: EnvLMCacheLocalCPU, Value: effectiveLocalCPU(cache, cfg)},
-		{Name: EnvLMCacheMaxLocalCPU, Value: effectiveHostMemoryGB(cache, cfg)},
+		{Name: EnvLMCacheRemoteSerde, Value: effectiveRemoteSerde(cache)},
+		{Name: EnvLMCacheChunkSize, Value: effectiveChunkSize(cache)},
+		{Name: EnvLMCacheLocalCPU, Value: effectiveLocalCPU(cache)},
+		{Name: EnvLMCacheMaxLocalCPU, Value: effectiveHostMemoryGB(cache)},
 		{Name: EnvVLLMUseV1, Value: defaultVLLMUseV1},
 		{Name: EnvInferenceCacheFailOpen, Value: FailOpenString(cache)},
 		{Name: EnvPythonHashSeed, Value: defaultPythonHashSeed},
@@ -214,27 +207,21 @@ func validateInjectPodCacheInputs(pod *corev1.PodSpec, cache *cachev1alpha1.Cach
 	return nil
 }
 
-func effectiveChunkSize(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+func effectiveChunkSize(cache *cachev1alpha1.CacheBackend) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.ChunkSizeTokens != nil {
 		return fmt.Sprintf("%d", *cache.Spec.LMCache.ChunkSizeTokens)
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		return defaultChunkSize
-	}
-	return ConfigOr(cfg, cfgKeyChunkSize, defaultChunkSize)
+	return defaultChunkSize
 }
 
-func effectiveRemoteSerde(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+func effectiveRemoteSerde(cache *cachev1alpha1.CacheBackend) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.RemoteSerde != "" {
 		return cache.Spec.LMCache.RemoteSerde
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		return defaultRemoteSerde
-	}
-	return ConfigOr(cfg, cfgKeyRemoteSerde, defaultRemoteSerde)
+	return defaultRemoteSerde
 }
 
-func effectiveHostMemoryGB(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+func effectiveHostMemoryGB(cache *cachev1alpha1.CacheBackend) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.HostMemory != nil &&
 		cache.Spec.LMCache.HostMemory.Capacity != nil {
 		bytes := cache.Spec.LMCache.HostMemory.Capacity.Value()
@@ -242,10 +229,7 @@ func effectiveHostMemoryGB(cache *cachev1alpha1.CacheBackend, cfg map[string]str
 			return fmt.Sprintf("%d", ceilPositiveBytesToGiB(bytes))
 		}
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		return defaultMaxLocalCPU
-	}
-	return ConfigOr(cfg, cfgKeyMaxLocalCPU, defaultMaxLocalCPU)
+	return defaultMaxLocalCPU
 }
 
 func ceilPositiveBytesToGiB(bytes int64) int64 {
@@ -257,18 +241,15 @@ func ceilPositiveBytesToGiB(bytes int64) int64 {
 	return gibibytes
 }
 
-func effectiveLocalCPU(cache *cachev1alpha1.CacheBackend, cfg map[string]string) string {
+func effectiveLocalCPU(cache *cachev1alpha1.CacheBackend) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.HostMemory != nil &&
 		cache.Spec.LMCache.HostMemory.Capacity != nil {
 		return "True"
 	}
-	if cache.Spec.UsesCanonicalCacheHierarchy() {
-		if cache.Spec.RemoteStorage == nil {
-			return "True"
-		}
-		return defaultLocalCPU
+	if cache.Spec.RemoteStorage == nil {
+		return "True"
 	}
-	return ConfigOr(cfg, cfgKeyLocalCPU, defaultLocalCPU)
+	return defaultLocalCPU
 }
 
 // EngineContainerIndex returns the index of the vLLM engine container the
@@ -472,31 +453,7 @@ func ConfigOr(cfg map[string]string, key, fallback string) string {
 // Centralising the rule here means a future tightening only needs to
 // touch one place to ripple to all three layers.
 func ValidateLMCacheEndpoint(s string) error {
-	raw := strings.TrimSpace(s)
-	if raw == "" {
-		return fmt.Errorf("endpoint is empty")
-	}
-	if strings.ContainsFunc(raw, func(r rune) bool {
-		return unicode.IsSpace(r) || unicode.IsControl(r)
-	}) {
-		return fmt.Errorf("endpoint must not contain whitespace or control characters within the host or port; use host:port or lm://host:port with no embedded spaces")
-	}
-	rest := raw
-	if i := strings.Index(raw, "://"); i >= 0 {
-		scheme := strings.ToLower(raw[:i])
-		rest = raw[i+3:]
-		if scheme != "lm" {
-			return fmt.Errorf("endpoint scheme %q is not supported; use a bare host:port (the LMCache adapter adds the lm:// scheme) or an explicit lm://host:port URL", scheme)
-		}
-	}
-	if strings.ContainsAny(rest, "/?#") {
-		return fmt.Errorf("endpoint must be host:port (optionally prefixed lm://); paths/queries/fragments are not part of the LMCache wire and would be silently dropped")
-	}
-	host, port, ok := splitLMCacheHostPort(rest)
-	if !ok || host == "" || port == "" {
-		return fmt.Errorf("endpoint must be a non-empty host AND port (e.g. cache.example.com:8200 or lm://cache.example.com:8200); a scheme alone, a host with no port, an empty port, or a port with no host is not a valid LMCache endpoint")
-	}
-	return nil
+	return adapterruntime.ValidateLMCacheEndpoint(s)
 }
 
 // splitLMCacheHostPort parses a host:port string into its host and port

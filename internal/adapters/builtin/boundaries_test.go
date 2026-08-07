@@ -14,44 +14,54 @@ import (
 
 const modulePath = "github.com/cachebox-project/inference-cache"
 
-func TestControllerProductionImportsRespectBoundaries(t *testing.T) {
+func TestProductionImportsRespectAdapterBoundaries(t *testing.T) {
 	t.Parallel()
 
 	root := repositoryRoot(t)
-	controllerRoot := filepath.Join(root, "internal", "controller")
-	var files []string
-	err := filepath.WalkDir(controllerRoot, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		files = append(files, path)
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk controller files: %v", err)
+	scopes := []struct {
+		root   string
+		banned []string
+	}{
+		{
+			root: filepath.Join(root, "internal", "controller"),
+			banned: []string{
+				modulePath + "/pkg/server",
+				modulePath + "/internal/webhook",
+				modulePath + "/internal/adapters/builtin",
+			},
+		},
+		{
+			root:   filepath.Join(root, "internal", "webhook"),
+			banned: []string{modulePath + "/internal/adapters/builtin"},
+		},
 	}
-	banned := map[string]struct{}{
-		modulePath + "/pkg/server":       {},
-		modulePath + "/internal/webhook": {},
-	}
-	for _, path := range files {
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
-		if err != nil {
-			t.Fatalf("parse %s: %v", path, err)
-		}
-		for _, imported := range file.Imports {
-			pathValue, err := strconv.Unquote(imported.Path.Value)
-			if err != nil {
-				t.Fatalf("unquote import in %s: %v", path, err)
+	for _, scope := range scopes {
+		err := filepath.WalkDir(scope.root, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
 			}
-			for prefix := range banned {
-				if pathValue == prefix || strings.HasPrefix(pathValue, prefix+"/") {
-					t.Errorf("%s imports implementation package %q", filepath.Base(path), pathValue)
+			if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+			if err != nil {
+				t.Fatalf("parse %s: %v", path, err)
+			}
+			for _, imported := range file.Imports {
+				pathValue, err := strconv.Unquote(imported.Path.Value)
+				if err != nil {
+					t.Fatalf("unquote import in %s: %v", path, err)
+				}
+				for _, prefix := range scope.banned {
+					if pathValue == prefix || strings.HasPrefix(pathValue, prefix+"/") {
+						t.Errorf("%s imports implementation package %q", filepath.Base(path), pathValue)
+					}
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk production files: %v", err)
 		}
 	}
 }

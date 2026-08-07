@@ -38,7 +38,7 @@ type SubscriberSidecarParams struct {
 // RenderSubscriberSidecar renders the kvevent-subscriber sidecar the Pod webhook
 // appends to an engine pod so its KV-cache events flow to the policy server with
 // no out-of-band bring-up. It is shared by every adapter whose engine emits the
-// vLLM-style ZMQ KV-event stream — the vLLM+LMCache and vLLM+Mooncake adapters
+// vLLM-style ZMQ KV-event stream — the vLLM+LMCache adapter across its remote bindings
 // (HashScheme "vllm") and the SGLang+LMCache adapter (HashScheme "sglang") today
 // — because the stream is produced by the engine itself, independent of which L2
 // store the engine offloads to. The engine dialect (HashScheme + EngineZMQPortStr)
@@ -50,7 +50,7 @@ type SubscriberSidecarParams struct {
 // dials the engine over 127.0.0.1 (the ZMQ PUB endpoint on EngineZMQPortStr);
 // identity flags are derived from Cache + Pod (--replica-id from pod.Name via the
 // downward API, --tenant-id from pod.Namespace ditto, --model-id from
-// spec.observation.modelID (or legacy backendConfig.model), --hash-scheme from
+// spec.observation.modelID, --hash-scheme from
 // HashScheme) so the CR is the single source of truth.
 //
 // The flag surface here is deliberately the intersection of what the shipped
