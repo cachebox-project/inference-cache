@@ -717,11 +717,11 @@ Additional checks by change type:
 
 Keep repository-boundary verification lightweight before completing Phase A:
 
-- [ ] Require every package under `pkg/` to have package documentation that
+- [x] Require every package under `pkg/` to have package documentation that
   states its intended public role.
-- [ ] Reject imports of module `internal/` packages from non-test Go code under
+- [x] Reject imports of module `internal/` packages from non-test Go code under
   `api/`, `gen/`, or `pkg/`.
-- [ ] Require generated public Go protobuf code to live only under `gen/`.
+- [x] Require generated public Go protobuf code to live only under `gen/`.
 
 Do not add component-by-component import bans or a hard-coded `pkg/` allow-list
 in this phase. Use normal code review for the finer-grained dependency rules.
