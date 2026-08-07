@@ -21,9 +21,9 @@ The repository structure should make the following questions easy to answer:
 
 The default rule for new code is:
 
-> Put code under the `internal/` component that owns it. Promote it to `pkg/`
-> only after a concrete external consumer exists and the project is prepared to
-> maintain its Go API compatibility.
+> Put repository-private code under the `internal/` component that owns it. Use
+> `pkg/` only for APIs intentionally exposed as extension contracts, SDKs, or
+> reusable libraries.
 
 ## Top-level directory responsibilities
 
@@ -70,8 +70,9 @@ The rules are:
 6. `internal/controlplaneapi` owns private HTTP DTOs shared by the controller
    and server. Neither binary imports the other's implementation for wire
    types.
-7. `internal/enginebinding` owns generic engine-pod metadata shared by admission
-   and controllers. Controllers do not import webhook packages.
+7. `internal/enginebinding` owns private engine-pod metadata and coordination
+   contracts shared by built-in adapters, admission, and controllers.
+   Controllers do not import webhook or built-in adapter packages.
 8. `pkg/adapters` contains the build-time extension contracts. Shipping
    implementations and registration belong under `internal/adapters`.
 9. `internal/adapters/builtin.New` owns the complete registry composition shipped
@@ -91,6 +92,15 @@ plugin system:
   CRD change;
 - the repository does not load Go plugins or discover adapter implementations at
   runtime.
+
+The seam is an implementation boundary, not a complete third-party integration
+platform. An adapter can extend engine wiring within the API and validation
+model the repository already exposes. Adding a new runtime, cache, or provider
+identifier still requires a custom controller build plus the corresponding API,
+CRD, admission, and, where applicable, reconciliation changes. Adding new
+configuration semantics likewise remains a core repository or custom-fork
+change; implementing `KVCacheRuntimeAdapter` alone does not bypass schema or
+admission validation.
 
 This build-time seam is the designated extension point, but its Go source
 contract is pre-stable. The Phase 0 audit found no real out-of-tree adapter
@@ -144,7 +154,7 @@ The baseline passes `go test ./...` and `git diff --check`.
 | `pkg/adapters/runtime` | Supported | Runtime extension interfaces and registry | Keep, narrow to contract-only code |
 | `internal/adapters/builtin/runtime` | Internal | Shipping vLLM/SGLang implementations and engine wire rendering | Keep |
 | `pkg/adapters/engine` | Internalize | Subscriber-side event ingest, metrics, and reporting | `internal/subscriber` |
-| `pkg/adapters/engineclient` | Internalize by default | Canary/harness client with no current external consumer | `internal/engineclient` |
+| `pkg/adapters/engineclient` | Supported, narrow and reclassify | Public inference-engine request client for gateways, benchmarks, and canaries | `pkg/engineclient` |
 | `pkg/fingerprint` | Supported | Language-neutral fingerprint contract used across integrations | Keep |
 | `pkg/tokenize` | Supported | Optional tokenizer boundary, including the tagged cgo implementation | Keep |
 | `pkg/index` | Internalize | Server-owned mutable cache-state implementation | `internal/index` |
@@ -152,13 +162,15 @@ The baseline passes `go test ./...` and `git diff --check`.
 | `pkg/server/auth` | Internalize | Server-owned HTTP authentication | `internal/server/auth` |
 | `pkg/server/proto/...` | Migrate | Generated public gRPC API under a server-owned path | `gen/inferencecache/v1alpha1` |
 | `pkg/cli/doctor/...` | Internalize | `cmd/inferencecache` implementation | `internal/cli/doctor` |
-| `pkg/render` | Remove placeholder | Empty server-owned placeholder with no implementation | Delete; create `internal/server/render` when implemented |
+| `pkg/render` | Reserved public API | Planned reusable `RenderTemplate` library; no production implementation or stable Go API yet | Keep and clarify package status |
 | `pkg/testing` | Internalize | In-repository envtest helpers | `internal/testutil` |
 | `pkg/version` | Internalize | Repository binary build metadata | `internal/version` |
 
 Every completed migration must update package documentation and repository docs
 in the same commit. A remaining `pkg/` package must explicitly document its
-external consumer or supported extension contract.
+external consumer, supported extension/SDK contract, or approved reserved-public
+status. A reserved package must state that no implementation or compatibility
+guarantee exists yet and must not accumulate speculative placeholder APIs.
 
 ## Target source layout
 
@@ -179,6 +191,8 @@ gen/
 internal/
 ├── adapters/
 │   └── builtin/
+│       ├── options.go
+│       ├── registry.go
 │       ├── runtime/
 │       │   ├── vllm_lmcache.go
 │       │   ├── vllm_lmcache_wire.go
@@ -200,8 +214,8 @@ internal/
 │   ├── policy.go
 │   ├── probe.go
 │   └── snapshot.go
+├── canary/
 ├── enginebinding/
-├── engineclient/
 ├── index/
 ├── server/
 │   └── auth/
@@ -216,7 +230,9 @@ pkg/
 ├── adapters/
 │   ├── backend/
 │   └── runtime/
+├── engineclient/
 ├── fingerprint/
+├── render/
 └── tokenize/
 
 proto/
@@ -290,21 +306,52 @@ Proposed commit:
 refactor(adapters): narrow public adapter contracts
 ```
 
-- [ ] Move shipping `Options`, subscriber image/server configuration, and
-  subscriber sidecar rendering from `pkg/adapters/runtime` into
-  `internal/adapters/builtin` or its runtime implementation package.
-- [ ] Keep the runtime interfaces, registry, runtime identifiers,
-  supported-pair types, required structured-binding contract, and required
-  cross-component wire contracts public.
+- [ ] Replace the shipping functional options with a plain
+  `internal/adapters/builtin.Options` value containing `SubscriberImage` and
+  `PolicyServerGRPCAddress`; `cmd/controller` passes that value to
+  `internal/adapters/builtin.New` rather than configuring built-ins through the
+  public runtime API.
+- [ ] In `internal/adapters/builtin.New`, map the composition-level `Options`
+  explicitly to a narrower `internal/adapters/builtin/runtime.SubscriberConfig`
+  value accepted by each shipping runtime constructor. The runtime subpackage
+  must not import its parent `builtin` package.
+- [ ] Remove the shipping `Option`, `WithSubscriberImage`, and
+  `WithPolicyServerGRPCAddress` functional-option API. Move subscriber
+  image/server defaults, config normalization, and sidecar rendering to
+  `internal/adapters/builtin/runtime/subscriber.go`; preserve existing zero-value
+  behavior.
+- [ ] Keep only the core extension contract public under
+  `pkg/adapters/runtime`: `KVCacheRuntimeAdapter`, `RuntimeID`, `Registry`,
+  `SupportedPair`, `PairLister`, `ResolveRuntimeID`, and the required
+  structured-binding methods. The public contract does not promise that an
+  out-of-tree adapter participates in shipping subscriber or kernel-health
+  status behavior.
+- [ ] Move the private `InitContainerProvider` capability,
+  `SubscriberContainerName`, LMCache kernel-check container/annotation/mode/
+  message/env contracts, mode validation, and shared engine-host-network helper
+  to `internal/enginebinding`. Built-in adapters, admission, and controllers
+  import that neutral private owner rather than one another's implementation.
+- [ ] Move built-in vLLM, SGLang, LMCache, and HiCache environment names,
+  defaults, endpoint rendering, and other implementation helpers to
+  `internal/adapters/builtin/runtime`.
+- [ ] Keep `Binding`, `Protocol`, `RenderedStorage`, `Provider`, and their
+  registries public under `pkg/adapters/backend`. Move provider-owned endpoint
+  and binding validation, including the existing external and LMCache endpoint
+  validators, from the runtime package to this backend contract package.
 - [ ] Convert the concrete reference adapter into a Go example or test fixture
   so it documents the extension contract without expanding the production API.
+- [ ] Replace webhook and built-in tests that import the production reference
+  adapter with local test fixtures, and remove migration-only contract aliases.
 - [ ] Keep the LMCache kernel-check implementation in
   `internal/adapters/builtin/runtime/lmcachecheck.go`.
 - [ ] Preserve registry selection, pod mutation, and admission behavior.
 - [ ] Update documentation that still references the pre-refactor adapter paths.
 
 This commit narrows source-level API exposure but must not redesign the adapter
-contract.
+contract. The public seam supports custom build-time implementations within the
+existing API and validation model; a new runtime, cache, provider, or config
+shape can still require API, CRD, webhook, and controller changes in the custom
+fork. It is not a dynamic or schema-extensible plugin mechanism.
 
 ### A2. Move generated gRPC bindings
 
@@ -318,8 +365,11 @@ refactor(proto): move generated grpc API under gen
   `github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1`.
 - [ ] Regenerate the Go protobuf and gRPC bindings under `gen/`.
 - [ ] Update all server, subscriber, test, and tool imports in the same commit.
-- [ ] Update generation and generated-drift checks to treat `gen/` as the only
-  Go output target.
+- [ ] Move the package documentation and generated-contract tests to the new
+  neutral owner.
+- [ ] Update Makefile generation, coverage exclusions, generated-drift checks,
+  CI generated-code checks, review-tool generated-path configuration, and
+  gRPC documentation to treat `gen/` as the only Go output target.
 - [ ] Remove `pkg/server/proto`.
 - [ ] Preserve the protobuf package, service names, field numbers, and wire
   behavior.
@@ -337,12 +387,19 @@ Proposed commit:
 refactor(controlplane): extract snapshot wire contract
 ```
 
-- [ ] Add `internal/controlplaneapi/snapshot.go` for the `/snapshot` JSON DTOs.
-- [ ] Keep mutable index domain types separate from the HTTP representation.
-- [ ] Map index state to the HTTP DTO in the server boundary.
+- [ ] Add `internal/controlplaneapi/snapshot.go` with `Snapshot`,
+  `ReplicaSnapshot`, and `TenantSnapshot` as the owners of the `/snapshot` JSON
+  field names, optional-field behavior, and controller/server skew contract.
+- [ ] Keep mutable index domain types separate from the HTTP representation;
+  do not use aliases between index state and `controlplaneapi` DTOs.
+- [ ] Keep `Index.Snapshot()` returning an index-owned domain snapshot and add
+  an explicit field-by-field mapping to the HTTP DTO at the server boundary.
 - [ ] Update the controller poller to import `internal/controlplaneapi`, not the
   index implementation.
-- [ ] Add JSON wire-shape tests before moving the index package.
+- [ ] Move exact-key, `omitempty`, and presence-bit/skew tests to
+  `internal/controlplaneapi`; keep aggregation, sorting, and accounting
+  invariants with the index implementation.
+- [ ] Add an endpoint-level mapping test before moving the index package.
 
 ### A4. Internalize the mutable cache index
 
@@ -405,36 +462,51 @@ refactor(cli): internalize doctor implementation
 
 The CLI output is a user-facing contract even though the Go package is private.
 
-### A8. Internalize repository support packages
+### A8. Reclassify repository support packages
 
 Proposed commit:
 
 ```text
-refactor(repo): internalize repository support packages
+refactor(repo): reclassify repository support packages
 ```
 
 - [ ] Move `pkg/testing` to `internal/testutil`.
 - [ ] Move `pkg/version` to `internal/version`.
 - [ ] Update Makefile `-ldflags` package paths.
-- [ ] Delete the empty `pkg/render` placeholder.
-- [ ] Create `internal/server/render` only when `RenderTemplate` receives a real
-  implementation.
+- [ ] Keep `pkg/render` as the reserved public package for the planned reusable
+  `RenderTemplate` implementation.
+- [ ] Update `pkg/render` documentation to state that no production
+  implementation or stable Go API exists yet and that the current server does
+  not depend on it.
+- [ ] Do not add speculative render interfaces or placeholder behavior before
+  the implementation requirement is defined.
 
-### A9. Reclassify the engine egress client
+### A9. Narrow and reclassify the public engine client
 
 Proposed commit:
 
 ```text
-refactor(engineclient): internalize the canary engine client
+refactor(engineclient): establish public engine client boundary
 ```
 
-- [ ] Confirm that there is still no external SDK consumer.
-- [ ] Move `pkg/adapters/engineclient` to `internal/engineclient` by default.
-- [ ] Remove or explicitly isolate the unimplemented gRPC placeholder.
-- [ ] Retain the OpenAI-compatible canary/harness behavior and tests.
-
-If a concrete external gateway consumer exists before this step, stop and
-define the supported SDK contract instead of performing the move automatically.
+- [ ] Move `pkg/adapters/engineclient` to the neutral public path
+  `pkg/engineclient`; this is a Go source import-path change.
+- [ ] Keep the public package focused on `EngineClient`, `CompletionParams`,
+  `Completion`, `OpenAIClient`, `NewOpenAI`, and the supported pre-tokenized
+  OpenAI-compatible `/v1/completions` request/response mapping.
+- [ ] Move `PrefixCacheProbe`, Prometheus scraping helpers, and live canary tests
+  to `internal/canary` when they remain reference-stack infrastructure rather
+  than general engine-client behavior.
+- [ ] Delete the unimplemented gRPC client and `ErrNotImplemented` when it has no
+  remaining caller. Add a gRPC transport only with a concrete engine consumer
+  and validated protocol.
+- [ ] Preserve token-ID request encoding, zero-temperature semantics, response
+  size limits, status/error handling, and completion/usage parsing.
+- [ ] Document the current boundary explicitly: it does not yet promise
+  authentication, retries, endpoint discovery, load balancing, streaming,
+  tracing, or a complete OpenAI API SDK.
+- [ ] Update reference-stack scripts, package documentation, and tests for the
+  new public import path and internal canary location.
 
 ## Phase B: split large files without creating new package boundaries
 
@@ -643,13 +715,16 @@ Additional checks by change type:
 | Test/reference-stack move | Affected Make target and GitHub workflow command paths |
 | End of each phase | `go test -race ./...` or the repository `make ci` gate as practical |
 
-Add a lightweight repository-boundary verification before completing Phase A:
+Keep repository-boundary verification lightweight before completing Phase A:
 
-- [ ] Maintain an explicit allow-list of supported `pkg/` packages.
-- [ ] Reject production imports from `pkg/` into `internal/`.
-- [ ] Reject imports from public adapter contracts into built-in adapters.
-- [ ] Reject controller imports of server or mutable-index implementations.
+- [ ] Require every package under `pkg/` to have package documentation that
+  states its intended public role.
+- [ ] Reject imports of module `internal/` packages from non-test Go code under
+  `api/`, `gen/`, or `pkg/`.
 - [ ] Require generated public Go protobuf code to live only under `gen/`.
+
+Do not add component-by-component import bans or a hard-coded `pkg/` allow-list
+in this phase. Use normal code review for the finer-grained dependency rules.
 
 ## Review discipline
 
