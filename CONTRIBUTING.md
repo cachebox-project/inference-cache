@@ -18,6 +18,7 @@ Run the baseline checks before sending a PR:
 ```bash
 make proto-gen
 make proto-lint
+make verify-dco test-dco
 make lint
 make python-lint
 make test-race
@@ -136,11 +137,39 @@ make verify-no-internal-refs    # scans tracked files; also runs in CI and the p
 
 The check (Makefile + `.githooks/pre-commit` + CI) scans every tracked file except the few that define or document this rule, and fails on any internal ticket ID or tracker URL. Emergency override (discouraged): `git commit --no-verify`.
 
+## Developer Certificate of Origin (required)
+
+Every human-authored commit in a pull request must include a `Signed-off-by:`
+trailer whose name and email match that commit's author or committer. The
+trailer certifies the contribution under the
+[Developer Certificate of Origin](https://developercertificate.org/); it is
+not a GPG or SSH signature.
+
+Add the trailer when creating a commit:
+
+```bash
+git commit --signoff
+# Short form:
+git commit -s
+```
+
+After reviewing the latest commit, add a missing trailer with:
+
+```bash
+git commit --amend --no-edit --signoff
+```
+
+For an older commit, use an interactive rebase and amend only commits you can
+personally certify. Do not add another contributor's sign-off on their behalf.
+The `DCO` pull-request check verifies every non-merge commit; bot-authored pull
+requests are exempt. Run the same check locally with `make verify-dco` (and its
+self-contained test suite with `make test-dco`).
+
 ## Before pushing / opening a PR
 
 Run `make install-hooks` once per clone. Thereafter:
 
-- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + format + vet + Go/Python lint + Prometheus rules + golden vectors + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`. CI also runs heavier gates that are not part of the local push hook, including the Rust/network-backed `make tokenize-cgo-test` job for the optional `smgcgo` tokenizer build tag.
+- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + DCO sign-off + format + vet + Go/Python lint + Prometheus rules + golden vectors + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`. CI also runs heavier gates that are not part of the local push hook, including the Rust/network-backed `make tokenize-cgo-test` job for the optional `smgcgo` tokenizer build tag.
 - **Before opening a PR**, run `make pre-pr` — it runs `make ci`, then a generated-code drift check, then `make verify-samples` (server-side dry-run of every YAML under `config/samples/` against an envtest apiserver + the CacheBackend admission webhook), then prints the review checklist. Review the diff against the tech spec before submitting.
 
 Emergency override for the push gate: `git push --no-verify` (discouraged).
