@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -135,6 +136,32 @@ func TestGeneratedProtobufCodeLivesUnderGen(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("scan generated protobuf files: %v", err)
+	}
+}
+
+func TestProtobufGoPackageIsPinnedToGen(t *testing.T) {
+	t.Parallel()
+
+	root := repositoryRoot(t)
+	protoPath := filepath.Join(root, "proto", "inferencecache", "v1alpha1", "inferencecache.proto")
+	contents, err := os.ReadFile(protoPath)
+	if err != nil {
+		t.Fatalf("read protobuf contract: %v", err)
+	}
+	want := `option go_package = "` + modulePath + `/gen/inferencecache/v1alpha1;inferencecachev1alpha1pb";`
+	var got string
+	for _, line := range strings.Split(string(contents), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "option go_package") {
+			continue
+		}
+		if got != "" {
+			t.Fatalf("protobuf contract contains multiple go_package options: %q and %q", got, line)
+		}
+		got = line
+	}
+	if got != want {
+		t.Fatalf("protobuf go_package must remain pinned to the public gen path: got %q, want %q", got, want)
 	}
 }
 
