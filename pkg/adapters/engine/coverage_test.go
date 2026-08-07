@@ -18,7 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 )
 
 func TestReporterOptionsApplied(t *testing.T) {

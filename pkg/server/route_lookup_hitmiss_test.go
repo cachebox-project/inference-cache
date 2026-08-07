@@ -8,9 +8,9 @@ import (
 	"context"
 	"testing"
 
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
 // A healthy routing index must yield a *mix* of hits and misses on a designed

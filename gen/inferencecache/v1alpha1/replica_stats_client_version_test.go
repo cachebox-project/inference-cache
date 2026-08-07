@@ -18,7 +18,7 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 )
 
 func TestReplicaStats_ClientVersion_RoundtripSet(t *testing.T) {

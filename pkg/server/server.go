@@ -21,9 +21,9 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/index"
 	"github.com/cachebox-project/inference-cache/pkg/server/auth"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 

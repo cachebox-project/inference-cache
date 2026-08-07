@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"time"
 
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 )
 
 // Reporter forwards decoded KV-cache events to the policy server over gRPC.

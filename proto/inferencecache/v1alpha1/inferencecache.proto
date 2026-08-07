@@ -6,7 +6,7 @@ syntax = "proto3";
 
 package inferencecache.v1alpha1;
 
-option go_package = "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1;inferencecachev1alpha1pb";
+option go_package = "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1;inferencecachev1alpha1pb";
 
 // InferenceCache is the cache-policy control-plane API. See
 // docs/design/grpc-contract.md.

@@ -17,7 +17,7 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 )
 
 // CacheTier selects which vLLM cache-usage gauge feeds cache_memory_bytes.

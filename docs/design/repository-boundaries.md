@@ -361,17 +361,17 @@ Proposed commit:
 refactor(proto): move generated grpc API under gen
 ```
 
-- [ ] Change `go_package` to
+- [x] Change `go_package` to
   `github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1`.
-- [ ] Regenerate the Go protobuf and gRPC bindings under `gen/`.
-- [ ] Update all server, subscriber, test, and tool imports in the same commit.
-- [ ] Move the package documentation and generated-contract tests to the new
+- [x] Regenerate the Go protobuf and gRPC bindings under `gen/`.
+- [x] Update all server, subscriber, test, and tool imports in the same commit.
+- [x] Move the package documentation and generated-contract tests to the new
   neutral owner.
-- [ ] Update Makefile generation, coverage exclusions, generated-drift checks,
+- [x] Update Makefile generation, coverage exclusions, generated-drift checks,
   CI generated-code checks, review-tool generated-path configuration, and
   gRPC documentation to treat `gen/` as the only Go output target.
-- [ ] Remove `pkg/server/proto`.
-- [ ] Preserve the protobuf package, service names, field numbers, and wire
+- [x] Remove `pkg/server/proto`.
+- [x] Preserve the protobuf package, service names, field numbers, and wire
   behavior.
 
 Because inference-cache has not been formally deployed, the default plan is not

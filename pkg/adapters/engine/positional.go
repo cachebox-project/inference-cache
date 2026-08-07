@@ -5,8 +5,8 @@
 package engine
 
 import (
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
 // positionalIndex turns the engine's incremental, parent-chained block-store

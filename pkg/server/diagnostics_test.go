@@ -13,8 +13,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/index"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
 // TestLookupRouteEmitsUnknownHashScheme pins the scheme-mismatch wire shape:

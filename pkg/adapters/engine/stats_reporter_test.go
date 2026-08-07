@@ -19,7 +19,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 )
 
 // stubScraper returns the configured stats (or error) and counts calls.

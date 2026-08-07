@@ -24,9 +24,9 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	authnv1 "k8s.io/api/authentication/v1"
 
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	"github.com/cachebox-project/inference-cache/pkg/index"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 

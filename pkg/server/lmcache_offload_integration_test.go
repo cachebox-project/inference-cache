@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
 // L2 offload regression: the cache-stress benchmark returned NO_HINT on every

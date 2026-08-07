@@ -313,7 +313,7 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 COVER_MIN ?= 90
 COVER_PROFILE ?= cover.out
 COVER_PROFILE_LOGIC ?= cover.logic.out
-COVER_EXCLUDE := pkg/server/proto/|zz_generated|/cmd/|/hack/|pkg/testing/
+COVER_EXCLUDE := gen/|zz_generated|/cmd/|/hack/|pkg/testing/
 
 .PHONY: cover
 cover: ## Run tests with coverage and print the per-function report (logic packages, cross-package counted).
@@ -539,7 +539,7 @@ install-hooks: ## Install git hooks (vendor-neutral naming guard) via core.hooks
 .PHONY: verify-naming
 verify-naming: ## Fail if core-identity files reference OCI/Oracle (see CONTRIBUTING.md).
 	@bad=$$(grep -rniEI '\boci\b|oci\.com|oraclecloud|\boracle\b' \
-		api proto pkg/server/proto config/crd config/rbac config/default config/manager config/observability config/samples config/server config/webhook config/certmanager config/overlays docs/observability internal PROJECT go.mod 2>/dev/null || true); \
+		api proto gen config/crd config/rbac config/default config/manager config/observability config/samples config/server config/webhook config/certmanager config/overlays docs/observability internal PROJECT go.mod 2>/dev/null || true); \
 	if [ -n "$$bad" ]; then \
 		echo "✗ OCI/Oracle reference in core-identity files (banned per CONTRIBUTING.md):"; \
 		echo "$$bad" | sed 's/^/    /'; \
@@ -624,7 +624,7 @@ ci: verify-naming verify-no-internal-refs verify-dco test-dco reuse-lint verify-
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.
 	@$(MAKE) --no-print-directory manifests generate proto-gen >/dev/null
-	@gen='config/crd config/rbac/role.yaml config/webhook/manifests.yaml api/v1alpha1/zz_generated.deepcopy.go pkg/server/proto'; \
+	@gen='config/crd config/rbac/role.yaml config/webhook/manifests.yaml api/v1alpha1/zz_generated.deepcopy.go gen'; \
 	if ! git diff --quiet -- $$gen; then \
 		echo "✗ generated-code drift — regenerate and commit these files:"; \
 		git --no-pager diff --name-only -- $$gen; \

@@ -8,8 +8,8 @@ import (
 	"context"
 	"testing"
 
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/index"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
 // LookupRoute-level tests for the routing floor score. The PolicyStore

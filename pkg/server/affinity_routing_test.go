@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/index"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
 // newServiceWithReplicas builds the service against a fresh index that

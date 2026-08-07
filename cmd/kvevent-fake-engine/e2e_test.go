@@ -42,10 +42,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	"github.com/cachebox-project/inference-cache/pkg/server"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
 const (

@@ -35,7 +35,7 @@ The repository is one operator split across two binaries plus the CRDs. In short
 | The gRPC contract | `proto/` → `make proto-gen` |
 
 Generated code (`config/crd/`, `config/rbac/role.yaml`, `zz_generated*.go`,
-`pkg/server/proto/`) is committed but never hand-edited — regenerate and commit it with the
+`gen/`) is committed but never hand-edited — regenerate and commit it with the
 source change. Each package's `doc.go` states which binary it belongs to.
 
 ## Design docs
