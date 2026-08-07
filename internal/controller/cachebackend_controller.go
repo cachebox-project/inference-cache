@@ -617,7 +617,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 			// operator running kubectl describe sees the same
 			// shape complaint they would get on a fresh kubectl
 			// apply.
-			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, endpoint); err != nil {
+			if err := backendadapter.ValidateExternalEndpoint(storage.Provider, endpoint); err != nil {
 				readyReason = conditionReasonExternalEndpointInvalid
 				readyMsg = "spec.remoteStorage." + err.Error()
 				break

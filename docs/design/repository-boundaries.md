@@ -306,46 +306,46 @@ Proposed commit:
 refactor(adapters): narrow public adapter contracts
 ```
 
-- [ ] Replace the shipping functional options with a plain
+- [x] Replace the shipping functional options with a plain
   `internal/adapters/builtin.Options` value containing `SubscriberImage` and
   `PolicyServerGRPCAddress`; `cmd/controller` passes that value to
   `internal/adapters/builtin.New` rather than configuring built-ins through the
   public runtime API.
-- [ ] In `internal/adapters/builtin.New`, map the composition-level `Options`
+- [x] In `internal/adapters/builtin.New`, map the composition-level `Options`
   explicitly to a narrower `internal/adapters/builtin/runtime.SubscriberConfig`
   value accepted by each shipping runtime constructor. The runtime subpackage
   must not import its parent `builtin` package.
-- [ ] Remove the shipping `Option`, `WithSubscriberImage`, and
+- [x] Remove the shipping `Option`, `WithSubscriberImage`, and
   `WithPolicyServerGRPCAddress` functional-option API. Move subscriber
   image/server defaults, config normalization, and sidecar rendering to
   `internal/adapters/builtin/runtime/subscriber.go`; preserve existing zero-value
   behavior.
-- [ ] Keep only the core extension contract public under
+- [x] Keep only the core extension contract public under
   `pkg/adapters/runtime`: `KVCacheRuntimeAdapter`, `RuntimeID`, `Registry`,
   `SupportedPair`, `PairLister`, `ResolveRuntimeID`, and the required
   structured-binding methods. The public contract does not promise that an
   out-of-tree adapter participates in shipping subscriber or kernel-health
   status behavior.
-- [ ] Move the private `InitContainerProvider` capability,
+- [x] Move the private `InitContainerProvider` capability,
   `SubscriberContainerName`, LMCache kernel-check container/annotation/mode/
   message/env contracts, mode validation, and shared engine-host-network helper
   to `internal/enginebinding`. Built-in adapters, admission, and controllers
   import that neutral private owner rather than one another's implementation.
-- [ ] Move built-in vLLM, SGLang, LMCache, and HiCache environment names,
+- [x] Move built-in vLLM, SGLang, LMCache, and HiCache environment names,
   defaults, endpoint rendering, and other implementation helpers to
   `internal/adapters/builtin/runtime`.
-- [ ] Keep `Binding`, `Protocol`, `RenderedStorage`, `Provider`, and their
+- [x] Keep `Binding`, `Protocol`, `RenderedStorage`, `Provider`, and their
   registries public under `pkg/adapters/backend`. Move provider-owned endpoint
   and binding validation, including the existing external and LMCache endpoint
   validators, from the runtime package to this backend contract package.
-- [ ] Convert the concrete reference adapter into a Go example or test fixture
+- [x] Convert the concrete reference adapter into a Go example or test fixture
   so it documents the extension contract without expanding the production API.
-- [ ] Replace webhook and built-in tests that import the production reference
+- [x] Replace webhook and built-in tests that import the production reference
   adapter with local test fixtures, and remove migration-only contract aliases.
-- [ ] Keep the LMCache kernel-check implementation in
+- [x] Keep the LMCache kernel-check implementation in
   `internal/adapters/builtin/runtime/lmcachecheck.go`.
-- [ ] Preserve registry selection, pod mutation, and admission behavior.
-- [ ] Update documentation that still references the pre-refactor adapter paths.
+- [x] Preserve registry selection, pod mutation, and admission behavior.
+- [x] Update documentation that still references the pre-refactor adapter paths.
 
 This commit narrows source-level API exposure but must not redesign the adapter
 contract. The public seam supports custom build-time implementations within the

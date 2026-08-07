@@ -27,21 +27,13 @@ const (
 )
 
 type sglangHiCacheAdapter struct {
-	subscriberImage         string
-	policyServerGRPCAddress string
+	subscriber SubscriberConfig
 }
 
 // NewSGLangHiCacheAdapter returns the endpoint-free adapter for SGLang's native
 // host-memory hierarchical cache.
-func NewSGLangHiCacheAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdapter {
-	var cfg runtimeadapter.Options
-	for _, option := range opts {
-		option(&cfg)
-	}
-	return sglangHiCacheAdapter{
-		subscriberImage:         cfg.SubscriberImage,
-		policyServerGRPCAddress: cfg.PolicyServerGRPCAddress,
-	}
+func NewSGLangHiCacheAdapter(subscriber SubscriberConfig) runtimeadapter.KVCacheRuntimeAdapter {
+	return sglangHiCacheAdapter{subscriber: subscriber}
 }
 
 func (sglangHiCacheAdapter) Supports(runtime runtimeadapter.RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
@@ -184,9 +176,8 @@ func (sglangHiCacheAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.
 }
 
 func (a sglangHiCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
-	return runtimeadapter.RenderSubscriberSidecar(runtimeadapter.SubscriberSidecarParams{
-		Image:            a.subscriberImage,
-		ServerAddr:       a.policyServerGRPCAddress,
+	return renderSubscriberSidecar(subscriberSidecarParams{
+		Config:           a.subscriber,
 		Cache:            cache,
 		Pod:              pod,
 		HashScheme:       sglangSubscriberHashScheme,

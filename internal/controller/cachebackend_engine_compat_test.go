@@ -14,8 +14,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 const testBackendUID = "be-uid-123"
@@ -54,7 +54,7 @@ func TestDetectEngineConnectorCrashLoop(t *testing.T) {
 	scheme := newScheme(t)
 	const ns, name = "ns1", "cache"
 	injectedBy := ns + "/" + name
-	sidecar := adapterruntime.SubscriberContainerName
+	sidecar := enginebinding.SubscriberContainerName
 	clbo := func(n string) ctrState { return ctrState{n, crashLoopBackOffReason} }
 	run := func(n string) ctrState { return ctrState{n, ""} }
 

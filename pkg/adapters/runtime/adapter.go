@@ -178,7 +178,7 @@ func (p SupportedPair) String() string {
 // when it can enumerate the concrete (runtime, backend) pairs it accepts.
 // Adapters that match a single canonical pair (the vLLM+LMCache adapter, the
 // future SGLang HiCache adapter) implement it; permissive adapters that
-// accept arbitrary backends (e.g. the in-tree reference adapter) leave it
+// accept arbitrary backends can leave it
 // off and simply do not contribute to [Registry.SupportedPairs].
 type PairLister interface {
 	SupportedPairs() []SupportedPair
@@ -223,45 +223,4 @@ func ResolveRuntimeID(cache *cachev1alpha1.CacheBackend) RuntimeID {
 		return ""
 	}
 	return RuntimeID(strings.ToLower(string(cache.Spec.Runtime)))
-}
-
-// Options configures runtime adapters and is passed through by the built-in
-// production composition. Zero values are
-// valid: empty PolicyServerGRPCAddress falls back to the package default, and
-// empty SubscriberImage disables sidecar auto-attach (see the field doc for
-// why).
-type Options struct {
-	// SubscriberImage is the image reference the vLLM/LMCache adapter uses for
-	// the kvevent-subscriber sidecar across remote bindings (the KV-event stream
-	// is engine-side, not
-	// store-specific). Empty (the zero value)
-	// **disables** sidecar auto-attach — the adapter returns no sidecar
-	// at all. Auto-attach is opt-in by design: a nonexistent default
-	// image would put the sidecar container into ImagePullBackOff and
-	// keep the engine pod from going Ready. See [DefaultSubscriberImage]
-	// for the build-tag operators pin to (or a digest-pinned production
-	// image), passed through the controller's --kvevent-subscriber-image
-	// flag.
-	SubscriberImage string
-
-	// PolicyServerGRPCAddress overrides the host:port the kvevent-
-	// subscriber sidecar dials to ReportCacheState. Empty selects the
-	// package default ([DefaultPolicyServerGRPCAddress]), which assumes the
-	// in-cluster Service produced by config/server installed into the
-	// inference-cache-system namespace.
-	PolicyServerGRPCAddress string
-}
-
-// Option mutates [Options] for callers that prefer the functional-option
-// style. Either Options{...} or a chain of Option helpers work.
-type Option func(*Options)
-
-// WithSubscriberImage sets [Options.SubscriberImage].
-func WithSubscriberImage(image string) Option {
-	return func(o *Options) { o.SubscriberImage = image }
-}
-
-// WithPolicyServerGRPCAddress sets [Options.PolicyServerGRPCAddress].
-func WithPolicyServerGRPCAddress(addr string) Option {
-	return func(o *Options) { o.PolicyServerGRPCAddress = addr }
 }

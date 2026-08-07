@@ -36,7 +36,7 @@ func newHiCacheBackend(spec *cachev1alpha1.SGLangHiCacheSpec) *cachev1alpha1.Cac
 }
 
 func TestHiCacheAdapterContract(t *testing.T) {
-	adapter := NewSGLangHiCacheAdapter()
+	adapter := NewSGLangHiCacheAdapter(SubscriberConfig{})
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
 
 	if !adapter.Supports(runtimeadapter.RuntimeSGLang, cache) {
@@ -80,7 +80,7 @@ func TestHiCacheInjectsOnlyRequestedFlags(t *testing.T) {
 	}
 	beforeNonArgs := pod.DeepCopy()
 
-	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err != nil {
+	if err := NewSGLangHiCacheAdapter(SubscriberConfig{}).InjectEngineConfig(pod, nil, cache); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	args := pod.Containers[0].Args
@@ -110,7 +110,7 @@ func TestHiCacheInjectsOnlyRequestedFlags(t *testing.T) {
 func TestHiCacheOptionalFieldsStayOmitted(t *testing.T) {
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "1.5"})
 	pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "only"}}}
-	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err != nil {
+	if err := NewSGLangHiCacheAdapter(SubscriberConfig{}).InjectEngineConfig(pod, nil, cache); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	if got, ok := testArgValue(pod.Containers[0].Args, SGLangHiCacheRatioArg); !ok || got != "1.5" {
@@ -143,7 +143,7 @@ func TestHiCacheMatchingArgsArePreserved(t *testing.T) {
 		Name: SGLangEngineContainerName,
 		Args: append([]string(nil), originalArgs...),
 	}}}
-	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err != nil {
+	if err := NewSGLangHiCacheAdapter(SubscriberConfig{}).InjectEngineConfig(pod, nil, cache); err != nil {
 		t.Fatalf("InjectEngineConfig: %v", err)
 	}
 	if !reflect.DeepEqual(pod.Containers[0].Args, originalArgs) {
@@ -182,7 +182,7 @@ func TestHiCacheConflictsFailAtomically(t *testing.T) {
 				Volumes: []corev1.Volume{{Name: "keep"}},
 			}
 			before := pod.DeepCopy()
-			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, base); err == nil {
+			if err := NewSGLangHiCacheAdapter(SubscriberConfig{}).InjectEngineConfig(pod, nil, base); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if !reflect.DeepEqual(pod, before) {
@@ -213,7 +213,7 @@ func TestHiCacheOmittedOptionalArgsFailAtomicallyWhenMalformedOrDuplicated(t *te
 				Env:  []corev1.EnvVar{{Name: "KEEP", Value: "yes"}},
 			}}}
 			before := pod.DeepCopy()
-			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err == nil {
+			if err := NewSGLangHiCacheAdapter(SubscriberConfig{}).InjectEngineConfig(pod, nil, cache); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if !reflect.DeepEqual(pod, before) {
@@ -274,7 +274,7 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 			cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
 			tc.mutate(cache)
 			pod := &corev1.PodSpec{Containers: []corev1.Container{{Name: "sglang"}}}
-			if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err == nil {
+			if err := NewSGLangHiCacheAdapter(SubscriberConfig{}).InjectEngineConfig(pod, nil, cache); err == nil {
 				t.Fatal("InjectEngineConfig returned no error")
 			}
 			if len(pod.Containers[0].Args) != 0 {
@@ -290,14 +290,14 @@ func TestHiCacheMultiContainerRequiresSGLangName(t *testing.T) {
 		{Name: "engine"},
 		{Name: "metrics"},
 	}}
-	if err := NewSGLangHiCacheAdapter().InjectEngineConfig(pod, nil, cache); err == nil ||
+	if err := NewSGLangHiCacheAdapter(SubscriberConfig{}).InjectEngineConfig(pod, nil, cache); err == nil ||
 		!strings.Contains(err.Error(), `none is named "sglang"`) {
 		t.Fatalf("InjectEngineConfig error = %v, want missing sglang container", err)
 	}
 }
 
 func TestHiCacheReservedArgs(t *testing.T) {
-	got := NewSGLangHiCacheAdapter().ReservedArgs()
+	got := NewSGLangHiCacheAdapter(SubscriberConfig{}).ReservedArgs()
 	want := []string{
 		SGLangEnableHiCacheArg,
 		SGLangHiCacheSizeArg,
@@ -309,7 +309,7 @@ func TestHiCacheReservedArgs(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReservedArgs = %v, want %v", got, want)
 	}
-	if got := NewSGLangHiCacheAdapter().ReservedEnv(); len(got) != 0 {
+	if got := NewSGLangHiCacheAdapter(SubscriberConfig{}).ReservedEnv(); len(got) != 0 {
 		t.Fatalf("ReservedEnv = %v, want empty", got)
 	}
 }
@@ -318,8 +318,7 @@ func TestHiCacheObservationSidecarReusesSGLangRenderer(t *testing.T) {
 	cache := newHiCacheBackend(&cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"})
 	cache.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
 	adapter := NewSGLangHiCacheAdapter(
-		runtimeadapter.WithSubscriberImage("subscriber:test"),
-		runtimeadapter.WithPolicyServerGRPCAddress("policy:50051"),
+		SubscriberConfig{Image: "subscriber:test", PolicyServerGRPCAddress: "policy:50051"},
 	)
 	sidecar, err := adapter.ObservationSidecar(cache, &corev1.Pod{})
 	if err != nil {

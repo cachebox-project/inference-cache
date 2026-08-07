@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 )
 
 // lookupInjectedEnv returns the value of the env var named name on the engine
@@ -335,7 +336,7 @@ func TestValidateLMCacheEndpoint(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateLMCacheEndpoint(tc.input)
+			err := backendadapter.ValidateLMCacheEndpoint(tc.input)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("ValidateLMCacheEndpoint(%q) = nil, want error containing %q", tc.input, tc.wantMatch)

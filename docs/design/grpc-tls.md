@@ -9,7 +9,7 @@ The **locked design decision** for the gRPC policy server is **one-sided Service
 TLS is **optional at the binary level**, controlled by flags (`--tls-cert-file` / `--tls-key-file`). The server *binary* fully supports TLS, but **`config/default` ships `:9090` plaintext, and TLS is an opt-in overlay** (`config/overlays/server-tls`).
 
 **Why opt-in, not on-by-default (yet).** Both gRPC clients of `:9090` are plaintext-only today:
-- the in-cluster **`kvevent-subscriber` producer** (C1) dials `:9090` to call `ReportCacheState` with `insecure.NewCredentials()` (`cmd/kvevent-subscriber`), targeting the policy Service (`DefaultPolicyServerGRPCAddress` in `pkg/adapters/runtime/lmcache_shared.go`); and
+- the in-cluster **`kvevent-subscriber` producer** (C1) dials `:9090` to call `ReportCacheState` with `insecure.NewCredentials()` (`cmd/kvevent-subscriber`), targeting the policy Service (the built-in default lives in `internal/adapters/builtin/runtime/subscriber.go`); and
 - the **external gateway client** (E1) isn't built yet.
 
 Flipping `config/default` to require TLS would break cache-state **ingestion** (the subscriber's handshake fails → no `ReportCacheState`). So this ticket **locks the decision and lands the full server-side mechanism** (flags, reloading cert, cert-manager Issuer/Certificate, posture metric, opt-in overlay, tests), and **defers the default flip** until both clients are TLS-aware — at which point enabling it is just making `config/overlays/server-tls` the default (and the subscriber needs the server CA distributed into engine-pod namespaces; see *Client trust anchor* below). Operators who want TLS now apply the overlay.

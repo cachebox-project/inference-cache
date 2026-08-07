@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-package runtime
+package backend
 
 import (
 	"fmt"
@@ -12,27 +12,6 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
-
-// Engine-side wire names are public so admission, controllers, tests, and
-// out-of-tree adapters can share the exact protocol spellings without
-// importing a built-in implementation.
-const (
-	EnvLMCacheRemoteURL       = "LMCACHE_REMOTE_URL"
-	EnvLMCacheRemoteSerde     = "LMCACHE_REMOTE_SERDE"
-	EnvLMCacheChunkSize       = "LMCACHE_CHUNK_SIZE"
-	EnvLMCacheLocalCPU        = "LMCACHE_LOCAL_CPU"
-	EnvLMCacheMaxLocalCPU     = "LMCACHE_MAX_LOCAL_CPU_SIZE"
-	EnvVLLMUseV1              = "VLLM_USE_V1"
-	EnvInferenceCacheFailOpen = "INFERENCECACHE_FAIL_OPEN"
-	EnvPythonHashSeed         = "PYTHONHASHSEED"
-	EngineContainerName       = "vllm"
-)
-
-// EngineHostNetworkRequested reports whether the operator opted an engine pod
-// using a Mooncake remote binding into host networking.
-func EngineHostNetworkRequested(cache *cachev1alpha1.CacheBackend) bool {
-	return cache != nil && cache.Spec.Integration != nil && cache.Spec.Integration.EngineHostNetwork
-}
 
 // ValidateLMCacheEndpoint validates a bare host:port or lm://host:port. The
 // port must be a decimal integer in the TCP range 1-65535.

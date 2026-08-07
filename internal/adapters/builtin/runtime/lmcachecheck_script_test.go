@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
 
 // runScript runs kernelCheckScript under python3 with PYTHONPATH=pkgParent and
@@ -39,14 +41,14 @@ func runScript(t *testing.T, pkgParent string, strict bool) (string, int) {
 	for _, kv := range os.Environ() {
 		if strings.HasPrefix(kv, "PYTHONPATH=") ||
 			strings.HasPrefix(kv, "KERNEL_CHECK_MSG=") ||
-			strings.HasPrefix(kv, EnvKernelCheckStrict+"=") {
+			strings.HasPrefix(kv, enginebinding.EnvKernelCheckStrict+"=") {
 			continue
 		}
 		env = append(env, kv)
 	}
 	env = append(env, "PYTHONPATH="+pkgParent, "KERNEL_CHECK_MSG="+msg)
 	if strict {
-		env = append(env, EnvKernelCheckStrict+"=1")
+		env = append(env, enginebinding.EnvKernelCheckStrict+"=1")
 	}
 	cmd.Env = env
 	err = cmd.Run()
@@ -81,7 +83,7 @@ func TestKernelCheckScriptNoNativeSoReportOnlyExitsZero(t *testing.T) {
 	if code != 0 {
 		t.Errorf("report-only exit code = %d, want 0", code)
 	}
-	if !strings.HasPrefix(strings.TrimSpace(msg), KernelCheckMsgFailPrefix) {
+	if !strings.HasPrefix(strings.TrimSpace(msg), enginebinding.KernelCheckMsgFailPrefix) {
 		t.Errorf("message = %q, want FAIL: prefix", msg)
 	}
 	if !strings.Contains(msg, "no native c_ops") {
@@ -94,7 +96,7 @@ func TestKernelCheckScriptNoNativeSoStrictExitsOne(t *testing.T) {
 	if code != 1 {
 		t.Errorf("strict exit code = %d, want 1", code)
 	}
-	if !strings.HasPrefix(strings.TrimSpace(msg), KernelCheckMsgFailPrefix) {
+	if !strings.HasPrefix(strings.TrimSpace(msg), enginebinding.KernelCheckMsgFailPrefix) {
 		t.Errorf("message = %q, want FAIL: prefix", msg)
 	}
 }
@@ -160,7 +162,7 @@ func TestKernelCheckScriptHealthyExtensionReportsOK(t *testing.T) {
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
 	}
-	if strings.TrimSpace(msg) != KernelCheckMsgOK {
-		t.Errorf("message = %q, want %q (a loadable native c_ops must report OK, not a false FAIL)", msg, KernelCheckMsgOK)
+	if strings.TrimSpace(msg) != enginebinding.KernelCheckMsgOK {
+		t.Errorf("message = %q, want %q (a loadable native c_ops must report OK, not a false FAIL)", msg, enginebinding.KernelCheckMsgOK)
 	}
 }

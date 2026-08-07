@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
@@ -43,31 +44,13 @@ const (
 // the observation sidecar but uses its own MP engine wire and a Redis provider
 // binding rather than the standalone lmcache-server.
 type vllmLMCacheAdapter struct {
-	// subscriberImage is the image the kvevent-subscriber sidecar runs.
-	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
-	// returns nil — so an unconfigured controller install doesn't push
-	// engine pods into ImagePullBackOff on a nonexistent default image.
-	subscriberImage string
-	// policyServerGRPCAddress overrides the default in-cluster Service DNS
-	// the sidecar dials to ReportCacheState. Empty falls back to
-	// [DefaultPolicyServerGRPCAddress].
-	policyServerGRPCAddress string
+	subscriber SubscriberConfig
 }
 
 // NewVLLMLMCacheAdapter returns the adapter that wires vLLM engine pods to an
-// LMCache CacheBackend. The optional [adapterruntime.Option] helpers let the controller pin
-// the subscriber sidecar's image + policy-server target; the no-arg form
-// reproduces the package defaults and keeps tests + the nil-Registry
-// fallback paths working.
-func NewVLLMLMCacheAdapter(opts ...adapterruntime.Option) adapterruntime.KVCacheRuntimeAdapter {
-	var cfg adapterruntime.Options
-	for _, o := range opts {
-		o(&cfg)
-	}
-	return vllmLMCacheAdapter{
-		subscriberImage:         cfg.SubscriberImage,
-		policyServerGRPCAddress: cfg.PolicyServerGRPCAddress,
-	}
+// LMCache CacheBackend.
+func NewVLLMLMCacheAdapter(subscriber SubscriberConfig) adapterruntime.KVCacheRuntimeAdapter {
+	return vllmLMCacheAdapter{subscriber: subscriber}
 }
 
 // Supports matches vLLM runtimes against an LMCache CacheBackend. Any other
@@ -170,16 +153,10 @@ func (vllmLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backe
 }
 
 func injectMooncakeEngineHostNetwork(pod *corev1.PodSpec, cache *cachev1alpha1.CacheBackend) {
-	if EngineHostNetworkRequested(cache) {
+	if enginebinding.EngineHostNetworkRequested(cache) {
 		pod.HostNetwork = true
 		pod.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 	}
-}
-
-// EngineHostNetworkRequested reports whether the operator opted engine pods
-// using a Mooncake remote binding into host networking.
-func EngineHostNetworkRequested(cache *cachev1alpha1.CacheBackend) bool {
-	return adapterruntime.EngineHostNetworkRequested(cache)
 }
 
 // InjectRouterConfig is a no-op for LMCache: the LMCache topology has no
@@ -199,7 +176,7 @@ func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, binding *backe
 
 // ObservationSidecar returns the kvevent-subscriber container the Pod webhook
 // appends to a vLLM engine pod so its KV-cache events flow to the policy
-// server. It delegates to the shared [adapterruntime.RenderSubscriberSidecar], pinning the
+// server. It delegates to the shared internal subscriber renderer, pinning the
 // vLLM-specific knobs: --hash-scheme=vllm and the vLLM ZMQ PUB port. The
 // eviction-forwarding policy (--ignore-block-removed) is mode-dependent and
 // computed by the shared builder (suppressed in Offload where the L2 tier
@@ -207,9 +184,8 @@ func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, binding *backe
 // subscriber shape is identical for every vLLM-engine L2 backend (LMCache,
 // Mooncake) because the KV-event stream comes from vLLM itself, not the L2 store.
 func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
-	return adapterruntime.RenderSubscriberSidecar(adapterruntime.SubscriberSidecarParams{
-		Image:            a.subscriberImage,
-		ServerAddr:       a.policyServerGRPCAddress,
+	return renderSubscriberSidecar(subscriberSidecarParams{
+		Config:           a.subscriber,
 		Cache:            cache,
 		Pod:              pod,
 		HashScheme:       vllmSubscriberHashScheme,
@@ -228,12 +204,3 @@ var (
 	kvTransferConfig = KVTransferConfig
 	upsertArgPair    = UpsertArgPair
 )
-
-// ValidateExternalEndpoint is the shared canonical endpoint seam used by
-// admission, reconciliation, and pod injection. It validates an
-// operator-supplied endpoint against the selected remote provider's wire
-// protocol. Bare host:port is portable across providers; explicit schemes are
-// accepted only when the provider's engine wire consumes them.
-func ValidateExternalEndpoint(provider cachev1alpha1.CacheBackendRemoteStorageProvider, endpoint string) error {
-	return adapterruntime.ValidateExternalEndpoint(provider, endpoint)
-}

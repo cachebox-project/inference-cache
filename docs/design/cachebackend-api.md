@@ -407,7 +407,7 @@ the pod, not the CacheBackend's current annotation), so flipping the annotation
 on a live backend takes effect as its pods roll.
 
 **Engine scope — vLLM only today.** The kernel-check init container is provided
-by the runtime adapter via the optional `InitContainerProvider` interface, which
+by the runtime adapter via the private internal `InitContainerProvider` capability, which
 only the vLLM+LMCache adapter implements. The SGLang+LMCache adapter does **not**
 implement it yet, so `inferencecache.io/lmcache-kernel-check` has no effect on
 SGLang engine pods and `EngineKernelsHealthy` is not published for them — even

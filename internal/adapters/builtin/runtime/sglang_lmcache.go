@@ -51,30 +51,12 @@ const (
 // GPU-validated end-to-end; full design: docs/design/sglang-lmcache-mp-mode.md. The
 // kvevent-subscriber sidecar rendering is still shared engine-agnostically.
 type sglangLMCacheAdapter struct {
-	// subscriberImage is the image the kvevent-subscriber sidecar runs.
-	// Empty (the default) disables sidecar auto-attach — ObservationSidecar
-	// returns nil — so an unconfigured controller install doesn't push engine
-	// pods into ImagePullBackOff on a nonexistent default image.
-	subscriberImage string
-	// policyServerGRPCAddress overrides the default in-cluster Service DNS the
-	// sidecar dials to ReportCacheState. Empty falls back to
-	// [runtimeadapter.DefaultPolicyServerGRPCAddress].
-	policyServerGRPCAddress string
+	subscriber SubscriberConfig
 }
 
-// NewSGLangLMCacheAdapter returns the runtime adapter for the (sglang, LMCache) pair. The
-// optional [runtimeadapter.Option] helpers let the controller pin the
-// subscriber sidecar's image + policy-server target — the same options
-// the built-in composition applies uniformly to every shipping adapter.
-func NewSGLangLMCacheAdapter(opts ...runtimeadapter.Option) runtimeadapter.KVCacheRuntimeAdapter {
-	var cfg runtimeadapter.Options
-	for _, o := range opts {
-		o(&cfg)
-	}
-	return sglangLMCacheAdapter{
-		subscriberImage:         cfg.SubscriberImage,
-		policyServerGRPCAddress: cfg.PolicyServerGRPCAddress,
-	}
+// NewSGLangLMCacheAdapter returns the runtime adapter for the (sglang, LMCache) pair.
+func NewSGLangLMCacheAdapter(subscriber SubscriberConfig) runtimeadapter.KVCacheRuntimeAdapter {
+	return sglangLMCacheAdapter{subscriber: subscriber}
 }
 
 // Supports matches SGLang engines against an LMCache CacheBackend. Every other
@@ -131,7 +113,7 @@ func (sglangLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, binding *bac
 
 // ObservationSidecar returns the kvevent-subscriber container the Pod webhook
 // appends to an SGLang engine pod so its KV-cache events flow to the policy
-// server. It delegates to the shared [runtimeadapter.RenderSubscriberSidecar],
+// server. It delegates to the shared internal subscriber renderer,
 // pinning the SGLang-specific knobs: --hash-scheme=sglang (so the index keeps
 // SGLang prefixes disjoint from vLLM's) and SGLang's ZMQ PUB port. The
 // eviction-forwarding policy (--ignore-block-removed) is mode-dependent and
@@ -140,9 +122,8 @@ func (sglangLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, binding *bac
 // binary decodes SGLang's KV-event stream unchanged because SGLang emits the
 // same msgspec BlockStored/BlockRemoved/AllBlocksCleared wire vLLM does.
 func (a sglangLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
-	return runtimeadapter.RenderSubscriberSidecar(runtimeadapter.SubscriberSidecarParams{
-		Image:            a.subscriberImage,
-		ServerAddr:       a.policyServerGRPCAddress,
+	return renderSubscriberSidecar(subscriberSidecarParams{
+		Config:           a.subscriber,
 		Cache:            cache,
 		Pod:              pod,
 		HashScheme:       sglangSubscriberHashScheme,

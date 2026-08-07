@@ -25,20 +25,19 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 // Engine env var names. The cache plane's contract with the engine: an
 // engine pod that carries these variables (plus the --kv-transfer-config
 // arg below) is wired to an LMCache-compatible cache.
 const (
-	EnvLMCacheRemoteURL       = adapterruntime.EnvLMCacheRemoteURL
-	EnvLMCacheRemoteSerde     = adapterruntime.EnvLMCacheRemoteSerde
-	EnvLMCacheChunkSize       = adapterruntime.EnvLMCacheChunkSize
-	EnvLMCacheLocalCPU        = adapterruntime.EnvLMCacheLocalCPU
-	EnvLMCacheMaxLocalCPU     = adapterruntime.EnvLMCacheMaxLocalCPU
-	EnvVLLMUseV1              = adapterruntime.EnvVLLMUseV1
-	EnvInferenceCacheFailOpen = adapterruntime.EnvInferenceCacheFailOpen
+	EnvLMCacheRemoteURL       = "LMCACHE_REMOTE_URL"
+	EnvLMCacheRemoteSerde     = "LMCACHE_REMOTE_SERDE"
+	EnvLMCacheChunkSize       = "LMCACHE_CHUNK_SIZE"
+	EnvLMCacheLocalCPU        = "LMCACHE_LOCAL_CPU"
+	EnvLMCacheMaxLocalCPU     = "LMCACHE_MAX_LOCAL_CPU_SIZE"
+	EnvVLLMUseV1              = "VLLM_USE_V1"
+	EnvInferenceCacheFailOpen = "INFERENCECACHE_FAIL_OPEN"
 	// EnvPythonHashSeed pins Python's hash seed so the NONE_HASH that seeds
 	// vLLM's prefix-cache block-hash chain is deterministic across the
 	// scheduler and the TP worker processes. Under TP>1 those are separate
@@ -47,7 +46,7 @@ const (
 	// stored hashes — LMCache reload silently 0-hits and the engine fully
 	// recomputes with no crash and no error. A correctness invariant, not a
 	// tunable.
-	EnvPythonHashSeed = adapterruntime.EnvPythonHashSeed
+	EnvPythonHashSeed = "PYTHONHASHSEED"
 )
 
 // EngineContainerName is the conventional name of the vLLM container in an
@@ -55,7 +54,7 @@ const (
 // pod is treated as the engine; a multi-container pod is rejected — silently
 // mutating every container would inject vLLM-only flags onto sidecars and
 // crash them.
-const EngineContainerName = adapterruntime.EngineContainerName
+const EngineContainerName = "vllm"
 
 // Defaults the engine env carries when the operator does not override them
 // through typed LMCache config. The CPU-safe
@@ -456,10 +455,6 @@ func ConfigOr(cfg map[string]string, key, fallback string) string {
 // stored values so the engine pod admits unwired rather than crashing).
 // Centralising the rule here means a future tightening only needs to
 // touch one place to ripple to all three layers.
-func ValidateLMCacheEndpoint(s string) error {
-	return adapterruntime.ValidateLMCacheEndpoint(s)
-}
-
 // splitLMCacheHostPort parses a host:port string into its host and port
 // halves with bracket-aware IPv6 handling. Returns (host, port, hasPort)
 // so callers can tell apart `cache` (no port → hasPort=false) from

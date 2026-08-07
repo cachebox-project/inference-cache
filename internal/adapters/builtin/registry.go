@@ -18,13 +18,24 @@ type Registries struct {
 	Storage *backendadapter.Registry
 }
 
-// New constructs the complete built-in registries. Runtime options are applied
+// Options configures the runtime adapters shipped by the controller binary.
+// It belongs to the built-in composition rather than the public adapter seam.
+type Options struct {
+	SubscriberImage         string
+	PolicyServerGRPCAddress string
+}
+
+// New constructs the complete built-in registries. Subscriber settings are applied
 // consistently to every adapter that injects the subscriber sidecar.
-func New(opts ...adapterruntime.Option) Registries {
+func New(opts Options) Registries {
+	subscriber := builtinruntime.SubscriberConfig{
+		Image:                   opts.SubscriberImage,
+		PolicyServerGRPCAddress: opts.PolicyServerGRPCAddress,
+	}
 	runtimeRegistry := adapterruntime.NewRegistry()
-	runtimeRegistry.Register(builtinruntime.NewVLLMLMCacheAdapter(opts...))
-	runtimeRegistry.Register(builtinruntime.NewSGLangLMCacheAdapter(opts...))
-	runtimeRegistry.Register(builtinruntime.NewSGLangHiCacheAdapter(opts...))
+	runtimeRegistry.Register(builtinruntime.NewVLLMLMCacheAdapter(subscriber))
+	runtimeRegistry.Register(builtinruntime.NewSGLangLMCacheAdapter(subscriber))
+	runtimeRegistry.Register(builtinruntime.NewSGLangHiCacheAdapter(subscriber))
 
 	return Registries{
 		Runtime: runtimeRegistry,

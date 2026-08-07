@@ -9,7 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
 
 // gpuResourceName is the extended resource an engine container requests when
@@ -69,17 +69,17 @@ except BaseException as e:
 // arrive — the fallback is a defense-in-depth default, not the typo guard.
 func resolveKernelCheckMode(cache *cachev1alpha1.CacheBackend) string {
 	if cache == nil {
-		return adapterruntime.KernelCheckModeAuto
+		return enginebinding.KernelCheckModeAuto
 	}
-	switch cache.Annotations[adapterruntime.AnnotationLMCacheKernelCheck] {
-	case adapterruntime.KernelCheckModeReportOnly:
-		return adapterruntime.KernelCheckModeReportOnly
-	case adapterruntime.KernelCheckModeStrict:
-		return adapterruntime.KernelCheckModeStrict
-	case adapterruntime.KernelCheckModeOff:
-		return adapterruntime.KernelCheckModeOff
+	switch cache.Annotations[enginebinding.AnnotationLMCacheKernelCheck] {
+	case enginebinding.KernelCheckModeReportOnly:
+		return enginebinding.KernelCheckModeReportOnly
+	case enginebinding.KernelCheckModeStrict:
+		return enginebinding.KernelCheckModeStrict
+	case enginebinding.KernelCheckModeOff:
+		return enginebinding.KernelCheckModeOff
 	default:
-		return adapterruntime.KernelCheckModeAuto
+		return enginebinding.KernelCheckModeAuto
 	}
 }
 
@@ -154,31 +154,31 @@ func (vllmLMCacheAdapter) KernelCheckInitContainer(cache *cachev1alpha1.CacheBac
 		return nil, nil
 	}
 	mode := resolveKernelCheckMode(cache)
-	if mode == adapterruntime.KernelCheckModeOff {
+	if mode == enginebinding.KernelCheckModeOff {
 		return nil, nil
 	}
 	engine := engineContainerForKernelCheck(pod)
 	if engine == nil || engine.Image == "" {
 		return nil, nil
 	}
-	if mode == adapterruntime.KernelCheckModeAuto && !requestsGPU(engine) {
+	if mode == enginebinding.KernelCheckModeAuto && !requestsGPU(engine) {
 		return nil, nil
 	}
 
 	strictValue := "0"
-	if mode == adapterruntime.KernelCheckModeStrict {
+	if mode == enginebinding.KernelCheckModeStrict {
 		strictValue = "1"
 	}
 	env := make([]corev1.EnvVar, 0, len(engine.Env)+1)
 	for _, entry := range engine.Env {
-		if entry.Name != adapterruntime.EnvKernelCheckStrict {
+		if entry.Name != enginebinding.EnvKernelCheckStrict {
 			env = append(env, entry)
 		}
 	}
-	env = append(env, corev1.EnvVar{Name: adapterruntime.EnvKernelCheckStrict, Value: strictValue})
+	env = append(env, corev1.EnvVar{Name: enginebinding.EnvKernelCheckStrict, Value: strictValue})
 
 	return &corev1.Container{
-		Name:                     adapterruntime.LMCacheKernelCheckContainerName,
+		Name:                     enginebinding.LMCacheKernelCheckContainerName,
 		Image:                    engine.Image,
 		ImagePullPolicy:          engine.ImagePullPolicy,
 		SecurityContext:          engine.SecurityContext.DeepCopy(),

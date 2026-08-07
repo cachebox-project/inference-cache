@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-package runtime
+package enginebinding
 
 import (
 	corev1 "k8s.io/api/core/v1"
@@ -10,9 +10,12 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
-// Kernel-check wire contract shared by the injecting built-in adapter and the
-// controller that reads its annotation and termination message.
+// Private wire contracts shared by built-in adapters, admission, and
+// controllers. They are implementation details of the controller binary, not
+// part of the public build-time adapter interface.
 const (
+	SubscriberContainerName = "kvevent-subscriber"
+
 	LMCacheKernelCheckContainerName = "lmcache-kernel-check"
 	AnnotationLMCacheKernelCheck    = "inferencecache.io/lmcache-kernel-check"
 
@@ -26,9 +29,9 @@ const (
 	EnvKernelCheckStrict     = "KERNEL_CHECK_STRICT"
 )
 
-// InitContainerProvider is the optional capability implemented by an adapter
-// that renders an engine-pod init container. Returning nil means no check is
-// required for the given cache and pod.
+// InitContainerProvider is the private capability implemented by a built-in
+// adapter that renders an engine-pod init container. Returning nil means no
+// check is required for the given cache and pod.
 type InitContainerProvider interface {
 	KernelCheckInitContainer(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error)
 }
@@ -42,4 +45,10 @@ func IsValidKernelCheckMode(s string) bool {
 	default:
 		return false
 	}
+}
+
+// EngineHostNetworkRequested reports whether the operator opted an engine pod
+// using a Mooncake remote binding into host networking.
+func EngineHostNetworkRequested(cache *cachev1alpha1.CacheBackend) bool {
+	return cache != nil && cache.Spec.Integration != nil && cache.Spec.Integration.EngineHostNetwork
 }

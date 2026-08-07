@@ -44,7 +44,7 @@ Concretely:
 
 * `KVCacheRuntimeAdapter` gains `ObservationSidecar(cb, pod) (*corev1.Container, error)`.
   The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return the `kvevent-subscriber`
-  container spec (via the shared `RenderSubscriberSidecar` — the KV-event stream is the
+  container spec (via their shared internal subscriber renderer — the KV-event stream is the
   engine's own ZMQ publisher, independent of the L2 store; each adapter pins its engine's
   `--hash-scheme` tag + ZMQ port); the reference adapter returns `(nil, nil)`.
   External ownership stays on the runtime/cache adapter and can attach observation.
@@ -54,7 +54,7 @@ Concretely:
   fail open, matching the rest of the webhook.
 * **The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return nil unless the
   controller's `--kvevent-subscriber-image` flag is set** (all go through the same shared
-  `RenderSubscriberSidecar`, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
+  internal renderer, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
   container into `ImagePullBackOff`, which keeps the engine pod from going Ready — the
   exact "cache becomes a serving dependency" failure mode the fail-open posture exists
   to prevent. Defaulting auto-attach off lets the controller install cleanly into any
@@ -167,8 +167,8 @@ predates the T2 downgrade (earlier this path simply suppressed the eviction and
 left the entry stale at T1) and is kept for backward compatibility, but the
 signal it carries is unchanged. When set, a `BlockRemoved` becomes a T2 downgrade;
 when unset, it forwards `PREFIX_EVICTED`. `AllBlocksCleared` and `BlockStored`
-flow normally in both modes. The shared `RenderSubscriberSidecar` helper
-(`pkg/adapters/runtime/kvevent_subscriber.go`) — which the vLLM/LMCache,
+flow normally in both modes. The shared internal subscriber renderer
+(`internal/adapters/builtin/runtime/subscriber.go`) — which the vLLM/LMCache,
 vLLM/Mooncake, and SGLang/LMCache adapters all call — sets the flag **per
 integration mode**, because the L2 tier is present only in one of them:
 
