@@ -29,7 +29,7 @@ The repository is one operator split across two binaries plus the CRDs. In short
 | Controller / reconciler logic | `internal/controller/` |
 | gRPC handlers, server wiring | `internal/server/` |
 | Cache-state index logic | `internal/index/` |
-| Mutable-slot rendering | `pkg/render/` |
+| Planned reusable rendering API (reserved; not implemented) | `pkg/render/` |
 | Built-in runtime / storage adapters | `internal/adapters/builtin/{runtime,storage}/` |
 | Public adapter extension contracts | `pkg/adapters/{runtime,backend}/` |
 | The gRPC contract | `proto/` → `make proto-gen` |

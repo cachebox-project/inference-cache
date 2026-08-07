@@ -40,7 +40,7 @@ SBOM_TAG := $(subst /,_,$(TAG))
 MINIMAL_IMAGE_DOCKERFILE ?= dockerfiles/Dockerfile
 MINIMAL_RUNTIME_BASE ?= gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
 
-version_pkg = $(MODULE)/pkg/version
+version_pkg = $(MODULE)/internal/version
 LD_FLAGS += -X '$(version_pkg).GitVersion=$(TAG)'
 LD_FLAGS += -X '$(version_pkg).GitCommit=$(shell git rev-parse HEAD 2>/dev/null || echo unknown)'
 
@@ -313,7 +313,7 @@ vulncheck: $(LOCALBIN) ## Scan dependencies + reachable code for known Go vulner
 COVER_MIN ?= 90
 COVER_PROFILE ?= cover.out
 COVER_PROFILE_LOGIC ?= cover.logic.out
-COVER_EXCLUDE := gen/|zz_generated|/cmd/|/hack/|pkg/testing/
+COVER_EXCLUDE := gen/|zz_generated|/cmd/|/hack/|internal/testutil/
 
 .PHONY: cover
 cover: ## Run tests with coverage and print the per-function report (logic packages, cross-package counted).

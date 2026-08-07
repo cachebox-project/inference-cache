@@ -94,7 +94,7 @@ the operator CLI and the CRDs.
 - `internal/server/` — gRPC service (`LookupRoute`, `RenderTemplate`, …), health, metrics
 - `proto/` (+ generated stubs) — the gRPC contract
 - `internal/index/` — cache-state aggregator (`CacheIndex`)
-- `pkg/render/` — mutable-slot prompt rendering engine (the wedge); importable library
+- `pkg/render/` — reserved path for a planned reusable renderer; no stable API yet
 
 **`kvevent-subscriber`** (`cmd/kvevent-subscriber`) — engine-side KV-event ingestion
 - `cmd/kvevent-subscriber/` — composition and lifecycle entrypoint
@@ -104,7 +104,7 @@ the operator CLI and the CRDs.
 - `cmd/inferencecache/` — cobra entrypoint
 - `internal/cli/doctor/` — diagnostic checks + output formatters (see `docs/cli/doctor.md`)
 
-**Shared** — `pkg/version/`, `hack/`, `dockerfiles/`, `.githooks/`
+**Shared** — `internal/version/`, `hack/`, `dockerfiles/`, `.githooks/`
 
 Private cross-binary HTTP DTOs live in `internal/controlplaneapi/`; pod-binding
 metadata shared by admission and reconcilers lives in `internal/enginebinding/`.

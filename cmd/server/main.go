@@ -20,8 +20,8 @@ import (
 
 	"github.com/cachebox-project/inference-cache/internal/server"
 	"github.com/cachebox-project/inference-cache/internal/server/auth"
+	"github.com/cachebox-project/inference-cache/internal/version"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
-	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
 func main() {

@@ -225,7 +225,7 @@ See the README's "Repository layout" for the full map. In short:
 | Pod-binding annotation / metadata contract | `internal/enginebinding/` |
 | gRPC handlers, server wiring | `internal/server/` |
 | Cache-state index logic | `internal/index/` |
-| Mutable-slot rendering (the wedge) | `pkg/render/` |
+| Planned reusable rendering API (reserved; not implemented) | `pkg/render/` |
 | Stable adapter extension contract | `pkg/adapters/{backend,runtime}/` |
 | Shipping adapter implementation / registration | `internal/adapters/builtin/` |
 | Engine KV-event ingest implementation | `internal/subscriber/` |

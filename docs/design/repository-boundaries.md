@@ -470,15 +470,15 @@ Proposed commit:
 refactor(repo): reclassify repository support packages
 ```
 
-- [ ] Move `pkg/testing` to `internal/testutil`.
-- [ ] Move `pkg/version` to `internal/version`.
-- [ ] Update Makefile `-ldflags` package paths.
-- [ ] Keep `pkg/render` as the reserved public package for the planned reusable
+- [x] Move `pkg/testing` to `internal/testutil`.
+- [x] Move `pkg/version` to `internal/version`.
+- [x] Update Makefile `-ldflags` package paths.
+- [x] Keep `pkg/render` as the reserved public package for the planned reusable
   `RenderTemplate` implementation.
-- [ ] Update `pkg/render` documentation to state that no production
+- [x] Update `pkg/render` documentation to state that no production
   implementation or stable Go API exists yet and that the current server does
   not depend on it.
-- [ ] Do not add speculative render interfaces or placeholder behavior before
+- [x] Do not add speculative render interfaces or placeholder behavior before
   the implementation requirement is defined.
 
 ### A9. Narrow and reclassify the public engine client

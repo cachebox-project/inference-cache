@@ -24,9 +24,9 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	"github.com/cachebox-project/inference-cache/internal/controller"
+	"github.com/cachebox-project/inference-cache/internal/version"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
 const leaderLockName = "inference-cache-controller-leader-lock"

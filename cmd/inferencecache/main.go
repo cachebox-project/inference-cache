@@ -19,7 +19,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/cachebox-project/inference-cache/pkg/version"
+	"github.com/cachebox-project/inference-cache/internal/version"
 )
 
 func main() {
