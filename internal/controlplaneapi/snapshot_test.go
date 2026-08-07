@@ -2,9 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-package index
+package controlplaneapi
 
-// Frozen wire-shape contract for pkg/index.Snapshot — the JSON the policy
+// Frozen wire-shape contract for Snapshot — the JSON the policy
 // server publishes at /snapshot and the controller decodes in
 // CacheIndexPoller. A silent rename of any JSON tag (e.g.
 // json:"replicaId" → json:"replica_id") would still pass a round-trip test
@@ -158,6 +158,35 @@ func TestSnapshotJSONOptionalTagWireShape(t *testing.T) {
 	}
 	if !strings.Contains(s, `"lastEventAt":"0001-01-01T00:00:00Z"`) {
 		t.Fatalf("lastEventAt is expected to emit the zero-time sentinel because Go's omitempty does not omit time.Time; got %s", s)
+	}
+}
+
+// TestSnapshotPresenceBitsSupportRollingSkew pins both directions of the
+// presence-bit contract: false values are omitted for old consumers, and a
+// new controller decoding an old-server payload sees the zero-value false
+// signal while retaining the legacy measurements used by its skew fallback.
+func TestSnapshotPresenceBitsSupportRollingSkew(t *testing.T) {
+	newBody, err := json.Marshal(Snapshot{
+		Replicas: []ReplicaSnapshot{{ReplicaID: "r1", HitRate: 0.5}},
+		Tenants:  []TenantSnapshot{{TenantID: "t1", HitRate: 0.5}},
+	})
+	if err != nil {
+		t.Fatalf("marshal new snapshot: %v", err)
+	}
+	if strings.Contains(string(newBody), `"statsReported"`) || strings.Contains(string(newBody), `"hitRateReported"`) {
+		t.Fatalf("false presence bits must be omitted for old consumers: %s", newBody)
+	}
+
+	oldBody := []byte(`{"replicas":[{"replicaId":"r-old","cacheMemoryBytes":100,"hitRate":0.66,"pressure":0,"lastUpdate":"2023-11-14T22:13:20Z","prefixCount":3,"lastEventAt":"0001-01-01T00:00:00Z"}],"tenants":[{"tenantId":"t-old","indexEntries":3,"hitRate":0.66,"memoryUsed":0}],"totalPrefixes":3,"hotPrefixes":0}`)
+	var decoded Snapshot
+	if err := json.Unmarshal(oldBody, &decoded); err != nil {
+		t.Fatalf("decode old-server snapshot: %v", err)
+	}
+	if len(decoded.Replicas) != 1 || decoded.Replicas[0].StatsReported || decoded.Replicas[0].HitRate != 0.66 {
+		t.Fatalf("old replica skew decode = %+v", decoded.Replicas)
+	}
+	if len(decoded.Tenants) != 1 || decoded.Tenants[0].HitRateReported || decoded.Tenants[0].HitRate != 0.66 {
+		t.Fatalf("old tenant skew decode = %+v", decoded.Tenants)
 	}
 }
 

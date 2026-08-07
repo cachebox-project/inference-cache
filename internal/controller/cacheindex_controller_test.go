@@ -28,19 +28,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
-	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
 func TestBuildCacheIndexStatus(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	snap := index.Snapshot{
+	snap := controlplaneapi.Snapshot{
 		TotalPrefixes: 5,
 		HotPrefixes:   0,
-		Replicas: []index.ReplicaSnapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "r1", Tenant: "ns-a", CacheMemoryBytes: 100, HitRate: 0.8, Pressure: 0.5, LastUpdate: now, StatsReported: true},
 		},
-		Tenants: []index.TenantSnapshot{
+		Tenants: []controlplaneapi.TenantSnapshot{
 			// MemoryUsed is non-zero here on purpose: it simulates an older /
 			// skewed server still reporting the deprecated, double-counted
 			// per-tenant memory. The controller must DISCARD it (hard-zero),
@@ -101,8 +101,8 @@ func derefStr(p *string) string {
 //     wins deterministically (preserves listMapKey=id uniqueness).
 func TestBuildCacheIndexStatusFiltersPrefixOnlyAndPicksWinner(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	snap := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	snap := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: "ns-a", CacheMemoryBytes: 100, LastUpdate: now, StatsReported: true},
 			{ReplicaID: "vllm-0", Tenant: "ns-b", CacheMemoryBytes: 200, LastUpdate: now, StatsReported: true},
 			{ReplicaID: "prefix-only", Tenant: "ns-a", PrefixCount: 5},
@@ -135,14 +135,14 @@ func TestBuildCacheIndexStatusFiltersPrefixOnlyAndPicksWinner(t *testing.T) {
 // — that is what this test pins.
 func TestBuildCacheIndexStatusHitRateNilWhenUnreported(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	snap := index.Snapshot{
+	snap := controlplaneapi.Snapshot{
 		TotalPrefixes: 4,
-		Replicas: []index.ReplicaSnapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			// Stats-bearing replica reporting a real 0% hit rate: HitRate is
 			// present as "0", NOT nil — an observed zero, not an absence.
 			{ReplicaID: "r-reported", Tenant: "ns-a", HitRate: 0, LastUpdate: now, StatsReported: true},
 		},
-		Tenants: []index.TenantSnapshot{
+		Tenants: []controlplaneapi.TenantSnapshot{
 			// Tenant with index entries but no reported stats: HitRate nil,
 			// IndexEntries present (a real observed 0-vs-N count).
 			{TenantID: "t-unreported", IndexEntries: 4, HitRate: 0, HitRateReported: false},
@@ -191,12 +191,12 @@ func TestBuildCacheIndexStatusHitRateNilWhenUnreported(t *testing.T) {
 func TestBuildCacheIndexStatusSkewFallbackPreservesOldServerHitRate(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	// Simulate an old server: presence bits unset, but real reported values.
-	snap := index.Snapshot{
+	snap := controlplaneapi.Snapshot{
 		TotalPrefixes: 3,
-		Replicas: []index.ReplicaSnapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "r-old", Tenant: "ns-a", CacheMemoryBytes: 100, HitRate: 0.66, LastUpdate: now, StatsReported: false},
 		},
-		Tenants: []index.TenantSnapshot{
+		Tenants: []controlplaneapi.TenantSnapshot{
 			{TenantID: "t-old", IndexEntries: 3, HitRate: 0.66, HitRateReported: false},
 		},
 	}
@@ -214,7 +214,7 @@ func TestBuildCacheIndexStatusSkewFallbackPreservesOldServerHitRate(t *testing.T
 func TestEmptyIndexStatusRendersZeroSummary(t *testing.T) {
 	// An empty index must still render prefixes.summary.{total,hot}=0 explicitly
 	// (not omit them), matching the contract shape.
-	st := buildCacheIndexStatus(index.Snapshot{}, "http://server/snapshot", time.Unix(1, 0))
+	st := buildCacheIndexStatus(controlplaneapi.Snapshot{}, "http://server/snapshot", time.Unix(1, 0))
 	b, err := json.Marshal(st)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -250,7 +250,7 @@ func TestStatusEqualIgnoresTimestamps(t *testing.T) {
 }
 
 func TestFetchSnapshot(t *testing.T) {
-	want := index.Snapshot{TotalPrefixes: 7, Replicas: []index.ReplicaSnapshot{{ReplicaID: "r1"}}}
+	want := controlplaneapi.Snapshot{TotalPrefixes: 7, Replicas: []controlplaneapi.ReplicaSnapshot{{ReplicaID: "r1"}}}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(want)
 	}))
@@ -284,7 +284,7 @@ func TestFetchSnapshotSendsBearerToken(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
-		_ = json.NewEncoder(w).Encode(index.Snapshot{TotalPrefixes: 1})
+		_ = json.NewEncoder(w).Encode(controlplaneapi.Snapshot{TotalPrefixes: 1})
 	}))
 	defer srv.Close()
 
@@ -370,7 +370,7 @@ func TestRefreshCreatesThenUpdatesOnlyOnChange(t *testing.T) {
 		Build()
 
 	var mu sync.Mutex
-	served := index.Snapshot{TotalPrefixes: 3, Replicas: []index.ReplicaSnapshot{{ReplicaID: "r1", CacheMemoryBytes: 100, HitRate: 0.8, LastUpdate: time.Unix(1_700_000_000, 0)}}}
+	served := controlplaneapi.Snapshot{TotalPrefixes: 3, Replicas: []controlplaneapi.ReplicaSnapshot{{ReplicaID: "r1", CacheMemoryBytes: 100, HitRate: 0.8, LastUpdate: time.Unix(1_700_000_000, 0)}}}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -408,7 +408,7 @@ func TestRefreshCreatesThenUpdatesOnlyOnChange(t *testing.T) {
 
 	// Change the served snapshot → status updates.
 	mu.Lock()
-	served = index.Snapshot{TotalPrefixes: 9, Replicas: []index.ReplicaSnapshot{{ReplicaID: "r1", CacheMemoryBytes: 500, HitRate: 0.9, LastUpdate: time.Unix(1_700_000_100, 0)}}}
+	served = controlplaneapi.Snapshot{TotalPrefixes: 9, Replicas: []controlplaneapi.ReplicaSnapshot{{ReplicaID: "r1", CacheMemoryBytes: 500, HitRate: 0.9, LastUpdate: time.Unix(1_700_000_100, 0)}}}
 	mu.Unlock()
 	if err := p.refresh(ctx); err != nil {
 		t.Fatalf("third refresh: %v", err)
@@ -425,7 +425,7 @@ func TestRefreshCreatesThenUpdatesOnlyOnChange(t *testing.T) {
 // buildPollerWithFixtures spins up a fake client + httptest server and returns
 // a poller wired to both. CacheBackends and engine pods are pre-loaded; the
 // served Snapshot is read under the supplied mutex.
-func buildPollerWithFixtures(t *testing.T, backends []*cachev1alpha1.CacheBackend, enginePods []*corev1.Pod, served *index.Snapshot, mu *sync.Mutex) (*CacheIndexPoller, client.Client, *httptest.Server) {
+func buildPollerWithFixtures(t *testing.T, backends []*cachev1alpha1.CacheBackend, enginePods []*corev1.Pod, served *controlplaneapi.Snapshot, mu *sync.Mutex) (*CacheIndexPoller, client.Client, *httptest.Server) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
@@ -514,9 +514,9 @@ func TestRefreshProjectsParticipationPerBackend(t *testing.T) {
 	t3 := time.Unix(1_700_000_100, 0).UTC()
 
 	var mu sync.Mutex
-	served := index.Snapshot{
+	served := controlplaneapi.Snapshot{
 		TotalPrefixes: 6,
-		Replicas: []index.ReplicaSnapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, LastEventAt: t1},
 			{ReplicaID: "vllm-a-1", Tenant: "default", PrefixCount: 3, LastEventAt: t2},
 			{ReplicaID: "vllm-b-0", Tenant: "default", PrefixCount: 1, LastEventAt: t3},
@@ -565,8 +565,8 @@ func TestRefreshNoEventsForBackendPublishesZeroParticipation(t *testing.T) {
 	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 1, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -605,8 +605,8 @@ func TestRefreshClearsStaleParticipationOnReplicaDrain(t *testing.T) {
 	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 	var mu sync.Mutex
 	tEvent := time.Unix(1_700_000_000, 0).UTC()
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 5, LastEventAt: tEvent},
 		},
 	}
@@ -627,7 +627,7 @@ func TestRefreshClearsStaleParticipationOnReplicaDrain(t *testing.T) {
 
 	// Drain: a successful scrape with zero matching replicas.
 	mu.Lock()
-	served = index.Snapshot{Replicas: nil}
+	served = controlplaneapi.Snapshot{Replicas: nil}
 	mu.Unlock()
 	if err := p.refresh(ctx); err != nil {
 		t.Fatalf("second refresh: %v", err)
@@ -651,8 +651,8 @@ func TestRefreshSameNameDifferentNamespaceAttributesByLabel(t *testing.T) {
 	podNS1 := enginePod("vllm-0", "ns-1", map[string]string{"app": "vllm"})
 	podNS2 := enginePod("vllm-0", "ns-2", map[string]string{"app": "vllm"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: "ns-1", PrefixCount: 2, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 			{ReplicaID: "vllm-0", Tenant: "ns-2", PrefixCount: 5, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
@@ -685,8 +685,8 @@ func TestRefreshDeletedEnginePodSkipsAttribution(t *testing.T) {
 	podA0 := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 	// vllm-a-1 reported in snapshot but no corresponding pod fixture.
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 			{ReplicaID: "vllm-a-1", Tenant: "default", PrefixCount: 99, LastEventAt: time.Unix(1_700_000_999, 0).UTC()},
 		},
@@ -717,8 +717,8 @@ func TestRefreshBackendWithNoEngineSelectorSkipped(t *testing.T) {
 	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
 	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -748,8 +748,8 @@ func TestRefreshNoChurnOnIdenticalSnapshot(t *testing.T) {
 	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
 	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 4, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -786,8 +786,8 @@ func TestRefreshHitRateStaysNil(t *testing.T) {
 	podA0 := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 	podA1 := enginePod("vllm-a-1", "default", map[string]string{"app": "vllm-a"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 2, HitRate: 0.75, StatsReported: true, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 			{ReplicaID: "vllm-a-1", Tenant: "default", PrefixCount: 3, HitRate: 0.85, StatsReported: true, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
@@ -824,8 +824,8 @@ func TestRefreshT2HitRatePresence(t *testing.T) {
 	podB := enginePod("vllm-b-0", "default", map[string]string{"app": "vllm-b"})
 	podC := enginePod("vllm-c-0", "default", map[string]string{"app": "vllm-c"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-h-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 750, T2QueryTokens: 1000, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
 			{ReplicaID: "vllm-b-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 0, T2QueryTokens: 500, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
 			{ReplicaID: "vllm-c-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 0, T2QueryTokens: 0, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
@@ -873,7 +873,7 @@ func TestRefreshT2HitRateGauge(t *testing.T) {
 	podB := enginePod("vb-0", "default", map[string]string{"app": "vb"})
 	podC := enginePod("vc-0", "default", map[string]string{"app": "vc"})
 	var mu sync.Mutex
-	served := index.Snapshot{Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{Replicas: []controlplaneapi.ReplicaSnapshot{
 		{ReplicaID: "vh-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 750, T2QueryTokens: 1000, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
 		{ReplicaID: "vb-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 0, T2QueryTokens: 500, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
 		{ReplicaID: "vc-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 0, T2QueryTokens: 0, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
@@ -915,7 +915,7 @@ inferencecache_backend_t2_query_tokens_total{backend="default/t2-h"} 0
 	// rate is cumulative, idleness alone would NOT prune it — drop-out does. Its
 	// series must be pruned, not left at a stale 0.
 	mu.Lock()
-	served.Replicas = []index.ReplicaSnapshot{
+	served.Replicas = []controlplaneapi.ReplicaSnapshot{
 		{ReplicaID: "vh-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 1200, T2QueryTokens: 1500, LastUpdate: time.Unix(1_700_000_100, 0).UTC()},
 	}
 	mu.Unlock()
@@ -1050,7 +1050,7 @@ func TestRefreshT2HitRateCumulativeAfterRegression(t *testing.T) {
 	cb := cbFixture("t2-r", "default", map[string]string{"app": "vr"})
 	pod := enginePod("vr-0", "default", map[string]string{"app": "vr"})
 	var mu sync.Mutex
-	served := index.Snapshot{Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{Replicas: []controlplaneapi.ReplicaSnapshot{
 		{ReplicaID: "vr-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 750, T2QueryTokens: 1000, LastUpdate: time.Unix(1_700_000_000, 0).UTC()},
 	}}
 	p, _, srv := buildPollerWithFixtures(t,
@@ -1062,7 +1062,7 @@ func TestRefreshT2HitRateCumulativeAfterRegression(t *testing.T) {
 	// Healthy: 750/1000 = 0.75. Now queries climb (1000 -> 5000) while hits stay
 	// flat at 750 — the tier stopped serving reloads.
 	mu.Lock()
-	served.Replicas = []index.ReplicaSnapshot{
+	served.Replicas = []controlplaneapi.ReplicaSnapshot{
 		{ReplicaID: "vr-0", Tenant: "default", PrefixCount: 1, T2HitTokens: 750, T2QueryTokens: 5000, LastUpdate: time.Unix(1_700_000_100, 0).UTC()},
 	}
 	mu.Unlock()
@@ -1087,8 +1087,8 @@ func TestRefreshScrapeFailureDoesNotClearParticipation(t *testing.T) {
 	cbA := cbFixture("backend-a", "default", map[string]string{"app": "vllm-a"})
 	podA := enginePod("vllm-a-0", "default", map[string]string{"app": "vllm-a"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-a-0", Tenant: "default", PrefixCount: 7, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -1128,8 +1128,8 @@ func TestRefreshOverlappingSelectorsFirstNameWins(t *testing.T) {
 	cbBeta := cbFixture("beta", "default", map[string]string{"app": "vllm", "model": "llama"})
 	podMatch := enginePod("vllm-0", "default", map[string]string{"app": "vllm", "model": "llama"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 4, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -1164,8 +1164,8 @@ func TestRefreshAnnotationOwnedBackendWithNoSelector(t *testing.T) {
 	cbOther := cbFixture("other", "default", map[string]string{"app": "vllm"})
 	pod := enginePodInjectedBy("vllm-0", "default", "default", "owner", map[string]string{"app": "vllm"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 3, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -1198,8 +1198,8 @@ func TestRefreshAnnotationOverridesSelectorMatch(t *testing.T) {
 	cbBeta := cbFixture("beta", "default", map[string]string{"app": "vllm"})
 	podMatch := enginePodInjectedBy("vllm-0", "default", "default", "beta", map[string]string{"app": "vllm"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 6, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -1243,8 +1243,8 @@ func TestRefreshPodLookupErrorPreservesPriorStatus(t *testing.T) {
 
 	// First refresh: clean client, publishes a positive participation.
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 9, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -1309,8 +1309,8 @@ func TestRefreshUsesRealisticSidecarIdentityShape(t *testing.T) {
 	// Pod name shaped like a real Deployment-managed ReplicaSet pod.
 	pod := enginePod("vllm-7d9c8b6f4-abcd", "default", map[string]string{"app": "vllm"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-7d9c8b6f4-abcd", Tenant: "default", PrefixCount: 12, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -1342,8 +1342,8 @@ func TestRefreshAnnotationPointsAtMissingBackend(t *testing.T) {
 	other := cbFixture("other", "default", map[string]string{"app": "vllm"})
 	pod := enginePodInjectedBy("vllm-0", "default", "default", "gone", map[string]string{"app": "vllm"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 3, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -1374,8 +1374,8 @@ func TestRefreshAnnotationInWrongNamespaceFallsBack(t *testing.T) {
 	// Pod in ns-pod, annotation points at ns-other/foreign — cross-namespace.
 	pod := enginePodInjectedBy("vllm-0", "ns-pod", "ns-other", "foreign", map[string]string{"app": "vllm"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: "ns-pod", PrefixCount: 4, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -1411,8 +1411,8 @@ func TestRefreshSelectorClearedAfterPublishingDrains(t *testing.T) {
 	cb := cbFixture("backend", "default", map[string]string{"app": "vllm"})
 	pod := enginePod("vllm-0", "default", map[string]string{"app": "vllm"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: "default", PrefixCount: 8, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -1526,7 +1526,7 @@ func TestReconcileTenantStatusesShadowedDuplicate(t *testing.T) {
 	ctx := context.Background()
 
 	// 3 distinct prefixes for "shared": under the effective budget (5).
-	snap := index.Snapshot{Tenants: []index.TenantSnapshot{{TenantID: "shared", IndexEntries: 3}}}
+	snap := controlplaneapi.Snapshot{Tenants: []controlplaneapi.TenantSnapshot{{TenantID: "shared", IndexEntries: 3}}}
 	if err := p.reconcileTenantStatuses(ctx, snap); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -1594,7 +1594,7 @@ func TestReconcileTenantStatusesProjectsAndFlapsQuota(t *testing.T) {
 	}
 
 	// Observed under budget: Ready=True, QuotaExceeded=False, indexEntries=2.
-	under := index.Snapshot{Tenants: []index.TenantSnapshot{{TenantID: "team-vision", IndexEntries: 2}}}
+	under := controlplaneapi.Snapshot{Tenants: []controlplaneapi.TenantSnapshot{{TenantID: "team-vision", IndexEntries: 2}}}
 	if err := p.reconcileTenantStatuses(ctx, under); err != nil {
 		t.Fatalf("reconcile (under): %v", err)
 	}
@@ -1610,7 +1610,7 @@ func TestReconcileTenantStatusesProjectsAndFlapsQuota(t *testing.T) {
 	}
 
 	// Observed over budget: QuotaExceeded flaps True (OverEntryBudget).
-	over := index.Snapshot{Tenants: []index.TenantSnapshot{{TenantID: "team-vision", IndexEntries: 5}}}
+	over := controlplaneapi.Snapshot{Tenants: []controlplaneapi.TenantSnapshot{{TenantID: "team-vision", IndexEntries: 5}}}
 	if err := p.reconcileTenantStatuses(ctx, over); err != nil {
 		t.Fatalf("reconcile (over): %v", err)
 	}
@@ -1651,7 +1651,7 @@ func TestReconcileTenantStatusesAbsentTenantObservedAsZero(t *testing.T) {
 
 	// A successful scrape with no row for team-quiet means it currently holds
 	// zero prefixes — an observed 0, not "unknown".
-	if err := p.reconcileTenantStatuses(ctx, index.Snapshot{}); err != nil {
+	if err := p.reconcileTenantStatuses(ctx, controlplaneapi.Snapshot{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	var got cachev1alpha1.CacheTenant

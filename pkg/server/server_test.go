@@ -25,6 +25,7 @@ import (
 	authnv1 "k8s.io/api/authentication/v1"
 
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	"github.com/cachebox-project/inference-cache/pkg/index"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
@@ -501,10 +502,11 @@ func getString(t *testing.T, url string) (int, string) {
 	return resp.StatusCode, string(body)
 }
 
-// TestSnapshotEndpointReflectsIngest ingests state over gRPC and confirms the
+// TestSnapshotEndpointMapsIndexDomainToWireDTO ingests state over gRPC and confirms the
 // internal /snapshot HTTP endpoint reflects it as JSON (the controller scrapes
-// this to populate the CacheIndex status).
-func TestSnapshotEndpointReflectsIngest(t *testing.T) {
+// this to populate the CacheIndex status). Decoding into the control-plane DTO
+// exercises the explicit index-domain-to-wire mapping at the endpoint boundary.
+func TestSnapshotEndpointMapsIndexDomainToWireDTO(t *testing.T) {
 	conn, _, snapshotURL, stop := startInProcessServerConnFull(t)
 	grpcClient := icpb.NewInferenceCacheClient(conn)
 	defer stop()
@@ -534,7 +536,7 @@ func TestSnapshotEndpointReflectsIngest(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("/snapshot status = %d, want 200", code)
 	}
-	var snap index.Snapshot
+	var snap controlplaneapi.Snapshot
 	if err := json.Unmarshal([]byte(body), &snap); err != nil {
 		t.Fatalf("decode snapshot JSON: %v (body=%s)", err, body)
 	}
@@ -597,14 +599,14 @@ func TestReportCacheState_AcceptsClientVersionOnReplicaStats(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("/snapshot status = %d, want 200", code)
 	}
-	var snap index.Snapshot
+	var snap controlplaneapi.Snapshot
 	if err := json.Unmarshal([]byte(body), &snap); err != nil {
 		t.Fatalf("decode snapshot JSON: %v (body=%s)", err, body)
 	}
 	if snap.TotalPrefixes != 1 {
 		t.Fatalf("totalPrefixes = %d, want 1 — ingestion path dropped the update", snap.TotalPrefixes)
 	}
-	var got *index.ReplicaSnapshot
+	var got *controlplaneapi.ReplicaSnapshot
 	for i := range snap.Replicas {
 		if snap.Replicas[i].ReplicaID == "replica-cv" {
 			got = &snap.Replicas[i]

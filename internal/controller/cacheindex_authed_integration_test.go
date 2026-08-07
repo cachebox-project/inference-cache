@@ -21,7 +21,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	"github.com/cachebox-project/inference-cache/pkg/server/auth"
 )
 
@@ -34,7 +34,7 @@ import (
 //	  -> in-process httptest server wrapped in pkg/server/auth.Middleware
 //	  -> Authenticator calls TokenReview against the envtest apiserver
 //	  -> apiserver validates the token it minted via TokenRequest
-//	  -> handler returns a synthetic index.Snapshot
+//	  -> handler returns a synthetic controlplaneapi.Snapshot
 //	  -> poller decodes it and writes CacheIndex.status against envtest
 //
 // pkg/server/auth/integration_test.go already covers the middleware in
@@ -90,9 +90,9 @@ func TestIntegrationCacheIndexPollerAgainstAuthedSnapshot(t *testing.T) {
 	// (the controller treats prefix-only replicas with no stats reported as
 	// hidden from the cluster-wide CacheIndex.status surface — see the
 	// per-backend CacheBackend.status.indexParticipation path for those).
-	served := index.Snapshot{
+	served := controlplaneapi.Snapshot{
 		TotalPrefixes: 7,
-		Replicas: []index.ReplicaSnapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "r1", CacheMemoryBytes: 200, HitRate: 0.75, LastUpdate: time.Now()},
 		},
 	}

@@ -187,7 +187,7 @@ func New(opts ...Option) *Service {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(idx.Snapshot()); err != nil {
+		if err := json.NewEncoder(w).Encode(snapshotForControlPlane(idx.Snapshot())); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})

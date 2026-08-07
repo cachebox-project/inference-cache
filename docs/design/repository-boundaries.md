@@ -387,19 +387,19 @@ Proposed commit:
 refactor(controlplane): extract snapshot wire contract
 ```
 
-- [ ] Add `internal/controlplaneapi/snapshot.go` with `Snapshot`,
+- [x] Add `internal/controlplaneapi/snapshot.go` with `Snapshot`,
   `ReplicaSnapshot`, and `TenantSnapshot` as the owners of the `/snapshot` JSON
   field names, optional-field behavior, and controller/server skew contract.
-- [ ] Keep mutable index domain types separate from the HTTP representation;
+- [x] Keep mutable index domain types separate from the HTTP representation;
   do not use aliases between index state and `controlplaneapi` DTOs.
-- [ ] Keep `Index.Snapshot()` returning an index-owned domain snapshot and add
+- [x] Keep `Index.Snapshot()` returning an index-owned domain snapshot and add
   an explicit field-by-field mapping to the HTTP DTO at the server boundary.
-- [ ] Update the controller poller to import `internal/controlplaneapi`, not the
+- [x] Update the controller poller to import `internal/controlplaneapi`, not the
   index implementation.
-- [ ] Move exact-key, `omitempty`, and presence-bit/skew tests to
+- [x] Move exact-key, `omitempty`, and presence-bit/skew tests to
   `internal/controlplaneapi`; keep aggregation, sorting, and accounting
   invariants with the index implementation.
-- [ ] Add an endpoint-level mapping test before moving the index package.
+- [x] Add an endpoint-level mapping test before moving the index package.
 
 ### A4. Internalize the mutable cache index
 

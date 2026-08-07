@@ -38,8 +38,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
-	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
 // These tests run the reconciler against a real kube-apiserver (envtest), so they
@@ -1491,8 +1491,8 @@ func TestIntegrationCacheIndexPollerProjectsParticipation(t *testing.T) {
 
 	tEvent := time.Now().Add(-30 * time.Second).UTC().Truncate(time.Second)
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-a-0", Tenant: ns, PrefixCount: 4, LastEventAt: tEvent},
 			{ReplicaID: "vllm-b-0", Tenant: ns, PrefixCount: 1, LastEventAt: tEvent},
 		},
@@ -1536,9 +1536,9 @@ func TestIntegrationCacheIndexAcceptsUntenantedTenantRow(t *testing.T) {
 	k8s, _, _ := startEnv(t)
 	ctx := context.Background()
 
-	served := index.Snapshot{
+	served := controlplaneapi.Snapshot{
 		TotalPrefixes: 5,
-		Tenants: []index.TenantSnapshot{
+		Tenants: []controlplaneapi.TenantSnapshot{
 			{TenantID: "", IndexEntries: 2}, // untenanted bucket
 			{TenantID: "team", IndexEntries: 3},
 		},

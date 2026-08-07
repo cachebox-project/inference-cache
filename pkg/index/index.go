@@ -1760,17 +1760,17 @@ func (i *Index) aggregateLocked() Aggregate {
 	return agg
 }
 
-// Snapshot is a point-in-time, cluster-wide view of the index for the
-// CacheIndex status surface (consumed by the controller). Metadata only.
+// Snapshot is a point-in-time, cluster-wide domain view of the index. The
+// server maps it to the controller-facing /snapshot DTO. Metadata only.
 //
 // TotalPrefixes is the number of distinct prefix keys (a prefix held by
 // multiple replicas counts once), and it equals the sum of
 // tenants[].indexEntries — see Aggregate.
 type Snapshot struct {
-	Replicas      []ReplicaSnapshot `json:"replicas"`
-	Tenants       []TenantSnapshot  `json:"tenants"`
-	TotalPrefixes int               `json:"totalPrefixes"`
-	HotPrefixes   int               `json:"hotPrefixes"` // always 0: intentionally unwired. The per-entry LFU access counter exists but governs cap eviction only; it is not aggregated into a cluster-wide "hot prefix" count.
+	Replicas      []ReplicaSnapshot
+	Tenants       []TenantSnapshot
+	TotalPrefixes int
+	HotPrefixes   int // always 0: intentionally unwired. The per-entry LFU access counter exists but governs cap eviction only; it is not aggregated into a cluster-wide "hot prefix" count.
 }
 
 // ReplicaSnapshot is the latest reported state for one replica, cluster-wide.
@@ -1787,14 +1787,14 @@ type Snapshot struct {
 // consumer scope a pod lookup. Empty when the replica is only known through
 // older code paths that did not carry tenant context.
 type ReplicaSnapshot struct {
-	ReplicaID        string    `json:"replicaId"`
-	Tenant           string    `json:"tenant,omitempty"`
-	CacheMemoryBytes int64     `json:"cacheMemoryBytes"`
-	HitRate          float32   `json:"hitRate"`
-	Pressure         float32   `json:"pressure"`
-	LastUpdate       time.Time `json:"lastUpdate"`
-	PrefixCount      int       `json:"prefixCount"`
-	LastEventAt      time.Time `json:"lastEventAt,omitempty"`
+	ReplicaID        string
+	Tenant           string
+	CacheMemoryBytes int64
+	HitRate          float32
+	Pressure         float32
+	LastUpdate       time.Time
+	PrefixCount      int
+	LastEventAt      time.Time
 	// StatsReported is true once the replica's stats reporter has emitted at
 	// least one stats payload (the replica appears in the stats map). It is the
 	// presence bit that lets a consumer distinguish an observed 0 hit rate /
@@ -1803,11 +1803,11 @@ type ReplicaSnapshot struct {
 	// zero-valued HitRate/Pressure/CacheMemoryBytes/LastUpdate. The CacheIndex
 	// status projection uses it to leave the cluster-aggregate replica hitRate
 	// nil rather than fabricating "0" (see internal/controller).
-	StatsReported bool `json:"statsReported,omitempty"`
+	StatsReported bool
 	// T2HitTokens / T2QueryTokens carry the replica's cumulative tier-2
 	// (external offload) reload token counters across the /snapshot wire.
-	T2HitTokens   int64 `json:"t2HitTokens,omitempty"`
-	T2QueryTokens int64 `json:"t2QueryTokens,omitempty"`
+	T2HitTokens   int64
+	T2QueryTokens int64
 }
 
 // TenantSnapshot is the aggregate footprint for one tenant.
@@ -1825,9 +1825,9 @@ type ReplicaSnapshot struct {
 // docs/design/crd-contract.md and docs/concepts/cachetenant-identity-and-quota.md
 // for the enforcement-boundary rationale.
 type TenantSnapshot struct {
-	TenantID     string  `json:"tenantId"`
-	IndexEntries int64   `json:"indexEntries"`
-	HitRate      float32 `json:"hitRate"`
+	TenantID     string
+	IndexEntries int64
+	HitRate      float32
 	// HitRateReported is true once at least one replica of this tenant has
 	// reported stats (the hit-rate average had n > 0 samples). It is the
 	// presence bit that distinguishes an observed mean hit rate of 0 from "no
@@ -1836,9 +1836,9 @@ type TenantSnapshot struct {
 	// and a zero-valued HitRate. The CacheIndex status projection uses it to
 	// leave the cluster-aggregate tenant hitRate nil rather than fabricating
 	// "0" (see internal/controller).
-	HitRateReported bool `json:"hitRateReported,omitempty"`
+	HitRateReported bool
 	// Deprecated: always 0; read ReplicaSnapshot.CacheMemoryBytes instead.
-	MemoryUsed int64 `json:"memoryUsed"`
+	MemoryUsed int64
 }
 
 // Snapshot returns the current cluster-wide aggregate. Replicas use the latest

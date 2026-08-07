@@ -29,8 +29,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
-	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
 // Defaults for the CacheIndex status poller.
@@ -196,7 +196,7 @@ func (p *CacheIndexPoller) refresh(ctx context.Context) error {
 // from churning resourceVersions (the same discipline as the CacheIndex write
 // and the CacheBackend status writers). A patch failure for one tenant does not
 // abort the others.
-func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap index.Snapshot) error {
+func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap controlplaneapi.Snapshot) error {
 	var tenants cachev1alpha1.CacheTenantList
 	if err := p.Client.List(ctx, &tenants); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -205,7 +205,7 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 		return fmt.Errorf("list CacheTenants: %w", err)
 	}
 
-	observedByID := make(map[string]index.TenantSnapshot, len(snap.Tenants))
+	observedByID := make(map[string]controlplaneapi.TenantSnapshot, len(snap.Tenants))
 	for _, t := range snap.Tenants {
 		observedByID[t.TenantID] = t
 	}
@@ -226,7 +226,7 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 		// reflects 0 rather than staying nil.
 		obs, ok := observedByID[ct.Spec.TenantID]
 		if !ok {
-			obs = index.TenantSnapshot{TenantID: ct.Spec.TenantID}
+			obs = controlplaneapi.TenantSnapshot{TenantID: ct.Spec.TenantID}
 		}
 		// Any CR whose tenantID is owned by a DIFFERENT CacheTenant is a shadowed
 		// duplicate — whether or not it declares a quota of its own. A no-quota
@@ -282,7 +282,7 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap ind
 // arbitrary, and a fabricated 0 would mislead operators, so backend hit-rate
 // aggregation is deliberately left to a follow-up; the presence bit added by
 // the pointer-harmonize change is consumed only by CacheIndex.status.
-func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context, snap index.Snapshot) error {
+func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context, snap controlplaneapi.Snapshot) error {
 	var backends cachev1alpha1.CacheBackendList
 	if err := p.Client.List(ctx, &backends); err != nil {
 		return fmt.Errorf("list CacheBackends: %w", err)
@@ -590,31 +590,31 @@ func (p *CacheIndexPoller) bearerToken() (string, error) {
 // fetchSnapshot GETs and decodes the server's /snapshot JSON. When token is
 // non-empty it is sent as an Authorization: Bearer header so the server's
 // auth middleware can validate it via TokenReview.
-func fetchSnapshot(ctx context.Context, hc *http.Client, url, token string) (index.Snapshot, error) {
+func fetchSnapshot(ctx context.Context, hc *http.Client, url, token string) (controlplaneapi.Snapshot, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return index.Snapshot{}, fmt.Errorf("build snapshot request %q: %w", url, err)
+		return controlplaneapi.Snapshot{}, fmt.Errorf("build snapshot request %q: %w", url, err)
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return index.Snapshot{}, fmt.Errorf("scrape snapshot %s: %w", url, err)
+		return controlplaneapi.Snapshot{}, fmt.Errorf("scrape snapshot %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return index.Snapshot{}, fmt.Errorf("snapshot %s: unexpected status %d", url, resp.StatusCode)
+		return controlplaneapi.Snapshot{}, fmt.Errorf("snapshot %s: unexpected status %d", url, resp.StatusCode)
 	}
-	var snap index.Snapshot
+	var snap controlplaneapi.Snapshot
 	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
-		return index.Snapshot{}, fmt.Errorf("decode snapshot: %w", err)
+		return controlplaneapi.Snapshot{}, fmt.Errorf("decode snapshot: %w", err)
 	}
 	return snap, nil
 }
 
 // buildCacheIndexStatus converts an index snapshot into CacheIndex status.
-func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time) cachev1alpha1.CacheIndexStatus {
+func buildCacheIndexStatus(snap controlplaneapi.Snapshot, serverURL string, now time.Time) cachev1alpha1.CacheIndexStatus {
 	st := cachev1alpha1.CacheIndexStatus{
 		Prefixes: cachev1alpha1.PrefixStatus{
 			Summary: cachev1alpha1.PrefixSummary{Total: int64(snap.TotalPrefixes), Hot: int64(snap.HotPrefixes)},
@@ -633,7 +633,7 @@ func buildCacheIndexStatus(snap index.Snapshot, serverURL string, now time.Time)
 	//     collide on `id` — pick the lexicographically-later tenant
 	//     deterministically so the chosen row is stable across ticks.
 	//     The `tenant` field on each row keeps the source identifiable.
-	byID := make(map[string]index.ReplicaSnapshot, len(snap.Replicas))
+	byID := make(map[string]controlplaneapi.ReplicaSnapshot, len(snap.Replicas))
 	for _, r := range snap.Replicas {
 		if r.LastUpdate.IsZero() {
 			continue
@@ -790,7 +790,7 @@ func effectiveTenantOwners(items []cachev1alpha1.CacheTenant) map[string]types.N
 // owns the same spec.tenantID and is the one actually enforced. Such a duplicate
 // must NOT report its own budget as effective: it goes Ready=False/Duplicate and
 // QuotaExceeded=False/NotEffective so the operator sees it is being ignored.
-func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs index.TenantSnapshot, shadowedBy *types.NamespacedName) cachev1alpha1.CacheTenantStatus {
+func buildCacheTenantStatus(ct *cachev1alpha1.CacheTenant, obs controlplaneapi.TenantSnapshot, shadowedBy *types.NamespacedName) cachev1alpha1.CacheTenantStatus {
 	st := cachev1alpha1.CacheTenantStatus{ObservedGeneration: ct.Generation}
 	// Seed from existing conditions so meta.SetStatusCondition keeps each
 	// condition's LastTransitionTime stable when its Status doesn't flip.

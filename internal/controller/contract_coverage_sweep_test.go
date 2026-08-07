@@ -33,8 +33,8 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
-	"github.com/cachebox-project/inference-cache/pkg/index"
 )
 
 // TestWebhookPollerSelectorFallbackAgreement is the load-bearing
@@ -84,8 +84,8 @@ func TestWebhookPollerSelectorFallbackAgreement(t *testing.T) {
 	const podName = "engine-a"
 	pollerPod := enginePod(podName, ns, labels) // no injected-by annotation
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: podName, Tenant: ns, PrefixCount: 7, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -131,8 +131,8 @@ func TestRefreshNotFoundAndSuccessSameTickSameNamespace(t *testing.T) {
 	// so the Get returns NotFound.
 	livePod := enginePod("vllm-live-0", ns, map[string]string{"app": "vllm-live"})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-live-0", Tenant: ns, PrefixCount: 5, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 			{ReplicaID: "vllm-stale-0", Tenant: ns, PrefixCount: 99, LastEventAt: time.Unix(1_700_000_500, 0).UTC()},
 		},
@@ -177,8 +177,8 @@ func TestRefreshSelectorIsStrictSubsetOfPodLabels(t *testing.T) {
 		"role":    "engine",
 	})
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: ns, PrefixCount: 3, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -217,8 +217,8 @@ func TestRefreshAnnotationNameIsPrefixOfAnotherBackend(t *testing.T) {
 		map[string]string{"app": "vllm-longer"})
 
 	var mu sync.Mutex
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "vllm-0", Tenant: ns, PrefixCount: 11, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
 		},
 	}
@@ -264,8 +264,8 @@ func TestRefreshSamePodNameAcrossTenantsIsFailSoft(t *testing.T) {
 	var mu sync.Mutex
 	tsA := time.Unix(1_700_000_000, 0).UTC()
 	tsB := time.Unix(1_700_000_500, 0).UTC()
-	served := index.Snapshot{
-		Replicas: []index.ReplicaSnapshot{
+	served := controlplaneapi.Snapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: podName, Tenant: nsA, PrefixCount: 4, LastEventAt: tsA},
 			{ReplicaID: podName, Tenant: nsB, PrefixCount: 9, LastEventAt: tsB},
 		},

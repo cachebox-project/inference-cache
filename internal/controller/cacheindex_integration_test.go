@@ -18,7 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // TestIntegrationCacheIndexPoller exercises the CacheIndex poller against a
@@ -36,11 +36,11 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 
 	t.Run("StatusSurfaceOnCreate", func(t *testing.T) {
 		lastUpdate := time.Unix(1_700_000_000, 0).UTC()
-		snap := index.Snapshot{
+		snap := controlplaneapi.Snapshot{
 			TotalPrefixes: 7,
 			// HotPrefixes intentionally left at 0: the controller should render
 			// the deferred access-counting surface explicitly as hot: 0.
-			Replicas: []index.ReplicaSnapshot{{
+			Replicas: []controlplaneapi.ReplicaSnapshot{{
 				ReplicaID:        "vllm-0",
 				Tenant:           "tenant-a",
 				CacheMemoryBytes: 2048,
@@ -49,7 +49,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 				LastUpdate:       lastUpdate,
 				StatsReported:    true,
 			}},
-			Tenants: []index.TenantSnapshot{{
+			Tenants: []controlplaneapi.TenantSnapshot{{
 				TenantID:        "tenant-a",
 				IndexEntries:    7,
 				HitRate:         0.75,
@@ -143,9 +143,9 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 
 	t.Run("SnapshotPollWritesOnlyOnChange", func(t *testing.T) {
 		var mu sync.Mutex
-		served := index.Snapshot{
+		served := controlplaneapi.Snapshot{
 			TotalPrefixes: 3,
-			Replicas: []index.ReplicaSnapshot{{
+			Replicas: []controlplaneapi.ReplicaSnapshot{{
 				ReplicaID:        "vllm-0",
 				Tenant:           "tenant-a",
 				CacheMemoryBytes: 100,
@@ -153,7 +153,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 				LastUpdate:       time.Unix(1_700_000_000, 0).UTC(),
 				StatsReported:    true,
 			}},
-			Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 3, HitRate: 0.8, HitRateReported: true}},
+			Tenants: []controlplaneapi.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 3, HitRate: 0.8, HitRateReported: true}},
 		}
 		var requests int
 		srv := newSnapshotServer(t, &served, &snapshotServerHooks{
@@ -194,9 +194,9 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 			if requests != 2 {
 				t.Fatalf("snapshot requests after two refreshes = %d, want 2", requests)
 			}
-			served = index.Snapshot{
+			served = controlplaneapi.Snapshot{
 				TotalPrefixes: 9,
-				Replicas: []index.ReplicaSnapshot{{
+				Replicas: []controlplaneapi.ReplicaSnapshot{{
 					ReplicaID:        "vllm-0",
 					Tenant:           "tenant-a",
 					CacheMemoryBytes: 500,
@@ -204,7 +204,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 					LastUpdate:       time.Unix(1_700_000_100, 0).UTC(),
 					StatsReported:    true,
 				}},
-				Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, HitRate: 0.9, HitRateReported: true}},
+				Tenants: []controlplaneapi.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 9, HitRate: 0.9, HitRateReported: true}},
 			}
 		}()
 
@@ -267,7 +267,7 @@ func TestIntegrationCacheIndexPoller(t *testing.T) {
 			t.Fatalf("spec after pruning = %#v, want omitted or legacy empty object", spec)
 		}
 
-		snap := index.Snapshot{TotalPrefixes: 1, Tenants: []index.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 1}}}
+		snap := controlplaneapi.Snapshot{TotalPrefixes: 1, Tenants: []controlplaneapi.TenantSnapshot{{TenantID: "tenant-a", IndexEntries: 1}}}
 		srv := newSnapshotServer(t, &snap, nil)
 		defer srv.Close()
 		poller := &CacheIndexPoller{
@@ -318,7 +318,7 @@ type snapshotServerHooks struct {
 	OnRequest func()
 }
 
-func newSnapshotServer(t *testing.T, served *index.Snapshot, hooks *snapshotServerHooks) *httptest.Server {
+func newSnapshotServer(t *testing.T, served *controlplaneapi.Snapshot, hooks *snapshotServerHooks) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/snapshot" {

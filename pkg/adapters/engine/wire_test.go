@@ -28,8 +28,8 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
-	"github.com/cachebox-project/inference-cache/pkg/index"
 	"github.com/cachebox-project/inference-cache/pkg/server"
 )
 
@@ -95,7 +95,7 @@ func TestStatsReporterPopulatesSnapshotReplicas(t *testing.T) {
 	// auth scoping); the test reads it directly since no auth is configured.
 	baseURL := "http://" + snapLis.Addr().String()
 	deadline := time.Now().Add(5 * time.Second)
-	var snap index.Snapshot
+	var snap controlplaneapi.Snapshot
 	for time.Now().Before(deadline) {
 		code, body := getSnapshot(t, baseURL)
 		if code == http.StatusOK && json.Unmarshal([]byte(body), &snap) == nil && len(snap.Replicas) > 0 {
