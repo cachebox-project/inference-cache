@@ -10,7 +10,7 @@ package fingerprint
 // (block i is the i-th full block, so block 0 covers the first blockSize tokens),
 // and blockTokenCounts[i] is the per-block token count (always blockSize for a
 // full block). It is the query-side mirror of the subscriber's per-block PrefixEntry
-// ingest (pkg/adapters/engine/positional.go) — so a lookup built from the same
+// ingest (internal/subscriber/positional.go) — so a lookup built from the same
 // tokens the engine cached matches the ingested keys by construction.
 //
 // Partial trailing tokens (fewer than blockSize) are discarded, matching engines

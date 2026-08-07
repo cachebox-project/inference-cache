@@ -58,7 +58,7 @@ event stream, computes the content fingerprint in-pod, and calls the server's
 `ReportCacheState`. It sets `replica_id = <pod-name>` and also runs a stats reporter that
 derives `cache_memory_bytes` from a scraped usage percentage. Auto-injection is opt-in —
 the controller injects it only when started with a `--kvevent-subscriber-image`.
-The subscriber binary owns the engine event adapters in `pkg/adapters/engine`.
+The subscriber binary owns the engine event adapters in `internal/subscriber`.
 
 ### `inferencecache` CLI
 

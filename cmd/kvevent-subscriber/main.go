@@ -34,7 +34,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
+	"github.com/cachebox-project/inference-cache/internal/subscriber"
 )
 
 func main() {
@@ -60,13 +60,13 @@ func main() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	names, err := engine.ParseAdapterNames(*adapterNames)
+	names, err := subscriber.ParseAdapterNames(*adapterNames)
 	if err != nil {
 		logger.Error("invalid --lora-adapter-names", "value", *adapterNames, "err", err)
 		os.Exit(2)
 	}
 
-	cfg := engine.Config{
+	cfg := subscriber.Config{
 		ReplicaID:    *replica,
 		ModelID:      *model,
 		TenantID:     *tenant,
@@ -77,9 +77,9 @@ func main() {
 		logger.Error("invalid config", "err", err)
 		os.Exit(2)
 	}
-	tier := engine.CacheTier(*cacheTier)
+	tier := subscriber.CacheTier(*cacheTier)
 	if !tier.IsValid() {
-		logger.Error("invalid --cache-tier", "value", *cacheTier, "valid", engine.ValidCacheTierNames())
+		logger.Error("invalid --cache-tier", "value", *cacheTier, "valid", subscriber.ValidCacheTierNames())
 		os.Exit(2)
 	}
 
@@ -97,15 +97,15 @@ func main() {
 
 	client := icpb.NewInferenceCacheClient(conn)
 
-	reporter := engine.NewReporter(client, cfg,
-		engine.WithWindow(*window),
-		engine.WithLogger(logger),
-		engine.WithIgnoreBlockRemoved(*ignoreBlockRemoved))
-	sub := engine.NewSubscriber(*endpoint, *topic, engine.WithSubscriberLogger(logger))
+	reporter := subscriber.NewReporter(client, cfg,
+		subscriber.WithWindow(*window),
+		subscriber.WithLogger(logger),
+		subscriber.WithIgnoreBlockRemoved(*ignoreBlockRemoved))
+	sub := subscriber.NewSubscriber(*endpoint, *topic, subscriber.WithSubscriberLogger(logger))
 
-	scraper := engine.NewMetricsScraper(
+	scraper := subscriber.NewMetricsScraper(
 		&http.Client{Timeout: 5 * time.Second},
-		engine.ScraperConfig{
+		subscriber.ScraperConfig{
 			URL:                   *metricsURL,
 			Tier:                  tier,
 			ModelLabel:            *engineModel,
@@ -114,12 +114,12 @@ func main() {
 		},
 		logger,
 	)
-	statsReporter := engine.NewStatsReporter(client, scraper, cfg,
-		engine.WithStatsInterval(*statsInterval),
-		engine.WithStatsLogger(logger),
+	statsReporter := subscriber.NewStatsReporter(client, scraper, cfg,
+		subscriber.WithStatsInterval(*statsInterval),
+		subscriber.WithStatsLogger(logger),
 	)
 
-	out := make(chan *engine.EventBatch, 256)
+	out := make(chan *subscriber.EventBatch, 256)
 
 	// The reporter stops by draining a closed channel, not by signal — so on
 	// shutdown the batches already buffered in `out` are flushed rather than

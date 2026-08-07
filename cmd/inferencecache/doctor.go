@@ -27,8 +27,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/cli/doctor/checks"
-	"github.com/cachebox-project/inference-cache/pkg/cli/doctor/output"
+	"github.com/cachebox-project/inference-cache/internal/cli/doctor/checks"
+	"github.com/cachebox-project/inference-cache/internal/cli/doctor/output"
 )
 
 // Server-discovery defaults. The Service name and system namespace match the

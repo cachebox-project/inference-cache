@@ -95,11 +95,14 @@ the operator CLI and the CRDs.
 - `proto/` (+ generated stubs) — the gRPC contract
 - `internal/index/` — cache-state aggregator (`CacheIndex`)
 - `pkg/render/` — mutable-slot prompt rendering engine (the wedge); importable library
-- `pkg/adapters/engine/` — engine KV-event hook (feeds the index)
+
+**`kvevent-subscriber`** (`cmd/kvevent-subscriber`) — engine-side KV-event ingestion
+- `cmd/kvevent-subscriber/` — composition and lifecycle entrypoint
+- `internal/subscriber/` — engine KV-event hook (feeds the index)
 
 **`inferencecache`** (`cmd/inferencecache`) — operator CLI; `doctor` runs a read-only pre-flight diagnostic
 - `cmd/inferencecache/` — cobra entrypoint
-- `pkg/cli/doctor/` — diagnostic checks + output formatters (see `docs/cli/doctor.md`)
+- `internal/cli/doctor/` — diagnostic checks + output formatters (see `docs/cli/doctor.md`)
 
 **Shared** — `pkg/version/`, `hack/`, `dockerfiles/`, `.githooks/`
 

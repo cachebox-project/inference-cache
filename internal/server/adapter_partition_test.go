@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
+	"github.com/cachebox-project/inference-cache/internal/subscriber"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 )
 
@@ -34,7 +34,7 @@ func TestLookupRouteAdapterPartitionRoundTrip(t *testing.T) {
 	toks := tokenSeq(1_000, blockTok)
 	key := fingerprint.Bytes(fingerprint.PrefixHashes(toks, blockTok)[0])
 
-	cfg := engine.Config{
+	cfg := subscriber.Config{
 		ReplicaID:  "vllm-engine-cs1",
 		ModelID:    modelID,
 		TenantID:   tenantID,
@@ -44,10 +44,10 @@ func TestLookupRouteAdapterPartitionRoundTrip(t *testing.T) {
 		AdapterNames: map[int64]string{sqlID: "sql-lora", chatID: "chat-lora"},
 	}
 	client, stop := runEngineReporterCfgAgainstServer(t, cfg,
-		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)},
-		&engine.EventBatch{Events: []engine.Event{
-			engine.BlockStored{BlockHashes: [][]byte{be8(1)}, TokenIDs: toks, BlockSize: blockTok, LoRAID: &sqlID},
-			engine.BlockStored{BlockHashes: [][]byte{be8(2)}, TokenIDs: toks, BlockSize: blockTok, LoRAID: &chatID},
+		[]subscriber.ReporterOption{subscriber.WithIgnoreBlockRemoved(true)},
+		&subscriber.EventBatch{Events: []subscriber.Event{
+			subscriber.BlockStored{BlockHashes: [][]byte{be8(1)}, TokenIDs: toks, BlockSize: blockTok, LoRAID: &sqlID},
+			subscriber.BlockStored{BlockHashes: [][]byte{be8(2)}, TokenIDs: toks, BlockSize: blockTok, LoRAID: &chatID},
 		}},
 	)
 	defer stop()
@@ -106,9 +106,9 @@ func TestLookupRouteWithoutAdapterIsUnchanged(t *testing.T) {
 	key := fingerprint.Bytes(fingerprint.PrefixHashes(toks, blockTok)[0])
 
 	client, stop := runEngineReporterAgainstServer(t,
-		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)},
-		&engine.EventBatch{Events: []engine.Event{
-			engine.BlockStored{BlockHashes: [][]byte{be8(1)}, TokenIDs: toks, BlockSize: blockTok},
+		[]subscriber.ReporterOption{subscriber.WithIgnoreBlockRemoved(true)},
+		&subscriber.EventBatch{Events: []subscriber.Event{
+			subscriber.BlockStored{BlockHashes: [][]byte{be8(1)}, TokenIDs: toks, BlockSize: blockTok},
 		}},
 	)
 	defer stop()

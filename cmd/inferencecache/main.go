@@ -10,7 +10,7 @@
 // The binary deliberately keeps its glue thin — flag parsing, Kubernetes/gRPC
 // client construction, and server-endpoint discovery live here, while the
 // diagnostic logic and output formatting live in the unit-tested
-// github.com/cachebox-project/inference-cache/pkg/cli/doctor packages.
+// internal/cli/doctor packages.
 package main
 
 import (

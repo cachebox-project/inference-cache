@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
+	"github.com/cachebox-project/inference-cache/internal/subscriber"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 )
 
@@ -16,15 +16,15 @@ import (
 // returns its BlockStored events. If the synthetic encoding drifts from what
 // the subscriber decodes, a smoke would assert against a key the subscriber
 // never produced (false green) — so every shape change must round-trip here.
-func decodeStored(t *testing.T, payload []byte) []engine.BlockStored {
+func decodeStored(t *testing.T, payload []byte) []subscriber.BlockStored {
 	t.Helper()
-	batch, err := engine.DecodeEventBatch(payload)
+	batch, err := subscriber.DecodeEventBatch(payload)
 	if err != nil {
 		t.Fatalf("DecodeEventBatch: %v", err)
 	}
-	out := make([]engine.BlockStored, 0, len(batch.Events))
+	out := make([]subscriber.BlockStored, 0, len(batch.Events))
 	for i, ev := range batch.Events {
-		bs, ok := ev.(engine.BlockStored)
+		bs, ok := ev.(subscriber.BlockStored)
 		if !ok {
 			t.Fatalf("event %d = %T, want BlockStored", i, ev)
 		}

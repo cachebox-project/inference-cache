@@ -441,11 +441,11 @@ Proposed commit:
 refactor(subscriber): internalize kv event ingestion
 ```
 
-- [ ] Move `pkg/adapters/engine` to `internal/subscriber`.
-- [ ] Keep `cmd/kvevent-subscriber` as a thin composition and lifecycle layer.
-- [ ] Preserve ZMQ decoding, positional fingerprinting, metrics scraping,
+- [x] Move `pkg/adapters/engine` to `internal/subscriber`.
+- [x] Keep `cmd/kvevent-subscriber` as a thin composition and lifecycle layer.
+- [x] Preserve ZMQ decoding, positional fingerprinting, metrics scraping,
   batching, reconnect, gRPC reporting, and fail-soft behavior.
-- [ ] Keep tests and testdata beside the implementation.
+- [x] Keep tests and testdata beside the implementation.
 
 ### A7. Internalize the doctor CLI implementation
 
@@ -455,9 +455,9 @@ Proposed commit:
 refactor(cli): internalize doctor implementation
 ```
 
-- [ ] Move `pkg/cli/doctor` to `internal/cli/doctor`.
-- [ ] Preserve the existing `checks` and `output` subpackages.
-- [ ] Preserve CLI flags, finding codes, JSON field names, output formats, and
+- [x] Move `pkg/cli/doctor` to `internal/cli/doctor`.
+- [x] Preserve the existing `checks` and `output` subpackages.
+- [x] Preserve CLI flags, finding codes, JSON field names, output formats, and
   exit-code behavior.
 
 The CLI output is a user-facing contract even though the Go package is private.

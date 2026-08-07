@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
+	"github.com/cachebox-project/inference-cache/internal/subscriber"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 )
 
@@ -38,14 +38,14 @@ func TestRouteLookupMixedHitMiss(t *testing.T) {
 	)
 
 	// Store K distinct single-block prefixes and remember each one's content key.
-	var batches []*engine.EventBatch
+	var batches []*subscriber.EventBatch
 	keys := make([][]byte, k)
 	for i := 0; i < k; i++ {
 		toks := tokenSeq(1_000+i*10_000, blockTok) // far-apart ranges → distinct content
 		keys[i] = fingerprint.Bytes(fingerprint.PrefixHashes(toks, blockTok)[0])
-		batches = append(batches, &engine.EventBatch{
+		batches = append(batches, &subscriber.EventBatch{
 			TimestampSeconds: 0, // 0 = "now" server-side; a real epoch ts would be past the freshness TTL
-			Events: []engine.Event{engine.BlockStored{
+			Events: []subscriber.Event{subscriber.BlockStored{
 				BlockHashes: [][]byte{be8(uint64(i) + 1)},
 				TokenIDs:    toks,
 				BlockSize:   blockTok,
@@ -54,7 +54,7 @@ func TestRouteLookupMixedHitMiss(t *testing.T) {
 	}
 
 	client, stop := runEngineReporterAgainstServer(t,
-		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)}, batches...)
+		[]subscriber.ReporterOption{subscriber.WithIgnoreBlockRemoved(true)}, batches...)
 	defer stop()
 
 	match := func(key []byte) bool {

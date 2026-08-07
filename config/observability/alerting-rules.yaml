@@ -82,7 +82,7 @@ groups:
         # have been present since vLLM ~0.18 (the release that added
         # LMCache-style offload support). This operator does not
         # currently scrape them
-        # (pkg/adapters/engine/metrics_scraper.go only reads
+        # (internal/subscriber/metrics_scraper.go only reads
         # vllm:prefix_cache_{hits,queries} for T1 plus
         # vllm:*_cache_usage_perc), so the alert binds directly to
         # vLLM's exposition. Operators should sanity-check the metric
@@ -109,7 +109,7 @@ groups:
         # Python-prometheus-client convention (counter `foo` exposed as
         # `foo_total`) AND the unsuffixed form used by some non-Python
         # Prometheus clients. The repo's own scraper hedges the same
-        # way (pkg/adapters/engine/metrics_scraper.go `sumCounter`), so
+        # way (internal/subscriber/metrics_scraper.go `sumCounter`), so
         # the alert stays in lockstep with the scraper.
         #
         # SCRAPE-SCOPING REQUIREMENT: this expression matches EVERY

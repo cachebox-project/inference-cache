@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
-	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	"github.com/cachebox-project/inference-cache/internal/index"
+	"github.com/cachebox-project/inference-cache/internal/subscriber"
+	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 
@@ -147,16 +147,16 @@ func TestLookupRouteTokenIDsEqualsExplicitChain(t *testing.T) {
 	)
 	tokens := tokenSeq(1_000, 64) // 4 blocks, matched_tokens=64 clears the default floor
 
-	batch := &engine.EventBatch{
+	batch := &subscriber.EventBatch{
 		TimestampSeconds: 0,
-		Events: []engine.Event{engine.BlockStored{
+		Events: []subscriber.Event{subscriber.BlockStored{
 			BlockHashes: [][]byte{be8(1), be8(2), be8(3), be8(4)},
 			TokenIDs:    tokens,
 			BlockSize:   blockSz,
 		}},
 	}
 	client, stop := runEngineReporterAgainstServer(t,
-		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)}, batch)
+		[]subscriber.ReporterOption{subscriber.WithIgnoreBlockRemoved(true)}, batch)
 	defer stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -255,11 +255,11 @@ func TestLookupRoutePromptTextDefaultTokenizeTimeout(t *testing.T) {
 // callers, not just pre-fingerprinted block_hashes requests.
 func TestLookupRouteTokenIDsNovelAffinityFallback(t *testing.T) {
 	stored := tokenSeq(1_000, 64)
-	batch := &engine.EventBatch{Events: []engine.Event{engine.BlockStored{
+	batch := &subscriber.EventBatch{Events: []subscriber.Event{subscriber.BlockStored{
 		BlockHashes: [][]byte{be8(1), be8(2), be8(3), be8(4)}, TokenIDs: stored, BlockSize: 16,
 	}}}
 	client, stop := runEngineReporterAgainstServer(t,
-		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)}, batch)
+		[]subscriber.ReporterOption{subscriber.WithIgnoreBlockRemoved(true)}, batch)
 	defer stop()
 
 	resp, err := client.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
@@ -391,11 +391,11 @@ func TestLookupRouteOversizedTokenizerOutputFailsOpen(t *testing.T) {
 // overrode it the server would fingerprint the novel tokens and miss.
 func TestLookupRouteExplicitChainBeatsTokenIDs(t *testing.T) {
 	stored := tokenSeq(1_000, 64)
-	batch := &engine.EventBatch{Events: []engine.Event{engine.BlockStored{
+	batch := &subscriber.EventBatch{Events: []subscriber.Event{subscriber.BlockStored{
 		BlockHashes: [][]byte{be8(1), be8(2), be8(3), be8(4)}, TokenIDs: stored, BlockSize: 16,
 	}}}
 	client, stop := runEngineReporterAgainstServer(t,
-		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)}, batch)
+		[]subscriber.ReporterOption{subscriber.WithIgnoreBlockRemoved(true)}, batch)
 	defer stop()
 
 	bh, btc := fingerprint.Chain(stored, 16)

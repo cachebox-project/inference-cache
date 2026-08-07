@@ -333,7 +333,7 @@ in the upstream v0.18 docs page). Our alert and triage queries accept
 both the unsuffixed and `_total` forms via `{__name__=~"...(_total)?"}`.
 
 This operator has no in-process scrape of those upstream metrics — its
-own scraper (`pkg/adapters/engine/metrics_scraper.go`) only reads the T1
+own scraper (`internal/subscriber/metrics_scraper.go`) only reads the T1
 `vllm:prefix_cache_{hits,queries}` plus `vllm:*_cache_usage_perc`. That
 means the alert binds directly to vLLM's exposition, and an upstream
 rename, deprecation, or version skew can silently make the alert inert

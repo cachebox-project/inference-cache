@@ -103,7 +103,7 @@ hundreds of bytes per replica, vs. hundreds of bytes per prefix entry.
 
 **The prefix-hash byte width does NOT dominate.** Going from 32-byte hashes (LMCache /
 SHA-256-style) to 16-byte hashes shaved only ~16 B/entry on the heap. The in-tree vLLM
-adapter ([`pkg/adapters/engine/events.go`](../../pkg/adapters/engine/events.go) —
+adapter ([`internal/subscriber/events.go`](../../internal/subscriber/events.go) —
 `uint64BE`) normalizes integer block hashes to **8-byte big-endian** under the `vllm`
 hash_scheme, which would shave a few more bytes. The map machinery and `time.Time` are
 the bulk of the cost, not the hash bytes — narrower hashes don't materially change pod
@@ -139,7 +139,7 @@ Replicas multiply E by R but only at ~50 B/extra-replica per shared entry.
 
 The index stores **one entry per block hash**, not per prompt. The vLLM KV-event
 subscriber maps each `BlockStored` event into one `PrefixEntry` per block hash (see
-[`pkg/adapters/engine/mapper.go`](../../pkg/adapters/engine/mapper.go) — `StoredPrefixes`),
+[`internal/subscriber/mapper.go`](../../internal/subscriber/mapper.go) — `StoredPrefixes`),
 each with a cumulative `token_count`. A 1000-token prompt at vLLM's 16-token block size
 produces ~63 block hashes (`ceil(1000/16)`), which becomes ~63 entries per replica. Plan
 for this expansion, not the single-blob shape, when sizing.

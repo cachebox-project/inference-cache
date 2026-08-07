@@ -11,7 +11,7 @@ import (
 	"time"
 
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
+	"github.com/cachebox-project/inference-cache/internal/subscriber"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
 )
 
@@ -35,9 +35,9 @@ import (
 // hashes are 8-byte big-endian to match the on-the-wire shape the
 // subscriber's hashToBytes produces from vLLM's integer-hash variant — the
 // canonical L2 offload shape.
-func runEngineReporterAgainstServer(t *testing.T, opts []engine.ReporterOption, batches ...*engine.EventBatch) (client icpb.InferenceCacheClient, stop func()) {
+func runEngineReporterAgainstServer(t *testing.T, opts []subscriber.ReporterOption, batches ...*subscriber.EventBatch) (client icpb.InferenceCacheClient, stop func()) {
 	t.Helper()
-	return runEngineReporterCfgAgainstServer(t, engine.Config{
+	return runEngineReporterCfgAgainstServer(t, subscriber.Config{
 		ReplicaID:  "vllm-engine-cs1",
 		ModelID:    "vllm-model",
 		TenantID:   "ic-smoke",
@@ -48,16 +48,16 @@ func runEngineReporterAgainstServer(t *testing.T, opts []engine.ReporterOption, 
 // runEngineReporterCfgAgainstServer is runEngineReporterAgainstServer with an
 // explicit subscriber Config, so a test can vary the engine-side identity (e.g.
 // supply Config.AdapterNames to exercise LoRA index partitioning end to end).
-func runEngineReporterCfgAgainstServer(t *testing.T, cfg engine.Config, opts []engine.ReporterOption, batches ...*engine.EventBatch) (client icpb.InferenceCacheClient, stop func()) {
+func runEngineReporterCfgAgainstServer(t *testing.T, cfg subscriber.Config, opts []subscriber.ReporterOption, batches ...*subscriber.EventBatch) (client icpb.InferenceCacheClient, stop func()) {
 	t.Helper()
 	conn, _, stopServer := startInProcessServerConn(t)
 	client = icpb.NewInferenceCacheClient(conn)
 
 	// Short flush window so the Run loop drains promptly when the input closes.
-	opts = append([]engine.ReporterOption{engine.WithWindow(10 * time.Millisecond)}, opts...)
-	reporter := engine.NewReporter(client, cfg, opts...)
+	opts = append([]subscriber.ReporterOption{subscriber.WithWindow(10 * time.Millisecond)}, opts...)
+	reporter := subscriber.NewReporter(client, cfg, opts...)
 
-	in := make(chan *engine.EventBatch, len(batches))
+	in := make(chan *subscriber.EventBatch, len(batches))
 	for _, b := range batches {
 		in <- b
 	}
@@ -114,8 +114,8 @@ func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 	toks := tokenSeq(1000, 128)  // one 128-token block
 	// The index keys on our content fingerprint; the gateway queries with the same.
 	our := fingerprint.Bytes(fingerprint.PrefixHashes(toks, 128)[0])
-	stored := engine.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
-	removed := engine.BlockRemoved{BlockHashes: [][]byte{h}}
+	stored := subscriber.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
+	removed := subscriber.BlockRemoved{BlockHashes: [][]byte{h}}
 
 	// The T2 re-report anchors the entry's freshness at the eviction event's
 	// timestamp (it's when reload-ability was last confirmed) — production vLLM
@@ -124,9 +124,9 @@ func TestLMCacheOffloadKeepsRoutingHintWithIgnoreBlockRemoved(t *testing.T) {
 	// a property of the test clock, not the offload-pinning behavior under test.)
 	now := float64(time.Now().Unix())
 	client, stop := runEngineReporterAgainstServer(t,
-		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)},
-		&engine.EventBatch{TimestampSeconds: now, Events: []engine.Event{stored}},
-		&engine.EventBatch{TimestampSeconds: now, Events: []engine.Event{removed}},
+		[]subscriber.ReporterOption{subscriber.WithIgnoreBlockRemoved(true)},
+		&subscriber.EventBatch{TimestampSeconds: now, Events: []subscriber.Event{stored}},
+		&subscriber.EventBatch{TimestampSeconds: now, Events: []subscriber.Event{removed}},
 	)
 	defer stop()
 
@@ -158,12 +158,12 @@ func TestDefaultForwardsBlockRemovedAndIndexLosesHint(t *testing.T) {
 	h := be8(0xC0FFEE0011223344)
 	toks := tokenSeq(2000, 128)
 	our := fingerprint.Bytes(fingerprint.PrefixHashes(toks, 128)[0])
-	stored := engine.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
-	removed := engine.BlockRemoved{BlockHashes: [][]byte{h}}
+	stored := subscriber.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
+	removed := subscriber.BlockRemoved{BlockHashes: [][]byte{h}}
 
 	client, stop := runEngineReporterAgainstServer(t, nil, // default reporter
-		&engine.EventBatch{TimestampSeconds: 0, Events: []engine.Event{stored}},
-		&engine.EventBatch{TimestampSeconds: 2.0, Events: []engine.Event{removed}},
+		&subscriber.EventBatch{TimestampSeconds: 0, Events: []subscriber.Event{stored}},
+		&subscriber.EventBatch{TimestampSeconds: 2.0, Events: []subscriber.Event{removed}},
 	)
 	defer stop()
 
@@ -192,11 +192,11 @@ func TestContentHashRoundTripViaReporterAndLookupRoute(t *testing.T) {
 	// floor, so the assertion is about the hash round-trip, not the floor.
 	toks := tokenSeq(3000, 128)
 	our := fingerprint.Bytes(fingerprint.PrefixHashes(toks, 128)[0])
-	stored := engine.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
+	stored := subscriber.BlockStored{BlockHashes: [][]byte{h}, TokenIDs: toks, BlockSize: 128}
 
 	client, stop := runEngineReporterAgainstServer(t,
-		[]engine.ReporterOption{engine.WithIgnoreBlockRemoved(true)},
-		&engine.EventBatch{TimestampSeconds: 0, Events: []engine.Event{stored}},
+		[]subscriber.ReporterOption{subscriber.WithIgnoreBlockRemoved(true)},
+		&subscriber.EventBatch{TimestampSeconds: 0, Events: []subscriber.Event{stored}},
 	)
 	defer stop()
 

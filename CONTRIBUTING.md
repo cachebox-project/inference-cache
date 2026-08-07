@@ -228,7 +228,7 @@ See the README's "Repository layout" for the full map. In short:
 | Mutable-slot rendering (the wedge) | `pkg/render/` |
 | Stable adapter extension contract | `pkg/adapters/{backend,runtime}/` |
 | Shipping adapter implementation / registration | `internal/adapters/builtin/` |
-| Engine KV-event ingest implementation | `pkg/adapters/engine/` (pending the documented `internal/subscriber/` move) |
+| Engine KV-event ingest implementation | `internal/subscriber/` |
 | Engine egress client (pre-tokenized request → engine; harness / benchmark, no binary owner) | `pkg/adapters/engineclient/` |
 | The gRPC contract | `proto/` → then `make proto-gen` |
 
