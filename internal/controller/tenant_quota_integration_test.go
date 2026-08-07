@@ -61,7 +61,6 @@ func TestIntegrationCacheTenantQuota(t *testing.T) {
 				IndexEntries:    tenant.IndexEntries,
 				HitRate:         tenant.HitRate,
 				HitRateReported: tenant.HitRateReported,
-				MemoryUsed:      tenant.MemoryUsed,
 			})
 		}
 		if err := poller.reconcileTenantStatuses(ctx, snap); err != nil {

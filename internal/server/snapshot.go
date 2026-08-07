@@ -43,7 +43,8 @@ func snapshotForControlPlane(src index.Snapshot) controlplaneapi.Snapshot {
 				IndexEntries:    tenant.IndexEntries,
 				HitRate:         tenant.HitRate,
 				HitRateReported: tenant.HitRateReported,
-				MemoryUsed:      tenant.MemoryUsed,
+				// MemoryUsed is intentionally omitted: the deprecated wire key
+				// remains present through its non-omitempty JSON tag, with value 0.
 			}
 		}
 	}
