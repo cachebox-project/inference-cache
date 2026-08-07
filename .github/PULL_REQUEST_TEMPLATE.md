@@ -17,6 +17,7 @@
 - [ ] Pre-commit naming guard passed (`make install-hooks` once, then it runs on every commit).
 
 ### Quality
+- [ ] Every human-authored commit includes a matching DCO `Signed-off-by:` trailer (`git commit --signoff`).
 - [ ] `make build` and `make test` pass locally.
 - [ ] `make lint` clean (gofmt + go vet).
 - [ ] `make manifests generate` produces **no drift** (generated code committed).

@@ -30,6 +30,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dco:
+    name: DCO
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: DCO applies to pull requests
+      if: github.event_name != 'pull_request'
+      run: echo "DCO sign-off is enforced on pull requests."
+
+    - name: Checkout complete history
+      if: github.event_name == 'pull_request'
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      with:
+        fetch-depth: 0
+
+    - name: Identify GitHub-verified bot commits
+      if: github.event_name == 'pull_request'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        bot_commits_file="$RUNNER_TEMP/dco-bot-commits"
+        gh api --paginate \
+          "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" \
+          --jq '.[] | select(.author.type == "Bot") | .sha' \
+          > "$bot_commits_file"
+        echo "DCO_BOT_COMMITS_FILE=$bot_commits_file" >> "$GITHUB_ENV"
+
+    - name: Verify every pull request commit is signed off
+      if: github.event_name == 'pull_request'
+      env:
+        DCO_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: make verify-dco DCO_BASE="$DCO_BASE_SHA" DCO_HEAD="$DCO_HEAD_SHA" DCO_BOT_COMMITS_FILE="$DCO_BOT_COMMITS_FILE"
+
   lint-generated-proto:
     name: Lint, Generated Code, Proto
     runs-on: ubuntu-latest
@@ -59,6 +96,9 @@ jobs:
 
     - name: Test docs-sync gate
       run: make test-docs-sync
+
+    - name: Test DCO gate
+      run: make test-dco
 
     - name: Install protoc
       env:
@@ -345,6 +385,7 @@ jobs:
     name: Lint, Test, Proto
     runs-on: ubuntu-latest
     needs:
+    - dco
     - lint-generated-proto
     - test
     - fingerprint-e2e
@@ -359,6 +400,7 @@ jobs:
     - name: Check split CI jobs
       env:
         LINT_GENERATED_PROTO_RESULT: ${{ needs.lint-generated-proto.result }}
+        DCO_RESULT: ${{ needs.dco.result }}
         TEST_RESULT: ${{ needs.test.result }}
         FINGERPRINT_E2E_RESULT: ${{ needs.fingerprint-e2e.result }}
         VULNERABILITY_SCAN_RESULT: ${{ needs.vulnerability-scan.result }}
@@ -368,6 +410,7 @@ jobs:
       run: |
         failed=0
         for item in \
+          "dco:$DCO_RESULT" \
           "lint-generated-proto:$LINT_GENERATED_PROTO_RESULT" \
           "test:$TEST_RESULT" \
           "fingerprint-e2e:$FINGERPRINT_E2E_RESULT" \

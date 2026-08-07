@@ -552,6 +552,19 @@ verify-docs-sync: ## Fail if a CRD/proto change in this branch updates no docs (
 test-docs-sync: ## Run the self-contained tests for the docs-sync gate (no network; throwaway git repos).
 	@bash hack/verify-docs-sync_test.sh
 
+# Revision range checked by the local DCO gate. CI overrides both values with
+# the pull request's immutable base and head SHAs.
+DCO_BASE ?= origin/main
+DCO_HEAD ?= HEAD
+DCO_BOT_COMMITS_FILE ?=
+.PHONY: verify-dco
+verify-dco: ## Verify DCO sign-off on every non-merge commit in DCO_BASE..DCO_HEAD.
+	@DCO_BOT_COMMITS_FILE="$(DCO_BOT_COMMITS_FILE)" bash hack/verify-dco.sh "$(DCO_BASE)" "$(DCO_HEAD)"
+
+.PHONY: test-dco
+test-dco: ## Run self-contained tests for the DCO verifier (no network; throwaway git repos).
+	@bash hack/verify-dco_test.sh
+
 .PHONY: verify-syft-pin
 verify-syft-pin: ## Fail if the Syft version/checksum pin drifts across release tooling.
 	@bash hack/verify-syft-version.sh
@@ -587,7 +600,7 @@ verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alertin
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs verify-syft-pin verify-minimal-base test-minimal-images fmt-check vet ci-lint python-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + Syft/minimal-image policy + Go/Python lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs verify-dco test-dco verify-syft-pin verify-minimal-base test-minimal-images fmt-check vet ci-lint python-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + DCO + Syft/minimal-image policy + Go/Python lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.
@@ -602,6 +615,7 @@ pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admissi
 	@$(MAKE) --no-print-directory verify-samples
 	@echo ""
 	@echo "Review checklist before 'gh pr create' (full list in CONTRIBUTING.md):"
+	@echo "  [ ] Every human-authored commit has a matching DCO Signed-off-by trailer"
 	@echo "  [ ] Vendor-neutral naming — no oci/oracle in core identity"
 	@echo "  [ ] Change matches the tech spec; CRD/proto backward-compatible for v1alpha1 consumers"
 	@echo "  [ ] New/changed behavior has unit tests"
