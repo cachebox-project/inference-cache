@@ -11,10 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 
@@ -103,7 +104,7 @@ func (b blockingTokenizer) EncodeText(context.Context, string, string, tokenize.
 // budget context, not before it).
 func TestLookupRoutePromptTextSlowTokenizerTimesOut(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{{Namespace: "tenant-x", LookupTimeoutMs: 20}})
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "tenant-x", LookupTimeoutMs: 20}})
 	release := make(chan struct{})
 	defer close(release) // unblock the tokenizer goroutine at test end
 	svc.tokenizer = blockingTokenizer{release: release}
@@ -486,7 +487,7 @@ func TestLookupRouteTokenIDsHonorsConfiguredBlockSize(t *testing.T) {
 func TestLookupRoutePromptTextEchoesTokensOnMinPrefixGate(t *testing.T) {
 	tokens := tokenSeq(2_500_000, 64) // 64 effective tokens, below the 1000 gate
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{{Namespace: "tenant-x", MinimumPrefixTokens: 1000}})
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "tenant-x", MinimumPrefixTokens: 1000}})
 	svc.tokenizer = fakeTokenizer{tokens: tokens}
 
 	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{

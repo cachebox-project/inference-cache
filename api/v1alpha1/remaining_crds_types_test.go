@@ -26,7 +26,7 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	requireRequired(t, policySchema, "spec")
 	policySpec := mustPath[map[string]any](t, policySchema, "properties", "spec")
 	// Eviction selects the index cap-based eviction algorithm. Both values are
-	// implemented in pkg/index (LRU-by-lastSeen and LFU-by-access-count) and the
+	// implemented in internal/index (LRU-by-lastSeen and LFU-by-access-count) and the
 	// controller propagates the choice (lower-cased) into ResolvedPolicy.
 	evictionSchema := mustProperty(t, policySpec, "eviction")
 	requireEnum(t, evictionSchema, []string{"LRU", "LFU"})

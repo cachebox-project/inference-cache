@@ -27,7 +27,7 @@ import (
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 
@@ -42,7 +42,7 @@ func newTestService() *inferenceCacheService {
 	policies := NewPolicyStore()
 	idx := index.New(
 		index.WithTTLResolver(policies),
-		index.WithReservedTenants(ProbeTenantID),
+		index.WithReservedTenants(controlplaneapi.ProbeTenantID),
 	)
 	return newInferenceCacheService(idx, newServerMetrics(), policies)
 }
@@ -674,9 +674,9 @@ func TestPolicyServedOnSnapshotListener(t *testing.T) {
 // replace-on-write payload.
 func emptyPolicySnapshotBody(t *testing.T) string {
 	t.Helper()
-	b, err := json.Marshal(PolicySnapshot{Version: PolicyPropagationVersion})
+	b, err := json.Marshal(controlplaneapi.PolicySnapshot{Version: controlplaneapi.PolicyPropagationVersion})
 	if err != nil {
-		t.Fatalf("marshal empty PolicySnapshot: %v", err)
+		t.Fatalf("marshal empty controlplaneapi.PolicySnapshot: %v", err)
 	}
 	return string(b)
 }
@@ -746,7 +746,7 @@ func TestControllerAuth_RejectsUnauthenticated(t *testing.T) {
 	// Audience left empty here — this test exercises the auth middleware's
 	// expectedSA / cache / 401-on-missing-bearer matrix end-to-end against
 	// real listeners for BOTH /snapshot AND /policy. The audience-binding
-	// path is covered by the envtest integration in pkg/server/auth (real
+	// path is covered by the envtest integration in internal/server/auth (real
 	// apiserver mints audience-bound tokens); a fake reviewer can't
 	// faithfully model audience enforcement.
 	svc := New(WithControllerAuth(reviewer, sa, ""))
@@ -1217,12 +1217,12 @@ func TestLookupRouteFailsOpenForReservedProbeTenant(t *testing.T) {
 	svc := newTestService()
 	// Seed something in the probe scope so a leak would actually surface.
 	svc.index.Ingest(index.Update{
-		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: controlplaneapi.ProbeTenantID, HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
 	})
 
 	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
-		ModelId: "m", TenantId: ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
+		ModelId: "m", TenantId: controlplaneapi.ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
 	})
 	if err != nil {
 		t.Fatalf("LookupRoute: %v", err)
@@ -1245,7 +1245,7 @@ func TestLookupRouteFailsOpenForReservedProbeTenant(t *testing.T) {
 func TestLookupRouteEmitsMetricForReservedProbeTenantNoHint(t *testing.T) {
 	svc := newTestService()
 	if _, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
-		ModelId: "m", TenantId: ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
+		ModelId: "m", TenantId: controlplaneapi.ProbeTenantID, HashScheme: "vllm", PrefixHash: []byte("p"),
 	}); err != nil {
 		t.Fatalf("LookupRoute: %v", err)
 	}
@@ -1302,13 +1302,13 @@ func lookupCallsValueFromService(t *testing.T, svc *inferenceCacheService, model
 func TestGetCacheStateReturnsEmptyForReservedProbeTenant(t *testing.T) {
 	svc := newTestService()
 	svc.index.Ingest(index.Update{
-		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: controlplaneapi.ProbeTenantID, HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
 		Stats:    &index.ReplicaStats{ReplicaID: ProbeReplicaID("cb-1"), CacheMemoryBytes: 1234, HitRate: 1.0},
 	})
 
 	resp, err := svc.GetCacheState(context.Background(), &icpb.GetCacheStateRequest{
-		ModelId: "m", TenantId: ProbeTenantID,
+		ModelId: "m", TenantId: controlplaneapi.ProbeTenantID,
 	})
 	if err != nil {
 		t.Fatalf("GetCacheState: %v", err)
@@ -1334,7 +1334,7 @@ func TestSnapshotFiltersReservedProbeTenant(t *testing.T) {
 		Stats:    &index.ReplicaStats{ReplicaID: "real-r", CacheMemoryBytes: 5000, HitRate: 0.5},
 	})
 	svc.index.Ingest(index.Update{
-		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		ReplicaID: ProbeReplicaID("cb-1"), Model: "m", Tenant: controlplaneapi.ProbeTenantID, HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("pp"), TokenCount: 16}},
 		Stats:    &index.ReplicaStats{ReplicaID: ProbeReplicaID("cb-1"), CacheMemoryBytes: 1234, HitRate: 1.0},
 	})
@@ -1345,12 +1345,12 @@ func TestSnapshotFiltersReservedProbeTenant(t *testing.T) {
 		t.Errorf("TotalPrefixes = %d, want 1 — reserved tenant must not contribute to the cluster total", snap.TotalPrefixes)
 	}
 	for _, r := range snap.Replicas {
-		if r.Tenant == ProbeTenantID || strings.HasPrefix(r.ReplicaID, ProbeReplicaPrefix) {
+		if r.Tenant == controlplaneapi.ProbeTenantID || strings.HasPrefix(r.ReplicaID, controlplaneapi.ProbeReplicaPrefix) {
 			t.Errorf("Snapshot exposed reserved replica row: %+v", r)
 		}
 	}
 	for _, tn := range snap.Tenants {
-		if tn.TenantID == ProbeTenantID {
+		if tn.TenantID == controlplaneapi.ProbeTenantID {
 			t.Errorf("Snapshot exposed reserved tenant row: %+v", tn)
 		}
 	}
@@ -1367,7 +1367,7 @@ func TestReportCacheStateDropsReservedProbeTenant(t *testing.T) {
 	stream := &fakeReportStream{updates: []*icpb.CacheStateUpdate{{
 		ReplicaId:  "spoofed",
 		ModelId:    "m",
-		TenantId:   ProbeTenantID,
+		TenantId:   controlplaneapi.ProbeTenantID,
 		HashScheme: "vllm",
 		Prefixes:   []*icpb.PrefixEntry{{PrefixHash: []byte("p"), TokenCount: 32}},
 	}}}
@@ -1375,7 +1375,7 @@ func TestReportCacheStateDropsReservedProbeTenant(t *testing.T) {
 		t.Fatalf("ReportCacheState: %v", err)
 	}
 	scores := svc.index.Lookup(index.LookupRequest{
-		Tenant: ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+		Tenant: controlplaneapi.ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
 	})
 	if len(scores) != 0 {
 		t.Fatalf("external ingest under reserved probe tenant landed in the index: %+v", scores)
@@ -1390,12 +1390,12 @@ func TestReportCacheStateDropsReservedProbeTenant(t *testing.T) {
 func TestPublishEventDropsReservedProbeTenant(t *testing.T) {
 	svc := newTestService()
 	svc.index.Ingest(index.Update{
-		ReplicaID: "real", Model: "m", Tenant: ProbeTenantID, HashScheme: "vllm",
+		ReplicaID: "real", Model: "m", Tenant: controlplaneapi.ProbeTenantID, HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 32}},
 	})
 	ack, err := svc.PublishEvent(context.Background(), &icpb.CacheEvent{
 		Type: icpb.CacheEvent_ALL_CLEARED, ReplicaId: "real",
-		ModelId: "m", TenantId: ProbeTenantID,
+		ModelId: "m", TenantId: controlplaneapi.ProbeTenantID,
 	})
 	if err != nil {
 		t.Fatalf("PublishEvent: %v", err)
@@ -1405,7 +1405,7 @@ func TestPublishEventDropsReservedProbeTenant(t *testing.T) {
 	}
 	// The seeded entry must survive — the ALL_CLEARED was dropped before the index saw it.
 	scores := svc.index.Lookup(index.LookupRequest{
-		Tenant: ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
+		Tenant: controlplaneapi.ProbeTenantID, Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"),
 	})
 	if len(scores) != 1 || scores[0].ReplicaID != "real" {
 		t.Fatalf("external CacheEvent against probe tenant disturbed reserved state: %+v", scores)
@@ -1489,7 +1489,7 @@ func TestMicrosToTime(t *testing.T) {
 // the index lookup and returns the normal PREFIX_MATCH response.
 func TestLookupRouteAboveMinimumPrefixTokensProceedsToLookup(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", MinimumPrefixTokens: 50},
 	})
 	svc.index.Ingest(index.Update{
@@ -1527,7 +1527,7 @@ func TestLookupRouteAboveMinimumPrefixTokensProceedsToLookup(t *testing.T) {
 func TestLookupRouteBelowMinimumPrefixTokensReturnsNoHintWithoutTouchingIndex(t *testing.T) {
 	svc := newTestService()
 	fal := false
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", MinimumPrefixTokens: 200, AffinityRouting: &fal},
 	})
 	svc.lookupFn = func(index.LookupRequest) index.LookupResult {
@@ -1583,7 +1583,7 @@ func TestLookupRouteReturnsTimeoutWhenCallerDeadlineBreached(t *testing.T) {
 // select pseudorandom choice could leak stale scores as PREFIX_MATCH.
 func TestLookupRouteReturnsTimeoutEvenIfLookupRacesPastDeadline(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", LookupTimeoutMs: 5},
 	})
 	// Lookup deliberately exceeds the budget before returning a hit.
@@ -1617,7 +1617,7 @@ func TestLookupRouteReturnsTimeoutEvenIfLookupRacesPastDeadline(t *testing.T) {
 // reason_code:TIMEOUT.
 func TestLookupRouteBoundsWallTimeWhenLookupBlocks(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", LookupTimeoutMs: 20},
 	})
 
@@ -1664,7 +1664,7 @@ func TestLookupRouteAppliesPolicyTimeoutBudget(t *testing.T) {
 	// deterministically by TestLookupRouteReturnsTimeoutEvenIfLookupRacesPastDeadline
 	// and TestLookupRouteBoundsWallTimeWhenLookupBlocks, which inject a lookup
 	// that overruns the budget by a large, jitter-proof margin.
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", LookupTimeoutMs: 1000},
 	})
 	svc.index.Ingest(index.Update{
@@ -1686,7 +1686,7 @@ func TestLookupRouteAppliesPolicyTimeoutBudget(t *testing.T) {
 
 func TestLookupRouteUnaffectedByPolicyForUnknownTenant(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", MinimumPrefixTokens: 200, LookupTimeoutMs: 1},
 	})
 	// TokenCount=128 keeps the realized match above the server-wide
@@ -1775,7 +1775,7 @@ func TestLookupRouteChainReturnsPartialPrefixMatch(t *testing.T) {
 // test scope to the request-side gate alone, matching its name.
 func TestLookupRouteAboveMinimumPrefixTokensViaChainCounts(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", MinimumPrefixTokens: 32, MinimumMatchedTokens: 0},
 	})
 	hashes := [][]byte{[]byte("b1"), []byte("b2"), []byte("b3")}
@@ -1805,7 +1805,7 @@ func TestLookupRouteAboveMinimumPrefixTokensViaChainCounts(t *testing.T) {
 func TestLookupRouteBelowMinimumPrefixTokensViaChainCounts(t *testing.T) {
 	svc := newTestService()
 	fal := false
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", MinimumPrefixTokens: 200, AffinityRouting: &fal},
 	})
 	svc.lookupFn = func(index.LookupRequest) index.LookupResult {
@@ -1855,9 +1855,9 @@ func TestLookupRouteRequireChainGateReturnsPolicyReason(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := newTestService()
 			reqChain := true
-			svc.policies.Replace([]ResolvedPolicy{{
+			svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{
 				Namespace: "team-a",
-				Strategy:  &ResolvedLookupStrategy{RequireChain: &reqChain},
+				Strategy:  &controlplaneapi.ResolvedLookupStrategy{RequireChain: &reqChain},
 			}})
 			svc.lookupFn = func(index.LookupRequest) index.LookupResult {
 				t.Fatal("index lookup should not run when policy requires a carried chain and request lacks one")
@@ -1967,9 +1967,9 @@ func TestLookupRouteDisableChainMatchingUsesExactPrefixHash(t *testing.T) {
 				svc.tokenizer = tc.tokenizer
 			}
 			enableChain := false
-			svc.policies.Replace([]ResolvedPolicy{{
+			svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{
 				Namespace: "team-a",
-				Strategy:  &ResolvedLookupStrategy{EnableChainMatching: &enableChain},
+				Strategy:  &controlplaneapi.ResolvedLookupStrategy{EnableChainMatching: &enableChain},
 			}})
 			var got index.LookupRequest
 			var called bool
@@ -2018,10 +2018,10 @@ func TestLookupRouteDisableChainMatchingMinPrefixIgnoresChainCounts(t *testing.T
 	svc := newTestService()
 	enableChain := false
 	affDisabled := false
-	svc.policies.Replace([]ResolvedPolicy{{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{
 		Namespace:           "team-a",
 		MinimumPrefixTokens: 100,
-		Strategy:            &ResolvedLookupStrategy{EnableChainMatching: &enableChain},
+		Strategy:            &controlplaneapi.ResolvedLookupStrategy{EnableChainMatching: &enableChain},
 		// affinity Disabled so the below-threshold request still short-circuits
 		// to NO_HINT without an index lookup (affinity Enabled would run the
 		// full lookup to classify diagnostics before any fallback).
@@ -2056,9 +2056,9 @@ func TestLookupRouteDisableTenantHotDowngradesToNoHint(t *testing.T) {
 	svc := newTestService()
 	enableTenantHot := false
 	affDisabled := false
-	svc.policies.Replace([]ResolvedPolicy{{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{
 		Namespace: "t",
-		Strategy:  &ResolvedLookupStrategy{EnableTenantHot: &enableTenantHot},
+		Strategy:  &controlplaneapi.ResolvedLookupStrategy{EnableTenantHot: &enableTenantHot},
 		// affinity Disabled so the tenant-hot downgrade surfaces as NO_HINT in
 		// isolation (affinity Enabled would pick up the StrategyNone result and
 		// return AFFINITY_HINT — covered by the affinity tests).
@@ -2175,7 +2175,7 @@ func TestLookupRouteChainNoOverlapNeverFallsThroughToTenantHot(t *testing.T) {
 	// (covered in affinity_routing_test.go) but orthogonal to the chain
 	// vs TENANT_HOT invariant this test pins.
 	fal := false
-	svc.policies.Replace([]ResolvedPolicy{{Namespace: "t", AffinityRouting: &fal}})
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "t", AffinityRouting: &fal}})
 
 	svc.index.Ingest(index.Update{
 		ReplicaID: "warm-r", Model: "m", Tenant: "t", HashScheme: "vllm",

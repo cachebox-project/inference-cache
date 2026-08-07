@@ -223,8 +223,8 @@ See the README's "Repository layout" for the full map. In short:
 | Controller / reconciler logic | `internal/controller/` |
 | Controller ↔ server HTTP wire type | `internal/controlplaneapi/` |
 | Pod-binding annotation / metadata contract | `internal/enginebinding/` |
-| gRPC handlers, server wiring | `pkg/server/` |
-| Cache-state index logic | `pkg/index/` |
+| gRPC handlers, server wiring | `internal/server/` |
+| Cache-state index logic | `internal/index/` |
 | Mutable-slot rendering (the wedge) | `pkg/render/` |
 | Stable adapter extension contract | `pkg/adapters/{backend,runtime}/` |
 | Shipping adapter implementation / registration | `internal/adapters/builtin/` |

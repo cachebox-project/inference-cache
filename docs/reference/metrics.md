@@ -15,7 +15,7 @@ silently.
 - **Namespace.** Every metric the cache plane owns is prefixed
   `inferencecache_*`, in both binaries. Server-binary metrics derive
   the prefix from the `metricNamespace` constant in
-  [`pkg/server/metrics.go`](../../pkg/server/metrics.go); controller-
+  [`internal/server/metrics.go`](../../internal/server/metrics.go); controller-
   binary metrics declare it inline on each `prometheus.NewXVec`
   declaration in `internal/controller/` (see
   `backendServerRestartCascadesTotal` for the pattern) — the two
@@ -48,7 +48,7 @@ silently.
 |---|---|---|---|
 | `inferencecache_server_up` | *(none)* | `1` if the cache policy server is serving requests, `0` otherwise. | Server starts (→`1`) / shuts down (→`0`). Liveness signal. |
 | `inferencecache_server_grpc_tls_enabled` | *(none)* | `1` if the gRPC server (`:9090`) is terminating TLS, `0` if serving plaintext. | Set once at startup from `--tls-cert-file`/`--tls-key-file` (both set → `1`, both empty → `0`). Confirms the prod wire posture from Prometheus. See `docs/design/grpc-tls.md`. |
-| `inferencecache_index_entries` | `model` | **Distinct prefix entries** the in-memory `CacheIndex` currently holds for that model, **excluding reserved-tenant (`inferencecache.io/probe`) entries**. One entry = one unique `(tenant, model, hash_scheme, adapter, prefix_hash)` tuple, regardless of how many replicas hold it. | Rises on new `(scheme, adapter, hash)` from `ReportCacheState`; falls on `AllBlocksCleared` / TTL eviction / max-entries cap. A `BlockRemoved` only drops the entry in **single-tier (non-L2) mode**, where the subscriber forwards it as `PREFIX_EVICTED`; in **L2/Offload mode** a `BlockRemoved` **retains** the entry — the subscriber re-reports it at tier T2 rather than deleting it, so the count holds (the entry ages out only via TTL). Idempotent re-reports and T1↔T2 tier changes on an existing `(scheme, adapter, hash)` do **not** move it. The probe's synthetic state IS in the index during a Run but is excluded from this gauge so a scrape that races Stage C cannot transiently surface a probe-tenant count on a real model bucket — see `WithReservedTenants` in `pkg/index/index.go`. |
+| `inferencecache_index_entries` | `model` | **Distinct prefix entries** the in-memory `CacheIndex` currently holds for that model, **excluding reserved-tenant (`inferencecache.io/probe`) entries**. One entry = one unique `(tenant, model, hash_scheme, adapter, prefix_hash)` tuple, regardless of how many replicas hold it. | Rises on new `(scheme, adapter, hash)` from `ReportCacheState`; falls on `AllBlocksCleared` / TTL eviction / max-entries cap. A `BlockRemoved` only drops the entry in **single-tier (non-L2) mode**, where the subscriber forwards it as `PREFIX_EVICTED`; in **L2/Offload mode** a `BlockRemoved` **retains** the entry — the subscriber re-reports it at tier T2 rather than deleting it, so the count holds (the entry ages out only via TTL). Idempotent re-reports and T1↔T2 tier changes on an existing `(scheme, adapter, hash)` do **not** move it. The probe's synthetic state IS in the index during a Run but is excluded from this gauge so a scrape that races Stage C cannot transiently surface a probe-tenant count on a real model bucket — see `WithReservedTenants` in `internal/index/index.go`. |
 
 ### Counters
 
@@ -71,7 +71,7 @@ silently.
 
 ## Controller metrics (`inferencecache_*`) — exposed today
 
-Emitted by the `cmd/controller` binary, registered into the controller-runtime metrics registry (`sigs.k8s.io/controller-runtime/pkg/metrics`), and served at the manager's `--metrics-bind-address` (default `:8080` on the controller binary — separate process from the server binary's `:8080`). This is a deliberately separate registry from the server's `pkg/server/metrics.go` one; the two processes have disjoint scrape targets.
+Emitted by the `cmd/controller` binary, registered into the controller-runtime metrics registry (`sigs.k8s.io/controller-runtime/pkg/metrics`), and served at the manager's `--metrics-bind-address` (default `:8080` on the controller binary — separate process from the server binary's `:8080`). This is a deliberately separate registry from the server's `internal/server/metrics.go` one; the two processes have disjoint scrape targets.
 
 ### Gauges
 
@@ -106,29 +106,29 @@ with OTEL collectors) without bumping `v1alpha1`.
 
 ### Server binary (`cmd/server`)
 
-- **Definitions:** [`pkg/server/metrics.go`](../../pkg/server/metrics.go) (the
+- **Definitions:** [`internal/server/metrics.go`](../../internal/server/metrics.go) (the
   `serverMetrics` struct + `newServerMetrics`).
 - **`indexEntries` writers:** the index pushes via the `index.Metrics`
-  interface (`SetIndexEntries`); see [`pkg/index/`](../../pkg/index/). The
+  interface (`SetIndexEntries`); see [`internal/index/`](../../internal/index/). The
   snapshot is taken under `reportMu` so concurrent reporters can't publish a
   stale count.
 - **`lookupCalls` + `lookupLatency` writers:** the `LookupRoute` handler in
-  [`pkg/server/inferencecache_service.go`](../../pkg/server/inferencecache_service.go)
+  [`internal/server/inferencecache_service.go`](../../internal/server/inferencecache_service.go)
   calls `metrics.observeLookup(...)` exactly once per request.
 - **`tenantEvictions` writer:** the index calls `AddTenantEvictions(...)` via the
   `index.Metrics` interface after a quota-driven eviction at ingest; see
-  [`pkg/index/`](../../pkg/index/). One increment per evicted distinct prefix.
+  [`internal/index/`](../../internal/index/). One increment per evicted distinct prefix.
 - **`indexEvictions` writer:** the index calls `AddIndexEvictions(algorithm, reason, n)`
   via the `index.Metrics` interface after the cap sweep (`reason="cap"`, on ingest)
-  and the TTL sweep (`reason="ttl"`); see [`pkg/index/`](../../pkg/index/). The
+  and the TTL sweep (`reason="ttl"`); see [`internal/index/`](../../internal/index/). The
   per-algorithm tally is emitted after the index lock is released.
 - **`snapshotAuth` + `policyAuth` + `probeAuth` writers:** the TokenReview
-  middleware in [`pkg/server/auth/`](../../pkg/server/auth/) reports one
+  middleware in [`internal/server/auth/`](../../internal/server/auth/) reports one
   outcome per request via the `auth.ResultRecorder` interface. The
   recorders themselves are returned by `serverMetrics.SnapshotAuthRecorder()`,
   `serverMetrics.PolicyAuthRecorder()`, and `serverMetrics.ProbeAuthRecorder()`
-  (in `pkg/server/metrics.go`) and wired into the per-endpoint authenticators
-  in `pkg/server/server.go`. One increment per `/snapshot`, `/policy`, or
+  (in `internal/server/metrics.go`) and wired into the per-endpoint authenticators
+  in `internal/server/server.go`. One increment per `/snapshot`, `/policy`, or
   `/probe` request reaching the middleware, labeled by `result`. All three
   endpoints share the controller ServiceAccount identity profile but emit
   per-endpoint counters and enforce endpoint-specific audiences so a dashboard
@@ -258,7 +258,7 @@ Two binaries each expose their own `/metrics` endpoint — separate processes, s
    registration pattern:
 
    - **Server binary (`cmd/server`)**: add a field to `serverMetrics` in
-     `pkg/server/metrics.go`, construct it in `newServerMetrics`, and
+     `internal/server/metrics.go`, construct it in `newServerMetrics`, and
      register it on the `prometheus.NewRegistry()` block. Add a typed
      writer method on `*serverMetrics` (e.g. `observeLookup`,
      `SetIndexEntries`) and call it from the relevant handler or index
@@ -282,7 +282,7 @@ Two binaries each expose their own `/metrics` endpoint — separate processes, s
    Include labels, meaning, and what makes it move. If the metric is a
    histogram, document the bucket array and *why* those buckets.
 4. **Wire test coverage.** Server-binary metrics: add an assertion in
-   `pkg/server/metrics_test.go`. Controller-binary metrics: add an
+   `internal/server/metrics_test.go`. Controller-binary metrics: add an
    assertion in a `_test.go` file alongside the reconciler that increments
    them (e.g. `cachebackend_server_restart_test.go` — see the
    `cascadeRestartsCount` helper for the pattern). In both cases verify

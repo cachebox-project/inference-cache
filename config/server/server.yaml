@@ -184,7 +184,7 @@ spec:
               # the first eviction target under node memory pressure. Operators
               # running closer to the cap should bump both the request and the
               # limit in lockstep — and, if they need MORE than the cap,
-              # DefaultMaxEntries is a compile-time constant in pkg/index, so
+              # DefaultMaxEntries is a compile-time constant in internal/index, so
               # exceeding it currently requires building a custom server image.
               memory: 256Mi
           securityContext:

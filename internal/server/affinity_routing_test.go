@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // newServiceWithReplicas builds the service against a fresh index that
@@ -64,7 +65,7 @@ func TestLookupRouteAffinityHintOnNoMatchEnabled(t *testing.T) {
 func TestLookupRouteAffinityHintDisabledReturnsNoHint(t *testing.T) {
 	svc, _, store := newServiceWithReplicas(t, "tenantA", "modelX", []string{"r-1", "r-2"})
 	fal := false
-	store.Replace([]ResolvedPolicy{{Namespace: "tenantA", AffinityRouting: &fal}})
+	store.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "tenantA", AffinityRouting: &fal}})
 
 	req := &icpb.LookupRouteRequest{
 		TenantId:         "tenantA",
@@ -178,7 +179,7 @@ func TestLookupRouteAffinityHintBypassesMinimumPrefixTokens(t *testing.T) {
 	svc, _, store := newServiceWithReplicas(t, "tenantA", "modelX", []string{"r-1", "r-2", "r-3"})
 	// Set a high minimumPrefixTokens floor that would short-circuit a
 	// small request. Affinity should still fire.
-	store.Replace([]ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024}})
+	store.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024}})
 
 	req := &icpb.LookupRouteRequest{
 		TenantId:         "tenantA",
@@ -207,7 +208,7 @@ func TestLookupRouteAffinityHintBypassesMinimumPrefixTokens(t *testing.T) {
 func TestLookupRouteMinimumPrefixTokensStillFiltersWhenAffinityDisabled(t *testing.T) {
 	svc, _, store := newServiceWithReplicas(t, "tenantA", "modelX", []string{"r-1", "r-2"})
 	fal := false
-	store.Replace([]ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024, AffinityRouting: &fal}})
+	store.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024, AffinityRouting: &fal}})
 
 	req := &icpb.LookupRouteRequest{
 		TenantId:         "tenantA",
@@ -249,7 +250,7 @@ func TestLookupRouteAffinityHintPreservesUnknownHashSchemePrecedence(t *testing.
 	store := NewPolicyStore()
 	// minimumPrefixTokens=1024 means the request below would short-circuit
 	// pre-lookup if it weren't for the precedence guard.
-	store.Replace([]ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024}})
+	store.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024}})
 	svc := newInferenceCacheService(idx, newServerMetrics(), store)
 
 	req := &icpb.LookupRouteRequest{
@@ -287,7 +288,7 @@ func TestLookupRouteMinimumPrefixTokensDowngradesPrefixMatchWhenAffinityEnabled(
 	// minimumPrefixTokens=1024 — the request below is well under the gate.
 	// minimumMatchedTokens=0 — disable the matched-tokens floor so the only
 	// thing in the way of PREFIX_MATCH is the minimumPrefixTokens downgrade.
-	store.Replace([]ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024, MinimumMatchedTokens: 0}})
+	store.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024, MinimumMatchedTokens: 0}})
 	svc := newInferenceCacheService(idx, newServerMetrics(), store)
 
 	req := &icpb.LookupRouteRequest{
@@ -334,7 +335,7 @@ func TestLookupRouteMinimumPrefixTokensDowngradesTenantHotWhenAffinityEnabled(t 
 	})
 	store := NewPolicyStore()
 	// MinimumPrefixTokens=1024 — way above the request's claimed 1 token.
-	store.Replace([]ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024}})
+	store.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "tenantA", MinimumPrefixTokens: 1024}})
 	svc := newInferenceCacheService(idx, newServerMetrics(), store)
 
 	req := &icpb.LookupRouteRequest{

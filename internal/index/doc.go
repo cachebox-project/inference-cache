@@ -2,9 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Package index is part of inferencecache-server: the cluster cache-state aggregator
-// (the CacheIndex), populated from engine KV events and queried by LookupRoute.
-// Observability and routing input only — not a routing-decision substrate.
+// Package index implements the inference-cache server's mutable cache-state
+// index, populated from engine KV events and queried by LookupRoute.
 //
 // The index engine (the in-memory store, ingestion, eviction, ranking) runs only
 // in the server binary. Snapshot types are index-owned domain values; the server

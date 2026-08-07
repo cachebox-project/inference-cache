@@ -14,7 +14,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
+	cacheserver "github.com/cachebox-project/inference-cache/internal/server"
 )
 
 // TestIntegrationCachePolicyRoutingFloorScore exercises the full
@@ -39,7 +40,7 @@ import (
 //   - A namespace with NO CachePolicy reports DefaultRoutingFloorScore
 //     (the server-wide safety floor fires for unconfigured tenants).
 //
-// Complements the pkg/server unit tests by exercising the real
+// Complements the internal/server unit tests by exercising the real
 // apiserver-side kubebuilder defaulting AND the controller→server
 // propagation path together — the C2 reconcile hot-loop class of bug
 // (envtest exposed it in the cap-eviction work).
@@ -101,18 +102,18 @@ func TestIntegrationCachePolicyRoutingFloorScore(t *testing.T) {
 	if got := store.RoutingFloorScore(nsExplicit); !approx(got, 5.0) {
 		t.Fatalf("explicit-floor namespace = %v, want 5.0 (policy override)", got)
 	}
-	if got := store.RoutingFloorScore(nsOmitted); !approx(got, cacheserver.DefaultRoutingFloorScore) {
+	if got := store.RoutingFloorScore(nsOmitted); !approx(got, controlplaneapi.DefaultRoutingFloorScore) {
 		t.Fatalf("omitted-field namespace = %v, want DefaultRoutingFloorScore (%v) — "+
 			"kubebuilder default did not fill in 0.1 at apiserver admission, OR the controller "+
 			"didn't flatten the apiserver-defaulted value",
-			got, cacheserver.DefaultRoutingFloorScore)
+			got, controlplaneapi.DefaultRoutingFloorScore)
 	}
 	if got := store.RoutingFloorScore(nsDisabled); got != 0 {
 		t.Fatalf("disabled-floor namespace = %v, want 0 (explicit opt-out)", got)
 	}
-	if got := store.RoutingFloorScore(nsUnconfigured); !approx(got, cacheserver.DefaultRoutingFloorScore) {
+	if got := store.RoutingFloorScore(nsUnconfigured); !approx(got, controlplaneapi.DefaultRoutingFloorScore) {
 		t.Fatalf("unconfigured namespace = %v, want DefaultRoutingFloorScore (%v) — server-wide fallback failed",
-			got, cacheserver.DefaultRoutingFloorScore)
+			got, controlplaneapi.DefaultRoutingFloorScore)
 	}
 
 	// Belt-and-braces: read the omitted-field CR back from the apiserver and

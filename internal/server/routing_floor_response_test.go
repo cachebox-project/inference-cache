@@ -8,8 +8,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // LookupRoute-level tests for the routing floor score. The PolicyStore
@@ -47,7 +48,7 @@ func TestLookupRouteRoutingFloorScoreDowngradesWhenAllReplicasHoldPrefix(t *test
 	// orthogonal to the routing-floor → NO_HINT invariant this test
 	// pins.
 	fal := false
-	svc.policies.Replace([]ResolvedPolicy{{Namespace: "no-policy", AffinityRouting: &fal}})
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "no-policy", AffinityRouting: &fal}})
 	for _, rid := range []string{"r0", "r1", "r2"} {
 		svc.index.Ingest(index.Update{
 			ReplicaID: rid, Model: "m", Tenant: "no-policy", HashScheme: "vllm",
@@ -116,7 +117,7 @@ func TestLookupRouteRoutingFloorScorePolicyOverride(t *testing.T) {
 	// TestLookupRouteRoutingFloorScoreDowngradesWhenAllReplicasHoldPrefix
 	// comment for the rationale.
 	fal := false
-	svc.policies.Replace([]ResolvedPolicy{{Namespace: "strict", RoutingFloorScore: f32Ptr(100), AffinityRouting: &fal}})
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "strict", RoutingFloorScore: f32Ptr(100), AffinityRouting: &fal}})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r0", Model: "m", Tenant: "strict", HashScheme: "vllm",
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("unique"), TokenCount: 64}},
@@ -150,13 +151,13 @@ func TestLookupRouteRoutingFloorScorePolicyOverride(t *testing.T) {
 // to surface every trivial match — the operator would have to set both
 // to 0 / "0". The point of the assertion here is the routing-floor opt-
 // out semantics in isolation; the matched-tokens opt-out is tested by
-// the matched-tokens floor suite (pkg/server/matched_tokens_floor_test.go).
+// the matched-tokens floor suite (internal/server/matched_tokens_floor_test.go).
 func TestLookupRouteRoutingFloorScoreZeroDisablesFloor(t *testing.T) {
 	svc := newTestService()
 	// MinimumMatchedTokens defaults to 0 in the struct, so this Replace
 	// installs a policy with both floors off — exercising the routing-
 	// floor opt-out in isolation.
-	svc.policies.Replace([]ResolvedPolicy{{Namespace: "raw", RoutingFloorScore: f32Ptr(0)}})
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "raw", RoutingFloorScore: f32Ptr(0)}})
 	for _, rid := range []string{"r0", "r1", "r2"} {
 		svc.index.Ingest(index.Update{
 			ReplicaID: rid, Model: "m", Tenant: "raw", HashScheme: "vllm",

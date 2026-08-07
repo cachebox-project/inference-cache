@@ -17,8 +17,8 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
-	"github.com/cachebox-project/inference-cache/pkg/index"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/index"
+	cacheserver "github.com/cachebox-project/inference-cache/internal/server"
 )
 
 // TestIntegrationCacheTenantQuota exercises the full CacheTenant quota loop
@@ -26,7 +26,7 @@ import (
 // APIs:
 //
 //   - a real PolicyStore + index.Index (the index's quota resolver IS the store,
-//     exactly as pkg/server.New wires it);
+//     exactly as internal/server.New wires it);
 //   - the real /policy push handler;
 //   - the real ControlPlaneReconciler (CRD → push) and CacheIndexPoller's
 //     snapshot-DTO projection into CacheTenant.status.

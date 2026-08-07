@@ -14,161 +14,6 @@ import (
 	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
-// PolicyPropagationVersion identifies the schema of the /policy snapshot the
-// server accepts. Bumped on a schema change so version skew is observable
-// (the controller writes the same constant on each push).
-//
-// v2 added the Tenants slice (CacheTenant quota propagation). v3 added
-// ResolvedPolicy.Eviction (per-namespace cap-eviction algorithm). v4 added
-// ResolvedPolicy.MinimumMatchedTokens (the result-side matched-tokens floor).
-// v5 added ResolvedPolicy.RoutingFloorScore (the per-namespace post-score
-// floor for the distinguishing-power-aware LookupRoute ranker). v6 added
-// ResolvedPolicy.Strategy (per-namespace LookupRoute strategy gates). v7 added
-// ResolvedPolicy.AffinityRouting (the per-namespace toggle for consistent-
-// hash fallback routing on the NO_HINT path).
-//
-// Rollout asymmetry — the bump is "additive when the new field can be
-// defaulted; rejected when it can't":
-//
-//   - **Newer server / older body.** A v7 server accepts a v3, v4, v5, or v6 body and
-//     normalizes each policy's missing MinimumMatchedTokens to
-//     DefaultMinimumMatchedTokens, missing RoutingFloorScore to
-//     DefaultRoutingFloorScore, missing Strategy to the historical gates
-//     (chain matching on, chain not required, tenant-hot on), and missing
-//     AffinityRouting to DefaultAffinityRoutingEnabled — so a
-//     server-first rollout does NOT drop existing CachePolicy state (TTL,
-//     timeouts, eviction, prefix gates, quotas). The normalized result is
-//     identical to a no-CachePolicy fallback for the new fields while every
-//     prior knob stays enforced. The lenience window is bounded by
-//     PolicyMinimumAcceptedVersion (the oldest body this server still
-//     understands); bodies older than that are still rejected as "unsupported".
-//   - **Older server / newer body.** The reverse — a v6 server receiving a
-//     v7 push — still hard-fails. Because the handler decodes the body
-//     before checking version, DisallowUnknownFields is the FIRST line of
-//     defense: the new affinityRouting field on each policy is unknown to the v6
-//     Go struct, so decode rejects the body with
-//     `decode policy snapshot: json: unknown field "affinityRouting"`.
-//     Even on a hypothetical breaking change where the field rename or
-//     removal slips past DisallowUnknownFields, the explicit version-band
-//     check below catches it with `unsupported policy snapshot version`.
-//     Both diagnostics are fail-loud; the operator sees one specific message,
-//     not silent state loss.
-const PolicyPropagationVersion = controlplaneapi.PolicyPropagationVersion
-
-// PolicyMinimumAcceptedVersion is the oldest /policy schema this server
-// understands. Bodies below this version are rejected outright; bodies at
-// or above are accepted with the new-field normalization described on
-// PolicyPropagationVersion. Bump this in lockstep with PolicyPropagationVersion
-// whenever a schema change is NOT additive-defaultable — anything load-bearing
-// for a tenant, anything whose missing value cannot be safely synthesized.
-const PolicyMinimumAcceptedVersion = controlplaneapi.PolicyMinimumAcceptedVersion
-
-// DefaultMinimumMatchedTokens is the server-side fallback floor on
-// MATCHED prefix tokens applied when a tenant has no CachePolicy at all.
-// Mirrors the +kubebuilder:default on CachePolicySpec.MinimumMatchedTokens
-// so the "no policy" and "policy with default value" paths both behave
-// identically — see PolicyStore.MinimumMatchedTokens. 64 ≈ 4 KV blocks at
-// the typical 16-token block size: substantially above the chat-template
-// framing tokens identical across every replica, well below any
-// useful real-prompt overlap.
-const DefaultMinimumMatchedTokens = controlplaneapi.DefaultMinimumMatchedTokens
-
-// DefaultRoutingFloorScore is the server-wide fallback the LookupRoute
-// handler applies to PREFIX_MATCH responses when no CachePolicy is installed
-// for the requesting tenant. Calibrated as a near-zero floor: the
-// distinguishing-power factor collapses to 0 for the trivial-overlap shape
-// (every replica holds the prefix), producing score=0; the floor also
-// catches the next slice of near-zero scores — heavy diffusion combined
-// with low matched_tokens (small partial overlaps), high pressure
-// (pressure_factor near 0), or near-expired freshness — which the gateway
-// gains little from routing on. Any substantive routing decision (a
-// uniquely-held prefix of any meaningful token count and freshness) sees a
-// score well above 0.1. Without this default the trivial-match-as-
-// PREFIX_MATCH bug would persist for every namespace that has not
-// installed a policy CR. Tunable per-namespace via
-// CachePolicy.spec.routingFloorScore.
-const DefaultRoutingFloorScore = controlplaneapi.DefaultRoutingFloorScore
-
-const (
-	DefaultEnableChainMatching = controlplaneapi.DefaultEnableChainMatching
-	DefaultRequireChain        = controlplaneapi.DefaultRequireChain
-	DefaultEnableTenantHot     = controlplaneapi.DefaultEnableTenantHot
-)
-
-// DefaultAffinityRoutingEnabled is the server-wide fallback applied when a
-// tenant has no CachePolicy, or has one whose affinityRouting field was
-// omitted. Mirrors the +kubebuilder:default=Enabled marker on
-// CachePolicySpec.AffinityRouting so the "no policy" and "policy with
-// default value" paths both behave identically.
-//
-// Diffuse single-turn workloads (chatbot, RAG with distinct corpus
-// chunks per query) are common and the consistent-hash fallback is
-// near-free, so default ON is the correct safety posture. Operators
-// can disable explicitly via affinityRouting: Disabled when they want
-// pure round-robin (raw-recall benchmarking, gateway debugging).
-const DefaultAffinityRoutingEnabled = controlplaneapi.DefaultAffinityRoutingEnabled
-
-// ResolvedPolicy is the slice of CachePolicy the server actually enforces:
-// only the fields the policy server needs at lookup/sweep time. The CRD
-// types live in api/v1alpha1; the controller flattens them into this shape
-// before pushing so pkg/server has no dependency on the CRD package.
-//
-// Zero values mean "unset / use server default" for most fields:
-//   - EvictionTTL <= 0       → fall back to index.DefaultTTL (via the global
-//     WithTTL the binary configured).
-//   - MinimumPrefixTokens <= 0 → no threshold (every prefix-hash hit returns).
-//   - MinimumMatchedTokens <= 0 → floor disabled for THIS namespace (every
-//     matched_tokens count, even 1-block trivial overlap, is reported as
-//     PREFIX_MATCH). A negative pointer round-trips as 0, which is the
-//     intentional opt-out. A tenant with no ResolvedPolicy at all instead
-//     falls back to DefaultMinimumMatchedTokens (the server-side default
-//     floor) via PolicyStore.MinimumMatchedTokens.
-//   - LookupTimeoutMs <= 0   → no deadline (lookup runs to completion).
-//   - Eviction == ""         → LRU (the index default and the kubebuilder default).
-//
-// RoutingFloorScore is the EXCEPTION and uses a pointer to distinguish three
-// distinct shapes on the wire:
-//   - nil  → field was OMITTED on the wire body (legacy / hand-crafted /
-//     un-defaulted CR). Server applies DefaultRoutingFloorScore for safety.
-//   - &0   → operator EXPLICITLY set "0" (the opt-out — raw-recall
-//     benchmarking, ranker debugging). Server applies no floor for this
-//     namespace.
-//   - &x   → operator set a specific threshold. Server applies x as-is.
-//
-// A flat float32 field with omitempty would conflate nil and &0 (both
-// produce no field on the wire), so a controller pushing a CR whose
-// kubebuilder-defaulted value was overridden to "0" by the operator would
-// be indistinguishable from a hand-crafted body that simply omitted the
-// field — the safe interpretation differs between those two cases.
-type ResolvedPolicy = controlplaneapi.ResolvedPolicy
-
-// ResolvedLookupStrategy carries the server-enforced LookupRoute strategy
-// gates flattened from CachePolicy.spec.strategy.
-type ResolvedLookupStrategy = controlplaneapi.ResolvedLookupStrategy
-
-// ResolvedTenant is the slice of a CacheTenant the server enforces at ingest
-// time: the tenant's external identity plus its index-entry budget. The CRD
-// types live in api/v1alpha1; the controller flattens them into this shape so
-// pkg/server has no dependency on the CRD package (mirrors ResolvedPolicy).
-//
-// Identity note: TenantID is the CacheTenant's spec.tenantID — the same value
-// a CacheStateUpdate carries in tenant_id — NOT the CR's metadata.name. That is
-// the join key the index matches an ingest against.
-//
-// There is deliberately no memory budget: the engine KV cache is a shared,
-// tenant-unaware pool, so the control plane can neither enforce nor honestly
-// attribute bytes per tenant. Only the index entry table — which the server
-// owns — is enforceable.
-type ResolvedTenant = controlplaneapi.ResolvedTenant
-
-// PolicySnapshot is the full set of CachePolicies + CacheTenants the controller
-// pushes on each reconcile. Pushed via POST to /policy (PUT is accepted too for
-// callers that prefer it). Replace-on-write: the controller is the source of
-// truth, so the server discards its prior state and adopts the new snapshot. A
-// CachePolicy/CacheTenant that disappears between snapshots reverts that
-// namespace/tenant to the server default (no policy / no quota).
-type PolicySnapshot = controlplaneapi.PolicySnapshot
-
 // PolicyStore is the server-side cache of resolved policies (indexed by
 // namespace) and resolved tenant quotas (indexed by tenant ID). Reads take
 // the read lock; pushes from /policy (POST or PUT) take the write lock and
@@ -181,8 +26,8 @@ type PolicySnapshot = controlplaneapi.PolicySnapshot
 // so they live in separate maps under the same lock.
 type PolicyStore struct {
 	mu       sync.RWMutex
-	policies map[string]ResolvedPolicy
-	tenants  map[string]ResolvedTenant
+	policies map[string]controlplaneapi.ResolvedPolicy
+	tenants  map[string]controlplaneapi.ResolvedTenant
 }
 
 // NewPolicyStore returns an empty store. Until the controller pushes a
@@ -190,8 +35,8 @@ type PolicyStore struct {
 // and every TenantQuota reports "no quota" (= unbounded, fail open).
 func NewPolicyStore() *PolicyStore {
 	return &PolicyStore{
-		policies: make(map[string]ResolvedPolicy),
-		tenants:  make(map[string]ResolvedTenant),
+		policies: make(map[string]controlplaneapi.ResolvedPolicy),
+		tenants:  make(map[string]controlplaneapi.ResolvedTenant),
 	}
 }
 
@@ -200,7 +45,7 @@ func NewPolicyStore() *PolicyStore {
 // ReplaceSnapshot(policies, nil). Retained as a convenience for callers that
 // don't exercise the tenant-quota axis (mostly tests); it delegates so it can
 // never leave a stale tenant table behind. Idempotent.
-func (s *PolicyStore) Replace(policies []ResolvedPolicy) {
+func (s *PolicyStore) Replace(policies []controlplaneapi.ResolvedPolicy) {
 	s.ReplaceSnapshot(policies, nil)
 }
 
@@ -210,15 +55,15 @@ func (s *PolicyStore) Replace(policies []ResolvedPolicy) {
 // uses; the policies-only Replace delegates here with nil tenants.
 // Replace-on-write: a tenant absent from the new snapshot reverts to "no quota"
 // (unbounded, fail open).
-func (s *PolicyStore) ReplaceSnapshot(policies []ResolvedPolicy, tenants []ResolvedTenant) {
-	nextPolicies := make(map[string]ResolvedPolicy, len(policies))
+func (s *PolicyStore) ReplaceSnapshot(policies []controlplaneapi.ResolvedPolicy, tenants []controlplaneapi.ResolvedTenant) {
+	nextPolicies := make(map[string]controlplaneapi.ResolvedPolicy, len(policies))
 	for _, p := range policies {
 		if p.Namespace == "" {
 			continue // see Replace: an unkeyed entry can't be routed.
 		}
 		nextPolicies[p.Namespace] = p
 	}
-	nextTenants := make(map[string]ResolvedTenant, len(tenants))
+	nextTenants := make(map[string]controlplaneapi.ResolvedTenant, len(tenants))
 	for _, t := range tenants {
 		if t.TenantID == "" {
 			// Defensive: a quota with no tenant ID can't be matched against any
@@ -246,7 +91,7 @@ func (s *PolicyStore) ReplaceSnapshot(policies []ResolvedPolicy, tenants []Resol
 
 // Lookup returns the resolved policy for a namespace and whether one was
 // configured (false → caller should use server defaults).
-func (s *PolicyStore) Lookup(namespace string) (ResolvedPolicy, bool) {
+func (s *PolicyStore) Lookup(namespace string) (controlplaneapi.ResolvedPolicy, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	p, ok := s.policies[namespace]
@@ -255,9 +100,9 @@ func (s *PolicyStore) Lookup(namespace string) (ResolvedPolicy, bool) {
 
 // Snapshot returns a copy of the current policies, sorted by namespace for
 // deterministic test output and /policy GET (if added later).
-func (s *PolicyStore) Snapshot() []ResolvedPolicy {
+func (s *PolicyStore) Snapshot() []controlplaneapi.ResolvedPolicy {
 	s.mu.RLock()
-	out := make([]ResolvedPolicy, 0, len(s.policies))
+	out := make([]controlplaneapi.ResolvedPolicy, 0, len(s.policies))
 	for _, p := range s.policies {
 		out = append(out, p)
 	}
@@ -312,7 +157,7 @@ func (s *PolicyStore) MinimumMatchedTokens(tenant string) int32 {
 		}
 		return p.MinimumMatchedTokens
 	}
-	return DefaultMinimumMatchedTokens
+	return controlplaneapi.DefaultMinimumMatchedTokens
 }
 
 // RoutingFloorScore returns the per-namespace post-score floor applied to
@@ -352,12 +197,12 @@ func (s *PolicyStore) MinimumMatchedTokens(tenant string) int32 {
 func (s *PolicyStore) RoutingFloorScore(tenant string) float32 {
 	p, ok := s.Lookup(tenant)
 	if !ok {
-		return DefaultRoutingFloorScore
+		return controlplaneapi.DefaultRoutingFloorScore
 	}
 	if p.RoutingFloorScore == nil {
 		// Policy is installed but did not carry this field (legacy / hand-
 		// crafted body). Apply the safety floor, not the opt-out.
-		return DefaultRoutingFloorScore
+		return controlplaneapi.DefaultRoutingFloorScore
 	}
 	if *p.RoutingFloorScore < 0 {
 		return 0
@@ -384,10 +229,10 @@ func (s *PolicyStore) RoutingFloorScore(tenant string) float32 {
 func (s *PolicyStore) AffinityRoutingEnabled(namespace string) bool {
 	p, ok := s.Lookup(namespace)
 	if !ok {
-		return DefaultAffinityRoutingEnabled
+		return controlplaneapi.DefaultAffinityRoutingEnabled
 	}
 	if p.AffinityRouting == nil {
-		return DefaultAffinityRoutingEnabled
+		return controlplaneapi.DefaultAffinityRoutingEnabled
 	}
 	return *p.AffinityRouting
 }
@@ -407,7 +252,7 @@ func (s *PolicyStore) LookupTimeout(tenant string) time.Duration {
 func (s *PolicyStore) ChainMatchingEnabled(tenant string) bool {
 	p, ok := s.Lookup(tenant)
 	if !ok || p.Strategy == nil || p.Strategy.EnableChainMatching == nil {
-		return DefaultEnableChainMatching
+		return controlplaneapi.DefaultEnableChainMatching
 	}
 	return *p.Strategy.EnableChainMatching
 }
@@ -418,7 +263,7 @@ func (s *PolicyStore) ChainMatchingEnabled(tenant string) bool {
 func (s *PolicyStore) ChainRequired(tenant string) bool {
 	p, ok := s.Lookup(tenant)
 	if !ok || p.Strategy == nil || p.Strategy.RequireChain == nil {
-		return DefaultRequireChain
+		return controlplaneapi.DefaultRequireChain
 	}
 	return *p.Strategy.RequireChain
 }
@@ -428,7 +273,7 @@ func (s *PolicyStore) ChainRequired(tenant string) bool {
 func (s *PolicyStore) TenantHotEnabled(tenant string) bool {
 	p, ok := s.Lookup(tenant)
 	if !ok || p.Strategy == nil || p.Strategy.EnableTenantHot == nil {
-		return DefaultEnableTenantHot
+		return controlplaneapi.DefaultEnableTenantHot
 	}
 	return *p.Strategy.EnableTenantHot
 }
@@ -447,7 +292,7 @@ func (s *PolicyStore) TenantHotEnabled(tenant string) bool {
 // The probe is server-internal state under a server-controlled tenant id; no
 // operator-supplied CacheTenant should govern it.
 func (s *PolicyStore) TenantQuota(tenant string) (maxEntries int64, ok bool) {
-	if tenant == ProbeTenantID {
+	if tenant == controlplaneapi.ProbeTenantID {
 		return 0, false
 	}
 	s.mu.RLock()
@@ -461,9 +306,9 @@ func (s *PolicyStore) TenantQuota(tenant string) (maxEntries int64, ok bool) {
 
 // TenantQuotas returns a copy of the current tenant quotas, sorted by tenant ID
 // for deterministic test output.
-func (s *PolicyStore) TenantQuotas() []ResolvedTenant {
+func (s *PolicyStore) TenantQuotas() []controlplaneapi.ResolvedTenant {
 	s.mu.RLock()
-	out := make([]ResolvedTenant, 0, len(s.tenants))
+	out := make([]controlplaneapi.ResolvedTenant, 0, len(s.tenants))
 	for _, t := range s.tenants {
 		out = append(out, t)
 	}
@@ -504,7 +349,7 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 		defer func() { _ = body.Close() }()
 		dec := json.NewDecoder(body)
 		dec.DisallowUnknownFields()
-		var snap PolicySnapshot
+		var snap controlplaneapi.PolicySnapshot
 		if err := dec.Decode(&snap); err != nil {
 			http.Error(w, "decode policy snapshot: "+err.Error()+"\n", http.StatusBadRequest)
 			return
@@ -517,7 +362,7 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 		// which surfaces as a `decode policy snapshot: json: unknown field "..."`
 		// — also fail-loud, just attributed to the decoder rather than this
 		// branch). Both outcomes give the operator a specific diagnostic.
-		if snap.Version < PolicyMinimumAcceptedVersion || snap.Version > PolicyPropagationVersion {
+		if snap.Version < controlplaneapi.PolicyMinimumAcceptedVersion || snap.Version > controlplaneapi.PolicyPropagationVersion {
 			http.Error(w, "unsupported policy snapshot version\n", http.StatusBadRequest)
 			return
 		}
@@ -568,14 +413,14 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 // Bodies already at PolicyPropagationVersion are returned untouched so an
 // operator's explicit opt-out (e.g. `routingFloorScore: 0` for raw-recall
 // benchmarking, or `enableTenantHot: false`, or `affinityRouting: false`) reaches the store as written.
-func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
-	if snap.Version >= PolicyPropagationVersion {
+func normalizePolicySnapshotForVersion(snap *controlplaneapi.PolicySnapshot) {
+	if snap.Version >= controlplaneapi.PolicyPropagationVersion {
 		return
 	}
 	if snap.Version < 4 {
 		for i := range snap.Policies {
 			if snap.Policies[i].MinimumMatchedTokens == 0 {
-				snap.Policies[i].MinimumMatchedTokens = DefaultMinimumMatchedTokens
+				snap.Policies[i].MinimumMatchedTokens = controlplaneapi.DefaultMinimumMatchedTokens
 			}
 		}
 	}
@@ -588,7 +433,7 @@ func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 		// branch only fires for the missing-field case.
 		for i := range snap.Policies {
 			if snap.Policies[i].RoutingFloorScore == nil {
-				v := DefaultRoutingFloorScore
+				v := controlplaneapi.DefaultRoutingFloorScore
 				snap.Policies[i].RoutingFloorScore = &v
 			}
 		}
@@ -605,7 +450,7 @@ func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 		// An operator's explicit `affinityRouting: Disabled` is already a
 		// non-nil &false and reaches the store as written; the nil branch
 		// only fires for the missing-field case.
-		def := DefaultAffinityRoutingEnabled
+		def := controlplaneapi.DefaultAffinityRoutingEnabled
 		for i := range snap.Policies {
 			if snap.Policies[i].AffinityRouting == nil {
 				v := def
@@ -615,20 +460,20 @@ func normalizePolicySnapshotForVersion(snap *PolicySnapshot) {
 	}
 }
 
-func applyResolvedLookupStrategyDefaults(p *ResolvedPolicy) {
+func applyResolvedLookupStrategyDefaults(p *controlplaneapi.ResolvedPolicy) {
 	if p.Strategy == nil {
-		p.Strategy = &ResolvedLookupStrategy{}
+		p.Strategy = &controlplaneapi.ResolvedLookupStrategy{}
 	}
 	if p.Strategy.EnableChainMatching == nil {
-		v := DefaultEnableChainMatching
+		v := controlplaneapi.DefaultEnableChainMatching
 		p.Strategy.EnableChainMatching = &v
 	}
 	if p.Strategy.RequireChain == nil {
-		v := DefaultRequireChain
+		v := controlplaneapi.DefaultRequireChain
 		p.Strategy.RequireChain = &v
 	}
 	if p.Strategy.EnableTenantHot == nil {
-		v := DefaultEnableTenantHot
+		v := controlplaneapi.DefaultEnableTenantHot
 		p.Strategy.EnableTenantHot = &v
 	}
 }

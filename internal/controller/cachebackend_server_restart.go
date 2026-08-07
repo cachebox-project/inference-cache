@@ -124,7 +124,7 @@ const cascadeRestartReasonServerInstanceChanged = "server_instance_changed"
 // Partitioned by namespaced CacheBackend identity and a short reason
 // code. Registered into the controller-runtime metrics registry on
 // package init so it appears on the manager's /metrics endpoint (no
-// per-Service registry — see pkg/server/metrics.go for the
+// per-Service registry — see internal/server/metrics.go for the
 // other-direction posture). Safe to mutate concurrently; tests
 // reset its inner state via resetBackendServerRestartCascadesTotalForTest.
 var backendServerRestartCascadesTotal = prometheus.NewCounterVec(

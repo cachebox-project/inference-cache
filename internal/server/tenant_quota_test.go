@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 // TestTenantQuotaExemptsProbeTenant pins the server-internal defense against
@@ -23,12 +25,12 @@ import (
 // govern it.
 func TestTenantQuotaExemptsProbeTenant(t *testing.T) {
 	store := NewPolicyStore()
-	store.ReplaceSnapshot(nil, []ResolvedTenant{
-		{TenantID: ProbeTenantID, MaxIndexEntries: 0, IsolationMode: "Fairness"},
+	store.ReplaceSnapshot(nil, []controlplaneapi.ResolvedTenant{
+		{TenantID: controlplaneapi.ProbeTenantID, MaxIndexEntries: 0, IsolationMode: "Fairness"},
 		// A normal tenant still gets its quota honored.
 		{TenantID: "team-a", MaxIndexEntries: 1000},
 	})
-	if _, ok := store.TenantQuota(ProbeTenantID); ok {
+	if _, ok := store.TenantQuota(controlplaneapi.ProbeTenantID); ok {
 		t.Fatal("TenantQuota(probe tenant) reported a quota; want exemption (fail open)")
 	}
 	if max, ok := store.TenantQuota("team-a"); !ok || max != 1000 {
@@ -48,8 +50,8 @@ func TestTenantQuotaExemptsProbeTenant(t *testing.T) {
 // version mismatch outside the accepted band is rejected with a clear
 // "unsupported version" rather than a decode error.
 func TestPolicyPropagationVersionIsV7(t *testing.T) {
-	if PolicyPropagationVersion != 7 {
-		t.Fatalf("PolicyPropagationVersion = %d, want 7", PolicyPropagationVersion)
+	if controlplaneapi.PolicyPropagationVersion != 7 {
+		t.Fatalf("controlplaneapi.PolicyPropagationVersion = %d, want 7", controlplaneapi.PolicyPropagationVersion)
 	}
 	// PolicyMinimumAcceptedVersion bounds the lenience window for older bodies.
 	// v3, v4, and v5 must be accepted so a server-first rollout does not drop
@@ -57,8 +59,8 @@ func TestPolicyPropagationVersionIsV7(t *testing.T) {
 	// (normalizePolicySnapshotForVersion fills the missing fields with their
 	// server-side defaults); bodies below v3 are still rejected — there is no
 	// documented path to normalize the older Tenants / Eviction shapes.
-	if PolicyMinimumAcceptedVersion != 3 {
-		t.Fatalf("PolicyMinimumAcceptedVersion = %d, want 3", PolicyMinimumAcceptedVersion)
+	if controlplaneapi.PolicyMinimumAcceptedVersion != 3 {
+		t.Fatalf("controlplaneapi.PolicyMinimumAcceptedVersion = %d, want 3", controlplaneapi.PolicyMinimumAcceptedVersion)
 	}
 }
 
@@ -107,24 +109,24 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	// The v3-missing fields must be normalized to their server-side defaults —
 	// otherwise a server-first rollout silently disables the floors for every
 	// namespace that already had a CR.
-	if pA.MinimumMatchedTokens != DefaultMinimumMatchedTokens {
-		t.Fatalf("team-a MinimumMatchedTokens after v3 push = %d, want DefaultMinimumMatchedTokens (%d) — v3 → v4 matched-tokens normalization missing", pA.MinimumMatchedTokens, DefaultMinimumMatchedTokens)
+	if pA.MinimumMatchedTokens != controlplaneapi.DefaultMinimumMatchedTokens {
+		t.Fatalf("team-a MinimumMatchedTokens after v3 push = %d, want controlplaneapi.DefaultMinimumMatchedTokens (%d) — v3 → v4 matched-tokens normalization missing", pA.MinimumMatchedTokens, controlplaneapi.DefaultMinimumMatchedTokens)
 	}
 	if pA.RoutingFloorScore == nil {
-		t.Fatalf("team-a RoutingFloorScore after v3 push is nil — v3 → v5 routing-floor normalization missing (must synthesize DefaultRoutingFloorScore)")
+		t.Fatalf("team-a RoutingFloorScore after v3 push is nil — v3 → v5 routing-floor normalization missing (must synthesize controlplaneapi.DefaultRoutingFloorScore)")
 	}
-	if *pA.RoutingFloorScore != DefaultRoutingFloorScore {
-		t.Fatalf("team-a RoutingFloorScore after v3 push = %v, want DefaultRoutingFloorScore (%v) — v3 → v5 routing-floor normalization synthesized the wrong value", *pA.RoutingFloorScore, DefaultRoutingFloorScore)
+	if *pA.RoutingFloorScore != controlplaneapi.DefaultRoutingFloorScore {
+		t.Fatalf("team-a RoutingFloorScore after v3 push = %v, want controlplaneapi.DefaultRoutingFloorScore (%v) — v3 → v5 routing-floor normalization synthesized the wrong value", *pA.RoutingFloorScore, controlplaneapi.DefaultRoutingFloorScore)
 	}
 	if !store.ChainMatchingEnabled("team-a") || store.ChainRequired("team-a") || !store.TenantHotEnabled("team-a") {
 		t.Fatalf("team-a strategy defaults after v3 push = chain=%v require=%v tenantHot=%v, want true/false/true",
 			store.ChainMatchingEnabled("team-a"), store.ChainRequired("team-a"), store.TenantHotEnabled("team-a"))
 	}
 	if pA.AffinityRouting == nil {
-		t.Fatalf("team-a AffinityRouting after v3 push is nil — v3 → v7 affinity-routing normalization missing (must synthesize DefaultAffinityRoutingEnabled)")
+		t.Fatalf("team-a AffinityRouting after v3 push is nil — v3 → v7 affinity-routing normalization missing (must synthesize controlplaneapi.DefaultAffinityRoutingEnabled)")
 	}
-	if *pA.AffinityRouting != DefaultAffinityRoutingEnabled {
-		t.Fatalf("team-a AffinityRouting after v3 push = %v, want DefaultAffinityRoutingEnabled (%v) — v3 → v7 affinity-routing normalization synthesized the wrong value", *pA.AffinityRouting, DefaultAffinityRoutingEnabled)
+	if *pA.AffinityRouting != controlplaneapi.DefaultAffinityRoutingEnabled {
+		t.Fatalf("team-a AffinityRouting after v3 push = %v, want controlplaneapi.DefaultAffinityRoutingEnabled (%v) — v3 → v7 affinity-routing normalization synthesized the wrong value", *pA.AffinityRouting, controlplaneapi.DefaultAffinityRoutingEnabled)
 	}
 	// Every other knob the v3 body carried must reach the store unchanged.
 	if pA.EvictionTTL != 900_000_000_000 || pA.MinimumPrefixTokens != 32 || pA.LookupTimeoutMs != 25 || pA.Eviction != "lfu" {
@@ -135,18 +137,18 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 	if !ok {
 		t.Fatal("team-b policy missing from store after v3 push")
 	}
-	if pB.MinimumMatchedTokens != DefaultMinimumMatchedTokens {
-		t.Fatalf("team-b MinimumMatchedTokens after v3 push = %d, want DefaultMinimumMatchedTokens (%d)", pB.MinimumMatchedTokens, DefaultMinimumMatchedTokens)
+	if pB.MinimumMatchedTokens != controlplaneapi.DefaultMinimumMatchedTokens {
+		t.Fatalf("team-b MinimumMatchedTokens after v3 push = %d, want controlplaneapi.DefaultMinimumMatchedTokens (%d)", pB.MinimumMatchedTokens, controlplaneapi.DefaultMinimumMatchedTokens)
 	}
-	if pB.RoutingFloorScore == nil || *pB.RoutingFloorScore != DefaultRoutingFloorScore {
-		t.Fatalf("team-b RoutingFloorScore after v3 push = %v, want &DefaultRoutingFloorScore (%v)", pB.RoutingFloorScore, DefaultRoutingFloorScore)
+	if pB.RoutingFloorScore == nil || *pB.RoutingFloorScore != controlplaneapi.DefaultRoutingFloorScore {
+		t.Fatalf("team-b RoutingFloorScore after v3 push = %v, want &controlplaneapi.DefaultRoutingFloorScore (%v)", pB.RoutingFloorScore, controlplaneapi.DefaultRoutingFloorScore)
 	}
 	if !store.ChainMatchingEnabled("team-b") || store.ChainRequired("team-b") || !store.TenantHotEnabled("team-b") {
 		t.Fatalf("team-b strategy defaults after v3 push = chain=%v require=%v tenantHot=%v, want true/false/true",
 			store.ChainMatchingEnabled("team-b"), store.ChainRequired("team-b"), store.TenantHotEnabled("team-b"))
 	}
-	if pB.AffinityRouting == nil || *pB.AffinityRouting != DefaultAffinityRoutingEnabled {
-		t.Fatalf("team-b AffinityRouting after v3 push = %v, want &DefaultAffinityRoutingEnabled (%v)", pB.AffinityRouting, DefaultAffinityRoutingEnabled)
+	if pB.AffinityRouting == nil || *pB.AffinityRouting != controlplaneapi.DefaultAffinityRoutingEnabled {
+		t.Fatalf("team-b AffinityRouting after v3 push = %v, want &controlplaneapi.DefaultAffinityRoutingEnabled (%v)", pB.AffinityRouting, controlplaneapi.DefaultAffinityRoutingEnabled)
 	}
 
 	// Tenant quotas survive the version normalization unchanged.
@@ -215,8 +217,8 @@ func TestPolicySnapshotV4ExplicitZeroPreservedAndRoutingFloorNormalized(t *testi
 	if p.RoutingFloorScore == nil {
 		t.Fatal("RoutingFloorScore after v4 push is nil — v4 → v5 routing-floor normalization missing")
 	}
-	if *p.RoutingFloorScore != DefaultRoutingFloorScore {
-		t.Fatalf("RoutingFloorScore after v4 push = %v, want DefaultRoutingFloorScore (%v) — v4 → v5 routing-floor normalization synthesized the wrong value", *p.RoutingFloorScore, DefaultRoutingFloorScore)
+	if *p.RoutingFloorScore != controlplaneapi.DefaultRoutingFloorScore {
+		t.Fatalf("RoutingFloorScore after v4 push = %v, want controlplaneapi.DefaultRoutingFloorScore (%v) — v4 → v5 routing-floor normalization synthesized the wrong value", *p.RoutingFloorScore, controlplaneapi.DefaultRoutingFloorScore)
 	}
 	if !store.ChainMatchingEnabled("raw-recall") || store.ChainRequired("raw-recall") || !store.TenantHotEnabled("raw-recall") {
 		t.Fatalf("strategy defaults after v4 push = chain=%v require=%v tenantHot=%v, want true/false/true",
@@ -229,8 +231,8 @@ func TestPolicySnapshotV4ExplicitZeroPreservedAndRoutingFloorNormalized(t *testi
 	if p.AffinityRouting == nil {
 		t.Fatal("AffinityRouting after v4 push is nil — v4 → v7 affinity normalization missing")
 	}
-	if *p.AffinityRouting != DefaultAffinityRoutingEnabled {
-		t.Fatalf("AffinityRouting after v4 push = %v, want DefaultAffinityRoutingEnabled (%v) — v4 → v7 affinity normalization synthesized the wrong value", *p.AffinityRouting, DefaultAffinityRoutingEnabled)
+	if *p.AffinityRouting != controlplaneapi.DefaultAffinityRoutingEnabled {
+		t.Fatalf("AffinityRouting after v4 push = %v, want controlplaneapi.DefaultAffinityRoutingEnabled (%v) — v4 → v7 affinity normalization synthesized the wrong value", *p.AffinityRouting, controlplaneapi.DefaultAffinityRoutingEnabled)
 	}
 }
 
@@ -252,9 +254,9 @@ func TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved(t *testing.T) {
 	defer srv.Close()
 
 	zero := float32(0)
-	body, err := json.Marshal(PolicySnapshot{
+	body, err := json.Marshal(controlplaneapi.PolicySnapshot{
 		Version: 5, // literal v5 — must reach the store byte-for-byte even on a v7 server.
-		Policies: []ResolvedPolicy{
+		Policies: []controlplaneapi.ResolvedPolicy{
 			{Namespace: "raw-recall", RoutingFloorScore: &zero},
 		},
 	})
@@ -287,11 +289,11 @@ func TestPolicySnapshotExplicitStrategyPreserved(t *testing.T) {
 	enable := true
 	disable := false
 	require := true
-	body, err := json.Marshal(PolicySnapshot{
-		Version: PolicyPropagationVersion,
-		Policies: []ResolvedPolicy{{
+	body, err := json.Marshal(controlplaneapi.PolicySnapshot{
+		Version: controlplaneapi.PolicyPropagationVersion,
+		Policies: []controlplaneapi.ResolvedPolicy{{
 			Namespace: "strict",
-			Strategy: &ResolvedLookupStrategy{
+			Strategy: &controlplaneapi.ResolvedLookupStrategy{
 				EnableChainMatching: &enable,
 				RequireChain:        &require,
 				EnableTenantHot:     &disable,
@@ -332,7 +334,7 @@ func TestPolicySnapshotVersionTooOldRejected(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("v2 body status = %d, want 400 (below PolicyMinimumAcceptedVersion)", resp.StatusCode)
+		t.Fatalf("v2 body status = %d, want 400 (below controlplaneapi.PolicyMinimumAcceptedVersion)", resp.StatusCode)
 	}
 }
 
@@ -341,10 +343,10 @@ func TestPolicySnapshotRoundTripCarriesPoliciesAndTenants(t *testing.T) {
 	srv := httptest.NewServer(NewPolicyHTTPHandler(store))
 	defer srv.Close()
 
-	snap := PolicySnapshot{
-		Version:  PolicyPropagationVersion,
-		Policies: []ResolvedPolicy{{Namespace: "team-a", MinimumPrefixTokens: 16}},
-		Tenants: []ResolvedTenant{
+	snap := controlplaneapi.PolicySnapshot{
+		Version:  controlplaneapi.PolicyPropagationVersion,
+		Policies: []controlplaneapi.ResolvedPolicy{{Namespace: "team-a", MinimumPrefixTokens: 16}},
+		Tenants: []controlplaneapi.ResolvedTenant{
 			{TenantID: "team-a", MaxIndexEntries: 1000, IsolationMode: "Fairness"},
 			{TenantID: "team-b", MaxIndexEntries: 0},
 		},
@@ -387,7 +389,7 @@ func TestPolicySnapshotRoundTripCarriesPoliciesAndTenants(t *testing.T) {
 
 func TestReplaceSnapshotRevertsRemovedTenant(t *testing.T) {
 	store := NewPolicyStore()
-	store.ReplaceSnapshot(nil, []ResolvedTenant{{TenantID: "team-a", MaxIndexEntries: 5}})
+	store.ReplaceSnapshot(nil, []controlplaneapi.ResolvedTenant{{TenantID: "team-a", MaxIndexEntries: 5}})
 	if _, ok := store.TenantQuota("team-a"); !ok {
 		t.Fatal("team-a quota should be present after first push")
 	}
@@ -400,7 +402,7 @@ func TestReplaceSnapshotRevertsRemovedTenant(t *testing.T) {
 
 func TestReplaceSnapshotDropsEmptyTenantID(t *testing.T) {
 	store := NewPolicyStore()
-	store.ReplaceSnapshot(nil, []ResolvedTenant{{TenantID: "", MaxIndexEntries: 5}})
+	store.ReplaceSnapshot(nil, []controlplaneapi.ResolvedTenant{{TenantID: "", MaxIndexEntries: 5}})
 	if _, ok := store.TenantQuota(""); ok {
 		t.Fatal("an empty tenant ID must not be stored (would shadow empty-tenant lookups)")
 	}
@@ -413,7 +415,7 @@ func TestReplaceSnapshotDropsEmptyTenantID(t *testing.T) {
 // ReplaceSnapshot must clamp it to the design minimum of 0 (admit nothing).
 func TestReplaceSnapshotClampsNegativeBudget(t *testing.T) {
 	store := NewPolicyStore()
-	store.ReplaceSnapshot(nil, []ResolvedTenant{{TenantID: "team-a", MaxIndexEntries: -1}})
+	store.ReplaceSnapshot(nil, []controlplaneapi.ResolvedTenant{{TenantID: "team-a", MaxIndexEntries: -1}})
 	max, ok := store.TenantQuota("team-a")
 	if !ok {
 		t.Fatal("a negative budget must still register an (enforced) quota, not fail open")

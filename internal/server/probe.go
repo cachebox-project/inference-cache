@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // Functional-probe machinery.
@@ -74,111 +74,6 @@ import (
 // registry. Internal types here that are not yet read by anything outside
 // this file's tests are explicitly carved out (per the project's "no inert
 // field" rule — wired today, or names the follow-up that will wire it).
-
-// ProbeTenantID is the reserved tenant id every probe synthesizes its state
-// under. Real workload tenants (CacheTenant.spec.tenantID) are MinLength=1 and
-// arbitrary; the slash-delimited `inferencecache.io/probe` form is in the
-// project-canonical `inferencecache.io/...` namespace so a real tenant cannot
-// accidentally collide. The /probe HTTP handler does not accept a caller-
-// supplied tenant — the reservation is enforced server-side, never trusted
-// from the request — so a real workload cannot read or write probe entries by
-// spoofing the tenant id.
-const ProbeTenantID = controlplaneapi.ProbeTenantID
-
-// ProbeReplicaPrefix is the literal prefix every probe replica id starts with.
-// Real subscribers set replica_id = pod-name; Kubernetes pod names are RFC
-// 1123 subdomain labels that disallow underscores entirely, so the reserved
-// `__probe-` prefix (with its leading underscores) is collision-free with any
-// legitimate replica id. Cleanup keys on this prefix (and the probe tenant +
-// backend-derived suffix) to wipe ONLY the probe's own state on each Run,
-// never a real replica's entries.
-const ProbeReplicaPrefix = controlplaneapi.ProbeReplicaPrefix
-
-// ProbeTokenCount is the per-block token count carried by the synthesized
-// BlockStored. 16 is the smallest unit a vLLM-class engine reports
-// (one KV block) — small enough that the probe payload stays trivial in the
-// index even if cleanup is somehow skipped, but non-zero so the LookupRoute
-// ranker treats it as a real prefix hit.
-const ProbeTokenCount = controlplaneapi.ProbeTokenCount
-
-// ProbeStageResult is the per-stage outcome encoded in the JSON ProbeResult
-// the controller reads. Strings (not enums) so the wire stays stable when
-// new outcomes appear — same forward-compat reasoning as gRPC reason_code.
-type ProbeStageResult = controlplaneapi.ProbeStageResult
-
-// Possible per-stage outcomes. "skipped" applies to a stage the probe chose
-// not to run (T2 on a non-LMCache backend, or any downstream stage when an
-// upstream stage failed — running them would surface a cascade of false
-// failures that masks the real one).
-const (
-	ProbeStageOK      = controlplaneapi.ProbeStageOK
-	ProbeStageFailed  = controlplaneapi.ProbeStageFailed
-	ProbeStageSkipped = controlplaneapi.ProbeStageSkipped
-)
-
-// Stage names appear verbatim in ProbeStageError.Stage and (Stage 2) in the
-// inferencecache_backend_probe_result_total metric `stage` label. Stage A's wire
-// name is `ingest` — it exercises in-process index.Ingest, not the wire
-// ReportCacheState handler the real subscriber uses (the handler drops
-// probe-tenant messages by design). See the file-top doc for what a Stage
-// A pass/fail does and does not prove.
-const (
-	ProbeStageIngest  = controlplaneapi.ProbeStageIngest
-	ProbeStageRouting = controlplaneapi.ProbeStageRouting
-	ProbeStageT2      = controlplaneapi.ProbeStageT2
-)
-
-// BackendTypeLMCache is the spec.type value that gates Stage C. The probe
-// only runs the T2 put/get against LMCache-backed CacheBackends — Memory
-// and External backends carry no tier-2 client to drive. The string MUST
-// agree with the CacheBackend.spec.type enum value in api/v1alpha1; using
-// the literal here (rather than importing the CRD types) keeps pkg/server
-// dependency-free of the CRD package, matching the policy/tenant pattern in
-// pkg/server/policy.go.
-//
-// An empty BackendType on a ProbeRequest is treated as LMCache to match the
-// CacheBackend CRD's defaulter (spec.type defaults to LMCache via the
-// kubebuilder marker). Operators who run the probe by hand against a non-
-// LMCache backend must set BackendType explicitly; the CacheBackend
-// reconciler always reads spec.type from the CR and never sends empty.
-const BackendTypeLMCache = controlplaneapi.BackendTypeLMCache
-
-// ProbeRequest carries the parameters the probe needs to synthesize a
-// deterministic round-trip. The tenant_id is NOT a request field — it is
-// always ProbeTenantID, fixed server-side.
-//
-// Backend uniquely identifies which CacheBackend the probe is running
-// against AND is interpolated into the reserved replica id
-// (__probe-<backend>) and the deterministic probe hash. To prevent
-// same-name CacheBackends in different namespaces from colliding in the
-// reserved replica id, callers MUST pass a globally-unique form — the
-// canonical shape is `<namespace>/<name>` (matching K8s resource identity).
-// The CacheBackend reconciler always sends `<namespace>/<name>`; the
-// HTTP handler validates that the field is non-empty but does not enforce
-// the slash format, since hand-invoked probes on a single-namespace
-// install can use any unique string.
-//
-// Model + HashScheme pin the engine domain the synthesized state lives
-// under (so a probe for the vllm adapter cannot collide with a probe for
-// the sglang adapter on the same backend). BackendType decides whether
-// Stage C runs.
-type ProbeRequest = controlplaneapi.ProbeRequest
-
-// ProbeResult is the per-stage outcome returned to the controller. The
-// CacheBackend reconciler maps a stage's failed result onto the
-// corresponding FunctionalProbeOK condition reason:
-//
-//	ingest  failed → ProbeIngestFailed
-//	routing failed → ProbeRoutingFailed
-//	t2      failed → ProbeT2Failed
-//
-// Errors carries a stage-keyed message so the operator-visible condition
-// surfaces a concrete diagnostic, not just "something failed".
-type ProbeResult = controlplaneapi.ProbeResult
-
-// ProbeStageError names one stage's failure mode in operator-readable form.
-// Stage is one of ProbeStageIngest / ProbeStageRouting / ProbeStageT2.
-type ProbeStageError = controlplaneapi.ProbeStageError
 
 // T2Prober drives a put/get round trip against an external tier-2 backend
 // (today: LMCache). The controller-side caller is already wired (see
@@ -315,7 +210,7 @@ func (p *Prober) lockForRun(backend, model string) *sync.Mutex {
 // real lookup" — can construct the same id without re-deriving the
 // prefix-plus-backend rule.
 func ProbeReplicaID(backend string) string {
-	return ProbeReplicaPrefix + backend
+	return controlplaneapi.ProbeReplicaPrefix + backend
 }
 
 // ProbeHash returns the deterministic 32-byte SHA-256 of a canonical input
@@ -391,7 +286,7 @@ type hashWriter interface {
 // before cleanup (panic, ctx done) still leaves only reserved-tenant entries
 // the index's TTL sweep will eventually reap — the reserved naming makes the
 // residue invisible to real workload lookups regardless.
-func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
+func (p *Prober) Run(ctx context.Context, req controlplaneapi.ProbeRequest) controlplaneapi.ProbeResult {
 	replicaID := ProbeReplicaID(req.Backend)
 	probeHash := ProbeHash(req.Backend, req.Model, req.HashScheme)
 
@@ -404,7 +299,7 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	mu.Lock()
 	defer mu.Unlock()
 
-	result := ProbeResult{Backend: req.Backend}
+	result := controlplaneapi.ProbeResult{Backend: req.Backend}
 
 	// Cleanup ALWAYS runs — even on early return from a Stage-A failure or a
 	// panic in Stage B/C — so a flaky probe can't leak reserved-tenant entries
@@ -424,12 +319,12 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	update := index.Update{
 		ReplicaID:  replicaID,
 		Model:      req.Model,
-		Tenant:     ProbeTenantID,
+		Tenant:     controlplaneapi.ProbeTenantID,
 		HashScheme: req.HashScheme,
 		Timestamp:  p.now(),
 		Prefixes: []index.PrefixRef{{
 			BlockHashes:      [][]byte{probeHash},
-			BlockTokenCounts: []int32{ProbeTokenCount},
+			BlockTokenCounts: []int32{controlplaneapi.ProbeTokenCount},
 		}},
 		Stats: &index.ReplicaStats{
 			ReplicaID:        replicaID,
@@ -441,26 +336,26 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	p.ingestFn(update)
 
 	directReq := index.LookupRequest{
-		Tenant:           ProbeTenantID,
+		Tenant:           controlplaneapi.ProbeTenantID,
 		Model:            req.Model,
 		HashScheme:       req.HashScheme,
 		BlockHashes:      [][]byte{probeHash},
-		BlockTokenCounts: []int32{ProbeTokenCount},
+		BlockTokenCounts: []int32{controlplaneapi.ProbeTokenCount},
 	}
 	if !replicaInScores(p.index.Lookup(directReq), replicaID) {
-		result.Ingest = ProbeStageFailed
-		result.Errors = append(result.Errors, ProbeStageError{
-			Stage:   ProbeStageIngest,
+		result.Ingest = controlplaneapi.ProbeStageFailed
+		result.Errors = append(result.Errors, controlplaneapi.ProbeStageError{
+			Stage:   controlplaneapi.ProbeStageIngest,
 			Message: "synthesized probe event did not land in the index — in-process index ingest path is broken (Stage A calls index.Ingest directly; the wire ReportCacheState handler is not exercised here)",
 		})
 		// An entry that never landed cannot route, so Stage B is undefined;
 		// skip it so the controller's condition pinpoints the upstream stage
 		// instead of also flagging a routing failure that's just a cascade.
-		result.Routing = ProbeStageSkipped
-		result.T2 = ProbeStageSkipped
+		result.Routing = controlplaneapi.ProbeStageSkipped
+		result.T2 = controlplaneapi.ProbeStageSkipped
 		return result
 	}
-	result.Ingest = ProbeStageOK
+	result.Ingest = controlplaneapi.ProbeStageOK
 
 	// Stage B — index routing. Call index.LookupRoute (the orchestrated
 	// ranking entrypoint: PREFIX_MATCH / TENANT_HOT / NO_HINT) against the
@@ -477,16 +372,16 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	// (minimumPrefixTokens), lookupTimeoutMs deadline, proto→domain
 	// translation in updateFromProto/effectivePrefixTokens — are NOT
 	// covered by Stage B and require their own tests (handler unit tests
-	// exist for each gate in pkg/server/server_test.go). A Stage B pass
+	// exist for each gate in internal/server/server_test.go). A Stage B pass
 	// proves the index orchestration ranks the probe's hash correctly; it
 	// is not proof the public LookupRoute gRPC handler is healthy
 	// end-to-end.
 	routeRes := p.routeFn(directReq)
 	switch {
 	case routeRes.Strategy != index.StrategyPrefixMatch:
-		result.Routing = ProbeStageFailed
-		result.Errors = append(result.Errors, ProbeStageError{
-			Stage:   ProbeStageRouting,
+		result.Routing = controlplaneapi.ProbeStageFailed
+		result.Errors = append(result.Errors, controlplaneapi.ProbeStageError{
+			Stage:   controlplaneapi.ProbeStageRouting,
 			Message: fmt.Sprintf("LookupRoute returned %s, expected PREFIX_MATCH — index routing/key-derivation regression (this stage does not exercise the gRPC handler; see probe.go)", reasonForStrategy(routeRes.Strategy)),
 		})
 	case !replicaInScores(routeRes.Scores, replicaID):
@@ -499,23 +394,23 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 		// to the reserved replica id. Name the expected replica explicitly
 		// so the operator's condition message points at a probe-id-
 		// derivation regression, not a vague "wrong reason code".
-		result.Routing = ProbeStageFailed
-		result.Errors = append(result.Errors, ProbeStageError{
-			Stage:   ProbeStageRouting,
+		result.Routing = controlplaneapi.ProbeStageFailed
+		result.Errors = append(result.Errors, controlplaneapi.ProbeStageError{
+			Stage:   controlplaneapi.ProbeStageRouting,
 			Message: fmt.Sprintf("LookupRoute returned PREFIX_MATCH but probe replica %q is not among the scored replicas — possible probe-id or reserved-replica collision", replicaID),
 		})
 	}
-	if result.Routing == ProbeStageFailed {
+	if result.Routing == controlplaneapi.ProbeStageFailed {
 		// Skip Stage C on a routing failure for the same reason Stage B was
 		// skipped on a Stage-A failure: running a downstream stage when an
 		// upstream one is broken cascades the diagnostic — the controller's
 		// FunctionalProbeOK condition would then have to disentangle whether
 		// a T2 fail was real or a side-effect of routing being broken.
 		// Surface only the upstream stage; the operator fixes that first.
-		result.T2 = ProbeStageSkipped
+		result.T2 = controlplaneapi.ProbeStageSkipped
 		return result
 	}
-	result.Routing = ProbeStageOK
+	result.Routing = controlplaneapi.ProbeStageOK
 
 	// Stage C — T2 cycle. Skip on non-LMCache backends (no tier-2 to test) and
 	// when no prober is wired (Stage 1 default). Empty BackendType is treated as
@@ -527,20 +422,20 @@ func (p *Prober) Run(ctx context.Context, req ProbeRequest) ProbeResult {
 	// a successful round-trip is observable as a byte match on the receiving
 	// side; the probe doesn't care about the payload's content, only that what
 	// went in came out.
-	runT2 := req.BackendType == BackendTypeLMCache || req.BackendType == ""
+	runT2 := req.BackendType == controlplaneapi.BackendTypeLMCache || req.BackendType == ""
 	if !runT2 || p.t2 == nil {
-		result.T2 = ProbeStageSkipped
+		result.T2 = controlplaneapi.ProbeStageSkipped
 		return result
 	}
 	if err := p.t2.ProbePutGet(ctx, req.Backend, probePayload(probeHash)); err != nil {
-		result.T2 = ProbeStageFailed
-		result.Errors = append(result.Errors, ProbeStageError{
-			Stage:   ProbeStageT2,
+		result.T2 = controlplaneapi.ProbeStageFailed
+		result.Errors = append(result.Errors, controlplaneapi.ProbeStageError{
+			Stage:   controlplaneapi.ProbeStageT2,
 			Message: fmt.Sprintf("T2 put/get cycle failed: %s", t2ErrorMessage(err)),
 		})
 		return result
 	}
-	result.T2 = ProbeStageOK
+	result.T2 = controlplaneapi.ProbeStageOK
 	return result
 }
 
@@ -556,7 +451,7 @@ func (p *Prober) cleanup(model, replicaID string) {
 		Type:      index.EventAllCleared,
 		ReplicaID: replicaID,
 		Model:     model,
-		Tenant:    ProbeTenantID,
+		Tenant:    controlplaneapi.ProbeTenantID,
 		Timestamp: p.now(),
 	})
 }
@@ -621,7 +516,7 @@ func probeHandler(prober *Prober) http.HandlerFunc {
 		defer func() { _ = body.Close() }()
 		dec := json.NewDecoder(body)
 		dec.DisallowUnknownFields()
-		var req ProbeRequest
+		var req controlplaneapi.ProbeRequest
 		if err := dec.Decode(&req); err != nil {
 			http.Error(w, "decode probe request: "+err.Error()+"\n", http.StatusBadRequest)
 			return

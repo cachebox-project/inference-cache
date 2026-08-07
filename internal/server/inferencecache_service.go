@@ -12,9 +12,10 @@ import (
 	"math"
 	"time"
 
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 
@@ -202,7 +203,7 @@ func (s *inferenceCacheService) LookupRoute(ctx context.Context, req *icpb.Looku
 	// would require a schema change owned by the standalone F-series
 	// metric work.) The legitimate probe path uses index.LookupRoute
 	// directly, not the gRPC handler.
-	if tenant == ProbeTenantID {
+	if tenant == controlplaneapi.ProbeTenantID {
 		resp := &icpb.LookupRouteResponse{ReasonCode: reasonNoHint}
 		s.metrics.observeLookup(model, resp.ReasonCode, false, 0)
 		return resp, nil
@@ -576,7 +577,7 @@ func (s *inferenceCacheService) buildLookupResponse(req *icpb.LookupRouteRequest
 	if result.Strategy == index.StrategyPrefixMatch {
 		if floor := s.policyRoutingFloorScore(tenant); floor > 0 && len(result.Scores) > 0 {
 			// Scores are sorted descending by Score (see
-			// sortScoresDescByScoreThenID in pkg/index), so the first
+			// sortScoresDescByScoreThenID in internal/index), so the first
 			// element is the best surviving replica.
 			if result.Scores[0].Score < floor {
 				// Drop the hits map by constructing a fresh result —
@@ -694,7 +695,7 @@ func (s *inferenceCacheService) tryAffinityResponse(req *icpb.LookupRouteRequest
 // CachePolicy.spec.affinityRouting + PolicyStore.AffinityRoutingEnabled.
 func (s *inferenceCacheService) affinityRoutingEnabled(tenant string) bool {
 	if s.policies == nil {
-		return DefaultAffinityRoutingEnabled
+		return controlplaneapi.DefaultAffinityRoutingEnabled
 	}
 	return s.policies.AffinityRoutingEnabled(tenant)
 }
@@ -912,21 +913,21 @@ func (s *inferenceCacheService) policyRoutingFloorScore(tenant string) float32 {
 
 func (s *inferenceCacheService) policyChainMatchingEnabled(tenant string) bool {
 	if s.policies == nil {
-		return DefaultEnableChainMatching
+		return controlplaneapi.DefaultEnableChainMatching
 	}
 	return s.policies.ChainMatchingEnabled(tenant)
 }
 
 func (s *inferenceCacheService) policyChainRequired(tenant string) bool {
 	if s.policies == nil {
-		return DefaultRequireChain
+		return controlplaneapi.DefaultRequireChain
 	}
 	return s.policies.ChainRequired(tenant)
 }
 
 func (s *inferenceCacheService) policyTenantHotEnabled(tenant string) bool {
 	if s.policies == nil {
-		return DefaultEnableTenantHot
+		return controlplaneapi.DefaultEnableTenantHot
 	}
 	return s.policies.TenantHotEnabled(tenant)
 }
@@ -973,7 +974,7 @@ func (*inferenceCacheService) LookupPDRoute(context.Context, *icpb.LookupPDRoute
 // reads the cluster-wide aggregate via /snapshot, which also filters reserved
 // tenants.
 func (s *inferenceCacheService) GetCacheState(_ context.Context, req *icpb.GetCacheStateRequest) (*icpb.GetCacheStateResponse, error) {
-	if req.GetTenantId() == ProbeTenantID {
+	if req.GetTenantId() == controlplaneapi.ProbeTenantID {
 		return &icpb.GetCacheStateResponse{Summary: &icpb.CacheSummary{}}, nil
 	}
 	replicas, totalPrefixes := s.index.CacheState(req.GetTenantId(), req.GetModelId())
@@ -1014,7 +1015,7 @@ func (s *inferenceCacheService) ReportCacheState(stream icpb.InferenceCache_Repo
 			}
 			return err
 		}
-		if update.GetTenantId() == ProbeTenantID {
+		if update.GetTenantId() == controlplaneapi.ProbeTenantID {
 			continue
 		}
 		s.index.Ingest(updateFromProto(update))
@@ -1028,7 +1029,7 @@ func (s *inferenceCacheService) ReportCacheState(stream icpb.InferenceCache_Repo
 // regardless, but the silent drop keeps the public gRPC contract from
 // touching server-internal state.
 func (s *inferenceCacheService) PublishEvent(_ context.Context, ev *icpb.CacheEvent) (*icpb.Ack, error) {
-	if ev.GetTenantId() == ProbeTenantID {
+	if ev.GetTenantId() == controlplaneapi.ProbeTenantID {
 		return &icpb.Ack{Accepted: true}, nil
 	}
 	if t := eventTypeFromProto(ev.GetType()); t != 0 {

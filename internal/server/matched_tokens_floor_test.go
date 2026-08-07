@@ -14,8 +14,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // Server-side matched_tokens floor for LookupRoute. Trivial
@@ -41,8 +42,8 @@ import (
 // that hasn't installed a CachePolicy — which is the common case.
 func TestPolicyStoreMinimumMatchedTokensFallsBackToDefaultWhenNoPolicy(t *testing.T) {
 	store := NewPolicyStore()
-	if got := store.MinimumMatchedTokens("never-configured"); got != DefaultMinimumMatchedTokens {
-		t.Fatalf("MinimumMatchedTokens(no-policy) = %d, want DefaultMinimumMatchedTokens (%d)", got, DefaultMinimumMatchedTokens)
+	if got := store.MinimumMatchedTokens("never-configured"); got != controlplaneapi.DefaultMinimumMatchedTokens {
+		t.Fatalf("MinimumMatchedTokens(no-policy) = %d, want controlplaneapi.DefaultMinimumMatchedTokens (%d)", got, controlplaneapi.DefaultMinimumMatchedTokens)
 	}
 }
 
@@ -53,7 +54,7 @@ func TestPolicyStoreMinimumMatchedTokensFallsBackToDefaultWhenNoPolicy(t *testin
 // to >=64 and remove the disable-the-floor primitive.
 func TestPolicyStoreMinimumMatchedTokensRespectsPolicyValue(t *testing.T) {
 	store := NewPolicyStore()
-	store.Replace([]ResolvedPolicy{
+	store.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "ns-strict", MinimumMatchedTokens: 256},
 		{Namespace: "ns-disabled", MinimumMatchedTokens: 0},
 	})
@@ -73,7 +74,7 @@ func TestPolicyStoreMinimumMatchedTokensRespectsPolicyValue(t *testing.T) {
 // instead of clamping to the safest interpretation.
 func TestPolicyStoreMinimumMatchedTokensClampsNegativeToZero(t *testing.T) {
 	store := NewPolicyStore()
-	store.Replace([]ResolvedPolicy{{Namespace: "ns-bad", MinimumMatchedTokens: -1}})
+	store.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "ns-bad", MinimumMatchedTokens: -1}})
 	if got := store.MinimumMatchedTokens("ns-bad"); got != 0 {
 		t.Fatalf("negative floor = %d, want 0 (clamped)", got)
 	}
@@ -93,10 +94,10 @@ func TestLookupRouteAppliesDefaultMatchedTokensFloorWhenNoPolicy(t *testing.T) {
 	// MinimumMatchedTokens (64) explicitly because Replace overwrites
 	// the no-policy fallback the resolver would otherwise pick.
 	fal := false
-	svc.policies.Replace([]ResolvedPolicy{{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{
 		Namespace:            "no-policy-tenant",
 		AffinityRouting:      &fal,
-		MinimumMatchedTokens: DefaultMinimumMatchedTokens,
+		MinimumMatchedTokens: controlplaneapi.DefaultMinimumMatchedTokens,
 	}})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "no-policy-tenant", HashScheme: "vllm",
@@ -112,7 +113,7 @@ func TestLookupRouteAppliesDefaultMatchedTokensFloorWhenNoPolicy(t *testing.T) {
 	}
 	if resp.GetReasonCode() != "NO_HINT" {
 		t.Fatalf("reason = %q, want NO_HINT — 16-token match below default floor (%d) should not surface as PREFIX_MATCH",
-			resp.GetReasonCode(), DefaultMinimumMatchedTokens)
+			resp.GetReasonCode(), controlplaneapi.DefaultMinimumMatchedTokens)
 	}
 	if len(resp.GetReplicaScores()) != 0 {
 		t.Fatalf("sub-floor match must downgrade to NO_HINT with empty scores, got %+v", resp.GetReplicaScores())
@@ -128,7 +129,7 @@ func TestLookupRouteKeepsPrefixMatchAtDefaultFloorWhenNoPolicy(t *testing.T) {
 	svc := newTestService()
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "no-policy-tenant", HashScheme: "vllm",
-		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: DefaultMinimumMatchedTokens}},
+		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: controlplaneapi.DefaultMinimumMatchedTokens}},
 	})
 
 	resp, err := svc.LookupRoute(context.Background(), &icpb.LookupRouteRequest{
@@ -141,8 +142,8 @@ func TestLookupRouteKeepsPrefixMatchAtDefaultFloorWhenNoPolicy(t *testing.T) {
 	if resp.GetReasonCode() != "PREFIX_MATCH" {
 		t.Fatalf("reason = %q, want PREFIX_MATCH — match exactly at the floor should pass (>=, not >)", resp.GetReasonCode())
 	}
-	if got := resp.GetReplicaScores()[0].GetMatchedTokens(); got != DefaultMinimumMatchedTokens {
-		t.Fatalf("matched_tokens = %d, want %d (the boundary value)", got, DefaultMinimumMatchedTokens)
+	if got := resp.GetReplicaScores()[0].GetMatchedTokens(); got != controlplaneapi.DefaultMinimumMatchedTokens {
+		t.Fatalf("matched_tokens = %d, want %d (the boundary value)", got, controlplaneapi.DefaultMinimumMatchedTokens)
 	}
 }
 
@@ -156,7 +157,7 @@ func TestLookupRoutePolicyMatchedTokensFloorOverridesDefault(t *testing.T) {
 	fal := false
 	// Disable affinity to keep the floor downgrade as NO_HINT (see
 	// the sibling test for rationale).
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-strict", MinimumMatchedTokens: 256, AffinityRouting: &fal},
 	})
 	svc.index.Ingest(index.Update{
@@ -185,7 +186,7 @@ func TestLookupRoutePolicyMatchedTokensFloorOverridesDefault(t *testing.T) {
 // ranker's raw recall.
 func TestLookupRoutePolicyMatchedTokensFloorZeroDisablesEnforcement(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "raw-recall", MinimumMatchedTokens: 0},
 	})
 	svc.index.Ingest(index.Update{
@@ -215,7 +216,7 @@ func TestLookupRoutePolicyMatchedTokensFloorZeroDisablesEnforcement(t *testing.T
 // for every well-warmed peer in the same response.
 func TestLookupRouteMatchedTokensFloorFiltersBelowFloorReplicasKeepsTheRest(t *testing.T) {
 	svc := newTestService()
-	svc.policies.Replace([]ResolvedPolicy{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "mixed-warmth", MinimumMatchedTokens: 64},
 	})
 	// Both replicas hold the same chain head; A holds the leading 4 blocks
@@ -270,10 +271,10 @@ func TestLookupRouteSubFloorMatchEmitsNoHintMetric(t *testing.T) {
 	// MinimumMatchedTokens explicitly (Replace overrides the
 	// no-policy fallback the resolver would otherwise pick).
 	fal := false
-	svc.policies.Replace([]ResolvedPolicy{{
+	svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{
 		Namespace:            "no-policy-tenant",
 		AffinityRouting:      &fal,
-		MinimumMatchedTokens: DefaultMinimumMatchedTokens,
+		MinimumMatchedTokens: controlplaneapi.DefaultMinimumMatchedTokens,
 	}})
 	svc.index.Ingest(index.Update{
 		ReplicaID: "r", Model: "m", Tenant: "no-policy-tenant", HashScheme: "vllm",
@@ -343,7 +344,7 @@ func TestLookupRouteSubFloorMatchEmitsNoHintMetric(t *testing.T) {
 // rB-keyed entry under b1, so b1 itself stays via rA).
 func TestLookupRouteFloorPrunesLFUHitsForFilteredReplicas(t *testing.T) {
 	policies := NewPolicyStore()
-	policies.Replace([]ResolvedPolicy{
+	policies.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "t", Eviction: "lfu", MinimumMatchedTokens: 64},
 	})
 	idx := index.New(

@@ -11,7 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
-	"github.com/cachebox-project/inference-cache/pkg/server/auth"
+	"github.com/cachebox-project/inference-cache/internal/server/auth"
 )
 
 // metricNamespace is the prefix for this project's own metrics (tech spec

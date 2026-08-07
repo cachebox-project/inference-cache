@@ -40,7 +40,7 @@ the condition `.message` first — the controller embeds the server's stage diag
 
 | Reason | Stage | Meaning | First response |
 |---|---|---|---|
-| `ProbeIngestFailed` | ingest | The server's in-process index ingest path is dropping writes. (Not a subscriber problem — the probe bypasses the gRPC ingest surface by design.) | Read `.message`; check `inferencecache_backend_probe_result_total{stage="ingest",result="failed"}`; confirm `inferencecache_server_up == 1`; inspect server `pkg/index` logs. |
+| `ProbeIngestFailed` | ingest | The server's in-process index ingest path is dropping writes. (Not a subscriber problem — the probe bypasses the gRPC ingest surface by design.) | Read `.message`; check `inferencecache_backend_probe_result_total{stage="ingest",result="failed"}`; confirm `inferencecache_server_up == 1`; inspect server `internal/index` logs. |
 | `ProbeRoutingFailed` | routing | `LookupRoute` did not return a clean `PREFIX_MATCH` for the probe's reserved replica — usually an internal `hash_scheme` regression that dropped the probe's scheme on ingest, or a lookup-filter regression. | Read `.message` (the server names the failure mode); check the `stage="routing"` probe counter; inspect server lookup-path logs. |
 | `ProbeT2Failed` | tier-2 | The tier-2 put/get cycle failed. Only reachable once a tier-2 prober is wired — none ships today, so this does not appear on a clean install. | Not actionable today. |
 

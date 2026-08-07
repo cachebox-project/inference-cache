@@ -91,9 +91,9 @@ the operator CLI and the CRDs.
 
 **`inferencecache-server`** (`cmd/server`) — gRPC policy server + cache-state index + metrics
 - `cmd/server/` — gRPC + HTTP server entrypoint
-- `pkg/server/` — gRPC service (`LookupRoute`, `RenderTemplate`, …), health, metrics
+- `internal/server/` — gRPC service (`LookupRoute`, `RenderTemplate`, …), health, metrics
 - `proto/` (+ generated stubs) — the gRPC contract
-- `pkg/index/` — cache-state aggregator (`CacheIndex`)
+- `internal/index/` — cache-state aggregator (`CacheIndex`)
 - `pkg/render/` — mutable-slot prompt rendering engine (the wedge); importable library
 - `pkg/adapters/engine/` — engine KV-event hook (feeds the index)
 

@@ -13,8 +13,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // TestLookupRouteEmitsUnknownHashScheme pins the scheme-mismatch wire shape:
@@ -119,7 +120,7 @@ func TestLookupRouteGenuineMissStillNoHint(t *testing.T) {
 		// behavior on the same scenario is covered in
 		// affinity_routing_test.go.
 		fal := false
-		svc.policies.Replace([]ResolvedPolicy{{Namespace: "t", AffinityRouting: &fal}})
+		svc.policies.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "t", AffinityRouting: &fal}})
 		// Use Stats: nil so the warm-replica TENANT_HOT path can't fire — we
 		// want to isolate the "real miss" branch end-to-end.
 		svc.index.Ingest(index.Update{

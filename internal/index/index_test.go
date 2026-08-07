@@ -27,7 +27,7 @@ func hash(s string) []byte { return []byte(s) }
 // Stage A lookup still finds them) but invisible to the cap accounting,
 // aggregate, snapshot, and per-model entry-count gauge — so a probe in flight
 // cannot displace real workload state via the cap sweep AND cannot leak
-// into observability surfaces. Mirrors TestProberRun* in pkg/server, but
+// into observability surfaces. Mirrors TestProberRun* in internal/server, but
 // from the index's perspective.
 func TestReservedTenantHiddenFromCapAndAggregate(t *testing.T) {
 	const reserved = "inferencecache.io/probe"

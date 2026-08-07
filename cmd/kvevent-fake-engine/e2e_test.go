@@ -9,7 +9,7 @@ package main
 //	fake engine (this package, real ZMQ PUB socket)
 //	  → kvevent-subscriber pipeline (engine.Subscriber → engine.Reporter —
 //	    the same components cmd/kvevent-subscriber wires)
-//	  → inference-cache server (pkg/server, real gRPC over loopback TCP)
+//	  → inference-cache server (internal/server, real gRPC over loopback TCP)
 //	  → LookupRoute
 //
 // This is the regression lock for the all-NO_HINT bug: the engine's own KV
@@ -43,9 +43,9 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/server"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
-	"github.com/cachebox-project/inference-cache/pkg/server"
 )
 
 const (

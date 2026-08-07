@@ -19,8 +19,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
-	"github.com/cachebox-project/inference-cache/pkg/server/auth"
+	cacheserver "github.com/cachebox-project/inference-cache/internal/server"
+	"github.com/cachebox-project/inference-cache/internal/server/auth"
 )
 
 // TestIntegrationCachePolicyPushAgainstAuthedEndpoint is the mirror of
@@ -31,12 +31,12 @@ import (
 //	ControlPlaneReconciler.pushSnapshot
 //	  -> bearerToken() reads the SA token from a tmpfile (kubelet-shape)
 //	  -> POST carries Authorization: Bearer <token>
-//	  -> in-process httptest server wrapped in pkg/server/auth.Middleware
+//	  -> in-process httptest server wrapped in internal/server/auth.Middleware
 //	  -> Authenticator calls TokenReview against the envtest apiserver
 //	  -> apiserver validates the token it minted via TokenRequest
 //	  -> handler accepts and returns 204
 //
-// The auth middleware unit tests in pkg/server/auth already cover the
+// The auth middleware unit tests in internal/server/auth already cover the
 // middleware in isolation; this test pins the production CLIENT code (the
 // reconciler) onto the same backend, since that's the surface this hardening
 // changes for downstream callers.

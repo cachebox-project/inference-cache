@@ -36,7 +36,7 @@ SGLang adopted vLLM's KV-event wire wholesale: `--kv-events-config` drives a ZMQ
    is the `--hash-scheme=sglang` tag. The Go decoder is exercised against a synthetic
    SGLang-shaped frame in `pkg/adapters/engine/sglang_wire_test.go`, and the
    cross-engine isolation (`hash_scheme` keeps SGLang and vLLM prefixes disjoint) in
-   `pkg/index` (`TestNoCrossEngineFalseHitVLLMvsSGLang`).
+   `internal/index` (`TestNoCrossEngineFalseHitVLLMvsSGLang`).
 2. **You can validate the wire off-GPU** (below): the Go test covers SGLang's exact
    wire shape; the Python synthetic tooling covers the shared decode/redaction logic.
 

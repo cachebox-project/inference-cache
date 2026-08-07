@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 func TestPolicyStoreLookupReturnsDefaultsWhenUnset(t *testing.T) {
@@ -35,7 +37,7 @@ func TestPolicyStoreLookupReturnsDefaultsWhenUnset(t *testing.T) {
 
 func TestPolicyStoreReplaceIsAtomicAndDropsStale(t *testing.T) {
 	s := NewPolicyStore()
-	s.Replace([]ResolvedPolicy{
+	s.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", EvictionTTL: 15 * time.Minute, MinimumPrefixTokens: 32, LookupTimeoutMs: 25},
 		{Namespace: "team-b", EvictionTTL: time.Hour},
 	})
@@ -51,7 +53,7 @@ func TestPolicyStoreReplaceIsAtomicAndDropsStale(t *testing.T) {
 	}
 
 	// Replace with a snapshot that omits team-b — that namespace must revert.
-	s.Replace([]ResolvedPolicy{
+	s.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "team-a", EvictionTTL: 5 * time.Minute},
 	})
 	if _, ok := s.Lookup("team-b"); ok {
@@ -64,7 +66,7 @@ func TestPolicyStoreReplaceIsAtomicAndDropsStale(t *testing.T) {
 
 func TestPolicyStoreReplaceDropsEmptyNamespace(t *testing.T) {
 	s := NewPolicyStore()
-	s.Replace([]ResolvedPolicy{
+	s.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "", EvictionTTL: time.Hour}, // bogus — must be dropped
 		{Namespace: "ok", EvictionTTL: time.Minute},
 	})
@@ -81,7 +83,7 @@ func TestPolicyStoreReplaceDropsEmptyNamespace(t *testing.T) {
 // reads never observe a partial state catches missing locks.
 func TestPolicyStoreConcurrentReadsWithWriter(t *testing.T) {
 	s := NewPolicyStore()
-	s.Replace([]ResolvedPolicy{{Namespace: "t", EvictionTTL: time.Hour}})
+	s.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "t", EvictionTTL: time.Hour}})
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -110,7 +112,7 @@ func TestPolicyStoreConcurrentReadsWithWriter(t *testing.T) {
 	}
 
 	for i := 0; i < 500; i++ {
-		s.Replace([]ResolvedPolicy{
+		s.Replace([]controlplaneapi.ResolvedPolicy{
 			{Namespace: "t", EvictionTTL: time.Duration(i+1) * time.Minute},
 		})
 	}
@@ -126,9 +128,9 @@ func TestPolicyHandlerReplacesSnapshot(t *testing.T) {
 	srv := httptest.NewServer(policyHandler(s))
 	defer srv.Close()
 
-	body, _ := json.Marshal(PolicySnapshot{
-		Version: PolicyPropagationVersion,
-		Policies: []ResolvedPolicy{
+	body, _ := json.Marshal(controlplaneapi.PolicySnapshot{
+		Version: controlplaneapi.PolicyPropagationVersion,
+		Policies: []controlplaneapi.ResolvedPolicy{
 			{Namespace: "team-a", EvictionTTL: 7 * time.Minute, MinimumPrefixTokens: 16},
 		},
 	})
@@ -155,9 +157,9 @@ func TestPolicySnapshotRoundTripCarriesEviction(t *testing.T) {
 	srv := httptest.NewServer(policyHandler(s))
 	defer srv.Close()
 
-	body, _ := json.Marshal(PolicySnapshot{
-		Version: PolicyPropagationVersion,
-		Policies: []ResolvedPolicy{
+	body, _ := json.Marshal(controlplaneapi.PolicySnapshot{
+		Version: controlplaneapi.PolicyPropagationVersion,
+		Policies: []controlplaneapi.ResolvedPolicy{
 			{Namespace: "team-lfu", Eviction: "lfu"},
 			{Namespace: "team-lru", Eviction: "lru"},
 			{Namespace: "team-default"}, // no eviction set
@@ -195,7 +197,7 @@ func TestPolicySnapshotRoundTripCarriesEviction(t *testing.T) {
 func TestPolicyHandlerRejectsBadVersion(t *testing.T) {
 	srv := httptest.NewServer(policyHandler(NewPolicyStore()))
 	defer srv.Close()
-	body, _ := json.Marshal(PolicySnapshot{Version: 99, Policies: []ResolvedPolicy{}})
+	body, _ := json.Marshal(controlplaneapi.PolicySnapshot{Version: 99, Policies: []controlplaneapi.ResolvedPolicy{}})
 	resp, err := http.Post(srv.URL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -237,13 +239,13 @@ func TestPolicyHandlerCapsBodySize(t *testing.T) {
 	srv := httptest.NewServer(policyHandler(NewPolicyStore()))
 	defer srv.Close()
 	// Build a snapshot that comfortably exceeds the 1 MiB cap.
-	policies := make([]ResolvedPolicy, 0, 20000)
+	policies := make([]controlplaneapi.ResolvedPolicy, 0, 20000)
 	for i := 0; i < 20000; i++ {
-		policies = append(policies, ResolvedPolicy{
+		policies = append(policies, controlplaneapi.ResolvedPolicy{
 			Namespace: fmt.Sprintf("ns-%d-padded-with-bytes-to-exceed-cap", i),
 		})
 	}
-	body, _ := json.Marshal(PolicySnapshot{Version: PolicyPropagationVersion, Policies: policies})
+	body, _ := json.Marshal(controlplaneapi.PolicySnapshot{Version: controlplaneapi.PolicyPropagationVersion, Policies: policies})
 	resp, err := http.Post(srv.URL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
@@ -263,7 +265,7 @@ func TestPolicyStoreAffinityRoutingEnabled(t *testing.T) {
 	}
 
 	tru, fal := true, false
-	store.Replace([]ResolvedPolicy{
+	store.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "ns-nil"},
 		{Namespace: "ns-true", AffinityRouting: &tru},
 		{Namespace: "ns-false", AffinityRouting: &fal},

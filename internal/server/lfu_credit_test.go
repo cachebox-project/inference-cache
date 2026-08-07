@@ -9,8 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // lfuCreditService builds a service whose index runs LFU for tenant "t" with a
@@ -18,7 +19,7 @@ import (
 func lfuCreditService(t *testing.T) *inferenceCacheService {
 	t.Helper()
 	policies := NewPolicyStore()
-	policies.Replace([]ResolvedPolicy{{Namespace: "t", Eviction: "lfu", LookupTimeoutMs: 5}})
+	policies.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "t", Eviction: "lfu", LookupTimeoutMs: 5}})
 	idx := index.New(
 		index.WithTTL(time.Hour),
 		index.WithMaxEntries(1),

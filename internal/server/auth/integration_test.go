@@ -21,7 +21,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"github.com/cachebox-project/inference-cache/pkg/server/auth"
+	"github.com/cachebox-project/inference-cache/internal/server/auth"
 )
 
 // TestAuthMiddleware_AgainstEnvtestAPIServer exercises the middleware against

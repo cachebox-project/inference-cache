@@ -20,7 +20,8 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	authnv1 "k8s.io/api/authentication/v1"
 
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // fakeT2Prober is the Stage-C fake. ProbePutGet returns whatever err the
@@ -150,10 +151,10 @@ func TestProbeHashEncodingIsInjective(t *testing.T) {
 // collision-free namespace that keeps probe + workload state disjoint.
 func TestProbeReplicaIDReservedPrefix(t *testing.T) {
 	got := ProbeReplicaID("my-backend")
-	if !strings.HasPrefix(got, ProbeReplicaPrefix) {
-		t.Fatalf("ProbeReplicaID = %q, want prefix %q", got, ProbeReplicaPrefix)
+	if !strings.HasPrefix(got, controlplaneapi.ProbeReplicaPrefix) {
+		t.Fatalf("ProbeReplicaID = %q, want prefix %q", got, controlplaneapi.ProbeReplicaPrefix)
 	}
-	if got == ProbeReplicaPrefix {
+	if got == controlplaneapi.ProbeReplicaPrefix {
 		t.Fatalf("ProbeReplicaID(%q) returned bare prefix — backend suffix dropped", "my-backend")
 	}
 }
@@ -164,19 +165,19 @@ func TestProbeReplicaIDReservedPrefix(t *testing.T) {
 // same as "every stage succeeded" — without this guard, the controller-
 // wiring follow-up could flip FunctionalProbeOK True on an empty response.
 func TestProbeResultAllPassedZeroValueFailsClosed(t *testing.T) {
-	if (ProbeResult{}).AllPassed() {
-		t.Fatal("ProbeResult{}.AllPassed() = true, want false — zero-value must not pass")
+	if (controlplaneapi.ProbeResult{}).AllPassed() {
+		t.Fatal("controlplaneapi.ProbeResult{}.AllPassed() = true, want false — zero-value must not pass")
 	}
 	// A partially-populated result also fails: two stages ok + one
 	// zero-value field is still "no information" for that stage.
-	partial := ProbeResult{Ingest: ProbeStageOK, Routing: ProbeStageOK}
+	partial := controlplaneapi.ProbeResult{Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK}
 	if partial.AllPassed() {
-		t.Fatal("ProbeResult with zero-value T2 returned AllPassed=true; want false")
+		t.Fatal("controlplaneapi.ProbeResult with zero-value T2 returned AllPassed=true; want false")
 	}
 	// The all-explicit-ok case still passes.
-	all := ProbeResult{Ingest: ProbeStageOK, Routing: ProbeStageOK, T2: ProbeStageSkipped}
+	all := controlplaneapi.ProbeResult{Ingest: controlplaneapi.ProbeStageOK, Routing: controlplaneapi.ProbeStageOK, T2: controlplaneapi.ProbeStageSkipped}
 	if !all.AllPassed() {
-		t.Fatal("explicit ok/ok/skipped ProbeResult should report AllPassed=true")
+		t.Fatal("explicit ok/ok/skipped controlplaneapi.ProbeResult should report AllPassed=true")
 	}
 }
 
@@ -187,21 +188,21 @@ func TestProbeResultAllPassedZeroValueFailsClosed(t *testing.T) {
 // yet.
 func TestProberRunHappyPathStageABCSkippedT2(t *testing.T) {
 	prober, _ := newProberForTest(t, nil)
-	result := prober.Run(t.Context(), ProbeRequest{
+	result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 		Backend:     "cb-happy",
 		Model:       "llama-3-8b",
 		HashScheme:  "vllm",
-		BackendType: BackendTypeLMCache,
+		BackendType: controlplaneapi.BackendTypeLMCache,
 	})
 
-	if result.Ingest != ProbeStageOK {
-		t.Errorf("Ingest = %q, want %q", result.Ingest, ProbeStageOK)
+	if result.Ingest != controlplaneapi.ProbeStageOK {
+		t.Errorf("Ingest = %q, want %q", result.Ingest, controlplaneapi.ProbeStageOK)
 	}
-	if result.Routing != ProbeStageOK {
-		t.Errorf("Routing = %q, want %q", result.Routing, ProbeStageOK)
+	if result.Routing != controlplaneapi.ProbeStageOK {
+		t.Errorf("Routing = %q, want %q", result.Routing, controlplaneapi.ProbeStageOK)
 	}
-	if result.T2 != ProbeStageSkipped {
-		t.Errorf("T2 = %q, want %q when no T2Prober is wired", result.T2, ProbeStageSkipped)
+	if result.T2 != controlplaneapi.ProbeStageSkipped {
+		t.Errorf("T2 = %q, want %q when no T2Prober is wired", result.T2, controlplaneapi.ProbeStageSkipped)
 	}
 	if !result.AllPassed() {
 		t.Fatalf("AllPassed() = false; result = %+v", result)
@@ -219,14 +220,14 @@ func TestProberRunHappyPathStageABCSkippedT2(t *testing.T) {
 func TestProberRunStageCSkippedForNonLMCache(t *testing.T) {
 	t2 := &fakeT2Prober{}
 	prober, _ := newProberForTest(t, t2)
-	result := prober.Run(t.Context(), ProbeRequest{
+	result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 		Backend:     "cb-mem",
 		Model:       "m",
 		HashScheme:  "vllm",
 		BackendType: "Memory", // not LMCache
 	})
-	if result.T2 != ProbeStageSkipped {
-		t.Fatalf("T2 = %q, want %q for non-LMCache backend", result.T2, ProbeStageSkipped)
+	if result.T2 != controlplaneapi.ProbeStageSkipped {
+		t.Fatalf("T2 = %q, want %q for non-LMCache backend", result.T2, controlplaneapi.ProbeStageSkipped)
 	}
 	if t2.calls != 0 {
 		t.Fatalf("T2Prober was called %d times for non-LMCache backend, want 0", t2.calls)
@@ -241,7 +242,7 @@ func TestProberRunStageCSkippedForNonLMCache(t *testing.T) {
 func TestProberRunStageCTreatsEmptyBackendTypeAsLMCache(t *testing.T) {
 	t2 := &fakeT2Prober{}
 	prober, _ := newProberForTest(t, t2)
-	result := prober.Run(t.Context(), ProbeRequest{
+	result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 		Backend:    "cb-default",
 		Model:      "m",
 		HashScheme: "vllm",
@@ -249,8 +250,8 @@ func TestProberRunStageCTreatsEmptyBackendTypeAsLMCache(t *testing.T) {
 		// the CR omitted spec.type (the kubebuilder defaulter writes LMCache,
 		// but a hand-rolled request can still arrive empty).
 	})
-	if result.T2 != ProbeStageOK {
-		t.Errorf("T2 = %q, want %q — empty BackendType must run Stage C (CRD default)", result.T2, ProbeStageOK)
+	if result.T2 != controlplaneapi.ProbeStageOK {
+		t.Errorf("T2 = %q, want %q — empty BackendType must run Stage C (CRD default)", result.T2, controlplaneapi.ProbeStageOK)
 	}
 	if t2.calls != 1 {
 		t.Errorf("T2Prober calls = %d, want 1 — empty BackendType silently skipped Stage C", t2.calls)
@@ -265,14 +266,14 @@ func TestProberRunStageCTreatsEmptyBackendTypeAsLMCache(t *testing.T) {
 func TestProberRunStageCRunsForLMCacheWithProber(t *testing.T) {
 	t2 := &fakeT2Prober{}
 	prober, _ := newProberForTest(t, t2)
-	result := prober.Run(t.Context(), ProbeRequest{
+	result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 		Backend:     "cb-lm",
 		Model:       "m",
 		HashScheme:  "vllm",
-		BackendType: BackendTypeLMCache,
+		BackendType: controlplaneapi.BackendTypeLMCache,
 	})
-	if result.T2 != ProbeStageOK {
-		t.Errorf("T2 = %q, want %q", result.T2, ProbeStageOK)
+	if result.T2 != controlplaneapi.ProbeStageOK {
+		t.Errorf("T2 = %q, want %q", result.T2, controlplaneapi.ProbeStageOK)
 	}
 	if t2.calls != 1 {
 		t.Errorf("T2Prober calls = %d, want 1", t2.calls)
@@ -294,22 +295,22 @@ func TestProberRunStageAFailsWhenIngestNoOps(t *testing.T) {
 	prober, _ := newProberForTest(t, nil)
 	prober.ingestFn = func(index.Update) {} // simulate a write that never lands
 
-	result := prober.Run(t.Context(), ProbeRequest{
+	result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 		Backend: "cb-1", Model: "m", HashScheme: "vllm",
 	})
-	if result.Ingest != ProbeStageFailed {
-		t.Errorf("Ingest = %q, want %q", result.Ingest, ProbeStageFailed)
+	if result.Ingest != controlplaneapi.ProbeStageFailed {
+		t.Errorf("Ingest = %q, want %q", result.Ingest, controlplaneapi.ProbeStageFailed)
 	}
-	if result.Routing != ProbeStageSkipped {
-		t.Errorf("Routing = %q, want %q (cascade from failed Stage A)", result.Routing, ProbeStageSkipped)
+	if result.Routing != controlplaneapi.ProbeStageSkipped {
+		t.Errorf("Routing = %q, want %q (cascade from failed Stage A)", result.Routing, controlplaneapi.ProbeStageSkipped)
 	}
-	if result.T2 != ProbeStageSkipped {
-		t.Errorf("T2 = %q, want %q (cascade from failed Stage A)", result.T2, ProbeStageSkipped)
+	if result.T2 != controlplaneapi.ProbeStageSkipped {
+		t.Errorf("T2 = %q, want %q (cascade from failed Stage A)", result.T2, controlplaneapi.ProbeStageSkipped)
 	}
 	if result.AllPassed() {
 		t.Fatal("AllPassed() = true despite Ingest failed")
 	}
-	if !stageErrorPresent(result.Errors, ProbeStageIngest) {
+	if !stageErrorPresent(result.Errors, controlplaneapi.ProbeStageIngest) {
 		t.Errorf("expected ingest stage error, got %+v", result.Errors)
 	}
 }
@@ -332,17 +333,17 @@ func TestProberRunStageBFailsWhenRouteReturnsNoHint(t *testing.T) {
 		return index.LookupResult{Strategy: index.StrategyNone}
 	}
 
-	result := prober.Run(t.Context(), ProbeRequest{
-		Backend: "cb-1", Model: "m", HashScheme: "vllm", BackendType: BackendTypeLMCache,
+	result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{
+		Backend: "cb-1", Model: "m", HashScheme: "vllm", BackendType: controlplaneapi.BackendTypeLMCache,
 	})
-	if result.Ingest != ProbeStageOK {
-		t.Errorf("Ingest = %q, want %q — direct Lookup is unaffected by the routeFn override", result.Ingest, ProbeStageOK)
+	if result.Ingest != controlplaneapi.ProbeStageOK {
+		t.Errorf("Ingest = %q, want %q — direct Lookup is unaffected by the routeFn override", result.Ingest, controlplaneapi.ProbeStageOK)
 	}
-	if result.Routing != ProbeStageFailed {
-		t.Errorf("Routing = %q, want %q", result.Routing, ProbeStageFailed)
+	if result.Routing != controlplaneapi.ProbeStageFailed {
+		t.Errorf("Routing = %q, want %q", result.Routing, controlplaneapi.ProbeStageFailed)
 	}
-	if result.T2 != ProbeStageSkipped {
-		t.Errorf("T2 = %q, want %q — must skip on Stage-B failure to avoid cascading diagnostic", result.T2, ProbeStageSkipped)
+	if result.T2 != controlplaneapi.ProbeStageSkipped {
+		t.Errorf("T2 = %q, want %q — must skip on Stage-B failure to avoid cascading diagnostic", result.T2, controlplaneapi.ProbeStageSkipped)
 	}
 	if t2.calls != 0 {
 		t.Errorf("T2Prober was called %d times after Stage B failed; want 0 (cascade prevention)", t2.calls)
@@ -350,7 +351,7 @@ func TestProberRunStageBFailsWhenRouteReturnsNoHint(t *testing.T) {
 	if result.AllPassed() {
 		t.Fatal("AllPassed() = true despite Routing failed")
 	}
-	if !stageErrorPresent(result.Errors, ProbeStageRouting) {
+	if !stageErrorPresent(result.Errors, controlplaneapi.ProbeStageRouting) {
 		t.Errorf("expected routing stage error, got %+v", result.Errors)
 	}
 }
@@ -371,13 +372,13 @@ func TestProberRunStageBDistinguishesWrongReplicaFromWrongStrategy(t *testing.T)
 		}
 	}
 
-	result := prober.Run(t.Context(), ProbeRequest{
+	result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 		Backend: "cb-1", Model: "m", HashScheme: "vllm",
 	})
-	if result.Routing != ProbeStageFailed {
-		t.Fatalf("Routing = %q, want %q", result.Routing, ProbeStageFailed)
+	if result.Routing != controlplaneapi.ProbeStageFailed {
+		t.Fatalf("Routing = %q, want %q", result.Routing, controlplaneapi.ProbeStageFailed)
 	}
-	msg := stageErrorMessage(result.Errors, ProbeStageRouting)
+	msg := stageErrorMessage(result.Errors, controlplaneapi.ProbeStageRouting)
 	expectedReplica := ProbeReplicaID("cb-1")
 	if !strings.Contains(msg, "not among the scored replicas") {
 		t.Errorf("routing error %q should distinguish wrong-replica from wrong-strategy", msg)
@@ -405,17 +406,17 @@ func TestProberRunStageCDistinguishesPutFromGet(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t2 := &fakeT2Prober{err: tc.err}
 			prober, _ := newProberForTest(t, t2)
-			result := prober.Run(t.Context(), ProbeRequest{
+			result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 				Backend: "cb-1", Model: "m", HashScheme: "vllm",
-				BackendType: BackendTypeLMCache,
+				BackendType: controlplaneapi.BackendTypeLMCache,
 			})
-			if result.T2 != ProbeStageFailed {
-				t.Fatalf("T2 = %q, want %q", result.T2, ProbeStageFailed)
+			if result.T2 != controlplaneapi.ProbeStageFailed {
+				t.Fatalf("T2 = %q, want %q", result.T2, controlplaneapi.ProbeStageFailed)
 			}
-			if !stageErrorPresent(result.Errors, ProbeStageT2) {
+			if !stageErrorPresent(result.Errors, controlplaneapi.ProbeStageT2) {
 				t.Fatalf("expected t2 stage error, got %+v", result.Errors)
 			}
-			msg := stageErrorMessage(result.Errors, ProbeStageT2)
+			msg := stageErrorMessage(result.Errors, controlplaneapi.ProbeStageT2)
 			if !strings.Contains(msg, tc.wantSubstr) {
 				t.Errorf("T2 error message %q does not contain %q", msg, tc.wantSubstr)
 			}
@@ -430,9 +431,9 @@ func TestProberRunStageCDistinguishesPutFromGet(t *testing.T) {
 // reconcile pass, polluting both /snapshot and the entry-count metric.
 func TestProberRunLeavesNoStateInIndex(t *testing.T) {
 	prober, idx := newProberForTest(t, nil)
-	_ = prober.Run(t.Context(), ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
+	_ = prober.Run(t.Context(), controlplaneapi.ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
 
-	replicas, totalPrefixes := idx.CacheState(ProbeTenantID, "m")
+	replicas, totalPrefixes := idx.CacheState(controlplaneapi.ProbeTenantID, "m")
 	if totalPrefixes != 0 {
 		t.Errorf("totalPrefixes after probe = %d, want 0 — cleanup did not run", totalPrefixes)
 	}
@@ -451,10 +452,10 @@ func TestProberRunSerializesConcurrentProbesForSameBackend(t *testing.T) {
 	prober, idx := newProberForTest(t, nil)
 
 	const concurrent = 8
-	results := make(chan ProbeResult, concurrent)
+	results := make(chan controlplaneapi.ProbeResult, concurrent)
 	for i := 0; i < concurrent; i++ {
 		go func() {
-			results <- prober.Run(t.Context(), ProbeRequest{
+			results <- prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 				Backend: "cb-shared", Model: "m", HashScheme: "vllm",
 			})
 		}()
@@ -468,7 +469,7 @@ func TestProberRunSerializesConcurrentProbesForSameBackend(t *testing.T) {
 	}
 
 	// All Runs serialized correctly, so the final state is clean.
-	_, totalPrefixes := idx.CacheState(ProbeTenantID, "m")
+	_, totalPrefixes := idx.CacheState(controlplaneapi.ProbeTenantID, "m")
 	if totalPrefixes != 0 {
 		t.Errorf("after %d concurrent runs, totalPrefixes = %d, want 0", concurrent, totalPrefixes)
 	}
@@ -481,12 +482,12 @@ func TestProberRunSerializesConcurrentProbesForSameBackend(t *testing.T) {
 func TestProberRunIsIdempotent(t *testing.T) {
 	prober, idx := newProberForTest(t, nil)
 	for i := 0; i < 3; i++ {
-		result := prober.Run(t.Context(), ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
+		result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
 		if !result.AllPassed() {
 			t.Fatalf("iteration %d: AllPassed() = false; result = %+v", i, result)
 		}
 	}
-	_, totalPrefixes := idx.CacheState(ProbeTenantID, "m")
+	_, totalPrefixes := idx.CacheState(controlplaneapi.ProbeTenantID, "m")
 	if totalPrefixes != 0 {
 		t.Fatalf("after 3 idempotent runs, totalPrefixes = %d, want 0", totalPrefixes)
 	}
@@ -504,7 +505,7 @@ func TestProberRunDoesNotEvictRealWorkloadOnFullIndex(t *testing.T) {
 	// Index sized exactly to one entry, with the probe tenant reserved.
 	idx := index.New(
 		index.WithMaxEntries(1),
-		index.WithReservedTenants(ProbeTenantID),
+		index.WithReservedTenants(controlplaneapi.ProbeTenantID),
 	)
 	idx.Start(t.Context())
 	prober := NewProber(idx, nil)
@@ -518,7 +519,7 @@ func TestProberRunDoesNotEvictRealWorkloadOnFullIndex(t *testing.T) {
 	// Run the probe. With WithReservedTenants, the probe-tenant entry is
 	// cap-invisible: enforceCapLocked sees effectiveTotal=1 (the real entry)
 	// even though totalEntries is 2 momentarily. No eviction.
-	result := prober.Run(t.Context(), ProbeRequest{
+	result := prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 		Backend: "cb-1", Model: "m", HashScheme: "vllm",
 	})
 	if !result.AllPassed() {
@@ -546,7 +547,7 @@ func TestProberRunDoesNotEvictRealWorkloadOnFullIndex(t *testing.T) {
 func TestProberRunConcurrentWithRealWorkloadDoesNotEvict(t *testing.T) {
 	idx := index.New(
 		index.WithMaxEntries(1),
-		index.WithReservedTenants(ProbeTenantID),
+		index.WithReservedTenants(controlplaneapi.ProbeTenantID),
 	)
 	idx.Start(t.Context())
 	prober := NewProber(idx, nil)
@@ -560,7 +561,7 @@ func TestProberRunConcurrentWithRealWorkloadDoesNotEvict(t *testing.T) {
 	done := make(chan struct{}, concurrent*2)
 	for i := 0; i < concurrent; i++ {
 		go func() {
-			_ = prober.Run(t.Context(), ProbeRequest{
+			_ = prober.Run(t.Context(), controlplaneapi.ProbeRequest{
 				Backend: "cb-1", Model: "m", HashScheme: "vllm",
 			})
 			done <- struct{}{}
@@ -604,7 +605,7 @@ func TestProberRunReservedTenantUsedRegardlessOfRequest(t *testing.T) {
 		Prefixes: []index.PrefixRef{{PrefixHash: []byte("p"), TokenCount: 64}},
 	})
 
-	_ = prober.Run(t.Context(), ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
+	_ = prober.Run(t.Context(), controlplaneapi.ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
 
 	// The real workload entry must survive. If the probe somehow leaked into
 	// real-tenant's scope, ALL_CLEARED cleanup would have removed it.
@@ -623,7 +624,7 @@ func TestProbeHandlerHappyPath(t *testing.T) {
 	prober, _ := newProberForTest(t, nil)
 	handler := NewProbeHTTPHandler(prober)
 
-	body, err := json.Marshal(ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
+	body, err := json.Marshal(controlplaneapi.ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -638,7 +639,7 @@ func TestProbeHandlerHappyPath(t *testing.T) {
 	if got := rr.Header().Get("Content-Type"); got != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", got)
 	}
-	var result ProbeResult
+	var result controlplaneapi.ProbeResult
 	if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
 		t.Fatalf("decode body: %v (body=%s)", err, rr.Body.String())
 	}
@@ -807,7 +808,7 @@ func TestControllerAuth_ProbeRejectsUnauthenticated(t *testing.T) {
 // required fields).
 func emptyProbeRequestBody(t *testing.T) string {
 	t.Helper()
-	b, err := json.Marshal(ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
+	b, err := json.Marshal(controlplaneapi.ProbeRequest{Backend: "cb-1", Model: "m", HashScheme: "vllm"})
 	if err != nil {
 		t.Fatalf("marshal probe request: %v", err)
 	}
@@ -837,7 +838,7 @@ func postJSON(t *testing.T, url, token, body string) int {
 	return resp.StatusCode
 }
 
-func stageErrorPresent(errs []ProbeStageError, stage string) bool {
+func stageErrorPresent(errs []controlplaneapi.ProbeStageError, stage string) bool {
 	for _, e := range errs {
 		if e.Stage == stage {
 			return true
@@ -846,7 +847,7 @@ func stageErrorPresent(errs []ProbeStageError, stage string) bool {
 	return false
 }
 
-func stageErrorMessage(errs []ProbeStageError, stage string) string {
+func stageErrorMessage(errs []controlplaneapi.ProbeStageError, stage string) string {
 	for _, e := range errs {
 		if e.Stage == stage {
 			return e.Message

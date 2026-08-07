@@ -18,8 +18,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	"github.com/cachebox-project/inference-cache/pkg/server"
-	"github.com/cachebox-project/inference-cache/pkg/server/auth"
+	"github.com/cachebox-project/inference-cache/internal/server"
+	"github.com/cachebox-project/inference-cache/internal/server/auth"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 	"github.com/cachebox-project/inference-cache/pkg/version"
 )
@@ -150,7 +150,7 @@ func main() {
 		"snapshot_addr", cfg.SnapshotAddr,
 	)
 	if err := server.ListenAndServe(ctx, cfg, opts...); err != nil {
-		// Terminal error — log once here. pkg/server.Serve does NOT log on
+		// Terminal error — log once here. internal/server.Serve does NOT log on
 		// the errCh branch so we don't double-emit when a listener fails.
 		slog.ErrorContext(ctx, "serve_error", "err", err)
 		os.Exit(1)

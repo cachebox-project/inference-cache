@@ -10,7 +10,7 @@ import (
 )
 
 // CachePolicyEvictionAlgorithm identifies an index entry-eviction algorithm.
-// Each value has a corresponding implementation in pkg/index; the enum grows
+// Each value has a corresponding implementation in internal/index; the enum grows
 // as new algorithms land. The choice is per-namespace: the controller flattens
 // it (lower-cased) into ResolvedPolicy.Eviction. The index reads it when the
 // entry cap is exceeded (to order victims) and, for LFU, on the lookup path (to

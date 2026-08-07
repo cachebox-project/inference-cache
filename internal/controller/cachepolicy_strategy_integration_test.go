@@ -13,7 +13,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	cacheserver "github.com/cachebox-project/inference-cache/internal/server"
 )
 
 func TestIntegrationCachePolicyStrategyGates(t *testing.T) {

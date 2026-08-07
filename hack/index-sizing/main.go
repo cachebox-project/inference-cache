@@ -8,7 +8,7 @@
 // prints heap + peak RSS so operators can pick CacheTenant.spec.quota.maxIndexEntries,
 // the per-namespace CachePolicy.spec.evictionTTL, and pod memory limits with
 // real numbers instead of a guess. The global server cap is the compile-time
-// constant pkg/index.DefaultMaxEntries.
+// constant internal/index.DefaultMaxEntries.
 //
 // Not a shipping binary; not built by `make build`. Run with:
 //
@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // runPlan is the derived per-run shape: per-bucket key count, the actually-

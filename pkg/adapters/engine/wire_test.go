@@ -29,8 +29,8 @@ import (
 
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
 	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
+	"github.com/cachebox-project/inference-cache/internal/server"
 	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
-	"github.com/cachebox-project/inference-cache/pkg/server"
 )
 
 func TestStatsReporterPopulatesSnapshotReplicas(t *testing.T) {

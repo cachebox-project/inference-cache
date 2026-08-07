@@ -21,9 +21,10 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
-	"github.com/cachebox-project/inference-cache/pkg/server/auth"
+	"github.com/cachebox-project/inference-cache/internal/index"
+	"github.com/cachebox-project/inference-cache/internal/server/auth"
 	"github.com/cachebox-project/inference-cache/pkg/tokenize"
 )
 
@@ -147,7 +148,7 @@ func New(opts ...Option) *Service {
 		// - reservedEntries) and the victim candidate set, so the probe path's
 		// "never mutates real workload state" invariant holds even under
 		// concurrent real-workload writes on a saturated index.
-		index.WithReservedTenants(ProbeTenantID),
+		index.WithReservedTenants(controlplaneapi.ProbeTenantID),
 	)
 
 	publicMux := http.NewServeMux()

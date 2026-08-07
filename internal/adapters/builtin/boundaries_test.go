@@ -29,7 +29,6 @@ func TestProductionImportsRespectAdapterBoundaries(t *testing.T) {
 		{
 			root: filepath.Join(root, "internal", "controller"),
 			banned: []string{
-				modulePath + "/pkg/server",
 				modulePath + "/internal/webhook",
 				modulePath + "/internal/adapters/builtin",
 			},

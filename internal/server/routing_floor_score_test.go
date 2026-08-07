@@ -7,6 +7,8 @@ package server
 import (
 	"math"
 	"testing"
+
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
 )
 
 func f32Ptr(v float32) *float32 { return &v }
@@ -28,8 +30,8 @@ func approxFloorEq(a, b float32) bool { return math.Abs(float64(a-b)) <= floorTo
 // CachePolicy CR — server defaults are deliberately sane).
 func TestPolicyStoreRoutingFloorScoreFallsBackToDefault(t *testing.T) {
 	store := NewPolicyStore()
-	if got := store.RoutingFloorScore("never-configured"); !approxFloorEq(got, DefaultRoutingFloorScore) {
-		t.Fatalf("RoutingFloorScore(no-policy) = %v, want DefaultRoutingFloorScore (%v)", got, DefaultRoutingFloorScore)
+	if got := store.RoutingFloorScore("never-configured"); !approxFloorEq(got, controlplaneapi.DefaultRoutingFloorScore) {
+		t.Fatalf("RoutingFloorScore(no-policy) = %v, want controlplaneapi.DefaultRoutingFloorScore (%v)", got, controlplaneapi.DefaultRoutingFloorScore)
 	}
 }
 
@@ -42,7 +44,7 @@ func TestPolicyStoreRoutingFloorScoreFallsBackToDefault(t *testing.T) {
 // regression-testing the ranker.
 func TestPolicyStoreRoutingFloorScoreRespectsPolicyValue(t *testing.T) {
 	store := NewPolicyStore()
-	store.Replace([]ResolvedPolicy{
+	store.Replace([]controlplaneapi.ResolvedPolicy{
 		{Namespace: "ns-strict", RoutingFloorScore: f32Ptr(5.0)},
 		{Namespace: "ns-disabled", RoutingFloorScore: f32Ptr(0)},
 	})
@@ -50,7 +52,7 @@ func TestPolicyStoreRoutingFloorScoreRespectsPolicyValue(t *testing.T) {
 		t.Fatalf("strict floor = %v, want 5.0", got)
 	}
 	if got := store.RoutingFloorScore("ns-disabled"); got != 0 {
-		t.Fatalf("disabled floor = %v, want exactly 0 (explicit opt-out, not DefaultRoutingFloorScore)", got)
+		t.Fatalf("disabled floor = %v, want exactly 0 (explicit opt-out, not controlplaneapi.DefaultRoutingFloorScore)", got)
 	}
 }
 
@@ -65,15 +67,15 @@ func TestPolicyStoreRoutingFloorScoreRespectsPolicyValue(t *testing.T) {
 // operator never expressed an opt-out intent.
 func TestPolicyStoreRoutingFloorScoreNilFieldFallsBackToDefault(t *testing.T) {
 	store := NewPolicyStore()
-	store.Replace([]ResolvedPolicy{
+	store.Replace([]controlplaneapi.ResolvedPolicy{
 		// CachePolicy present in the store but with RoutingFloorScore=nil
 		// (the wire body omitted the field — pre-defaulting body, manual
 		// crafter, legacy CR).
 		{Namespace: "ns-bare", RoutingFloorScore: nil},
 	})
-	if got := store.RoutingFloorScore("ns-bare"); !approxFloorEq(got, DefaultRoutingFloorScore) {
-		t.Fatalf("bare-field-present ns = %v, want DefaultRoutingFloorScore (%v) — absent field MUST NOT be inferred as opt-out",
-			got, DefaultRoutingFloorScore)
+	if got := store.RoutingFloorScore("ns-bare"); !approxFloorEq(got, controlplaneapi.DefaultRoutingFloorScore) {
+		t.Fatalf("bare-field-present ns = %v, want controlplaneapi.DefaultRoutingFloorScore (%v) — absent field MUST NOT be inferred as opt-out",
+			got, controlplaneapi.DefaultRoutingFloorScore)
 	}
 }
 
@@ -83,7 +85,7 @@ func TestPolicyStoreRoutingFloorScoreNilFieldFallsBackToDefault(t *testing.T) {
 // floor<0 never fires) instead of the safest interpretation. Clamp to 0.
 func TestPolicyStoreRoutingFloorScoreClampsNegative(t *testing.T) {
 	store := NewPolicyStore()
-	store.Replace([]ResolvedPolicy{{Namespace: "ns-bad", RoutingFloorScore: f32Ptr(-1.0)}})
+	store.Replace([]controlplaneapi.ResolvedPolicy{{Namespace: "ns-bad", RoutingFloorScore: f32Ptr(-1.0)}})
 	if got := store.RoutingFloorScore("ns-bad"); got != 0 {
 		t.Fatalf("negative floor = %v, want 0 (clamped)", got)
 	}

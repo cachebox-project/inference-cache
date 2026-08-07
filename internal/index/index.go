@@ -1003,7 +1003,7 @@ func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]
 // PREFIX_MATCH path when the top score falls below the per-namespace
 // routingFloorScore OR when every replica's matched_tokens falls below
 // the per-namespace minimumMatchedTokens floor — see
-// pkg/server/inferencecache_service.go buildLookupResponse. The downgrade
+// internal/server/inferencecache_service.go buildLookupResponse. The downgrade
 // lands on StrategyNone, which surfaces as AFFINITY_HINT under
 // default-enabled affinity with a usable seed + serving replica or as
 // NO_HINT under affinityRouting: Disabled. Old gateway clients that only
@@ -1607,7 +1607,7 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 // modulo trade-off); a Phase-2 follow-up may replace the modulo with
 // Rendezvous / HRW without altering this method's signature.
 //
-// Wired by pkg/server/inferencecache_service.buildLookupResponse on the
+// Wired by internal/server/inferencecache_service.buildLookupResponse on the
 // StrategyNone branch when CachePolicy.spec.affinityRouting is Enabled
 // (the kubebuilder default). The index is policy-unaware; the toggle
 // lives entirely in the server.

@@ -409,11 +409,11 @@ Proposed commit:
 refactor(index): internalize the cache index
 ```
 
-- [ ] Move `pkg/index` to `internal/index`.
-- [ ] Update the server, tests, and `hack/index-sizing` imports.
-- [ ] Preserve ingest, lookup, ranking, quota, TTL, eviction, and soft-state
+- [x] Move `pkg/index` to `internal/index`.
+- [x] Update the server, tests, and `hack/index-sizing` imports.
+- [x] Preserve ingest, lookup, ranking, quota, TTL, eviction, and soft-state
   behavior.
-- [ ] Do not split `index.go` in this commit.
+- [x] Do not split `index.go` in this commit.
 
 ### A5. Internalize the server implementation
 
@@ -423,15 +423,15 @@ Proposed commit:
 refactor(server): internalize the server implementation
 ```
 
-- [ ] Move `pkg/server` to `internal/server`.
-- [ ] Move `pkg/server/auth` to `internal/server/auth` and retain it as a
+- [x] Move `pkg/server` to `internal/server`.
+- [x] Move `pkg/server/auth` to `internal/server/auth` and retain it as a
   cohesive security-focused subpackage.
-- [ ] Update `cmd/server` and integration-test imports.
-- [ ] Remove temporary `internal/controlplaneapi` type and constant aliases from
+- [x] Update `cmd/server` and integration-test imports.
+- [x] Remove temporary `internal/controlplaneapi` type and constant aliases from
   the server package after all callers use the neutral owner directly.
-- [ ] Preserve HTTP routes, gRPC methods, metrics, TLS, authentication, and
+- [x] Preserve HTTP routes, gRPC methods, metrics, TLS, authentication, and
   fail-open behavior.
-- [ ] Do not split server implementation files in this commit.
+- [x] Do not split server implementation files in this commit.
 
 ### A6. Internalize the KV-event subscriber implementation
 

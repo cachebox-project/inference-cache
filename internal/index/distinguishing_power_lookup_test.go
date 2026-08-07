@@ -31,7 +31,7 @@ func startTestIndex(t *testing.T) *Index {
 // TestLookupExactZeroDistinguishingWhenAllReplicasHoldPrefix is the headline
 // case: three replicas all hold a 16-token chat-template prefix. The
 // distinguishing-power factor must collapse to 0, so every Score is 0 —
-// the service-layer post-score floor (covered in pkg/server) then downgrades
+// the service-layer post-score floor (covered in internal/server) then downgrades
 // the response to NO_HINT. The index itself stays policy-unaware: it still
 // returns the matched replicas; the floor decides whether they ship.
 func TestLookupExactZeroDistinguishingWhenAllReplicasHoldPrefix(t *testing.T) {

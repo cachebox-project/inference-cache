@@ -14,7 +14,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
+	cacheserver "github.com/cachebox-project/inference-cache/internal/server"
 )
 
 // TestIntegrationCachePolicyMinimumMatchedTokensFloor pins the wiring
@@ -36,7 +37,7 @@ import (
 //   - A namespace with NO CachePolicy reports DefaultMinimumMatchedTokens
 //     (the server-wide fallback fires for unconfigured tenants).
 //
-// This test complements the pkg/server unit tests by exercising the real
+// This test complements the internal/server unit tests by exercising the real
 // apiserver-side kubebuilder defaulting AND the controller→server propagation
 // path together — the C2 reconcile hot-loop class of bug (envtest exposed it
 // in the cap-eviction work and motivates this entire integration tier).
@@ -97,18 +98,18 @@ func TestIntegrationCachePolicyMinimumMatchedTokensFloor(t *testing.T) {
 	if got := store.MinimumMatchedTokens(nsExplicit); got != 256 {
 		t.Fatalf("explicit-floor namespace = %d, want 256 (policy override)", got)
 	}
-	if got := store.MinimumMatchedTokens(nsOmitted); got != cacheserver.DefaultMinimumMatchedTokens {
+	if got := store.MinimumMatchedTokens(nsOmitted); got != controlplaneapi.DefaultMinimumMatchedTokens {
 		t.Fatalf("omitted-field namespace = %d, want DefaultMinimumMatchedTokens (%d) — "+
 			"kubebuilder default did not fill in 64 at apiserver admission, OR the controller "+
 			"didn't flatten the apiserver-defaulted value",
-			got, cacheserver.DefaultMinimumMatchedTokens)
+			got, controlplaneapi.DefaultMinimumMatchedTokens)
 	}
 	if got := store.MinimumMatchedTokens(nsDisabled); got != 0 {
 		t.Fatalf("disabled-floor namespace = %d, want 0 (explicit opt-out)", got)
 	}
-	if got := store.MinimumMatchedTokens(nsUnconfigured); got != cacheserver.DefaultMinimumMatchedTokens {
+	if got := store.MinimumMatchedTokens(nsUnconfigured); got != controlplaneapi.DefaultMinimumMatchedTokens {
 		t.Fatalf("unconfigured namespace = %d, want DefaultMinimumMatchedTokens (%d) — server-wide fallback failed",
-			got, cacheserver.DefaultMinimumMatchedTokens)
+			got, controlplaneapi.DefaultMinimumMatchedTokens)
 	}
 
 	// Belt-and-braces: read the omitted-field CR back from the apiserver and
@@ -125,8 +126,8 @@ func TestIntegrationCachePolicyMinimumMatchedTokensFloor(t *testing.T) {
 		t.Fatalf("bare CachePolicy(%s).spec.minimumMatchedTokens is nil after apiserver round-trip — "+
 			"the +kubebuilder:default=64 marker did not materialize on the stored object", nsOmitted)
 	}
-	if got := *readback.Spec.MinimumMatchedTokens; got != cacheserver.DefaultMinimumMatchedTokens {
+	if got := *readback.Spec.MinimumMatchedTokens; got != controlplaneapi.DefaultMinimumMatchedTokens {
 		t.Fatalf("bare CachePolicy(%s).spec.minimumMatchedTokens = %d after apiserver round-trip, want %d "+
-			"(the kubebuilder default)", nsOmitted, got, cacheserver.DefaultMinimumMatchedTokens)
+			"(the kubebuilder default)", nsOmitted, got, controlplaneapi.DefaultMinimumMatchedTokens)
 	}
 }

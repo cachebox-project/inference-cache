@@ -45,7 +45,7 @@ The gRPC + HTTP server. It:
   aggregate), `/policy` (controller writes resolved policy), `/probe` (functional
   self-test). All three are gated by ServiceAccount bearer auth + a `NetworkPolicy`.
 
-Owns the index (`pkg/index`), the mutable-slot render pipeline (`pkg/render`), and the
+Owns the index (`internal/index`), the mutable-slot render pipeline (`pkg/render`), and the
 deterministic content fingerprint (`pkg/fingerprint`).
 
 The server **fails closed**: without `--allowed-controller-sa` or

@@ -14,14 +14,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/index"
+	cacheserver "github.com/cachebox-project/inference-cache/internal/server"
 )
 
 // TestIntegrationCachePolicyEvictionAlgorithm exercises the full
 // CachePolicy.spec.eviction loop against a real apiserver: the reconciler
 // flattens the CRD enum (lower-cased) into the PolicyStore, and an index wired
-// with that store as its EvictionResolver (exactly as pkg/server.New does)
+// with that store as its EvictionResolver (exactly as internal/server.New does)
 // picks LFU vs LRU victims accordingly when the entry cap is exceeded.
 //
 // One index per namespace/algorithm, each holding only its own tenant's

@@ -17,7 +17,7 @@ and `CacheTenant.spec.quota.maxIndexEntries` for their workload.
 
 **Source of measurements.** All numbers below come from the in-tree sizing harness
 [`hack/index-sizing`](../../hack/index-sizing) on `go1.26.4` / `darwin/arm64`, ingested
-through the real `pkg/index` code path. Re-run the harness on your own platform if you
+through the real `internal/index` code path. Re-run the harness on your own platform if you
 need same-arch numbers — the harness is documented at the top of `main.go`.
 
 ---
@@ -48,7 +48,7 @@ The global cap (`DefaultMaxEntries = 1,000,000`), the global TTL fallback, and t
 
 The "peak RSS" column is `Maxrss` from the harness run — the high-water mark the process ever reached, not current RSS. For a one-shot bulk ingest the peak ≈ steady-state + transient ingest allocations; in production the steady-state is somewhat lower. Treat the column as a **conservative pod-budget figure**: if you provision for the peak, the steady-state has headroom built in.
 
-The default global entry cap of `DefaultMaxEntries = 1,000,000` (see [`pkg/index/index.go`](../../pkg/index/index.go))
+The default global entry cap of `DefaultMaxEntries = 1,000,000` (see [`internal/index/index.go`](../../internal/index/index.go))
 is sized for a **1 GiB server pod**. Raise either both (memory + cap) or neither —
 the cap is not currently a server flag (see [Knobs](#knobs-the-operator-actually-has)),
 so reaching for a larger footprint needs a recompile today.
@@ -61,7 +61,7 @@ so reaching for a larger footprint needs a recompile today.
 field `tenants[].indexEntries`, and the metric `inferencecache_index_entries` (with a
 `model` label, e.g. `inferencecache_index_entries{model="meta-llama/Llama-3"}`) all
 count **distinct prefix keys** — one per `(tenant, model, hash_scheme, adapter, prefix_hash)`,
-regardless of how many replicas hold it. The internal `pkg/index.DefaultMaxEntries` cap,
+regardless of how many replicas hold it. The internal `internal/index.DefaultMaxEntries` cap,
 by contrast, counts **total storage entries** — one per `(prefix_key, replica)` tuple.
 A single prefix held by R replicas is 1 "indexEntries" but R "storage entries". When
 the doc says "entries" below, the column header makes which unit explicit.
@@ -178,7 +178,7 @@ working set down to ~1M, and the rest of the prefixes won't have hints. Three ch
    roughly 3×, to ~830K, comfortably under the cap. Pod stays at 1 GiB. Cost: prefixes
    re-used at the 15-minute mark go to miss instead of hit. Cheapest tuning option and
    usually the right one.
-3. **Rebuild with a higher cap.** Bump `DefaultMaxEntries` in `pkg/index/index.go` to,
+3. **Rebuild with a higher cap.** Bump `DefaultMaxEntries` in `internal/index/index.go` to,
    say, 3M. At ~500 B/entry that's ~1.4 GiB peak RSS — size the pod for at least 2 GiB
    to leave the 20 % headroom on top of the linear scaling. Most heavyweight option;
    reach for it when the workload can't tolerate the hit-rate loss from option 1 or
@@ -192,7 +192,7 @@ tolerate lower hit rate, tighter TTL, or a custom build.
 ## TTL trade-offs
 
 `CachePolicy.spec.evictionTTL` is a per-namespace knob with a server-side default
-of 30 minutes (`pkg/index.DefaultTTL`). The fallback fires whenever the resolver
+of 30 minutes (`internal/index.DefaultTTL`). The fallback fires whenever the resolver
 returns ≤ 0 — i.e. **only a CachePolicy that explicitly sets `evictionTTL`
 overrides the default**. A namespace with no CachePolicy, or a CachePolicy that
 omits `evictionTTL`, both fall through to `DefaultTTL`.
@@ -232,7 +232,7 @@ prefix warm, the engine recomputes. So the cost of "TTL too long" is wasted inde
 | Sweep interval | server compile-time constant | `DefaultSweepInterval = 1m` | How often the TTL pass runs. Higher = more lag, less CPU. |
 
 **State today.** The global cap, global TTL, and sweep interval are compile-time
-constants in `pkg/index/index.go`; flipping any of them requires a server rebuild. The
+constants in `internal/index/index.go`; flipping any of them requires a server rebuild. The
 per-namespace and per-tenant CRs above are the runtime-tunable surface.
 
 ---

@@ -6,7 +6,7 @@ package server
 
 import (
 	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // snapshotForControlPlane maps the index-owned domain snapshot to the private
