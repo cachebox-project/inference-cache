@@ -9,8 +9,10 @@
 #     (mp_host/mp_port) and reads its config from --lmcache-config-file; the old
 #     lm:// LMCACHE_REMOTE_URL env is gone (MP mode ignores it).
 # This mirrors what the (sglang, LMCache) runtime adapter auto-injects on a matched
-# engine pod (pkg/adapters/runtime/sglang + .../internal/enginewire/sglang_mp.go +
-# redis_l2.go), which is GPU-validated end to end. The engine image / --model-path /
+# engine pod (internal/adapters/builtin/runtime/sglang_lmcache.go +
+# internal/adapters/builtin/runtime/sglang_lmcache_wire.go +
+# internal/adapters/builtin/storage/redis.go), which is GPU-validated end to end.
+# The engine image / --model-path /
 # resources / --kv-events-config remain operator-owned scaffolding the adapter
 # assumes is already present, so this is NOT byte-for-byte adapter output.
 #

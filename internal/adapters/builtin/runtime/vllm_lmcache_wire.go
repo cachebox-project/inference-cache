@@ -84,10 +84,10 @@ const (
 // lone container is treated as the engine); a multi-container pod with
 // no `vllm` container is rejected.
 //
-// Both the in-tree vLLM+LMCache adapter (managed backend) and the External
-// passthrough adapter call this — same wire shape, the only difference is
-// the source of endpoint (controller-resolved Service DNS vs operator-
-// supplied address in spec.endpoint).
+// The in-tree vLLM+LMCache adapter calls this for both managed and externally
+// owned bindings. The wire shape is identical; only the endpoint source differs
+// (controller-resolved Service DNS vs the operator-supplied
+// spec.remoteStorage.endpoint).
 func InjectVLLMLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alpha1.CacheBackend) error {
 	return injectLMCacheConnector(pod, endpoint, LMCacheRemoteURL(endpoint), cache)
 }

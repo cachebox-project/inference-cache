@@ -191,16 +191,16 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// Engine-local adapters such as native SGLang HiCache have a nil binding and
 	// therefore bypass this network-endpoint gate.
 	if binding != nil && binding.Endpoint == "" && !cache.Spec.IsEventsOnly() {
-		// The endpoint source is type-scoped (see effectiveEndpoint).
+		// The endpoint source is ownership-scoped (see effectiveEndpoint).
 		// Three reasons we can land here:
 		//   - managed CR: reconciler hasn't published status.endpoint
 		//     yet (steady-state during initial rollout).
-		//   - External CR: its spec endpoint is empty (admission rejects
-		//     this on fresh CRs; only reachable from a pre-existing
-		//     stored value).
-		//   - External CR: its endpoint fails the selected provider's
-		//     shared shape check (also pre-existing-only; current admission
-		//     rejects malformed values). effectiveEndpoint deliberately
+		//   - externally owned CR: spec.remoteStorage.endpoint is empty
+		//     (current admission rejects this; reachable only for objects that
+		//     bypassed admission).
+		//   - externally owned CR: its endpoint fails the selected provider's
+		//     shared shape check (current admission rejects malformed values).
+		//     effectiveEndpoint deliberately
 		//     returns "" for this case so the engine pod admits
 		//     un-wired rather than receiving an endpoint its connector
 		//     refuses at startup.
@@ -552,12 +552,12 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 }
 
 // effectiveEndpoint returns the address the engine pod should be wired
-// to for the given CacheBackend. The source is type-scoped:
+// to for the given CacheBackend. The source is ownership-scoped:
 //
 //   - External ownership: spec.remoteStorage.endpoint is authoritative — the operator owns it,
 //     admission validates it, status.endpoint is just a reconciler
 //     mirror that may briefly lag during an update. If a new pod
-//     admits between an operator's spec.endpoint update and the
+//     admits between an operator's spec.remoteStorage.endpoint update and the
 //     status patch, status would still hold the OLD value and the
 //     pod would boot wired to the stale address; pod admission is
 //     CREATE-only so that bad wiring is permanent. Preferring the trimmed
@@ -596,8 +596,9 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	}
 	if storage := cache.Spec.EffectiveRemoteStorage(); storage != nil &&
 		storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
-		// For External, re-apply the provider-specific admission-time shape
-		// check on the stored spec endpoint. The validating webhook already
+		// For external ownership, re-apply the provider-specific admission-time
+		// shape check on the stored spec.remoteStorage.endpoint. The validating
+		// webhook already
 		// rejects malformed values at write time, but a pre-existing
 		// CR in etcd from before the shape rule shipped (or stored
 		// when an earlier, laxer rule set was in effect) can still

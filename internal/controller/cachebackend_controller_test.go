@@ -1332,13 +1332,15 @@ func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
 	got := getBackend(t, r, "cache", "ns1")
 
 	// status.endpoint stays EMPTY — events-only publishes no endpoint. The
-	// External path would have mirrored spec.endpoint here.
+	// external-ownership path would have mirrored
+	// spec.remoteStorage.endpoint here.
 	if got.Status.Endpoint != "" {
 		t.Fatalf("status.endpoint = %q, want empty (events-only wins over External; no endpoint mirrored)", got.Status.Endpoint)
 	}
 
 	// Ready is published by the events-only gate (AwaitingFirstKVEvent before any
-	// event), NOT by the External path (ExternalEndpointAccepted). The reason is
+	// event), NOT by the external-ownership path
+	// (ExternalEndpointAccepted). The reason is
 	// the discriminator between the two reconcile paths.
 	ready := findCondition(got.Status.Conditions, conditionTypeReady)
 	if ready == nil {
@@ -1383,12 +1385,13 @@ func TestReconcileExternalMirrorsEndpointToStatus(t *testing.T) {
 	reconcile(t, r, "example", "default")
 
 	if got := getBackend(t, r, "example", "default").Status.Endpoint; got != "external-cache.default.svc:8080" {
-		t.Fatalf("status.endpoint = %q, want spec endpoint", got)
+		t.Fatalf("status.endpoint = %q, want spec.remoteStorage.endpoint", got)
 	}
 }
 
 func TestReconcileExternalSetsReadyTrue(t *testing.T) {
-	// External admission accepts spec.endpoint at write time, so the
+	// Admission accepts spec.remoteStorage.endpoint for external ownership at
+	// write time, so the
 	// readiness signal is "operator says this endpoint exists and we
 	// accepted it" — there's no Service to wait on. Consumers (the
 	// future readiness gate, kubectl get cb, the indexParticipation
@@ -1430,7 +1433,8 @@ func TestReconcileExternalSetsReadyTrue(t *testing.T) {
 }
 
 func TestReconcileExternalInvalidEndpointSetsReadyFalse(t *testing.T) {
-	// An External CR with a non-empty but malformed spec.endpoint must
+	// An externally owned CR with a non-empty but malformed
+	// spec.remoteStorage.endpoint must
 	// be marked Ready=False/ExternalEndpointInvalid — current admission
 	// rejects these at write time, but a CR stored before the shape
 	// rule shipped can still carry e.g. `https://...`. Without this,
@@ -1629,8 +1633,8 @@ func TestReconcileExternalEmptyEndpointSetsReadyFalse(t *testing.T) {
 }
 
 func TestReconcileExternalWhitespaceEndpointTreatedAsMissing(t *testing.T) {
-	// Admission rejects a whitespace-only spec.endpoint, but a CR already
-	// in etcd from before admission was installed can still carry one.
+	// Admission rejects a whitespace-only spec.remoteStorage.endpoint, but a
+	// caller that bypasses admission can still construct one.
 	// The reconciler must treat it as missing — publishing a raw
 	// "LMCACHE_REMOTE_URL=lm://   " to the engine env is worse than
 	// publishing nothing, and Ready=True on whitespace would mislead

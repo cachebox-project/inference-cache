@@ -1735,7 +1735,8 @@ func TestValidator_ExternalEndpoint_LMSchemePortOnlyRejected(t *testing.T) {
 
 func TestValidator_ExternalEndpoint_PortlessHostRejected(t *testing.T) {
 	// Bare host with no port is rejected: the LMCache connector dials a
-	// specific TCP target, so spec.endpoint must carry both halves.
+	// specific TCP target, so spec.remoteStorage.endpoint must carry both
+	// halves.
 	// Without this check the CR admits and the engine boots with
 	// LMCACHE_REMOTE_URL=lm://cache.example.com — the connector then
 	// either picks an undocumented default or crashes; either way the
@@ -2010,11 +2011,9 @@ func (stubVLLMLMCacheAdapter) EngineContainerName() string { return "vllm" }
 
 // stubRegistry returns a Registry with the stub vLLM+LMCache adapter
 // installed. Hermetic — tests don't depend on the in-tree
-// builtin adapter composition, so they keep passing if a
-// future adapter joins or leaves the default set. An External-specific
-// runtime adapter is added by stubRegistryWithExternal so tests that
-// exercise admission of External CRs run against both adapters the
-// production wiring registers.
+// builtin adapter composition, so they keep passing if a future adapter joins
+// or leaves the default set. External ownership uses this same runtime adapter;
+// it is a remote-storage binding property, not a separate cache type.
 func stubRegistry() *adapterruntime.Registry {
 	r := adapterruntime.NewRegistry()
 	r.Register(builtinruntime.NewVLLMLMCacheAdapter())
@@ -2829,7 +2828,7 @@ func TestValidator_EngineOverrides_NilRegistry_FallsBackToShippingSet(t *testing
 }
 
 func TestValidator_EngineOverrides_ExternalBackendAdmittedWhenSafe(t *testing.T) {
-	// An External CR carrying engineOverrides that DON'T touch the
+	// An externally owned CR carrying engineOverrides that DON'T touch the
 	// adapter's reserved set must still admit. The LMCache wire is shared across
 	// ownership modes. LMCACHE_CHUNK_SIZE
 	// is a perf knob, not reserved; suppressing or amending it is fine.
@@ -2845,9 +2844,9 @@ func TestValidator_EngineOverrides_ExternalBackendAdmittedWhenSafe(t *testing.T)
 
 func TestValidator_EngineOverrides_ExternalRejectsPythonHashSeedOverride(t *testing.T) {
 	// The shared LMCache runtime adapter reserves the same env across ownership
-	// modes, so a PYTHONHASHSEED override on an External CR
+	// modes, so a PYTHONHASHSEED override on an externally owned CR
 	// is hard-rejected for the same reason — proving the correctness
-	// invariant holds across both spec.types, not just managed.
+	// invariant holds across both ownership modes, not just managed.
 	v := &CacheBackendValidator{Registry: stubRegistry()}
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		Env: []corev1.EnvVar{{Name: "PYTHONHASHSEED", Value: "1"}},

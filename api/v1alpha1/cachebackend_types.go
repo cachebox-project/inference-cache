@@ -487,10 +487,9 @@ type CacheBackendIntegrationSpec struct {
 	Mode CacheBackendIntegrationMode `json:"mode,omitempty"`
 
 	// Role controls whether the engine reads from, writes to, or fully
-	// participates in the cache. Defaults to ReadWrite — full participation,
-	// matching the [enginewire.IntegrationRole] read-time fallback for an
-	// omitted integration block. ReadOnly / WriteOnly are specialised
-	// producer/consumer roles operators opt into explicitly.
+	// participates in the cache. Defaults to ReadWrite — full participation.
+	// ReadOnly / WriteOnly are specialised producer/consumer roles operators
+	// opt into explicitly.
 	//
 	// Engine support is per-adapter: vLLM maps the role onto its LMCache
 	// connector's kv_role (ReadOnly→kv_consumer, WriteOnly→kv_producer,

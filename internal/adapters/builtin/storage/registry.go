@@ -1,4 +1,4 @@
-// Package provider contains the shipping remote-storage provider adapters.
+// Package storage contains the shipping remote-storage provider adapters.
 package storage
 
 import (

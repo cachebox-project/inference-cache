@@ -412,7 +412,8 @@ data plane), different resolution because the data planes differ:
 
 - **Phase 1 (this doc).** Record the design, and — **comment-only, no behavior
   change** — resolve the stale `TODO(wire-test before production)` in
-  `enginewire.go` and align its godoc to the validated MP reality. The engine wire
+  `internal/adapters/builtin/runtime/sglang_lmcache_wire.go` and align its godoc
+  to the validated MP reality. The engine wire
   is unchanged: dropping the MP-ignored `LMCACHE_*` env is deferred to Phase 2,
   where `InjectSGLangLMCache` is rewritten wholesale (so it is edited once, not
   twice). The advisory admission warning stays (no working data plane yet), so no

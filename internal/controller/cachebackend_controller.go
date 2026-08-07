@@ -155,28 +155,27 @@ const (
 // that watches lastEventAt, operator dashboards) can switch on reason
 // instead of regexing the message.
 const (
-	// conditionReasonExternalEndpointAccepted is set when an External
-	// CacheBackend's spec.endpoint is non-empty: admission accepted the
-	// operator-supplied endpoint and we trust it without probing
-	// reachability. A future enhancement could degrade Ready on a
-	// connection-probe failure, but that's out of scope for the
-	// passthrough adapter today (fail-soft, trust the operator).
+	// conditionReasonExternalEndpointAccepted is set when a CacheBackend uses
+	// external remote-storage ownership and spec.remoteStorage.endpoint is
+	// non-empty: admission accepted the operator-supplied endpoint and we trust
+	// it without probing reachability. A future enhancement could degrade Ready
+	// on a connection-probe failure, but that's out of scope for the structured
+	// external binding path today (fail-soft, trust the operator).
 	conditionReasonExternalEndpointAccepted = "ExternalEndpointAccepted"
 	// conditionReasonExternalEndpointMissing is set defensively when an
-	// External CacheBackend has spec.endpoint empty. Admission rejects
-	// this at the validating webhook, so reaching this branch means a CR
-	// already in etcd from before the webhook was installed.
+	// externally owned CacheBackend has spec.remoteStorage.endpoint empty.
+	// Admission rejects this at the validating webhook, so this branch covers
+	// objects that bypassed current admission.
 	conditionReasonExternalEndpointMissing = "ExternalEndpointMissing"
 	// conditionReasonExternalEndpointInvalid is set defensively when an
-	// External CacheBackend has a non-empty spec.endpoint that fails the
-	// shared shape check (bad scheme, no port, embedded whitespace,
-	// unbracketed IPv6, …). Current admission rejects all of these at
-	// the validating webhook; the reason is reachable only for a CR
-	// stored before the relevant shape rule shipped. Status reflects
-	// the gap loudly rather than advertising the malformed value as
-	// Ready=True (which would let the pod webhook then inject an
-	// LMCACHE_REMOTE_URL the engine connector refuses at startup —
-	// turning a cache misconfiguration into a serving outage).
+	// externally owned CacheBackend has a non-empty
+	// spec.remoteStorage.endpoint that fails the shared shape check (bad scheme,
+	// no port, embedded whitespace, unbracketed IPv6, …). Current admission
+	// rejects all of these; this defensive reason covers objects that bypassed
+	// admission. Status reflects the gap loudly rather than advertising the
+	// malformed value as Ready=True (which would let the pod webhook then inject
+	// an LMCACHE_REMOTE_URL the engine connector refuses at startup — turning a
+	// cache misconfiguration into a serving outage).
 	conditionReasonExternalEndpointInvalid = "ExternalEndpointInvalid"
 )
 
@@ -525,12 +524,12 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	return r.reconcileManaged(ctx, logger, backend, rendered)
 }
 
-// reconcileExternal mirrors a pre-existing backend's configured endpoint to
-// status and marks the backend Ready: there is no Service to wait on, so
-// admission acceptance of spec.endpoint is the only readiness signal the
-// controller has. The Ready condition flips to True in lock step so the
-// Ready printcolumn (kubectl get cb) reflects the accepted endpoint for
-// External CRs that admission has already accepted.
+// reconcileExternal mirrors an externally owned backend's configured endpoint
+// to status and marks the backend Ready: there is no Service to wait on, so
+// admission acceptance of spec.remoteStorage.endpoint is the only readiness
+// signal the controller has. The Ready condition flips to True in lock step so
+// the Ready printcolumn (kubectl get cb) reflects the accepted endpoint for
+// externally owned resources that admission has already accepted.
 //
 // Three terminal states, each driven by the SAME shape rule the
 // validating webhook applies on CREATE/UPDATE — so the reconciler is

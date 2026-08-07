@@ -74,7 +74,7 @@ const (
 // It does NOT stamp spec.integration.failOpen explicitly — once the
 // defaulter materialises spec.integration above, the apiserver applies
 // the `+kubebuilder:default=true` marker on the now-present failOpen
-// field (alongside mode, engine, role, firstEventTimeout) before persisting,
+// field (alongside mode and role) before persisting,
 // so an admitted CR with no integration block ends up with failOpen
 // populated in etcd. The read-time fallback in [IntegrationFailOpen]
 // covers callers that bypass the apiserver (raw-struct test invocation,
@@ -580,10 +580,9 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 // integration.* markers only fire when spec.integration is already present
 // in the submitted object — when the operator omits the integration block
 // entirely the apiserver has nothing to apply nested defaults to, which is
-// why the webhook materialises the parent below (and the read-time
-// helpers in [adapterruntime.ResolveRuntimeID] / [enginewire.IntegrationRole]
-// / [IntegrationFailOpen] provide the same effective default at read time
-// for callers that don't go through admission).
+// why the webhook materialises the parent below. Callers that bypass
+// admission use the API's read-time mode and fail-open helpers and the
+// built-in adapters' equivalent ReadWrite role fallback.
 //
 // A non-nil pointer or non-empty value is treated as an explicit operator
 // choice and left alone, preserving the established "defaulter never
@@ -730,9 +729,8 @@ func usesMooncakeStorage(cb *cachev1alpha1.CacheBackend) bool {
 // This is the standard pattern for tightening admission rules on a
 // v1alpha1 CRD: create-time is strict; update-time only rejects fresh
 // violations so existing CRs aren't trapped. Without it, adding a new
-// rule (e.g. rejectEndpointOnNonExternal) would break every existing CR
-// that happens to violate it the moment an operator runs `kubectl
-// annotate` on it.
+// field-level rule would break every existing CR that happens to violate it
+// the moment an operator runs `kubectl annotate` on it.
 func (v *CacheBackendValidator) ValidateUpdate(ctx context.Context, oldCB, newCB *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend update",
 		"namespace", newCB.Namespace, "name", newCB.Name, "type", newCB.Spec.Type)
@@ -841,14 +839,14 @@ func filterIntroducedErrors(oldErrs, newErrs field.ErrorList) field.ErrorList {
 	return out
 }
 
-// checkRuntimeAdapter rejects a CacheBackend whose effective (engine, type)
-// pair no installed runtime adapter supports. The effective engine is
+// checkRuntimeAdapter rejects a CacheBackend whose (runtime, type) pair no
+// installed runtime adapter supports. The runtime is
 // resolved through [adapterruntime.ResolveRuntimeID] — the same helper the
 // reconciler and pod-mutating webhook consult — so admission, reconcile,
 // and pod injection agree on which adapter the registry should pick. In
-// particular, an unset engine defaults to vLLM here just as it does at
-// reconcile, so an unsupported pair does not slip past admission only to fail
-// downstream. Remote-storage provider and ownership do not affect runtime
+// particular, an unset runtime remains empty and cannot match an adapter;
+// persisted resources cannot reach that state because the CRD schema requires
+// spec.runtime. Remote-storage provider and ownership do not affect runtime
 // adapter selection; they are validated independently as bindings.
 //
 // The check is bypassed only when Spec.Type is empty: a CR that came
@@ -1192,8 +1190,8 @@ func unsupportedPairMessage(engine adapterruntime.RuntimeID, backend cachev1alph
 //   - spec.autoscaling has no workload to scale — the controller deploys
 //     nothing for an events-only backend.
 //
-// spec.endpoint is already rejected on any non-External backend by
-// rejectEndpointOnNonExternal, so it needs no events-only-specific check.
+// spec.remoteStorage.endpoint is already forbidden for managed ownership by
+// validateCacheHierarchy, so it needs no events-only-specific check.
 func rejectEventsOnlyMisconfiguration(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if !cb.Spec.IsEventsOnly() {
 		return nil

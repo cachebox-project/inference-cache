@@ -20,6 +20,7 @@ kind: CacheBackend
 metadata:
   name: cachebackend-invalid-scale-to-zero-no-min
 spec:
+  runtime: VLLM
   type: LMCache
   replicas: 0
   autoscaling:

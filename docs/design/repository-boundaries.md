@@ -92,6 +92,16 @@ plugin system:
 - the repository does not load Go plugins or discover adapter implementations at
   runtime.
 
+This build-time seam is the designated extension point, but its Go source
+contract is pre-stable. The Phase 0 audit found no real out-of-tree adapter
+consumer, so the structured-binding change intentionally did not retain a
+second compatibility interface. A custom controller fork upgrading from an
+earlier revision must implement `SupportsBinding(*backend.Binding)` and update
+both injection methods to accept `*backend.Binding`; custom forks must pin the
+repository revision they build against. Once the project supports its first
+external adapter consumer, later source-breaking interface changes require an
+explicit versioned contract or migration layer.
+
 This is the default extension model until a concrete consumer requires runtime
 plugin loading. Do not introduce dynamic loading speculatively.
 
@@ -256,6 +266,8 @@ added.
   capabilities and the endpoint-string fallback helpers.
 - [x] Update the reference adapter, all shipping adapters, admission,
   reconciliation, pod injection, tests, and extension documentation together.
+- [x] Confirm no real out-of-tree adapter consumer exists and document the
+  pre-stable source contract plus the custom-fork migration requirement.
 - [x] Keep provider lifecycle independent: backend providers render storage and
   its protocol, while runtime adapters only accept and consume the resulting
   binding.

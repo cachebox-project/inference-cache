@@ -12,6 +12,7 @@
 // prefix bytes). The engine-side LMCache *launch* surface differs from vLLM
 // (--enable-lmcache + LMCACHE_USE_EXPERIMENTAL rather than
 // --kv-transfer-config). Managed cache-server rendering belongs to
-// internal/adapters/builtin/storage; subscriber-sidecar helpers remain shared with
-// the vLLM adapter in pkg/adapters/runtime/lmcache_shared.go.
+// internal/adapters/builtin/storage; subscriber-sidecar rendering remains shared
+// in pkg/adapters/runtime/kvevent_subscriber.go, with common defaults in
+// pkg/adapters/runtime/lmcache_shared.go.
 package runtime

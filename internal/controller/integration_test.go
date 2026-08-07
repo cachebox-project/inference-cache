@@ -601,8 +601,8 @@ func TestIntegrationCacheBackendReconcile(t *testing.T) {
 		}
 		// After the switch to External the controller publishes
 		// Ready=True with reason ExternalEndpointAccepted — admission
-		// acceptance of spec.endpoint is the only readiness signal we
-		// have without provisioning a Service to probe.
+		// acceptance of spec.remoteStorage.endpoint is the only readiness
+		// signal we have without provisioning a Service to probe.
 		ready := findCondition(cb.Status.Conditions, conditionTypeReady)
 		if ready == nil {
 			t.Fatalf("Ready condition missing after switch to External; conditions = %v", cb.Status.Conditions)
@@ -1455,7 +1455,7 @@ func TestIntegrationCacheIndexPollerProjectsParticipation(t *testing.T) {
 	ns := freshNS(t, k8s)
 
 	// Seed two CacheBackends with EngineSelectors plus an engine pod each.
-	// External type keeps the CacheBackend reconciler out of the picture —
+	// External ownership avoids managed child provisioning in this fixture —
 	// we are testing the poller's Status().Patch in isolation.
 	mkBackend := func(name string, selector map[string]string) *cachev1alpha1.CacheBackend {
 		return &cachev1alpha1.CacheBackend{
@@ -1590,7 +1590,7 @@ func TestIntegrationCacheBackendPrinterColumnsRenderParticipation(t *testing.T) 
 	ns := freshNS(t, k8s)
 
 	// Two backends: one with positive participation, one drained-but-quiet.
-	// External type keeps the CacheBackend reconciler out of the picture so
+	// External ownership avoids managed child provisioning in this fixture so
 	// we are testing the printer-column projection from status, not the
 	// reconciler.
 	active := &cachev1alpha1.CacheBackend{

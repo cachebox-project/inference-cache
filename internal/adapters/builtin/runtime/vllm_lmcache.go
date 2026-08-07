@@ -217,7 +217,7 @@ func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend
 // unit tests in vllm_lmcache_test.go continue to assert on the wire format
 // through the canonical adapter API surface. New tests for the shared wire
 // (LMCache, Mooncake, and External all speak the LMCache connector) belong in
-// pkg/adapters/runtime/internal/
+// this package alongside vllm_lmcache_wire_test.go.
 const defaultEngineKVTransferConfigArg = "--kv-transfer-config"
 
 var (

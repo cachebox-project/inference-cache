@@ -3593,6 +3593,7 @@ metadata:
   annotations:
     inferencecache.io/lmcache-kernel-check: "strcit"
 spec:
+  runtime: VLLM
   type: LMCache
   engineSelector:
     matchLabels:

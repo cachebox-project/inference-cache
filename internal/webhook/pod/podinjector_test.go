@@ -1086,11 +1086,11 @@ func TestHandle_EventsOnly_EngineOverrides_DoNotTouchEngineContainer(t *testing.
 }
 
 func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
-	// A pod that matches an External CR's engine selector must come out
+	// A pod that matches an externally owned CR's engine selector must come out
 	// of admission wired to the operator-supplied endpoint via the
 	// LMCache engine wire format — the controller doesn't render a
 	// Service for the cache, so the only source of truth for the
-	// address is spec.endpoint (mirrored to status.endpoint by
+	// address is spec.remoteStorage.endpoint (mirrored to status.endpoint by
 	// reconcileExternal).
 	const (
 		ns       = "engines"
@@ -1136,8 +1136,8 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	if !containsArgPairLocal(mutated.Spec.Containers[0].Args, "--model", "Qwen/Qwen2.5-0.5B-Instruct") {
 		t.Fatalf("user --model arg was lost; args = %v", mutated.Spec.Containers[0].Args)
 	}
-	// External path attaches no observation sidecar — the controller has
-	// no observability seam into an operator-managed cache.
+	// The external-ownership path attaches no observation sidecar — the
+	// controller has no observability seam into an operator-managed cache.
 	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
 		t.Fatalf("External backend must NOT get a subscriber sidecar; found %+v", c)
 	}
@@ -1148,8 +1148,8 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 }
 
 func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
-	// A pre-existing External CR carrying a malformed spec.endpoint
-	// (stored before the shape rule shipped) must not be wired —
+	// An externally owned CR carrying a malformed spec.remoteStorage.endpoint
+	// must not be wired —
 	// injecting LMCACHE_REMOTE_URL=lm://https://... or lm://2001:db8::1
 	// would crash the engine at startup. effectiveEndpoint applies the
 	// same shape check the admission webhook uses and returns "" for
@@ -1228,14 +1228,14 @@ func TestEffectiveEndpointCanonicalExternalUsesProviderProtocol(t *testing.T) {
 
 func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 	// Pod admission is CREATE-only — if an engine pod admits before the
-	// controller has mirrored spec.endpoint into status.endpoint, the
-	// webhook would fail-open and leave the pod unwired *forever* (no
-	// re-admission on subsequent status updates). For External CRs the
-	// webhook sources the endpoint from spec.endpoint directly (NOT
-	// "falling back" — effectiveEndpoint type-scopes the source so
-	// External never reads status.endpoint, preventing wiring against a
+	// controller has mirrored spec.remoteStorage.endpoint into status.endpoint,
+	// the webhook would fail-open and leave the pod unwired *forever* (no
+	// re-admission on subsequent status updates). For externally owned CRs the
+	// webhook sources the endpoint from spec.remoteStorage.endpoint directly
+	// (NOT "falling back" — effectiveEndpoint ownership-scopes the source so
+	// external ownership never reads status.endpoint, preventing wiring against a
 	// stale mirror during an endpoint update). Without this, applying
-	// the External CacheBackend and the engine Deployment in the same
+	// the externally owned CacheBackend and the engine Deployment in the same
 	// kubectl apply silently produces unwired engine pods.
 	const (
 		ns       = "engines"
@@ -1275,9 +1275,10 @@ func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 }
 
 func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
-	// When the operator updates spec.endpoint for an External CR but a
-	// new engine pod admits before the reconciler patches status, the
-	// pod must be wired to the NEW spec.endpoint — not the stale
+	// When the operator updates spec.remoteStorage.endpoint for an externally
+	// owned CR but a new engine pod admits before the reconciler patches status,
+	// the
+	// pod must be wired to the NEW spec.remoteStorage.endpoint — not the stale
 	// status.endpoint. Pod admission is CREATE-only, so a pod wired to
 	// the old address on admission stays misrouted forever.
 	const (
@@ -1314,11 +1315,11 @@ func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
 		t.Fatalf("expected Allowed, got %+v", resp.Result)
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	// Must use spec.endpoint, NOT the stale status.endpoint.
+	// Must use spec.remoteStorage.endpoint, NOT the stale status.endpoint.
 	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+freshSpec)
 	for _, e := range mutated.Spec.Containers[0].Env {
 		if e.Name == adapterruntime.EnvLMCacheRemoteURL && e.Value == "lm://"+staleStatus {
-			t.Fatalf("pod wired to stale status.endpoint %q; should be spec.endpoint %q", staleStatus, freshSpec)
+			t.Fatalf("pod wired to stale status.endpoint %q; should be spec.remoteStorage.endpoint %q", staleStatus, freshSpec)
 		}
 	}
 }
@@ -1373,8 +1374,8 @@ func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
 	// missing rather than injecting `LMCACHE_REMOTE_URL=lm://   ` which
 	// the engine connector would reject at runtime. The defensive trim
 	// applies to whichever field effectiveEndpoint reads for the CR's
-	// type — spec.endpoint for External (which never reads status), and
-	// status.endpoint for managed.
+	// ownership — spec.remoteStorage.endpoint for external ownership (which
+	// never reads status), and status.endpoint for managed ownership.
 	const ns = "engines"
 	cb := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "managed-ws", Namespace: ns},
@@ -1407,10 +1408,10 @@ func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
 }
 
 func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
-	// Counterpart to the External fallback: managed backends MUST wait
+	// Counterpart to the external-ownership path: managed backends MUST wait
 	// for status.endpoint (the reconciler builds it from the rendered
-	// Service). spec.endpoint is admission-rejected on managed types,
-	// so there's nothing else to fall back on — the webhook must
+	// Service). spec.remoteStorage.endpoint is admission-rejected for managed
+	// ownership, so there's nothing else to fall back on — the webhook must
 	// fail-open without injecting until status catches up.
 	const ns = "engines"
 	cb := &cachev1alpha1.CacheBackend{
