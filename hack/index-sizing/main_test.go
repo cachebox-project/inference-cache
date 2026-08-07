@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Targeted tests for the helpers that produce the harness's reported numbers.
 // The harness is operator tooling and excluded from coverage (see COVER_EXCLUDE
 // in the Makefile), but encodeHash, humanBytes, and planRun drive the

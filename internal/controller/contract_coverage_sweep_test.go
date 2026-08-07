@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package controller
 
 // Cross-system contract coverage and edge-case sweep for the CacheIndex

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # PrometheusRule for inference-cache, for prometheus-operator / kube-prometheus
 # installs. The `spec.groups` body is a verbatim copy of alerting-rules.yaml in
 # this directory — both files MUST stay in sync. The flat file is what gets

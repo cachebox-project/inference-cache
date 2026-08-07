@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # SGLang with an engine-side LMCache host tier and an explicitly selected
 # Managed Redis remote tier. SGLang drives LMCache in MULTIPROCESS (MP) mode:
 #   - spec.runtime + spec.type select only the SGLang/LMCache engine wire;

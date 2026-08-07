@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package checks implements the `inferencecache doctor` pre-flight diagnostics.
 //
 // Each exported Check* function inspects one facet of an inference-cache

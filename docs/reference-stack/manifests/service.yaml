@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Exposes the reference backend. NodePorts line up with the kind extraPortMappings
 # (kind/cluster.yaml) so the host can reach the API on :30080 and subscribe to
 # KV events on :30557 without port-forwarding.

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # An events-only (tier-1 routing) CacheBackend. This is the lighter,
 # routing-only integration: cache-aware routing is wired, but NO KV-offload
 # connector is loaded into the engine and NO backend server is provisioned.

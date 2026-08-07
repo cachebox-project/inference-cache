@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Per-PR install smoke for `kubectl apply -k config/default`.
 #
 # Runs docs/reference-stack/scripts/default_install_smoke.sh: builds controller

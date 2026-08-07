@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package fingerprint computes deterministic, content-addressed prefix hashes
 // from token IDs.
 //

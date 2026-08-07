@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # krew plugin manifest for the inferencecache CLI.
 #
 # STATUS: PREPARED, NOT YET SUBMITTED to krew-index. The full krew publish flow

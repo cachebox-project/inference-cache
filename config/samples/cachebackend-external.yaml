@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # An External CacheBackend points the controller at a pre-existing remote
 # cache the operator manages themselves. The controller does NOT provision
 # pods for this backend (no Deployment, no Service, no HPA); it only mirrors

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // This file holds the engine-side wire format used by built-in runtime
 // adapters that front an LMCache-compatible cache. The in-tree
 // vLLM+LMCache adapter uses it for LMCacheServer, Mooncake, and externally

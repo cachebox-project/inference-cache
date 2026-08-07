@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Patch the controller Deployment to expose the webhook serving port and
 # mount the cert-manager-issued serving certificate at the path
 # controller-runtime's webhook server reads by default

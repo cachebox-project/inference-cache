@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # A managed LMCache backend the controller reconciles into a standalone
 # lmcache-server Deployment + Service. Engine pods (vLLM) are user-owned;
 # spec.engineSelector identifies the pods the controller's mutating Pod

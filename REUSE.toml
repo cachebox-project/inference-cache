@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+# SPDX-License-Identifier: Apache-2.0
+
+version = 1
+
+# Documentation and fixture formats either cannot carry comments or have
+# parser-sensitive front matter. Keep their licensing explicit without
+# changing the human-facing content or test payloads.
+[[annotations]]
+path = [
+  "**/*.json",
+  "**/*.lock",
+  "**/*.md",
+  "**/*.sum",
+  "**/*.table",
+  "**/*.xml",
+  "LICENSE",
+  "pkg/adapters/engine/testdata/*.txt",
+  "pkg/cli/doctor/output/testdata/*.txt",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 The inference-cache Authors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# These files are regenerated from authored API/protobuf inputs. Headers in
+# the generated output would be overwritten, so license them through metadata.
+[[annotations]]
+path = [
+  "config/crd/bases/*.yaml",
+  "config/rbac/role.yaml",
+  "config/webhook/manifests.yaml",
+  "pkg/server/proto/**/*.pb.go",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 The inference-cache Authors"
+SPDX-License-Identifier = "Apache-2.0"

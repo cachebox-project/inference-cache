@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package auth provides HTTP middleware that gates the policy server's
 // internal controller-facing endpoints (/snapshot, /policy, and /probe) on a
 // Kubernetes ServiceAccount bearer token.

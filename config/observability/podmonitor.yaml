@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # PodMonitor for `inference-cache-controller-manager`. Without this, a
 # prometheus-operator install scrapes ONLY the server-binary metrics
 # (covered by servicemonitor.yaml) and silently misses every

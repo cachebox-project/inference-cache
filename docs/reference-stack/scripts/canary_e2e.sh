@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Full-chain CPU canary for the cache substrate, BINARY data-path edition.
 # Brings up the engine + server + subscriber as host processes (no Kubernetes
 # admission in the loop) and asserts the binaries wire correctly:

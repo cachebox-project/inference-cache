@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Regenerate golden_vectors.json — the canonical, language-neutral golden
 fixture for the content-fingerprint scheme.
 

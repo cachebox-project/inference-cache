@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # On-demand / scheduled full-chain CPU canary for the cache substrate.
 #
 # Runs docs/reference-stack/scripts/canary_e2e.sh: brings up a CPU vLLM engine +

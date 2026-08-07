@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package engineclient sends a PRE-TOKENIZED prompt (token IDs) to an inference
 // engine. It is the "pass tokens to the engine" half of server-side tokenization:
 // the engine caches exactly the tokens the router fingerprinted, so the routing

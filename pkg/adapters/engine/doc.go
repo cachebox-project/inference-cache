@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package engine is the KV-event subscriber. It runs as a sidecar next to a vLLM
 // engine replica, subscribes to the engine's KV cache events over ZMQ, decodes
 // them, and reports cache state to the inferencecache-server over gRPC.

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # CPU-only variant — runs WITHOUT a GPU and WITHOUT LMCache.
 #
 # Validates the full engine-config path off-GPU: a prefix-cache hit AND the

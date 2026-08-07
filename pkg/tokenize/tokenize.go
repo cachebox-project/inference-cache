@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package tokenize is the server-owned tokenization seam: it turns a
 // (model, prompt) request into engine-aligned token IDs so the lookup path can
 // fingerprint over the same tokens the engine caches.

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Standalone lmcache-server backend for substrate validation on a GPU-free
 # cluster (e.g. kind). The lmcache-server itself is always CPU-only (its
 # storage device is `cpu` in-memory) regardless of what engine attaches to

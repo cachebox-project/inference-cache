@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Command inferencecache is the operator-facing CLI for the inference-cache
 // control plane. Today it ships a single subcommand, `doctor`, an early
 // carve-out of the full CLI plugin: a read-only pre-flight diagnostic that

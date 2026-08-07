@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build smgcgo
 
 // This file is the cgo-backed Tokenizer, compiled only with the `smgcgo` build

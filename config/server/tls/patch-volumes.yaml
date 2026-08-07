@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Strategic-merge patch: mount the cert-manager Secret (inference-cache-server-tls,
 # from certificate.yaml) into the server. volumeMounts + volumes merge BY NAME,
 # so this ADDS the grpc-tls entries without replacing any the base Deployment may

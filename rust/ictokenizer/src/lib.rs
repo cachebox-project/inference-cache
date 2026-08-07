@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! C-ABI shim over `llm-tokenizer` for the inference-cache Go server.
 //!
 //! Exposes the minimum needed to turn (model, prompt) into engine-aligned token

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package backend defines the remote-storage provider boundary. Runtime
 // adapters consume the resulting Binding; they do not select or provision a
 // provider.

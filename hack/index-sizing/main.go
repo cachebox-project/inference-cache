@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package main is the index-sizing measurement helper used to characterize the
 // inferencecache-server in-memory index footprint at various entry counts. It
 // ingests N synthetic prefix entries, forces GC + returns memory to the OS, and

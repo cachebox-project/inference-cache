@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 name: CI
 
 on:
@@ -99,6 +103,9 @@ jobs:
 
     - name: Test DCO gate
       run: make test-dco
+
+    - name: Verify REUSE compliance
+      run: make reuse-lint
 
     - name: Install protoc
       env:

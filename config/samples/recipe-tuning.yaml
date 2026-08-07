@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Recipe: Tuning — CPU dev shape plus a meaningful engineOverrides block.
 #
 # Scenario: the canonical LMCache injection works, but you want to tune an

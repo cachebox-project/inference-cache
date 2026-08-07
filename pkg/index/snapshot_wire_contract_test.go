@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package index
 
 // Frozen wire-shape contract for pkg/index.Snapshot — the JSON the policy

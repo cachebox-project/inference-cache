@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # JSON6902 patch: append the gRPC TLS flags to the server's args. Append
 # (`args/-`) rather than a list-replacing merge, so a server flag added to the
 # base Deployment later is preserved. The Secret volume + mount are added by

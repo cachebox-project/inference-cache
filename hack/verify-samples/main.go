@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package main is the verify-samples CI helper. It runs every YAML file under
 // config/samples/ through admission against an in-process envtest apiserver
 // plus the CRD admission webhooks (CacheBackend, CachePolicy, CacheTenant),

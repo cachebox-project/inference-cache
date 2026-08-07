@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Example overlay: the default install WITH opt-in gRPC Service TLS on :9090.
 #
 # config/default serves the policy gRPC port plaintext (the in-cluster

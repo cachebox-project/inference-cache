@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Package controlplaneapi defines the private HTTP wire contracts shared by
 // the inference-cache controller and server binaries.
 //

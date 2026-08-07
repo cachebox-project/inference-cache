@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Restrict ingress to the cache server's internal :8081 controller-facing
 # listener (which serves /snapshot, /policy, AND /probe) while leaving the
 # unauthenticated health/metrics port (:8080) and the gRPC port (:9090) open

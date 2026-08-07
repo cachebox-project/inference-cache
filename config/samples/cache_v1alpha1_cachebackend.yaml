@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Kubebuilder-generated minimum-viable sample: a minimal CacheBackend that
 # applies cleanly against the current schema + admission webhook. Hand-curated,
 # scenario-specific recipes live in the sibling cachebackend-*.yaml files.

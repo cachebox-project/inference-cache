@@ -19,6 +19,7 @@ Run the baseline checks before sending a PR:
 make proto-gen
 make proto-lint
 make verify-dco test-dco
+make reuse-lint
 make lint
 make python-lint
 make test-race
@@ -167,11 +168,32 @@ human commits in a bot-opened pull request are still checked. The local gate
 has no trusted GitHub identity metadata, so it checks every commit. Run it with
 `make verify-dco` (and its self-contained test suite with `make test-dco`).
 
+## Licensing metadata
+
+The repository follows the [REUSE Specification](https://reuse.software/spec/).
+Authored source and configuration files carry SPDX comment headers. Generated
+artifacts, documentation, and non-commentable fixtures are covered by narrow
+entries in `REUSE.toml`; canonical license text lives under `LICENSES/`.
+
+Run the pinned compliance tool locally with:
+
+```bash
+make reuse-lint
+```
+
+The target installs REUSE in an isolated virtual environment under the ignored
+`bin/` directory. New authored source files should include:
+
+```text
+SPDX-FileCopyrightText: 2026 The inference-cache Authors
+SPDX-License-Identifier: Apache-2.0
+```
+
 ## Before pushing / opening a PR
 
 Run `make install-hooks` once per clone. Thereafter:
 
-- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + DCO sign-off + format + vet + Go/Python lint + Prometheus rules + golden vectors + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`. CI also runs heavier gates that are not part of the local push hook, including the Rust/network-backed `make tokenize-cgo-test` job for the optional `smgcgo` tokenizer build tag.
+- **On every push**, the `pre-push` hook runs `make ci` (naming + internal-refs + DCO/REUSE compliance + format + vet + Go/Python lint + Prometheus rules + golden vectors + race tests + build) and blocks the push if anything fails. Reproduce it anytime with `make ci`. CI also runs heavier gates that are not part of the local push hook, including the Rust/network-backed `make tokenize-cgo-test` job for the optional `smgcgo` tokenizer build tag.
 - **Before opening a PR**, run `make pre-pr` — it runs `make ci`, then a generated-code drift check, then `make verify-samples` (server-side dry-run of every YAML under `config/samples/` against an envtest apiserver + the CacheBackend admission webhook), then prints the review checklist. Review the diff against the tech spec before submitting.
 
 Emergency override for the push gate: `git push --no-verify` (discouraged).

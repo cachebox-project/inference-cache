@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 // Command kvevent-subscriber runs as a sidecar next to a vLLM engine replica:
 // it subscribes to the engine's KV-cache events over ZMQ and reports cache state
 // to the inferencecache-server over gRPC. Metadata only — never tokens or prompt

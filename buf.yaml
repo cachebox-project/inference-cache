@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # buf lint configuration for the InferenceCache gRPC contract.
 #
 # Code generation uses protoc (see `make proto-gen`); buf is used for LINTING

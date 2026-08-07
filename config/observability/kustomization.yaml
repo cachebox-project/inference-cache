@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Optional observability overlay — applies BOTH scrape configs (a
 # `ServiceMonitor` for the inference-cache-server and a `PodMonitor`
 # for the inference-cache-controller) AND the alerting rules (a
