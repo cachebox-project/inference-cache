@@ -489,23 +489,23 @@ Proposed commit:
 refactor(engineclient): establish public engine client boundary
 ```
 
-- [ ] Move `pkg/adapters/engineclient` to the neutral public path
+- [x] Move `pkg/adapters/engineclient` to the neutral public path
   `pkg/engineclient`; this is a Go source import-path change.
-- [ ] Keep the public package focused on `EngineClient`, `CompletionParams`,
+- [x] Keep the public package focused on `EngineClient`, `CompletionParams`,
   `Completion`, `OpenAIClient`, `NewOpenAI`, and the supported pre-tokenized
   OpenAI-compatible `/v1/completions` request/response mapping.
-- [ ] Move `PrefixCacheProbe`, Prometheus scraping helpers, and live canary tests
+- [x] Move `PrefixCacheProbe`, Prometheus scraping helpers, and live canary tests
   to `internal/canary` when they remain reference-stack infrastructure rather
   than general engine-client behavior.
-- [ ] Delete the unimplemented gRPC client and `ErrNotImplemented` when it has no
+- [x] Delete the unimplemented gRPC client and `ErrNotImplemented` when it has no
   remaining caller. Add a gRPC transport only with a concrete engine consumer
   and validated protocol.
-- [ ] Preserve token-ID request encoding, zero-temperature semantics, response
+- [x] Preserve token-ID request encoding, zero-temperature semantics, response
   size limits, status/error handling, and completion/usage parsing.
-- [ ] Document the current boundary explicitly: it does not yet promise
+- [x] Document the current boundary explicitly: it does not yet promise
   authentication, retries, endpoint discovery, load balancing, streaming,
   tracing, or a complete OpenAI API SDK.
-- [ ] Update reference-stack scripts, package documentation, and tests for the
+- [x] Update reference-stack scripts, package documentation, and tests for the
   new public import path and internal canary location.
 
 ## Phase B: split large files without creating new package boundaries

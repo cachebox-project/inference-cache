@@ -229,7 +229,7 @@ See the README's "Repository layout" for the full map. In short:
 | Stable adapter extension contract | `pkg/adapters/{backend,runtime}/` |
 | Shipping adapter implementation / registration | `internal/adapters/builtin/` |
 | Engine KV-event ingest implementation | `internal/subscriber/` |
-| Engine egress client (pre-tokenized request → engine; harness / benchmark, no binary owner) | `pkg/adapters/engineclient/` |
+| Engine egress client (pre-tokenized request → engine; harness / benchmark, no binary owner) | `pkg/engineclient/` |
 | The gRPC contract | `proto/` → then `make proto-gen` |
 
 Each package's `doc.go` (or package comment) states which binary owns it or why

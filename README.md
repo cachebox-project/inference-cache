@@ -100,6 +100,10 @@ the operator CLI and the CRDs.
 - `cmd/kvevent-subscriber/` — composition and lifecycle entrypoint
 - `internal/subscriber/` — engine KV-event hook (feeds the index)
 
+**Engine client library** — narrow pre-tokenized OpenAI-compatible completion client
+- `pkg/engineclient/` — public `EngineClient` contract and `/v1/completions` implementation
+- `internal/canary/` — repository-owned prefix-cache probe and live canary
+
 **`inferencecache`** (`cmd/inferencecache`) — operator CLI; `doctor` runs a read-only pre-flight diagnostic
 - `cmd/inferencecache/` — cobra entrypoint
 - `internal/cli/doctor/` — diagnostic checks + output formatters (see `docs/cli/doctor.md`)

@@ -2,7 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-package engineclient
+// Package canary provides repository-owned live and test probes for inference
+// engines. It is operational infrastructure, not part of the public engine
+// client API.
+package canary
 
 import (
 	"bufio"
@@ -13,6 +16,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/cachebox-project/inference-cache/pkg/engineclient"
 )
 
 // PrefixCacheProbe is the by-construction canary: it sends the SAME token-ID
@@ -24,10 +29,10 @@ import (
 // guarantee (the tokenizer half is proven by pkg/tokenize, the fingerprint half
 // by pkg/fingerprint).
 type PrefixCacheProbe struct {
-	Client     EngineClient // sends the token-ID prompt (typically NewOpenAI)
-	HTTP       *http.Client // scrapes /metrics; defaults to http.DefaultClient
-	EngineURL  string       // base URL, e.g. http://host:8000
-	MetricsURL string       // optional; defaults to EngineURL + "/metrics"
+	Client     engineclient.EngineClient // sends the token-ID prompt (typically NewOpenAI)
+	HTTP       *http.Client              // scrapes /metrics; defaults to http.DefaultClient
+	EngineURL  string                    // base URL, e.g. http://host:8000
+	MetricsURL string                    // optional; defaults to EngineURL + "/metrics"
 	Model      string
 	// HitsMetric / QueriesMetric name the vLLM prefix-cache counters to read.
 	// Empty defaults to the standard names below; override when a vLLM build
@@ -45,15 +50,15 @@ const (
 type ProbeResult struct {
 	HitsDelta    int // vllm:prefix_cache_hits_total change across the warm request
 	QueriesDelta int // vllm:prefix_cache_queries_total change across the warm request
-	Cold         Completion
-	Warm         Completion
+	Cold         engineclient.Completion
+	Warm         engineclient.Completion
 }
 
 // Run fires the cold request (populating the cache), then measures the
 // prefix-cache counters immediately before and after an identical warm request,
 // so HitsDelta reflects only the warm request. A HitsDelta > 0 is the success
 // signal.
-func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params CompletionParams) (ProbeResult, error) {
+func (p *PrefixCacheProbe) Run(ctx context.Context, tokens []uint32, params engineclient.CompletionParams) (ProbeResult, error) {
 	if p.Client == nil {
 		return ProbeResult{}, errors.New("canary: PrefixCacheProbe.Client is nil")
 	}

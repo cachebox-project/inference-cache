@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-package engineclient
+package canary
 
 import (
 	"context"
@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/cachebox-project/inference-cache/pkg/engineclient"
 )
 
 // mockVLLM mimics just enough of a vLLM OpenAI server for the canary: it serves
@@ -70,12 +72,12 @@ func TestPrefixCacheProbeDetectsWarmHit(t *testing.T) {
 	defer srv.Close()
 
 	probe := &PrefixCacheProbe{
-		Client:    NewOpenAI(nil),
+		Client:    engineclient.NewOpenAI(nil),
 		EngineURL: srv.URL,
 		Model:     "m",
 	}
 	tokens := tokenRange(0, 64)
-	res, err := probe.Run(context.Background(), tokens, CompletionParams{MaxTokens: 1})
+	res, err := probe.Run(context.Background(), tokens, engineclient.CompletionParams{MaxTokens: 1})
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
@@ -203,14 +205,14 @@ func TestPrefixCacheCanaryLive(t *testing.T) {
 	}
 
 	probe := &PrefixCacheProbe{
-		Client:    NewOpenAI(nil),
+		Client:    engineclient.NewOpenAI(nil),
 		EngineURL: engineURL,
 		Model:     model,
 		// Allow metric-name overrides for vLLM builds that rename the counters.
 		HitsMetric:    os.Getenv("IC_ENGINE_HITS_METRIC"),
 		QueriesMetric: os.Getenv("IC_ENGINE_QUERIES_METRIC"),
 	}
-	res, err := probe.Run(context.Background(), tokens, CompletionParams{MaxTokens: 1, Temperature: 0})
+	res, err := probe.Run(context.Background(), tokens, engineclient.CompletionParams{MaxTokens: 1, Temperature: 0})
 	if err != nil {
 		t.Fatalf("live canary: %v", err)
 	}

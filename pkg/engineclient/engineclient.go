@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Package engineclient sends a PRE-TOKENIZED prompt (token IDs) to an inference
+// Package engineclient sends a pre-tokenized prompt (token IDs) to an inference
 // engine. It is the "pass tokens to the engine" half of server-side tokenization:
 // the engine caches exactly the tokens the router fingerprinted, so the routing
 // key and the engine's cache key match by construction — no tokenizer-parity
@@ -12,17 +12,13 @@
 // it on the hot path. A gateway, benchmark, or canary drives the flow
 // (tokenize → fingerprint → LookupRoute → pick replica → Complete).
 //
-// Placement: it lives under pkg/adapters/ because it adapts to an inference
-// engine's request API (the OpenAI /v1/completions and, later, vLLM gRPC
-// surfaces). Unlike the engine subscriber under internal/subscriber (which a
-// binary owns for KV-event ingest), this egress client belongs to no binary —
-// it is harness/demonstrator code used by the canary and future gateway clients.
+// The supported boundary is deliberately narrow: EngineClient, CompletionParams,
+// Completion, OpenAIClient, NewOpenAI, and the pre-tokenized OpenAI-compatible
+// /v1/completions mapping. It does not promise authentication, retries, endpoint
+// discovery, load balancing, streaming, tracing, or a complete OpenAI API SDK.
 package engineclient
 
-import (
-	"context"
-	"errors"
-)
+import "context"
 
 // CompletionParams carries the sampling knobs a caller sets per request. Kept
 // minimal on purpose — this is a routing/cache demonstrator, not a full
@@ -48,6 +44,3 @@ type EngineClient interface {
 	// re-tokenization) so the cached prefix equals the fingerprinted tokens.
 	Complete(ctx context.Context, endpoint, model string, tokenIDs []uint32, p CompletionParams) (Completion, error)
 }
-
-// ErrNotImplemented is returned by clients whose transport is not wired yet.
-var ErrNotImplemented = errors.New("engineclient: not implemented")
