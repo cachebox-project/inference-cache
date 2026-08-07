@@ -40,7 +40,7 @@ action_shell_checksum="$(awk -F '"' '/default_sha256=/{ print $2; exit }' "$acti
 
 require_equal "Makefile SYFT_VERSION" "$makefile_version" "$version"
 require_equal "CI workflow SYFT_VERSION" "$ci_version" "$version"
-require_equal "Release SBOM workflow SYFT_VERSION" "$release_version" "$version"
+require_equal "Release supply-chain workflow SYFT_VERSION" "$release_version" "$version"
 require_equal "setup action shell default version" "$action_shell_version" "$version"
 require_equal "setup action shell default checksum" "$action_shell_checksum" "$checksum"
 

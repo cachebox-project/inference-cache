@@ -303,6 +303,9 @@ jobs:
     - name: Smoke registry image SBOM path
       run: bash hack/sbom-registry-smoke.sh
 
+    - name: Test release image digest resolution
+      run: make test-release-image-digests
+
   tokenize-cgo:
     name: Tokenizer cgo Build Tag (${{ matrix.build-tag }})
     runs-on: ubuntu-latest

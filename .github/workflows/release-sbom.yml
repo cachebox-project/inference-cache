@@ -1,4 +1,4 @@
-name: Release SBOM
+name: Release Supply Chain
 
 on:
   release:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to attach SBOM artifacts to
+        description: Release tag to build, sign, attest, and attach supply-chain artifacts to
         required: true
 
 permissions:
@@ -19,14 +19,21 @@ concurrency:
 
 env:
   RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  COSIGN_VERSION: v3.1.3
   SYFT_VERSION: v1.20.0
+  CONTROLLER_IMAGE_REPO: ghcr.io/cachebox-project/inference-cache-controller
+  SERVER_IMAGE_REPO: ghcr.io/cachebox-project/inference-cache-server
+  SUBSCRIBER_IMAGE_REPO: ghcr.io/cachebox-project/inference-cache-subscriber
 
 jobs:
-  generate-sbom:
-    name: Generate SBOMs
+  secure-release:
+    name: Publish and Secure Release Images
     runs-on: ubuntu-latest
     permissions:
+      artifact-metadata: write
+      attestations: write
       contents: read
+      id-token: write
       packages: write
     steps:
     - name: Validate release tag
@@ -73,35 +80,182 @@ jobs:
         path: release-source
         persist-credentials: false
 
+    - name: Verify provenance source revision
+      run: |
+        set -euo pipefail
+        release_sha="$(git -C release-source rev-parse HEAD)"
+        if [ "$release_sha" != "$GITHUB_SHA" ]; then
+          echo "Release source $release_sha does not match workflow source $GITHUB_SHA." >&2
+          echo "For manual runs, select the release tag in the 'Use workflow from' control." >&2
+          exit 1
+        fi
+
     - name: Generate source SBOM
       run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-release TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom"
 
-    - name: Generate published image SBOMs
-      run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-registry-images TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT="$GITHUB_WORKSPACE/release-source" SBOM_DOCKERFILE="$GITHUB_WORKSPACE/release-source/dockerfiles/Dockerfile"
+    - name: Build and publish release images
+      id: built-image-digests
+      env:
+        RELEASE_IMAGE_PLATFORMS: linux/amd64,linux/arm64
+      run: |
+        set -euo pipefail
 
-    - name: Upload SBOM workflow artifacts
+        build_image() {
+          local component="$1"
+          local repository="$2"
+          local metadata
+          local digest
+
+          metadata="$(mktemp)"
+          docker buildx build \
+            --push \
+            --platform "$RELEASE_IMAGE_PLATFORMS" \
+            --file release-source/dockerfiles/Dockerfile \
+            --target "$component" \
+            --tag "${repository}:${RELEASE_TAG}" \
+            --metadata-file "$metadata" \
+            release-source
+          digest="$(jq -r '."containerimage.digest" // empty' "$metadata")"
+          rm -f "$metadata"
+
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Build did not produce a valid digest for ${repository}:${RELEASE_TAG}." >&2
+            exit 1
+          fi
+          printf '%s=%s\n' "$component" "$digest" >> "$GITHUB_OUTPUT"
+        }
+
+        build_image controller "$CONTROLLER_IMAGE_REPO"
+        build_image server "$SERVER_IMAGE_REPO"
+        build_image subscriber "$SUBSCRIBER_IMAGE_REPO"
+
+    - name: Resolve published release image digests
+      id: published-image-digests
+      env:
+        DOCKER_BUILD_CMD: docker
+      run: hack/resolve-release-image-digests.sh >> "$GITHUB_OUTPUT"
+
+    - name: Verify published images match this release build
+      env:
+        BUILT_CONTROLLER_DIGEST: ${{ steps.built-image-digests.outputs.controller }}
+        BUILT_SERVER_DIGEST: ${{ steps.built-image-digests.outputs.server }}
+        BUILT_SUBSCRIBER_DIGEST: ${{ steps.built-image-digests.outputs.subscriber }}
+        PUBLISHED_CONTROLLER_DIGEST: ${{ steps.published-image-digests.outputs.controller }}
+        PUBLISHED_SERVER_DIGEST: ${{ steps.published-image-digests.outputs.server }}
+        PUBLISHED_SUBSCRIBER_DIGEST: ${{ steps.published-image-digests.outputs.subscriber }}
+      run: |
+        set -euo pipefail
+        test "$BUILT_CONTROLLER_DIGEST" = "$PUBLISHED_CONTROLLER_DIGEST"
+        test "$BUILT_SERVER_DIGEST" = "$PUBLISHED_SERVER_DIGEST"
+        test "$BUILT_SUBSCRIBER_DIGEST" = "$PUBLISHED_SUBSCRIBER_DIGEST"
+
+    - name: Generate published image SBOMs
+      run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-registry-images TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom"
+
+    - name: Set up Cosign
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+      with:
+        cosign-release: ${{ env.COSIGN_VERSION }}
+
+    - name: Sign release images
+      env:
+        CONTROLLER_DIGEST: ${{ steps.built-image-digests.outputs.controller }}
+        SERVER_DIGEST: ${{ steps.built-image-digests.outputs.server }}
+        SUBSCRIBER_DIGEST: ${{ steps.built-image-digests.outputs.subscriber }}
+      run: |
+        set -euo pipefail
+        cosign sign --yes "${CONTROLLER_IMAGE_REPO}@${CONTROLLER_DIGEST}"
+        cosign sign --yes "${SERVER_IMAGE_REPO}@${SERVER_DIGEST}"
+        cosign sign --yes "${SUBSCRIBER_IMAGE_REPO}@${SUBSCRIBER_DIGEST}"
+
+    - name: Generate controller SLSA provenance
+      id: attest-controller
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+      with:
+        subject-name: ${{ env.CONTROLLER_IMAGE_REPO }}
+        subject-digest: ${{ steps.built-image-digests.outputs.controller }}
+        push-to-registry: true
+
+    - name: Generate server SLSA provenance
+      id: attest-server
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+      with:
+        subject-name: ${{ env.SERVER_IMAGE_REPO }}
+        subject-digest: ${{ steps.built-image-digests.outputs.server }}
+        push-to-registry: true
+
+    - name: Generate subscriber SLSA provenance
+      id: attest-subscriber
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+      with:
+        subject-name: ${{ env.SUBSCRIBER_IMAGE_REPO }}
+        subject-digest: ${{ steps.built-image-digests.outputs.subscriber }}
+        push-to-registry: true
+
+    - name: Collect provenance bundles
+      env:
+        CONTROLLER_BUNDLE: ${{ steps.attest-controller.outputs.bundle-path }}
+        SERVER_BUNDLE: ${{ steps.attest-server.outputs.bundle-path }}
+        SUBSCRIBER_BUNDLE: ${{ steps.attest-subscriber.outputs.bundle-path }}
+      run: |
+        set -euo pipefail
+        mkdir -p dist/provenance
+        cp -- "$CONTROLLER_BUNDLE" "dist/provenance/inference-cache-controller-${RELEASE_TAG}.provenance.sigstore.json"
+        cp -- "$SERVER_BUNDLE" "dist/provenance/inference-cache-server-${RELEASE_TAG}.provenance.sigstore.json"
+        cp -- "$SUBSCRIBER_BUNDLE" "dist/provenance/inference-cache-subscriber-${RELEASE_TAG}.provenance.sigstore.json"
+
+    - name: Verify image signatures and SLSA provenance
+      env:
+        GH_TOKEN: ${{ github.token }}
+        COSIGN_IDENTITY: https://github.com/${{ github.workflow_ref }}
+        CONTROLLER_DIGEST: ${{ steps.built-image-digests.outputs.controller }}
+        SERVER_DIGEST: ${{ steps.built-image-digests.outputs.server }}
+        SUBSCRIBER_DIGEST: ${{ steps.built-image-digests.outputs.subscriber }}
+      run: |
+        set -euo pipefail
+        for ref in \
+          "${CONTROLLER_IMAGE_REPO}@${CONTROLLER_DIGEST}" \
+          "${SERVER_IMAGE_REPO}@${SERVER_DIGEST}" \
+          "${SUBSCRIBER_IMAGE_REPO}@${SUBSCRIBER_DIGEST}"; do
+          cosign verify \
+            --certificate-identity "$COSIGN_IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$ref" >/dev/null
+          gh attestation verify "oci://${ref}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --bundle-from-oci \
+            --cert-identity "$COSIGN_IDENTITY" \
+            --deny-self-hosted-runners \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --predicate-type https://slsa.dev/provenance/v1 >/dev/null
+        done
+
+    - name: Upload release supply-chain artifacts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
-        name: release-sboms
-        path: dist/sbom/*.spdx.json
+        name: release-supply-chain
+        path: |
+          dist/sbom/*.spdx.json
+          dist/provenance/*.sigstore.json
         if-no-files-found: error
 
-  attach-sbom:
-    name: Attach SBOMs to GitHub Release
+  attach-release-artifacts:
+    name: Attach Supply-Chain Artifacts to GitHub Release
     runs-on: ubuntu-latest
     needs:
-    - generate-sbom
+    - secure-release
     permissions:
       contents: write
     steps:
-    - name: Download SBOM workflow artifacts
+    - name: Download release supply-chain artifacts
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
       with:
-        name: release-sboms
-        path: dist/sbom
+        name: release-supply-chain
+        path: dist
 
-    - name: Attach SBOMs to GitHub Release
+    - name: Attach supply-chain artifacts to GitHub Release
       env:
         GH_TOKEN: ${{ github.token }}
         RELEASE_TAG: ${{ env.RELEASE_TAG }}
-      run: gh release upload "${RELEASE_TAG}" dist/sbom/*.spdx.json --clobber
+      run: gh release upload "${RELEASE_TAG}" dist/sbom/*.spdx.json dist/provenance/*.sigstore.json --clobber
