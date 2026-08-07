@@ -40,22 +40,32 @@ jobs:
       if: github.event_name != 'pull_request'
       run: echo "DCO sign-off is enforced on pull requests."
 
-    - name: Exempt bot-authored pull request
-      if: github.event_name == 'pull_request' && github.event.pull_request.user.type == 'Bot'
-      run: echo "Bot-authored pull requests are exempt from DCO sign-off."
-
     - name: Checkout complete history
-      if: github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot'
+      if: github.event_name == 'pull_request'
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       with:
         fetch-depth: 0
 
+    - name: Identify GitHub-verified bot commits
+      if: github.event_name == 'pull_request'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        bot_commits_file="$RUNNER_TEMP/dco-bot-commits"
+        gh api --paginate \
+          "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" \
+          --jq '.[] | select(.author.type == "Bot") | .sha' \
+          > "$bot_commits_file"
+        echo "DCO_BOT_COMMITS_FILE=$bot_commits_file" >> "$GITHUB_ENV"
+
     - name: Verify every pull request commit is signed off
-      if: github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot'
+      if: github.event_name == 'pull_request'
       env:
         DCO_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      run: make verify-dco DCO_BASE="$DCO_BASE_SHA" DCO_HEAD="$DCO_HEAD_SHA"
+      run: make verify-dco DCO_BASE="$DCO_BASE_SHA" DCO_HEAD="$DCO_HEAD_SHA" DCO_BOT_COMMITS_FILE="$DCO_BOT_COMMITS_FILE"
 
   lint-generated-proto:
     name: Lint, Generated Code, Proto

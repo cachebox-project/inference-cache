@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Verify that every non-merge commit in a revision range carries a valid DCO
-# Signed-off-by trailer. A trailer is valid when its name and email match the
-# commit author or committer, case-insensitively.
+# Verify that every non-merge, non-bot commit in a revision range carries a
+# valid DCO Signed-off-by trailer. A trailer is valid when its name and email
+# match the commit author or committer, case-insensitively.
 #
 # Usage:
 #   hack/verify-dco.sh <base-ref> <head-ref>
@@ -15,6 +15,7 @@ fi
 
 base="$1"
 head="$2"
+bot_commits_file="${DCO_BOT_COMMITS_FILE:-}"
 
 for ref in "$base" "$head"; do
   if ! git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
@@ -23,11 +24,26 @@ for ref in "$base" "$head"; do
   fi
 done
 
+# Bot status cannot be inferred safely from attacker-controlled Git metadata.
+# CI supplies a list of commit SHAs whose authors the GitHub API identified as
+# type Bot. Without that trusted list (the normal local case), no commit gets
+# a bot exemption.
+if [ -n "$bot_commits_file" ]; then
+  if [ ! -f "$bot_commits_file" ]; then
+    echo "ERROR: DCO bot commit list '${bot_commits_file}' does not exist" >&2
+    exit 1
+  fi
+  if grep -Evq '^[0-9a-f]{40}$' "$bot_commits_file"; then
+    echo "ERROR: DCO bot commit list contains an invalid commit SHA" >&2
+    exit 1
+  fi
+fi
+
 # Match the canonical DCO App's identity behavior: trailer labels and
 # author/committer identities are compared case-insensitively.
 shopt -s nocasematch
 signoff_pattern='^[[:space:]]*Signed-off-by:[[:space:]]+(.+)[[:space:]]+<([^<>[:space:]]+)>[[:space:]]*$'
-signoff_prefix='^[[:space:]]*Signed-off-by:'
+signoff_prefix='^Signed-off-by:'
 email_pattern='^[^@[:space:]<>]+@[^@[:space:]<>]+$'
 
 same_identity() {
@@ -47,6 +63,11 @@ while IFS= read -r commit; do
     continue
   fi
 
+  if [ -n "$bot_commits_file" ] && grep -qxF "$commit" "$bot_commits_file"; then
+    echo "SKIP ${commit:0:12} (GitHub-verified bot author)"
+    continue
+  fi
+
   checked=$((checked + 1))
   author_name="$(git show -s --format=%an "$commit")"
   author_email="$(git show -s --format=%ae "$commit")"
@@ -56,6 +77,9 @@ while IFS= read -r commit; do
   matched=0
   found_signoffs=()
 
+  # git interpret-trailers restricts parsing to the terminal trailer block.
+  # A Signed-off-by example in the subject or message body is not a trailer
+  # and therefore cannot satisfy the gate.
   while IFS= read -r line; do
     if [[ "$line" =~ $signoff_prefix ]]; then
       found_signoffs+=("$line")
@@ -76,7 +100,7 @@ while IFS= read -r commit; do
         matched=1
       fi
     fi
-  done < <(git show -s --format=%B "$commit")
+  done < <(git show -s --format=%B "$commit" | git interpret-trailers --parse)
 
   if [ "$matched" -eq 1 ]; then
     echo "OK   ${commit:0:12} ${subject}"

@@ -556,9 +556,10 @@ test-docs-sync: ## Run the self-contained tests for the docs-sync gate (no netwo
 # the pull request's immutable base and head SHAs.
 DCO_BASE ?= origin/main
 DCO_HEAD ?= HEAD
+DCO_BOT_COMMITS_FILE ?=
 .PHONY: verify-dco
 verify-dco: ## Verify DCO sign-off on every non-merge commit in DCO_BASE..DCO_HEAD.
-	@bash hack/verify-dco.sh "$(DCO_BASE)" "$(DCO_HEAD)"
+	@DCO_BOT_COMMITS_FILE="$(DCO_BOT_COMMITS_FILE)" bash hack/verify-dco.sh "$(DCO_BASE)" "$(DCO_HEAD)"
 
 .PHONY: test-dco
 test-dco: ## Run self-contained tests for the DCO verifier (no network; throwaway git repos).

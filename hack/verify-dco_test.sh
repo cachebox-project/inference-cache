@@ -24,8 +24,9 @@ new_repo() {
 
 expect() {
   local want="$1" name="$2" dir="$3" base="$4" head="$5"
+  local bot_commits_file="${6:-}"
   local rc=0 output
-  output="$(cd "$dir" && bash "$script" "$base" "$head" 2>&1)" || rc=$?
+  output="$(cd "$dir" && DCO_BOT_COMMITS_FILE="$bot_commits_file" bash "$script" "$base" "$head" 2>&1)" || rc=$?
   if [ "$rc" -eq "$want" ]; then
     echo "  ok   $name (exit $rc)"
   else
@@ -55,6 +56,17 @@ git -C "$case_repo" commit --allow-empty -q -m "malformed" \
   -m "Signed-off-by: Alice Example alice@example.com"
 expect 1 "malformed sign-off fails" "$case_repo" "$case_base" HEAD
 
+new_repo body-only
+git -C "$case_repo" commit --allow-empty -q -m "body-only sign-off" \
+  -m "Signed-off-by: Alice Example <alice@example.com>" \
+  -m "This line leaves the sign-off outside the terminal trailer block."
+expect 1 "sign-off in the message body is not a trailer" "$case_repo" "$case_base" HEAD
+
+new_repo indented-example
+git -C "$case_repo" commit --allow-empty -q -m "document sign-off" \
+  -m $'Example:\n    Signed-off-by: Alice Example <alice@example.com>'
+expect 1 "indented sign-off example is not a trailer" "$case_repo" "$case_base" HEAD
+
 new_repo committer
 GIT_AUTHOR_NAME="Bob Author" GIT_AUTHOR_EMAIL="bob@example.com" \
   git -C "$case_repo" commit --allow-empty -q --signoff -m "committer sign-off"
@@ -77,6 +89,20 @@ git -C "$case_repo" checkout -q main
 git -C "$case_repo" commit --allow-empty -q --signoff -m "main change"
 git -C "$case_repo" merge -q --no-ff side -m "unsigned merge"
 expect 0 "merge commits are skipped" "$case_repo" "$case_base" HEAD
+
+new_repo untrusted-bot
+GIT_AUTHOR_NAME="automation[bot]" GIT_AUTHOR_EMAIL="automation[bot]@users.noreply.github.com" \
+  git -C "$case_repo" commit --allow-empty -q -m "unsigned bot-like commit"
+expect 1 "bot-like Git metadata cannot claim an exemption" "$case_repo" "$case_base" HEAD
+
+bot_sha="$(git -C "$case_repo" rev-parse HEAD)"
+bot_commits_file="$tmp_root/github-verified-bot-commits"
+printf '%s\n' "$bot_sha" > "$bot_commits_file"
+expect 0 "GitHub-verified bot commit is exempt" "$case_repo" "$case_base" HEAD "$bot_commits_file"
+
+invalid_bot_commits_file="$tmp_root/invalid-bot-commits"
+printf '%s\n' "not-a-commit" > "$invalid_bot_commits_file"
+expect 1 "invalid bot commit list fails closed" "$case_repo" "$case_base" HEAD "$invalid_bot_commits_file"
 
 new_repo empty-range
 expect 0 "empty range passes" "$case_repo" "$case_base" "$case_base"

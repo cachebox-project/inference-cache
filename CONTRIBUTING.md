@@ -161,9 +161,11 @@ git commit --amend --no-edit --signoff
 
 For an older commit, use an interactive rebase and amend only commits you can
 personally certify. Do not add another contributor's sign-off on their behalf.
-The `DCO` pull-request check verifies every non-merge commit; bot-authored pull
-requests are exempt. Run the same check locally with `make verify-dco` (and its
-self-contained test suite with `make test-dco`).
+The `DCO` pull-request check verifies every non-merge commit. Individual bot
+commits are exempt only when the GitHub API identifies their author as a bot;
+human commits in a bot-opened pull request are still checked. The local gate
+has no trusted GitHub identity metadata, so it checks every commit. Run it with
+`make verify-dco` (and its self-contained test suite with `make test-dco`).
 
 ## Before pushing / opening a PR
 
