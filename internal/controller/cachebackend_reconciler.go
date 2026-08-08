@@ -140,6 +140,18 @@ func (r *CacheBackendReconciler) matchedEnginePodsChurnRequeueInterval() time.Du
 	return DefaultMatchedEnginePodsChurnRequeueInterval
 }
 
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+
 // Reconcile drives a CacheBackend toward its desired state. External backends
 // only mirror their configured endpoint to status; managed backends (LMCache
 // in Phase 1) ask the registered runtime adapter for the cache-server pod

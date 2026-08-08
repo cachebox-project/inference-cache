@@ -587,33 +587,9 @@ internal/webhook/v1alpha1/
 └── cachebackend_override_validation.go
 ```
 
-- [ ] Keep one `v1alpha1` webhook package.
-- [ ] Preserve validation ordering, field paths, error messages, and defaults.
-- [ ] Split the large webhook test file by rule family.
-
-### B4. Split CacheBackend API definitions
-
-Proposed commit:
-
-```text
-refactor(api): split cachebackend types by concern
-```
-
-Target files:
-
-```text
-api/v1alpha1/
-├── cachebackend_types.go
-├── cachebackend_cache_types.go
-├── cachebackend_storage_types.go
-├── cachebackend_integration_types.go
-└── cachebackend_status_types.go
-```
-
-- [ ] Keep one `api/v1alpha1` Go package.
-- [ ] Preserve all JSON names, kubebuilder markers, schema, defaults, printer
-  columns, and generated deepcopy behavior.
-- [ ] Regenerate and verify the CRD after moving markers and types.
+- [x] Keep one `v1alpha1` webhook package.
+- [x] Preserve validation ordering, field paths, error messages, and defaults.
+- [x] Split the large webhook test file by rule family.
 
 ## Phase C: organize samples, tests, docs, and build assets
 
