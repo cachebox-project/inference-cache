@@ -535,9 +535,9 @@ internal/index/
 └── accounting.go
 ```
 
-- [ ] Move tests beside the responsibility they exercise.
-- [ ] Keep all types and methods in package `index`.
-- [ ] Do not change algorithms, locking, clock behavior, or metrics.
+- [x] Move tests beside the responsibility they exercise.
+- [x] Keep all types and methods in package `index`.
+- [x] Do not change algorithms, locking, clock behavior, or metrics.
 
 ### B2. Split the server gRPC implementation
 
