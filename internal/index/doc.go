@@ -9,4 +9,8 @@
 // in the server binary. Snapshot types are index-owned domain values; the server
 // maps them explicitly to the controller-facing HTTP contract in
 // internal/controlplaneapi.
+//
+// The package is intentionally decoupled from the gRPC/proto layer: callers
+// translate wire messages into its domain types. Its contents are soft state;
+// losing them causes cache misses, never wrong answers.
 package index
