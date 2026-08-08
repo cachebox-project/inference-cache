@@ -32,14 +32,74 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
-func newVLLMRegistry(opts ...adapterruntime.Option) *adapterruntime.Registry {
+const (
+	testVLLMEngineContainerName = "vllm"
+	testSubscriberImage         = "subscriber:test"
+	testEnvLMCacheRemoteURL     = "LMCACHE_REMOTE_URL"
+	testEnvLMCacheChunkSize     = "LMCACHE_CHUNK_SIZE"
+	testEnvVLLMUseV1            = "VLLM_USE_V1"
+	testEnvPythonHashSeed       = "PYTHONHASHSEED"
+	testReferenceCacheEndpoint  = "INFERENCECACHE_CACHE_ENDPOINT"
+	testRuntimeReference        = adapterruntime.RuntimeID("reference")
+)
+
+func newVLLMRegistry(configs ...builtinruntime.SubscriberConfig) *adapterruntime.Registry {
+	var config builtinruntime.SubscriberConfig
+	if len(configs) > 0 {
+		config = configs[0]
+	}
 	registry := adapterruntime.NewRegistry()
-	registry.Register(builtinruntime.NewVLLMLMCacheAdapter(opts...))
+	registry.Register(builtinruntime.NewVLLMLMCacheAdapter(config))
 	return registry
+}
+
+// referenceRuntimeAdapter is a webhook-local fixture for the public runtime
+// extension contract. It deliberately renders no observation sidecar.
+type referenceRuntimeAdapter struct{}
+
+func (referenceRuntimeAdapter) Supports(runtime adapterruntime.RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
+	return cache != nil && runtime == testRuntimeReference
+}
+
+func (referenceRuntimeAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
+	return binding != nil && binding.Protocol != ""
+}
+
+func (referenceRuntimeAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, _ *cachev1alpha1.CacheBackend) error {
+	if pod == nil || binding == nil {
+		return errors.New("reference fixture requires pod and binding")
+	}
+	for i := range pod.Containers {
+		pod.Containers[i].Env = referenceUpsertEnv(pod.Containers[i].Env, corev1.EnvVar{Name: testReferenceCacheEndpoint, Value: binding.Endpoint})
+	}
+	return nil
+}
+
+func (referenceRuntimeAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
+	return nil
+}
+
+func (referenceRuntimeAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.Pod) (*corev1.Container, error) {
+	return nil, nil
+}
+
+func (referenceRuntimeAdapter) ReservedArgs() []string      { return nil }
+func (referenceRuntimeAdapter) ReservedEnv() []string       { return nil }
+func (referenceRuntimeAdapter) EngineContainerName() string { return "" }
+
+func referenceUpsertEnv(env []corev1.EnvVar, want corev1.EnvVar) []corev1.EnvVar {
+	for i := range env {
+		if env[i].Name == want.Name {
+			env[i] = want
+			return env
+		}
+	}
+	return append(env, want)
 }
 
 func externalLMCacheStorage(endpoint string) *cachev1alpha1.CacheBackendRemoteStorageSpec {
@@ -131,7 +191,7 @@ func vllmEnginePod(name string, labels map[string]string) *corev1.Pod {
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{
-				Name:  adapterruntime.EngineContainerName,
+				Name:  testVLLMEngineContainerName,
 				Image: "vllm/vllm-openai-cpu:latest",
 				Env: []corev1.EnvVar{
 					{Name: "USER_FLAG", Value: "preserved"},
@@ -203,7 +263,7 @@ func newHandler(t *testing.T, objs ...client.Object) *EngineInjector {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
 	return &EngineInjector{
 		Reader:   c,
-		Registry: builtinadapters.New().Runtime,
+		Registry: builtinadapters.New(builtinadapters.Options{}).Runtime,
 		Log:      logr.Discard(),
 	}
 }
@@ -217,9 +277,7 @@ func newHandlerWithSubscriber(t *testing.T, objs ...client.Object) *EngineInject
 	t.Helper()
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
-	reg := newVLLMRegistry(
-		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
-	)
+	reg := newVLLMRegistry(builtinruntime.SubscriberConfig{Image: testSubscriberImage})
 	return &EngineInjector{
 		Reader:   c,
 		Registry: reg,
@@ -244,9 +302,9 @@ func TestHandle_MatchAndInject(t *testing.T) {
 
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL,
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL,
 		"lm://"+cb.Status.Endpoint)
-	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
 	if got, want := mutated.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name; got != want {
 		t.Fatalf("annotation %s: got %q, want %q", AnnotationInjectedBy, got, want)
 	}
@@ -310,11 +368,11 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 			}
 		}
 		for _, e := range c.Env {
-			if e.Name == adapterruntime.EnvVLLMUseV1 || e.Name == adapterruntime.EnvPythonHashSeed {
+			if e.Name == testEnvVLLMUseV1 || e.Name == testEnvPythonHashSeed {
 				t.Fatalf("SGLang pod got vLLM-only env %q (SGLang injects neither)", e.Name)
 			}
-			if e.Name == adapterruntime.EnvLMCacheRemoteURL {
-				t.Fatalf("SGLang MP wire must not inject %s", adapterruntime.EnvLMCacheRemoteURL)
+			if e.Name == testEnvLMCacheRemoteURL {
+				t.Fatalf("SGLang MP wire must not inject %s", testEnvLMCacheRemoteURL)
 			}
 		}
 	}
@@ -469,8 +527,8 @@ func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
 
 	// The defining difference from the LMCache path: the remote URL carries
 	// the mooncakestore:// scheme, pointed at the master RPC endpoint.
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "mooncakestore://"+cb.Status.Endpoint)
-	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "mooncakestore://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 	// User-set engine arg survives the merge (merge, not clobber).
 	mustHaveArgPair(t, mutated, "--model", "Qwen/Qwen2.5-0.5B-Instruct")
@@ -480,7 +538,7 @@ func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
 
 	// The kvevent-subscriber sidecar is appended on the Mooncake path too
 	// (same shared builder; vLLM's KV-event stream is store-independent).
-	sub := findContainer(mutated, adapterruntime.SubscriberContainerName)
+	sub := findContainer(mutated, enginebinding.SubscriberContainerName)
 	if sub == nil {
 		t.Fatalf("subscriber sidecar missing on Mooncake path; containers = %v", containerNames(mutated))
 	}
@@ -545,7 +603,7 @@ func TestHandle_MooncakeBackend_EngineHostNetworkIsOptIn(t *testing.T) {
 		}
 		// The rest of the Mooncake wiring still lands — the opt-in gates the
 		// networking rewrite only, never the connector env.
-		mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "mooncakestore://mc.engines.svc.cluster.local:50051")
+		mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "mooncakestore://mc.engines.svc.cluster.local:50051")
 	})
 
 	t.Run("InjectedWhenOperatorOptsIn", func(t *testing.T) {
@@ -566,7 +624,7 @@ func TestHandle_MooncakeBackend_EngineHostNetworkIsOptIn(t *testing.T) {
 		if got, want := mutated.Spec.DNSPolicy, corev1.DNSClusterFirstWithHostNet; got != want {
 			t.Fatalf("dnsPolicy: got %q, want %q (hostNetwork pods lose cluster DNS without it, and status.endpoint is a DNS name)", got, want)
 		}
-		mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "mooncakestore://mc.engines.svc.cluster.local:50051")
+		mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "mooncakestore://mc.engines.svc.cluster.local:50051")
 	})
 }
 
@@ -618,7 +676,7 @@ func TestHandle_MooncakeBackend_HostNetworkNeverGrantedToAnUnwiredPod(t *testing
 	}
 	for _, c := range mutated.Spec.Containers {
 		for _, e := range c.Env {
-			if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+			if e.Name == testEnvLMCacheRemoteURL {
 				t.Fatalf("connector env %s injected without an endpoint", e.Name)
 			}
 		}
@@ -683,7 +741,7 @@ func TestHandle_AppendsObservationSidecar(t *testing.T) {
 	if len(mutated.Spec.Containers) != 2 {
 		t.Fatalf("expected 2 containers (engine + subscriber), got %d: %v", len(mutated.Spec.Containers), containerNames(mutated))
 	}
-	sub := findContainer(mutated, adapterruntime.SubscriberContainerName)
+	sub := findContainer(mutated, enginebinding.SubscriberContainerName)
 	if sub == nil {
 		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
 	}
@@ -698,7 +756,7 @@ func TestHandle_AppendsObservationSidecar(t *testing.T) {
 	}
 	// The engine container is still wired with LMCache env — appending the
 	// sidecar must not regress the engine-side injection.
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
 }
 
 func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
@@ -721,8 +779,9 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := newVLLMRegistry(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage))
-	reg.Register(builtinruntime.NewSGLangLMCacheAdapter(adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage)))
+	config := builtinruntime.SubscriberConfig{Image: testSubscriberImage}
+	reg := newVLLMRegistry(config)
+	reg.Register(builtinruntime.NewSGLangLMCacheAdapter(config))
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
@@ -736,7 +795,7 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 	if len(mutated.Spec.Containers) != 2 {
 		t.Fatalf("expected 2 containers (sglang engine + subscriber), got %d: %v", len(mutated.Spec.Containers), containerNames(mutated))
 	}
-	sub := findContainer(mutated, adapterruntime.SubscriberContainerName)
+	sub := findContainer(mutated, enginebinding.SubscriberContainerName)
 	if sub == nil {
 		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
 	}
@@ -831,7 +890,7 @@ func TestHandle_EventsOnly_EmptyEndpoint_InjectsSubscriberWithoutConnector(t *te
 		t.Fatalf("expected 2 containers (engine + subscriber), got %d: %v",
 			len(mutated.Spec.Containers), containerNames(mutated))
 	}
-	sub := findContainer(mutated, adapterruntime.SubscriberContainerName)
+	sub := findContainer(mutated, enginebinding.SubscriberContainerName)
 	if sub == nil {
 		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
 	}
@@ -851,7 +910,7 @@ func TestHandle_EventsOnly_EmptyEndpoint_InjectsSubscriberWithoutConnector(t *te
 	// The engine container gets NO KV connector wiring: events-only loads no
 	// connector (a hybrid-attention model's KV-cache manager would be disabled
 	// by one). The user's own env/args survive untouched.
-	engine := findContainer(mutated, adapterruntime.EngineContainerName)
+	engine := findContainer(mutated, testVLLMEngineContainerName)
 	if engine == nil {
 		t.Fatalf("engine container missing; containers = %v", containerNames(mutated))
 	}
@@ -936,7 +995,7 @@ func TestHandle_EventsOnly_NoSubscriberImage_InjectsNothingNoStamp(t *testing.T)
 
 	// No subscriber container appended.
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+	if c := findContainer(mutated, enginebinding.SubscriberContainerName); c != nil {
 		t.Fatalf("no subscriber image configured — must NOT append a sidecar; found %+v", c)
 	}
 	// No injected-by / injected-by-uid stamped — nothing was wired.
@@ -994,7 +1053,7 @@ func TestHandle_EventsOnly_PrebakedSubscriber_NotClaimedNoStamp(t *testing.T) {
 	h := newHandlerWithSubscriber(t, cb) // subscriber image IS configured
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
-		Name:  adapterruntime.SubscriberContainerName,
+		Name:  enginebinding.SubscriberContainerName,
 		Image: "operator/hand-baked-subscriber:wrong",
 	})
 	req := newRequest(t, pod, ns)
@@ -1008,7 +1067,7 @@ func TestHandle_EventsOnly_PrebakedSubscriber_NotClaimedNoStamp(t *testing.T) {
 	// Idempotent: still exactly one subscriber-named container (no duplicate append).
 	count := 0
 	for i := range mutated.Spec.Containers {
-		if mutated.Spec.Containers[i].Name == adapterruntime.SubscriberContainerName {
+		if mutated.Spec.Containers[i].Name == enginebinding.SubscriberContainerName {
 			count++
 		}
 	}
@@ -1017,7 +1076,7 @@ func TestHandle_EventsOnly_PrebakedSubscriber_NotClaimedNoStamp(t *testing.T) {
 			count, containerNames(mutated))
 	}
 	// The hand-baked container is left as-is — the subscriber is NOT webhook-authoritative.
-	if sub := findContainer(mutated, adapterruntime.SubscriberContainerName); sub == nil || sub.Image != "operator/hand-baked-subscriber:wrong" {
+	if sub := findContainer(mutated, enginebinding.SubscriberContainerName); sub == nil || sub.Image != "operator/hand-baked-subscriber:wrong" {
 		t.Fatalf("hand-baked subscriber must be left untouched; got %+v", sub)
 	}
 	// NOT claimed: the webhook authored no wiring, so it stamps no injected-by.
@@ -1058,7 +1117,7 @@ func TestHandle_EventsOnly_EngineOverrides_DoNotTouchEngineContainer(t *testing.
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
 
-	engine := findContainer(mutated, adapterruntime.EngineContainerName)
+	engine := findContainer(mutated, testVLLMEngineContainerName)
 	if engine == nil {
 		t.Fatalf("engine container missing; containers = %v", containerNames(mutated))
 	}
@@ -1081,7 +1140,7 @@ func TestHandle_EventsOnly_EngineOverrides_DoNotTouchEngineContainer(t *testing.
 	// The subscriber IS still injected (image configured) and the pod is wired,
 	// so injected-by is stamped — confirms the engine-untouched guarantee is
 	// independent of the sidecar-append path.
-	if sub := findContainer(mutated, adapterruntime.SubscriberContainerName); sub == nil {
+	if sub := findContainer(mutated, enginebinding.SubscriberContainerName); sub == nil {
 		t.Fatalf("subscriber sidecar must still attach for a configured events-only backend; containers = %v", containerNames(mutated))
 	}
 	if got, want := mutated.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name; got != want {
@@ -1133,8 +1192,8 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	// LMCACHE_REMOTE_URL must be the operator-supplied endpoint with the
 	// lm:// scheme prepended, identical to what the managed adapter
 	// would write for the same endpoint.
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+endpoint)
-	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+endpoint)
+	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
 	// User --model arg survives the merge — the adapter only adds; it
 	// never clobbers user-set args.
 	if !containsArgPairLocal(mutated.Spec.Containers[0].Args, "--model", "Qwen/Qwen2.5-0.5B-Instruct") {
@@ -1142,7 +1201,7 @@ func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
 	}
 	// The external-ownership path attaches no observation sidecar — the
 	// controller has no observability seam into an operator-managed cache.
-	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+	if c := findContainer(mutated, enginebinding.SubscriberContainerName); c != nil {
 		t.Fatalf("External backend must NOT get a subscriber sidecar; found %+v", c)
 	}
 	if mutated.Annotations[AnnotationInjectedBy] != ns+"/ext" {
@@ -1278,7 +1337,7 @@ func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
 		t.Fatalf("expected Allowed, got %+v", resp.Result)
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+endpoint)
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+endpoint)
 }
 
 func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
@@ -1323,9 +1382,9 @@ func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	// Must use spec.remoteStorage.endpoint, NOT the stale status.endpoint.
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+freshSpec)
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+freshSpec)
 	for _, e := range mutated.Spec.Containers[0].Env {
-		if e.Name == adapterruntime.EnvLMCacheRemoteURL && e.Value == "lm://"+staleStatus {
+		if e.Name == testEnvLMCacheRemoteURL && e.Value == "lm://"+staleStatus {
 			t.Fatalf("pod wired to stale status.endpoint %q; should be spec.remoteStorage.endpoint %q", staleStatus, freshSpec)
 		}
 	}
@@ -1372,7 +1431,7 @@ func TestHandle_ExternalBackend_UpperCaseSchemeNormalised(t *testing.T) {
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	// Must be the canonical lower-case scheme, with the original
 	// host portion preserved verbatim.
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://cache.example.com:8200")
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://cache.example.com:8200")
 }
 
 func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
@@ -1408,7 +1467,7 @@ func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	for _, e := range mutated.Spec.Containers[0].Env {
-		if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+		if e.Name == testEnvLMCacheRemoteURL {
 			t.Fatalf("whitespace status.endpoint must not become injected env; got %s=%q", e.Name, e.Value)
 		}
 	}
@@ -1450,7 +1509,7 @@ func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
 		t.Fatalf("pod has no containers after admission")
 	}
 	for _, e := range mutated.Spec.Containers[0].Env {
-		if e.Name == adapterruntime.EnvLMCacheRemoteURL {
+		if e.Name == testEnvLMCacheRemoteURL {
 			t.Fatalf("managed CR with no status.endpoint must NOT trigger injection; got %s=%q", e.Name, e.Value)
 		}
 	}
@@ -1475,11 +1534,11 @@ func TestHandle_ExternalBackend_NoSidecar(t *testing.T) {
 	// without appending a kvevent-subscriber container.
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime(adapterruntime.RuntimeReference)
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime(testRuntimeReference)
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	reg := adapterruntime.NewRegistry()
-	reg.Register(adapterruntime.NewReferenceAdapter())
+	reg.Register(referenceRuntimeAdapter{})
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
@@ -1489,7 +1548,7 @@ func TestHandle_ExternalBackend_NoSidecar(t *testing.T) {
 		t.Fatalf("expected Allowed, got %+v", resp.Result)
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+	if c := findContainer(mutated, enginebinding.SubscriberContainerName); c != nil {
 		t.Fatalf("External-style backend must NOT get a subscriber sidecar; found %+v", c)
 	}
 }
@@ -1512,10 +1571,10 @@ func TestHandle_SidecarOptInDefaultsToNoSidecar(t *testing.T) {
 		t.Fatalf("engine injection must still happen; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+	if c := findContainer(mutated, enginebinding.SubscriberContainerName); c != nil {
 		t.Fatalf("default install must NOT auto-attach the sidecar; got %+v", c)
 	}
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
 }
 
 func TestHandle_SidecarSkippedWithoutModel(t *testing.T) {
@@ -1533,10 +1592,10 @@ func TestHandle_SidecarSkippedWithoutModel(t *testing.T) {
 		t.Fatalf("engine injection must still happen; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+	if c := findContainer(mutated, enginebinding.SubscriberContainerName); c != nil {
 		t.Fatalf("sidecar must be skipped without a model id; got %+v", c)
 	}
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
 }
 
 func TestHandle_SidecarErrorIsFailOpen(t *testing.T) {
@@ -1561,7 +1620,7 @@ func TestHandle_SidecarErrorIsFailOpen(t *testing.T) {
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	mustHaveEnv(t, mutated, "STUB_INJECTED", "yes")
-	if c := findContainer(mutated, adapterruntime.SubscriberContainerName); c != nil {
+	if c := findContainer(mutated, enginebinding.SubscriberContainerName); c != nil {
 		t.Fatalf("sidecar errored — webhook must not append a partial container, got %+v", c)
 	}
 }
@@ -1573,7 +1632,7 @@ func TestHandle_PreExistingSidecar_NotDuplicated(t *testing.T) {
 	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
-		Name:  adapterruntime.SubscriberContainerName,
+		Name:  enginebinding.SubscriberContainerName,
 		Image: "operator/pre-baked:tag",
 	})
 	req := newRequest(t, pod, ns)
@@ -1585,13 +1644,13 @@ func TestHandle_PreExistingSidecar_NotDuplicated(t *testing.T) {
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	subs := 0
 	for _, c := range mutated.Spec.Containers {
-		if c.Name == adapterruntime.SubscriberContainerName {
+		if c.Name == enginebinding.SubscriberContainerName {
 			subs++
 		}
 	}
 	if subs != 1 {
 		t.Fatalf("expected exactly one %s container after admission, got %d: %v",
-			adapterruntime.SubscriberContainerName, subs, containerNames(mutated))
+			enginebinding.SubscriberContainerName, subs, containerNames(mutated))
 	}
 }
 
@@ -1627,7 +1686,7 @@ func (sidecarErrorAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *core
 
 func (sidecarErrorAdapter) ReservedArgs() []string      { return nil }
 func (sidecarErrorAdapter) ReservedEnv() []string       { return nil }
-func (sidecarErrorAdapter) EngineContainerName() string { return adapterruntime.EngineContainerName }
+func (sidecarErrorAdapter) EngineContainerName() string { return testVLLMEngineContainerName }
 
 func findContainer(pod *corev1.Pod, name string) *corev1.Container {
 	for i := range pod.Spec.Containers {
@@ -1712,7 +1771,7 @@ func TestHandle_PartialEnvOnly_StillConverges(t *testing.T) {
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
-		Name:  adapterruntime.EnvLMCacheRemoteURL,
+		Name:  testEnvLMCacheRemoteURL,
 		Value: "lm://stale.example:65432",
 	})
 	req := newRequest(t, pod, ns)
@@ -1724,8 +1783,8 @@ func TestHandle_PartialEnvOnly_StillConverges(t *testing.T) {
 	mutated := applyPatches(t, req.Object.Raw, resp)
 	// The stale URL is overwritten with the canonical one for the matched
 	// backend, and the missing pieces are added.
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
-	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
@@ -1951,11 +2010,11 @@ func TestHandle_RegistryOverride_UsedInsteadOfDefault(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.Runtime = ""
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime(adapterruntime.RuntimeReference)
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime(testRuntimeReference)
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	reg := adapterruntime.NewRegistry()
-	reg.Register(adapterruntime.NewReferenceAdapter())
+	reg.Register(referenceRuntimeAdapter{})
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
@@ -1965,7 +2024,7 @@ func TestHandle_RegistryOverride_UsedInsteadOfDefault(t *testing.T) {
 		t.Fatalf("expected Allowed with patches; got Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	mustHaveEnv(t, mutated, adapterruntime.EnvCacheEndpoint, cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, testReferenceCacheEndpoint, cb.Status.Endpoint)
 }
 
 func TestHandle_PodNamespaceDefaultedFromRequest(t *testing.T) {
@@ -2129,7 +2188,7 @@ func TestHandle_EngineOverrides_EnvUpsertAndArgAppend(t *testing.T) {
 			{Name: "FOO", Value: "bar"},
 			// Override a tunable canonical env value, which is allowed
 			// because LMCACHE_CHUNK_SIZE is NOT reserved.
-			{Name: adapterruntime.EnvLMCacheChunkSize, Value: "512"},
+			{Name: testEnvLMCacheChunkSize, Value: "512"},
 		},
 	}
 	h := newHandler(t, cb)
@@ -2146,10 +2205,10 @@ func TestHandle_EngineOverrides_EnvUpsertAndArgAppend(t *testing.T) {
 	mustHaveEnv(t, mutated, "FOO", "bar")
 	// Override wins for the tunable name (LMCACHE_CHUNK_SIZE is an
 	// adapter-owned canonical entry — the override surface can touch it).
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheChunkSize, "512")
+	mustHaveEnv(t, mutated, testEnvLMCacheChunkSize, "512")
 	// Canonical reserved env still landed unchanged.
-	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
 	// User-template env preserved.
 	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
 
@@ -2194,7 +2253,7 @@ func TestHandle_EngineOverrides_DoNotMutateUserTemplate(t *testing.T) {
 	// User-owned env untouched by the CR-driven override + suppress.
 	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
 	// Canonical injection still landed.
-	mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
+	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
@@ -2232,8 +2291,8 @@ func TestHandle_EngineOverrides_NoOverride_ByteIdenticalToBaseline(t *testing.T)
 		mutated := applyPatches(t, req.Object.Raw, resp)
 		// Sanity: canonical injection lands as expected — so a green test
 		// is meaningful (not green by producing an empty patch set).
-		mustHaveEnv(t, mutated, adapterruntime.EnvVLLMUseV1, "1")
-		mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+		mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
+		mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
 		mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 
 		raw, err := json.Marshal(mutated)
@@ -2348,17 +2407,17 @@ func TestHandle_KernelCheckInitContainer_AppendedOnGPUPod(t *testing.T) {
 	// The kernel-check init container must be present.
 	found := false
 	for _, ic := range mutated.Spec.InitContainers {
-		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if ic.Name == enginebinding.LMCacheKernelCheckContainerName {
 			found = true
 			break
 		}
 	}
 	if !found {
 		t.Fatalf("kernel-check init container %q missing from Spec.InitContainers; got: %v",
-			adapterruntime.LMCacheKernelCheckContainerName, initContainerNames(mutated))
+			enginebinding.LMCacheKernelCheckContainerName, initContainerNames(mutated))
 	}
 	// Engine-side injection must still have landed.
-	mustHaveEnv(t, mutated, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
 }
 
 // TestHandle_KernelCheckInitContainer_Idempotent verifies that a second
@@ -2382,7 +2441,7 @@ func TestHandle_KernelCheckInitContainer_Idempotent(t *testing.T) {
 
 	count := 0
 	for _, ic := range injected.Spec.InitContainers {
-		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if ic.Name == enginebinding.LMCacheKernelCheckContainerName {
 			count++
 		}
 	}
@@ -2400,7 +2459,7 @@ func TestHandle_KernelCheckInitContainer_Idempotent(t *testing.T) {
 
 	count = 0
 	for _, ic := range readmitted.Spec.InitContainers {
-		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if ic.Name == enginebinding.LMCacheKernelCheckContainerName {
 			count++
 		}
 	}
@@ -2423,7 +2482,7 @@ func TestHandle_EventsOnly_StripsPreexistingKernelCheckInitContainer(t *testing.
 
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
-		Name:  adapterruntime.LMCacheKernelCheckContainerName,
+		Name:  enginebinding.LMCacheKernelCheckContainerName,
 		Image: "stale-hand-baked-kernel-check:latest",
 	})
 	req := newRequest(t, pod, ns)
@@ -2435,13 +2494,13 @@ func TestHandle_EventsOnly_StripsPreexistingKernelCheckInitContainer(t *testing.
 	mutated := applyPatches(t, req.Object.Raw, resp)
 
 	for _, ic := range mutated.Spec.InitContainers {
-		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if ic.Name == enginebinding.LMCacheKernelCheckContainerName {
 			t.Fatalf("stale kernel-check init container survived events-only admission; init containers = %v",
 				initContainerNames(mutated))
 		}
 	}
 	// The subscriber sidecar is still wired (this is a normal events-only inject).
-	if findContainer(mutated, adapterruntime.SubscriberContainerName) == nil {
+	if findContainer(mutated, enginebinding.SubscriberContainerName) == nil {
 		t.Fatalf("subscriber sidecar missing; containers = %v", containerNames(mutated))
 	}
 }
@@ -2458,7 +2517,7 @@ func TestHandle_KernelCheckInitContainer_ReplacesForged(t *testing.T) {
 	// A hand-authored / forged same-name init container that would bypass the
 	// real check if the webhook merely skipped injection (e.g. a fake "OK").
 	pod.Spec.InitContainers = []corev1.Container{{
-		Name:    adapterruntime.LMCacheKernelCheckContainerName,
+		Name:    enginebinding.LMCacheKernelCheckContainerName,
 		Image:   "attacker/fake:latest",
 		Command: []string{"echo", "OK"},
 	}}
@@ -2469,7 +2528,7 @@ func TestHandle_KernelCheckInitContainer_ReplacesForged(t *testing.T) {
 	var got *corev1.Container
 	count := 0
 	for i := range injected.Spec.InitContainers {
-		if injected.Spec.InitContainers[i].Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if injected.Spec.InitContainers[i].Name == enginebinding.LMCacheKernelCheckContainerName {
 			got = &injected.Spec.InitContainers[i]
 			count++
 		}
@@ -2498,7 +2557,7 @@ func TestHandle_KernelCheckInitContainer_StrippedWhenAdapterDeclines(t *testing.
 	// the container by name), preserving "auto on a non-GPU pod = absent".
 	pod := vllmEnginePod("engine-cpu", map[string]string{"app": "vllm"})
 	pod.Spec.InitContainers = []corev1.Container{{
-		Name:    adapterruntime.LMCacheKernelCheckContainerName,
+		Name:    enginebinding.LMCacheKernelCheckContainerName,
 		Image:   "attacker/fake:latest",
 		Command: []string{"echo", "OK"},
 	}}
@@ -2507,7 +2566,7 @@ func TestHandle_KernelCheckInitContainer_StrippedWhenAdapterDeclines(t *testing.
 	injected := applyPatches(t, newRequest(t, pod, ns).Object.Raw, resp)
 
 	for _, ic := range injected.Spec.InitContainers {
-		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if ic.Name == enginebinding.LMCacheKernelCheckContainerName {
 			t.Fatalf("forged kernel-check init container survived on a non-GPU (auto) pod; want it stripped: %v",
 				initContainerNames(injected))
 		}
@@ -2545,7 +2604,7 @@ func TestHandle_KernelCheckInitContainer_SkipAnnotationSuppresses(t *testing.T) 
 		t.Fatalf("annotation %s = %q, want %q", AnnotationInjectSkipped, got, InjectSkippedReasonSkipAnnotation)
 	}
 	for _, ic := range mutated.Spec.InitContainers {
-		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if ic.Name == enginebinding.LMCacheKernelCheckContainerName {
 			t.Fatalf("kernel-check init container must be absent when skip annotation is set; found %+v", ic)
 		}
 	}
@@ -2564,7 +2623,7 @@ func TestHandle_KernelCheckInitContainer_SkippedForEventsOnly(t *testing.T) {
 	// Offload backend this would inject (and, on a strict failure, block the
 	// pod). Events-only must skip it regardless.
 	cb.Annotations = map[string]string{
-		adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict,
+		enginebinding.AnnotationLMCacheKernelCheck: enginebinding.KernelCheckModeStrict,
 	}
 	h := newHandlerWithSubscriber(t, cb)
 
@@ -2584,15 +2643,15 @@ func TestHandle_KernelCheckInitContainer_SkippedForEventsOnly(t *testing.T) {
 
 	// No kernel-check init container for events-only.
 	for _, ic := range mutated.Spec.InitContainers {
-		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if ic.Name == enginebinding.LMCacheKernelCheckContainerName {
 			t.Fatalf("events-only pod must NOT get the %q init container; init containers = %v",
-				adapterruntime.LMCacheKernelCheckContainerName, initContainerNames(mutated))
+				enginebinding.LMCacheKernelCheckContainerName, initContainerNames(mutated))
 		}
 	}
 
 	// Sanity: the events-only wiring still happened (subscriber sidecar
 	// appended), so this is not a fail-open no-op masquerading as a skip.
-	if sub := findContainer(mutated, adapterruntime.SubscriberContainerName); sub == nil {
+	if sub := findContainer(mutated, enginebinding.SubscriberContainerName); sub == nil {
 		t.Fatalf("events-only subscriber sidecar missing; containers = %v", containerNames(mutated))
 	}
 }
@@ -2605,7 +2664,7 @@ func TestHandle_KernelCheckInitContainer_AppendedOnOffloadStrict(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Annotations = map[string]string{
-		adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict,
+		enginebinding.AnnotationLMCacheKernelCheck: enginebinding.KernelCheckModeStrict,
 	}
 	h := newHandler(t, cb)
 
@@ -2623,14 +2682,14 @@ func TestHandle_KernelCheckInitContainer_AppendedOnOffloadStrict(t *testing.T) {
 
 	found := false
 	for _, ic := range mutated.Spec.InitContainers {
-		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if ic.Name == enginebinding.LMCacheKernelCheckContainerName {
 			found = true
 			break
 		}
 	}
 	if !found {
 		t.Fatalf("Offload (strict) pod must still get the %q init container; init containers = %v",
-			adapterruntime.LMCacheKernelCheckContainerName, initContainerNames(mutated))
+			enginebinding.LMCacheKernelCheckContainerName, initContainerNames(mutated))
 	}
 }
 
@@ -2673,9 +2732,7 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	// Configure the shipping vLLM adapter's subscriber image so the events-only
 	// sidecar path is live.
-	reg := newVLLMRegistry(
-		adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
-	)
+	reg := newVLLMRegistry(builtinruntime.SubscriberConfig{Image: testSubscriberImage})
 	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
 
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
@@ -2687,7 +2744,7 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
 
-	engine := findContainer(mutated, adapterruntime.EngineContainerName)
+	engine := findContainer(mutated, testVLLMEngineContainerName)
 	if engine == nil {
 		t.Fatalf("engine container missing; containers = %v", containerNames(mutated))
 	}
@@ -2705,7 +2762,7 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 	}
 	// No kernel-check init container either; assert the contract end-to-end.
 	for _, ic := range mutated.Spec.InitContainers {
-		if ic.Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if ic.Name == enginebinding.LMCacheKernelCheckContainerName {
 			t.Fatalf("events-only+External pod must NOT get the kernel-check init container; init containers = %v",
 				initContainerNames(mutated))
 		}

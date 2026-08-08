@@ -677,7 +677,7 @@ func TestProbeResultMetricEmitsPerStage(t *testing.T) {
 // metricCounter reads the inferencecache_backend_probe_result_total counter for
 // one label combination by collecting the metric directly. Avoids pulling
 // in the prometheus/testutil dependency just for one assertion (the
-// pkg/server tests use the same trick).
+// internal/server tests use the same trick).
 func metricCounter(t *testing.T, backend, stage, result string) float64 {
 	t.Helper()
 	m, err := probeResultMetric.GetMetricWithLabelValues(backend, stage, result)

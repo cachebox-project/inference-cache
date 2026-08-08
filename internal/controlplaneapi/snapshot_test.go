@@ -1,0 +1,209 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package controlplaneapi
+
+// Frozen wire-shape contract for Snapshot — the JSON the policy
+// server publishes at /snapshot and the controller decodes in
+// CacheIndexPoller. A silent rename of any JSON tag (e.g.
+// json:"replicaId" → json:"replica_id") would still pass a round-trip test
+// because the rename applies to both encoder and decoder. This test
+// freezes the actual on-wire key names so the rename surface is
+// observable in code review: bump THIS list when you bump the contract.
+
+import (
+	"encoding/json"
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestSnapshotJSONTagsAreFrozen pins the on-wire JSON tag
+// names used by Snapshot, ReplicaSnapshot, and TenantSnapshot. The
+// CacheIndex poller in internal/controller depends on these EXACT strings
+// when decoding /snapshot — and any older controller deployed alongside a
+// newer server (or the other way around) would silently degrade if a tag
+// was renamed because the structs would just deserialize zero values for
+// the renamed fields and the per-backend status writer would publish
+// drained-looking participation. A "compile-time round-trip" check does
+// not catch this; the rename has to be visible at the string level.
+//
+// To update the contract:
+//   - Add the new tag(s) to the wantTop, wantReplica, or wantTenant slices.
+//   - Make sure the change is intentional and the consumer side
+//     (internal/controller/cacheindex_controller.go fetchSnapshot path) is
+//     updated in the same commit. Coordinate with anything else that
+//     decodes /snapshot.
+func TestSnapshotJSONTagsAreFrozen(t *testing.T) {
+	// Construct a Snapshot whose leaf fields are set so the json encoder
+	// emits all keys (including ones marked omitempty). One exception:
+	// TenantSnapshot.MemoryUsed is deprecated and deliberately left 0 — its
+	// JSON tag carries NO omitempty, so the key stays on the wire even at 0
+	// (the skew-compat guarantee). Do NOT "fix" it to a non-zero value.
+	// Tags marked omitempty whose values would be zero are excluded from
+	// the frozen list below ON PURPOSE — they're documented optional and
+	// their absence on the wire is part of the contract.
+	snap := Snapshot{
+		Replicas: []ReplicaSnapshot{{
+			ReplicaID:        "vllm-0",
+			Tenant:           "ns-a",
+			CacheMemoryBytes: 100,
+			HitRate:          0.5,
+			Pressure:         0.25,
+			LastUpdate:       time.Unix(1_700_000_000, 0).UTC(),
+			PrefixCount:      3,
+			LastEventAt:      time.Unix(1_700_000_500, 0).UTC(),
+			// StatsReported carries omitempty (bool), so it must be true here to
+			// emit the key for the frozen-shape check.
+			StatsReported: true,
+			T2HitTokens:   600,
+			T2QueryTokens: 1000,
+		}},
+		Tenants: []TenantSnapshot{{
+			TenantID:     "team-a",
+			IndexEntries: 3,
+			HitRate:      0.5,
+			// HitRateReported carries omitempty (bool), so it must be true here
+			// to emit the key for the frozen-shape check.
+			HitRateReported: true,
+			// Deprecated, always 0 in production; pinned here because the JSON
+			// tag carries no omitempty, so the key stays on the wire (skew-safe
+			// for an older controller still decoding it).
+			MemoryUsed: 0,
+		}},
+		TotalPrefixes: 3,
+		HotPrefixes:   0,
+	}
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+
+	// Top-level Snapshot keys.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatalf("unmarshal top: %v", err)
+	}
+	wantTop := []string{"replicas", "tenants", "totalPrefixes", "hotPrefixes"}
+	assertExactKeys(t, "Snapshot", top, wantTop)
+
+	// Per-replica keys.
+	var replicas []map[string]json.RawMessage
+	if err := json.Unmarshal(top["replicas"], &replicas); err != nil {
+		t.Fatalf("unmarshal replicas: %v", err)
+	}
+	if len(replicas) != 1 {
+		t.Fatalf("expected one replica row; got %d", len(replicas))
+	}
+	wantReplica := []string{
+		"replicaId", "tenant", "cacheMemoryBytes", "hitRate", "pressure",
+		"lastUpdate", "prefixCount", "lastEventAt", "statsReported",
+		"t2HitTokens", "t2QueryTokens",
+	}
+	assertExactKeys(t, "ReplicaSnapshot", replicas[0], wantReplica)
+
+	// Per-tenant keys.
+	var tenants []map[string]json.RawMessage
+	if err := json.Unmarshal(top["tenants"], &tenants); err != nil {
+		t.Fatalf("unmarshal tenants: %v", err)
+	}
+	if len(tenants) != 1 {
+		t.Fatalf("expected one tenant row; got %d", len(tenants))
+	}
+	wantTenant := []string{"tenantId", "indexEntries", "hitRate", "hitRateReported", "memoryUsed"}
+	assertExactKeys(t, "TenantSnapshot", tenants[0], wantTenant)
+}
+
+// TestSnapshotJSONOptionalTagWireShape pins the actual wire-emission
+// behaviour for two ReplicaSnapshot fields whose omitempty semantics are
+// subtle (other fields also carry ",omitempty" — e.g. statsReported and the
+// T2 counters — but their behaviour is the ordinary basic-type one):
+//
+//   - `Tenant string` — omitempty works on strings, so an empty Tenant
+//     omits the key entirely. Older controllers built against the
+//     pre-tenant snapshot shape interpreted the key's absence as "no
+//     tenant context", and that interpretation must keep working.
+//   - `LastEventAt time.Time` — omitempty does NOT actually omit time.Time
+//     because Go's encoding/json treats only basic-type zero values and
+//     empty containers as omitable; time.Time is a struct. The field
+//     consequently emits as `"0001-01-01T00:00:00Z"` when zero. The
+//     controller-side consumer uses `IsZero()` (not key-absence) to
+//     branch, so this is wire-shape oddity rather than a bug. Pin both
+//     the present-key and the sentinel value so a future "fix" (e.g.
+//     switching to *time.Time) is a deliberate joint change with the
+//     consumer, not a silent break.
+//
+// To genuinely make LastEventAt absent on zero, the struct would need to
+// switch to *time.Time — out of scope for this test sweep (the prompt
+// excludes shape changes); flag and re-frame as its own ticket if
+// downstream consumers require true absence semantics.
+func TestSnapshotJSONOptionalTagWireShape(t *testing.T) {
+	snap := Snapshot{
+		Replicas: []ReplicaSnapshot{{
+			ReplicaID:  "vllm-0",
+			LastUpdate: time.Unix(1_700_000_000, 0).UTC(),
+			// Tenant left empty; LastEventAt left zero.
+		}},
+	}
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(raw)
+	if strings.Contains(s, `"tenant"`) {
+		t.Fatalf("tenant should be omitted when empty (string omitempty works); got %s", s)
+	}
+	if !strings.Contains(s, `"lastEventAt":"0001-01-01T00:00:00Z"`) {
+		t.Fatalf("lastEventAt is expected to emit the zero-time sentinel because Go's omitempty does not omit time.Time; got %s", s)
+	}
+}
+
+// TestSnapshotPresenceBitsSupportRollingSkew pins both directions of the
+// presence-bit contract: false values are omitted for old consumers, and a
+// new controller decoding an old-server payload sees the zero-value false
+// signal while retaining the legacy measurements used by its skew fallback.
+func TestSnapshotPresenceBitsSupportRollingSkew(t *testing.T) {
+	newBody, err := json.Marshal(Snapshot{
+		Replicas: []ReplicaSnapshot{{ReplicaID: "r1", HitRate: 0.5}},
+		Tenants:  []TenantSnapshot{{TenantID: "t1", HitRate: 0.5}},
+	})
+	if err != nil {
+		t.Fatalf("marshal new snapshot: %v", err)
+	}
+	if strings.Contains(string(newBody), `"statsReported"`) || strings.Contains(string(newBody), `"hitRateReported"`) {
+		t.Fatalf("false presence bits must be omitted for old consumers: %s", newBody)
+	}
+
+	oldBody := []byte(`{"replicas":[{"replicaId":"r-old","cacheMemoryBytes":100,"hitRate":0.66,"pressure":0,"lastUpdate":"2023-11-14T22:13:20Z","prefixCount":3,"lastEventAt":"0001-01-01T00:00:00Z"}],"tenants":[{"tenantId":"t-old","indexEntries":3,"hitRate":0.66,"memoryUsed":0}],"totalPrefixes":3,"hotPrefixes":0}`)
+	var decoded Snapshot
+	if err := json.Unmarshal(oldBody, &decoded); err != nil {
+		t.Fatalf("decode old-server snapshot: %v", err)
+	}
+	if len(decoded.Replicas) != 1 || decoded.Replicas[0].StatsReported || decoded.Replicas[0].HitRate != 0.66 {
+		t.Fatalf("old replica skew decode = %+v", decoded.Replicas)
+	}
+	if len(decoded.Tenants) != 1 || decoded.Tenants[0].HitRateReported || decoded.Tenants[0].HitRate != 0.66 {
+		t.Fatalf("old tenant skew decode = %+v", decoded.Tenants)
+	}
+}
+
+// assertExactKeys verifies the set of top-level JSON keys in `got` is
+// exactly `want`, no more no less. Order doesn't matter; missing or
+// extra keys both fail.
+func assertExactKeys(t *testing.T, surface string, got map[string]json.RawMessage, want []string) {
+	t.Helper()
+	gotKeys := make([]string, 0, len(got))
+	for k := range got {
+		gotKeys = append(gotKeys, k)
+	}
+	sort.Strings(gotKeys)
+	wantSorted := append([]string(nil), want...)
+	sort.Strings(wantSorted)
+	if !reflect.DeepEqual(gotKeys, wantSorted) {
+		t.Fatalf("%s JSON keys = %v, want %v (the frozen wire-shape — update both the struct tag and this list together)",
+			surface, gotKeys, wantSorted)
+	}
+}

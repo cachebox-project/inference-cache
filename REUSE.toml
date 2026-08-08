@@ -15,8 +15,8 @@ path = [
   "**/*.table",
   "**/*.xml",
   "LICENSE",
-  "pkg/adapters/engine/testdata/*.txt",
-  "pkg/cli/doctor/output/testdata/*.txt",
+  "internal/cli/doctor/output/testdata/*.txt",
+  "internal/subscriber/testdata/*.txt",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 The inference-cache Authors"
@@ -29,7 +29,7 @@ path = [
   "config/crd/bases/*.yaml",
   "config/rbac/role.yaml",
   "config/webhook/manifests.yaml",
-  "pkg/server/proto/**/*.pb.go",
+  "gen/**/*.pb.go",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 The inference-cache Authors"

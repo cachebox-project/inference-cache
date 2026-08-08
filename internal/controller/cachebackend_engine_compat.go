@@ -142,7 +142,7 @@ func engineContainerStatus(pod *corev1.Pod, engineContainerName string) *corev1.
 	var engine *corev1.ContainerStatus
 	nonSidecar := 0
 	for i := range pod.Status.ContainerStatuses {
-		if pod.Status.ContainerStatuses[i].Name == adapterruntime.SubscriberContainerName {
+		if pod.Status.ContainerStatuses[i].Name == enginebinding.SubscriberContainerName {
 			continue
 		}
 		engine = &pod.Status.ContainerStatuses[i]

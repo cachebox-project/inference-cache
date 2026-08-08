@@ -8,7 +8,7 @@
 // prints heap + peak RSS so operators can pick CacheTenant.spec.quota.maxIndexEntries,
 // the per-namespace CachePolicy.spec.evictionTTL, and pod memory limits with
 // real numbers instead of a guess. The global server cap is the compile-time
-// constant pkg/index.DefaultMaxEntries.
+// constant internal/index.DefaultMaxEntries.
 //
 // Not a shipping binary; not built by `make build`. Run with:
 //
@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cachebox-project/inference-cache/pkg/index"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // runPlan is the derived per-run shape: per-bucket key count, the actually-
@@ -96,7 +96,7 @@ func planRun(keys, replicas, hashSize, tenants, models, batchSize int) (runPlan,
 func main() {
 	keys := flag.Int("keys", 1_000_000, "distinct prefix keys to ingest")
 	replicas := flag.Int("replicas", 1, "replicas reporting each prefix (entries = keys × replicas)")
-	hashSize := flag.Int("hash-bytes", 32, "prefix-hash bytes per entry. Conservative default representing LMCache-style SHA hashes; the in-tree vLLM adapter normalizes integer block hashes to 8 bytes big-endian (see pkg/adapters/engine/events.go uint64BE). Minimum 8 to guarantee uniqueness across the keys range.")
+	hashSize := flag.Int("hash-bytes", 32, "prefix-hash bytes per entry. Conservative default representing LMCache-style SHA hashes; the in-tree vLLM adapter normalizes integer block hashes to 8 bytes big-endian (see internal/subscriber/events.go uint64BE). Minimum 8 to guarantee uniqueness across the keys range.")
 	tenants := flag.Int("tenants", 1, "distinct tenant IDs (keys are split evenly across tenants×models)")
 	models := flag.Int("models", 1, "distinct model IDs")
 	batchSize := flag.Int("batch", 1_000, "prefixes per Ingest call")

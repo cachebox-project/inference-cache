@@ -27,15 +27,15 @@ The repository is one operator split across two binaries plus the CRDs. In short
 |---|---|
 | A CRD field / new API type | `api/v1alpha1/` → `make manifests generate` |
 | Controller / reconciler logic | `internal/controller/` |
-| gRPC handlers, server wiring | `pkg/server/` |
-| Cache-state index logic | `pkg/index/` |
-| Mutable-slot rendering | `pkg/render/` |
+| gRPC handlers, server wiring | `internal/server/` |
+| Cache-state index logic | `internal/index/` |
+| Planned reusable rendering API (reserved; not implemented) | `pkg/render/` |
 | Built-in runtime / storage adapters | `internal/adapters/builtin/{runtime,storage}/` |
 | Public adapter extension contracts | `pkg/adapters/{runtime,backend}/` |
 | The gRPC contract | `proto/` → `make proto-gen` |
 
 Generated code (`config/crd/`, `config/rbac/role.yaml`, `zz_generated*.go`,
-`pkg/server/proto/`) is committed but never hand-edited — regenerate and commit it with the
+`gen/`) is committed but never hand-edited — regenerate and commit it with the
 source change. Each package's `doc.go` states which binary it belongs to.
 
 ## Design docs

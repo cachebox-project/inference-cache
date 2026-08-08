@@ -15,17 +15,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 func podWithKernelStatus(state corev1.ContainerState) corev1.Pod {
 	return corev1.Pod{
 		Spec: corev1.PodSpec{InitContainers: []corev1.Container{{
-			Name: adapterruntime.LMCacheKernelCheckContainerName,
+			Name: enginebinding.LMCacheKernelCheckContainerName,
 		}}},
 		Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
-			Name:  adapterruntime.LMCacheKernelCheckContainerName,
+			Name:  enginebinding.LMCacheKernelCheckContainerName,
 			State: state,
 		}}},
 	}
@@ -35,7 +35,7 @@ func podWithKernelStatus(state corev1.ContainerState) corev1.Pod {
 // observed status yet — a just-created / unscheduled pod.
 func specOnlyKernelPod() corev1.Pod {
 	return corev1.Pod{Spec: corev1.PodSpec{InitContainers: []corev1.Container{{
-		Name: adapterruntime.LMCacheKernelCheckContainerName,
+		Name: enginebinding.LMCacheKernelCheckContainerName,
 	}}}}
 }
 
@@ -45,8 +45,8 @@ func specOnlyKernelPod() corev1.Pod {
 func strictPodWithKernelStatus(state corev1.ContainerState) corev1.Pod {
 	p := podWithKernelStatus(state)
 	p.Spec.InitContainers = []corev1.Container{{
-		Name: adapterruntime.LMCacheKernelCheckContainerName,
-		Env:  []corev1.EnvVar{{Name: adapterruntime.EnvKernelCheckStrict, Value: "1"}},
+		Name: enginebinding.LMCacheKernelCheckContainerName,
+		Env:  []corev1.EnvVar{{Name: enginebinding.EnvKernelCheckStrict, Value: "1"}},
 	}}
 	return p
 }
@@ -76,9 +76,9 @@ func TestAggregateKernelHealth(t *testing.T) {
 			podWithKernelStatus(termed(0, "FAIL: ImportError: libcudart.so.13")),
 		}, metav1.ConditionFalse, reasonKernelLoadFailed, true},
 		{"strict crashloop fail via lastState", []corev1.Pod{{
-			Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: adapterruntime.LMCacheKernelCheckContainerName}}},
+			Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: enginebinding.LMCacheKernelCheckContainerName}}},
 			Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
-				Name:                 adapterruntime.LMCacheKernelCheckContainerName,
+				Name:                 enginebinding.LMCacheKernelCheckContainerName,
 				State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
 				LastTerminationState: termed(1, "FAIL: ImportError: libcudart.so.13"),
 			}}},
@@ -163,7 +163,7 @@ func TestEvaluateEngineKernelHealthAnnotationStrictButReportOnlyPodDoesNotDowngr
 	// the pod was already running. Pod truth wins: do NOT downgrade Ready (that
 	// pod is actually serving), though the condition still surfaces False.
 	cb := &cachev1alpha1.CacheBackend{ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "ns",
-		Annotations: map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: adapterruntime.KernelCheckModeStrict}}}
+		Annotations: map[string]string{enginebinding.AnnotationLMCacheKernelCheck: enginebinding.KernelCheckModeStrict}}}
 	up := kvReadiness{readyStatus: metav1.ConditionTrue}
 	v := evaluateEngineKernelHealth(cb, up, []corev1.Pod{podWithKernelStatus(termed(0, "FAIL: ImportError: libcudart.so.13"))}, true)
 	if v.downgradeReady {

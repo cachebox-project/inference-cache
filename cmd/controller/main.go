@@ -24,10 +24,9 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	"github.com/cachebox-project/inference-cache/internal/controller"
+	"github.com/cachebox-project/inference-cache/internal/version"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	cachewebhookv1alpha1 "github.com/cachebox-project/inference-cache/internal/webhook/v1alpha1"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	"github.com/cachebox-project/inference-cache/pkg/version"
 )
 
 const leaderLockName = "inference-cache-controller-leader-lock"
@@ -70,7 +69,7 @@ func defaultOptions() options {
 		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
 		policyPushEvery:         controller.DefaultPolicyPushInterval,
 		subscriberImage:         "",
-		policyServerGRPCAddress: adapterruntime.DefaultPolicyServerGRPCAddress,
+		policyServerGRPCAddress: "inference-cache-server.inference-cache-system.svc.cluster.local:9090",
 		zapOpts: zap.Options{
 			TimeEncoder: zapcore.RFC3339TimeEncoder,
 		},
@@ -133,10 +132,10 @@ func main() {
 	// address are operator-supplied: pinning the image to a digest in
 	// production and pointing the sidecar at the right Service DNS are
 	// deployment concerns, not CR-level knobs.
-	adapterRegistries := builtinadapters.New(
-		adapterruntime.WithSubscriberImage(opts.subscriberImage),
-		adapterruntime.WithPolicyServerGRPCAddress(opts.policyServerGRPCAddress),
-	)
+	adapterRegistries := builtinadapters.New(builtinadapters.Options{
+		SubscriberImage:         opts.subscriberImage,
+		PolicyServerGRPCAddress: opts.policyServerGRPCAddress,
+	})
 	adapterRegistry := adapterRegistries.Runtime
 
 	// /probe wrapper for the CacheBackend reconciler's functional-probe gate.

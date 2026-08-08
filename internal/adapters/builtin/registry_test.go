@@ -14,7 +14,7 @@ import (
 func TestNewIncludesEveryShippingRuntimeAdapter(t *testing.T) {
 	t.Parallel()
 
-	registry := New().Runtime
+	registry := New(Options{}).Runtime
 	for _, tc := range []struct {
 		name        string
 		runtime     adapterruntime.RuntimeID
@@ -40,7 +40,7 @@ func TestNewIncludesEveryShippingRuntimeAdapter(t *testing.T) {
 func TestNewIncludesShippingStorageProviders(t *testing.T) {
 	t.Parallel()
 
-	registry := New().Storage
+	registry := New(Options{}).Storage
 	for _, provider := range []cachev1alpha1.CacheBackendRemoteStorageProvider{
 		cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 		cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,

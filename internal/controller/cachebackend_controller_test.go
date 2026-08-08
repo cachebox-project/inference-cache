@@ -32,6 +32,7 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
 	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
@@ -81,7 +82,7 @@ func configureTestRegistries(r *CacheBackendReconciler) {
 	if r.Registry != nil && r.BackendRegistry != nil {
 		return
 	}
-	registries := builtinadapters.New()
+	registries := builtinadapters.New(builtinadapters.Options{})
 	if r.Registry == nil {
 		r.Registry = registries.Runtime
 	}
@@ -314,7 +315,7 @@ func TestReconcileCanonicalHostOnlyCacheReportsEngineDiagnostics(t *testing.T) {
 	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
 		MatchLabels: map[string]string{"app": "engine"},
 	}
-	pod := strictPodWithKernelStatus(termed(1, adapterruntime.KernelCheckMsgFailPrefix+" lmcache c_ops failed"))
+	pod := strictPodWithKernelStatus(termed(1, enginebinding.KernelCheckMsgFailPrefix+" lmcache c_ops failed"))
 	pod.ObjectMeta = metav1.ObjectMeta{
 		Name:      "engine",
 		Namespace: cb.Namespace,
@@ -1293,7 +1294,7 @@ func TestReconcileEventsOnlyAdapterRejectingHostOnlyBindingIsUnmanaged(t *testin
 	}
 	r := newReconciler(scheme, cb)
 	r.Registry = adapterruntime.NewRegistry()
-	r.Registry.Register(remoteOnlyRuntimeAdapter{KVCacheRuntimeAdapter: builtinruntime.NewVLLMLMCacheAdapter()})
+	r.Registry.Register(remoteOnlyRuntimeAdapter{KVCacheRuntimeAdapter: builtinruntime.NewVLLMLMCacheAdapter(builtinruntime.SubscriberConfig{})})
 
 	reconcile(t, r, "cache", "ns1")
 
@@ -1329,7 +1330,7 @@ func TestReconcileEventsOnlyTakesPrecedenceOverExternal(t *testing.T) {
 	}
 	r := newReconciler(scheme, cb)
 	r.Registry = adapterruntime.NewRegistry()
-	r.Registry.Register(builtinruntime.NewVLLMLMCacheAdapter())
+	r.Registry.Register(builtinruntime.NewVLLMLMCacheAdapter(builtinruntime.SubscriberConfig{}))
 
 	reconcile(t, r, "cache", "ns1")
 

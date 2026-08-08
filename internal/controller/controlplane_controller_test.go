@@ -23,14 +23,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
+	cacheserver "github.com/cachebox-project/inference-cache/internal/server"
 )
 
 // pushRecorder records every PolicySnapshot received over HTTP so the test
 // can assert on the body the controller would send to the real server.
 type pushRecorder struct {
 	mu        sync.Mutex
-	snapshots []cacheserver.PolicySnapshot
+	snapshots []controlplaneapi.PolicySnapshot
 	method    string
 	authz     string // last Authorization header observed
 }
@@ -43,7 +44,7 @@ func (p *pushRecorder) handler() http.HandlerFunc {
 			return
 		}
 		_ = r.Body.Close()
-		var snap cacheserver.PolicySnapshot
+		var snap controlplaneapi.PolicySnapshot
 		if err := json.Unmarshal(body, &snap); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -63,11 +64,11 @@ func (p *pushRecorder) lastAuthz() string {
 	return p.authz
 }
 
-func (p *pushRecorder) latest() (cacheserver.PolicySnapshot, bool) {
+func (p *pushRecorder) latest() (controlplaneapi.PolicySnapshot, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.snapshots) == 0 {
-		return cacheserver.PolicySnapshot{}, false
+		return controlplaneapi.PolicySnapshot{}, false
 	}
 	return p.snapshots[len(p.snapshots)-1], true
 }
@@ -136,8 +137,8 @@ func TestPushSnapshotFlattensPoliciesAndTenants(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a push")
 	}
-	if snap.Version != cacheserver.PolicyPropagationVersion {
-		t.Fatalf("version = %d, want %d", snap.Version, cacheserver.PolicyPropagationVersion)
+	if snap.Version != controlplaneapi.PolicyPropagationVersion {
+		t.Fatalf("version = %d, want %d", snap.Version, controlplaneapi.PolicyPropagationVersion)
 	}
 	if len(snap.Policies) != 1 || snap.Policies[0].Namespace != "team-a" {
 		t.Fatalf("policies = %+v, want one for team-a", snap.Policies)
@@ -199,8 +200,8 @@ func TestPushSnapshotIncludesAllPolicies(t *testing.T) {
 	if !ok {
 		t.Fatal("expected at least one push")
 	}
-	if snap.Version != cacheserver.PolicyPropagationVersion {
-		t.Fatalf("snapshot version = %d, want %d", snap.Version, cacheserver.PolicyPropagationVersion)
+	if snap.Version != controlplaneapi.PolicyPropagationVersion {
+		t.Fatalf("snapshot version = %d, want %d", snap.Version, controlplaneapi.PolicyPropagationVersion)
 	}
 	if rec.method != http.MethodPost {
 		t.Fatalf("HTTP method = %q, want POST", rec.method)
@@ -610,11 +611,11 @@ func TestResolveOnePolicyRoutingFloorScoreFallbackOnInvalidInput(t *testing.T) {
 	// controller must still fall back to the safety default rather than 0.
 	overflowing := "999999999999999999999999999999999999999999999999"
 	cases := []tc{
-		{name: "overflowing literal", spec: overflowing, want: cacheserver.DefaultRoutingFloorScore},
-		{name: "malformed", spec: "not-a-number", want: cacheserver.DefaultRoutingFloorScore},
+		{name: "overflowing literal", spec: overflowing, want: controlplaneapi.DefaultRoutingFloorScore},
+		{name: "malformed", spec: "not-a-number", want: controlplaneapi.DefaultRoutingFloorScore},
 		// A negative leak — bypasses the CRD pattern but flows through to
 		// the parser. Must fall back, not be honored.
-		{name: "negative", spec: "-1.5", want: cacheserver.DefaultRoutingFloorScore},
+		{name: "negative", spec: "-1.5", want: controlplaneapi.DefaultRoutingFloorScore},
 		// Sanity: a well-formed value parses cleanly.
 		{name: "valid", spec: "2.5", want: 2.5},
 		{name: "explicit zero opt-out", spec: "0", want: 0},

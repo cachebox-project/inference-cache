@@ -100,7 +100,7 @@ func TestVerifySamplesAdmissionEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ctrl.NewManager: %v", err)
 	}
-	registries := builtinadapters.New()
+	registries := builtinadapters.New(builtinadapters.Options{})
 	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, registries.Runtime); err != nil {
 		t.Fatalf("register CacheBackend webhook: %v", err)
 	}

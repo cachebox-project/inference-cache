@@ -124,7 +124,7 @@ replaces that placeholder.) Concretely:
   satisfy (engine ↔ worker lmcache parity, and lmcache kernels ↔ the SGLang base
   image's CUDA runtime) are spelled out in the build steps above.
 - **What IS validated without a GPU:** SGLang's exact event wire is covered by the
-  Go `pkg/adapters/engine` SGLang test; the Python synthetic publisher covers only
+  Go `internal/subscriber` SGLang test; the Python synthetic publisher covers only
   the shared decode/redaction. See
   [`manifests/sglang-lmcache/README.md`](manifests/sglang-lmcache/README.md).
 

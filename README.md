@@ -91,17 +91,24 @@ the operator CLI and the CRDs.
 
 **`inferencecache-server`** (`cmd/server`) — gRPC policy server + cache-state index + metrics
 - `cmd/server/` — gRPC + HTTP server entrypoint
-- `pkg/server/` — gRPC service (`LookupRoute`, `RenderTemplate`, …), health, metrics
+- `internal/server/` — gRPC service (`LookupRoute`, `RenderTemplate`, …), health, metrics
 - `proto/` (+ generated stubs) — the gRPC contract
-- `pkg/index/` — cache-state aggregator (`CacheIndex`)
-- `pkg/render/` — mutable-slot prompt rendering engine (the wedge); importable library
-- `pkg/adapters/engine/` — engine KV-event hook (feeds the index)
+- `internal/index/` — cache-state aggregator (`CacheIndex`)
+- `pkg/render/` — reserved path for a planned reusable renderer; no stable API yet
+
+**`kvevent-subscriber`** (`cmd/kvevent-subscriber`) — engine-side KV-event ingestion
+- `cmd/kvevent-subscriber/` — composition and lifecycle entrypoint
+- `internal/subscriber/` — engine KV-event hook (feeds the index)
+
+**Engine client library** — narrow pre-tokenized OpenAI-compatible completion client
+- `pkg/engineclient/` — public `EngineClient` contract and `/v1/completions` implementation
+- `internal/canary/` — repository-owned prefix-cache probe and live canary
 
 **`inferencecache`** (`cmd/inferencecache`) — operator CLI; `doctor` runs a read-only pre-flight diagnostic
 - `cmd/inferencecache/` — cobra entrypoint
-- `pkg/cli/doctor/` — diagnostic checks + output formatters (see `docs/cli/doctor.md`)
+- `internal/cli/doctor/` — diagnostic checks + output formatters (see `docs/cli/doctor.md`)
 
-**Shared** — `pkg/version/`, `hack/`, `dockerfiles/`, `.githooks/`
+**Shared** — `internal/version/`, `hack/`, `dockerfiles/`, `.githooks/`
 
 Private cross-binary HTTP DTOs live in `internal/controlplaneapi/`; pod-binding
 metadata shared by admission and reconcilers lives in `internal/enginebinding/`.

@@ -31,7 +31,7 @@
 # >> You need an NVIDIA GPU. << SGLang loads weights on CUDA and the LMCache MP
 # worker moves KV over CUDA-IPC. There is no first-class CPU fallback here, so this
 # manifest is GPU-only. SGLang's exact KV-event wire (the 3-tuple EventBatch
-# envelope) is covered off-GPU by `go test ./pkg/adapters/engine/ -run SGLang`; the
+# envelope) is covered off-GPU by `go test ./internal/subscriber/ -run SGLang`; the
 # Python scripts/ tooling exercises the shared decode + token-redaction (it models
 # vLLM's 2-tuple envelope). See this directory's README.
 #

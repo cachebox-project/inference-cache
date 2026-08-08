@@ -1,0 +1,209 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package server
+
+import (
+	"strconv"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
+	"github.com/cachebox-project/inference-cache/internal/server/auth"
+)
+
+// metricNamespace is the prefix for this project's own metrics (tech spec
+// §4.3): every inference-cache metric name is `inferencecache_*`. The /metrics
+// registry additionally exposes the standard Go runtime and process collectors
+// (`go_*`, `process_*`) — conventional for Prometheus exporters and useful for
+// ops — which are not part of the §4.3 schema.
+const metricNamespace = "inferencecache"
+
+// serverMetrics holds the Prometheus registry and collectors for one Service.
+//
+// We use a per-Service registry rather than the global default one so that (a)
+// the server binary's metrics stay isolated from the controller binary, which
+// registers to controller-runtime's registry, and (b) tests can construct
+// multiple Services without "duplicate metrics collector registration" panics.
+//
+// The full §4.3 metric schema (hit_rate, lookup latency, index_entries, …) is
+// owned by the standalone metric-schema work (F3). What ships here today: the
+// liveness gauge (`inferencecache_server_up`), the gRPC transport-posture
+// gauge (`inferencecache_server_grpc_tls_enabled`), the index population gauge
+// (`inferencecache_index_entries`), the lookup counter + latency histogram
+// (`inferencecache_lookup_route_*`), the quota-eviction counter
+// (`inferencecache_tenant_evictions_total`), the cap/TTL eviction counter
+// (`inferencecache_index_evictions_total`), and the per-endpoint auth counters
+// (`inferencecache_snapshot_auth_total`, `inferencecache_policy_auth_total`,
+// `inferencecache_probe_auth_total`).
+// Update this comment when adding a new metric so the ownership note in
+// docs/reference/metrics.md and this struct stay in lockstep.
+type serverMetrics struct {
+	registry        *prometheus.Registry
+	up              prometheus.Gauge
+	grpcTLSEnabled  prometheus.Gauge
+	indexEntries    *prometheus.GaugeVec
+	lookupCalls     *prometheus.CounterVec
+	lookupLatency   *prometheus.HistogramVec
+	tenantEvictions *prometheus.CounterVec
+	indexEvictions  *prometheus.CounterVec
+	snapshotAuth    *prometheus.CounterVec
+	policyAuth      *prometheus.CounterVec
+	probeAuth       *prometheus.CounterVec
+}
+
+func newServerMetrics() *serverMetrics {
+	up := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricNamespace,
+		Name:      "server_up",
+		Help:      "1 if the cache policy server is serving requests, 0 otherwise.",
+	})
+	// gRPC transport posture so operators can confirm from Prometheus whether
+	// the policy port (:9090) is terminating TLS in-process (1) or running
+	// plaintext (0, the default; TLS is the opt-in config/overlays/server-tls
+	// overlay). See docs/design/grpc-tls.md.
+	grpcTLSEnabled := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricNamespace,
+		Name:      "server_grpc_tls_enabled",
+		Help:      "1 if the gRPC server is terminating TLS, 0 if serving plaintext.",
+	})
+	indexEntries := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricNamespace,
+		Name:      "index_entries",
+		Help:      "Distinct prefix entries currently held in the cache index, per model.",
+	}, []string{"model"})
+	lookupCalls := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "lookup_route_calls_total",
+		Help:      "LookupRoute calls by model, reason_code, and whether a hint was returned.",
+	}, []string{"model", "reason_code", "hint_used"})
+	lookupLatency := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: metricNamespace,
+		Name:      "lookup_route_latency_seconds",
+		Help:      "Server-side LookupRoute latency, per model.",
+		// Cache-path lookups target sub-millisecond; bucket from 100µs up.
+		Buckets: []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1},
+	}, []string{"model"})
+	tenantEvictions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "tenant_evictions_total",
+		Help:      "Index prefixes evicted to enforce a CacheTenant quota, by tenant and reason.",
+	}, []string{"tenant_id", "reason"})
+	indexEvictions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "index_evictions_total",
+		Help:      "Index entries evicted by the cap or TTL sweep, by algorithm (lru|lfu) and reason (cap|ttl).",
+	}, []string{"algorithm", "reason"})
+	snapshotAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "snapshot_auth_total",
+		Help:      "Authentication outcomes for the internal /snapshot endpoint (ok|unauth|forbidden|error).",
+	}, []string{"result"})
+	policyAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "policy_auth_total",
+		Help:      "Authentication outcomes for the internal /policy endpoint (ok|unauth|forbidden|error).",
+	}, []string{"result"})
+	// /probe is the third controller↔server endpoint on the snapshot
+	// listener; its auth outcomes get their own counter so dashboards can
+	// distinguish a probe auth failure (which would silently degrade Ready
+	// gating once the controller-wiring follow-up lands) from a snapshot read
+	// failure (info leak attempt) or a policy write failure (active tampering).
+	// Following the same pattern as snapshot/policy keeps the three
+	// controller-facing endpoints structurally uniform.
+	probeAuth := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricNamespace,
+		Name:      "probe_auth_total",
+		Help:      "Authentication outcomes for the internal /probe endpoint (ok|unauth|forbidden|error).",
+	}, []string{"result"})
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		up,
+		grpcTLSEnabled,
+		indexEntries,
+		lookupCalls,
+		lookupLatency,
+		tenantEvictions,
+		indexEvictions,
+		snapshotAuth,
+		policyAuth,
+		probeAuth,
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+
+	return &serverMetrics{
+		registry:        registry,
+		up:              up,
+		grpcTLSEnabled:  grpcTLSEnabled,
+		indexEntries:    indexEntries,
+		lookupCalls:     lookupCalls,
+		lookupLatency:   lookupLatency,
+		tenantEvictions: tenantEvictions,
+		indexEvictions:  indexEvictions,
+		snapshotAuth:    snapshotAuth,
+		policyAuth:      policyAuth,
+		probeAuth:       probeAuth,
+	}
+}
+
+// SnapshotAuthRecorder returns an auth.ResultRecorder that increments the
+// /snapshot auth counter for each invocation. Wired by Service.New when the
+// snapshot listener has bearer auth configured.
+func (m *serverMetrics) SnapshotAuthRecorder() auth.ResultRecorder {
+	return auth.ResultRecorderFunc(func(r auth.Result) {
+		m.snapshotAuth.WithLabelValues(string(r)).Inc()
+	})
+}
+
+// PolicyAuthRecorder returns an auth.ResultRecorder that increments the
+// /policy auth counter for each invocation. Wired by Service.New when the
+// snapshot listener has bearer auth configured — /policy joins /snapshot on
+// the auth-required listener under one shared SA identity, but each endpoint
+// emits its own outcome counter so dashboards can distinguish read-side
+// (/snapshot) from write-side (/policy) auth failures.
+func (m *serverMetrics) PolicyAuthRecorder() auth.ResultRecorder {
+	return auth.ResultRecorderFunc(func(r auth.Result) {
+		m.policyAuth.WithLabelValues(string(r)).Inc()
+	})
+}
+
+// ProbeAuthRecorder returns an auth.ResultRecorder that increments the /probe
+// auth counter for each invocation. Wired by Service.New when the snapshot
+// listener has bearer auth configured — /probe joins /snapshot and /policy on
+// the auth-required listener under the shared controller SA identity; the
+// dedicated counter lets dashboards distinguish a probe-side auth failure
+// (which would silently degrade Ready gating once the controller-wiring
+// follow-up lands) from snapshot read or policy write failures.
+func (m *serverMetrics) ProbeAuthRecorder() auth.ResultRecorder {
+	return auth.ResultRecorderFunc(func(r auth.Result) {
+		m.probeAuth.WithLabelValues(string(r)).Inc()
+	})
+}
+
+// SetIndexEntries reports the live prefix-entry count for a model. It satisfies
+// index.Metrics so the index can push counts as it mutates.
+func (m *serverMetrics) SetIndexEntries(model string, entries int) {
+	m.indexEntries.WithLabelValues(model).Set(float64(entries))
+}
+
+// AddTenantEvictions records n quota-driven entry evictions for a tenant.
+// Satisfies index.Metrics.
+func (m *serverMetrics) AddTenantEvictions(tenantID, reason string, n int) {
+	m.tenantEvictions.WithLabelValues(tenantID, reason).Add(float64(n))
+}
+
+// AddIndexEvictions records n cap/TTL-driven index-entry evictions for an
+// algorithm. Satisfies index.Metrics.
+func (m *serverMetrics) AddIndexEvictions(algorithm, reason string, n int) {
+	m.indexEvictions.WithLabelValues(algorithm, reason).Add(float64(n))
+}
+
+// observeLookup records one LookupRoute call's outcome and latency.
+func (m *serverMetrics) observeLookup(model, reasonCode string, hintUsed bool, d time.Duration) {
+	m.lookupCalls.WithLabelValues(model, reasonCode, strconv.FormatBool(hintUsed)).Inc()
+	m.lookupLatency.WithLabelValues(model).Observe(d.Seconds())
+}

@@ -18,7 +18,6 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 // EngineKernelsHealthy gate: surfaces the engine-side native CUDA-kernel
@@ -112,7 +111,7 @@ func evaluateEngineKernelHealth(
 	if cond.Status == metav1.ConditionFalse && strictFail {
 		v.downgradeReady = true
 		v.readyReason = reasonEngineKernelDegraded
-		v.readyMessage = "lmcache CUDA kernels failed to load on one or more engine pods; in strict mode those pods stay in Init holding their GPU reservation without serving — fix the engine image's lmcache/CUDA alignment or set " + adapterruntime.AnnotationLMCacheKernelCheck + "=report-only"
+		v.readyMessage = "lmcache CUDA kernels failed to load on one or more engine pods; in strict mode those pods stay in Init holding their GPU reservation without serving — fix the engine image's lmcache/CUDA alignment or set " + enginebinding.AnnotationLMCacheKernelCheck + "=report-only"
 	}
 	return v
 }
@@ -153,7 +152,7 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 		}
 		msg := strings.TrimSpace(term.Message)
 		switch {
-		case strings.HasPrefix(msg, adapterruntime.KernelCheckMsgFailPrefix):
+		case strings.HasPrefix(msg, enginebinding.KernelCheckMsgFailPrefix):
 			nFail++
 			if failMsg == "" {
 				failMsg = msg
@@ -161,7 +160,7 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 			if kernelCheckAdmittedStrict(&pods[i]) {
 				strictFail = true
 			}
-		case msg == adapterruntime.KernelCheckMsgOK && term.ExitCode == 0:
+		case msg == enginebinding.KernelCheckMsgOK && term.ExitCode == 0:
 			nOK++
 		default:
 			// Terminated without our OK/FAIL: contract: python3 missing (exit
@@ -218,7 +217,7 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 // has been observed yet.
 func kernelCheckInSpec(pod *corev1.Pod) bool {
 	for i := range pod.Spec.InitContainers {
-		if pod.Spec.InitContainers[i].Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if pod.Spec.InitContainers[i].Name == enginebinding.LMCacheKernelCheckContainerName {
 			return true
 		}
 	}
@@ -232,11 +231,11 @@ func kernelCheckInSpec(pod *corev1.Pod) bool {
 func kernelCheckAdmittedStrict(pod *corev1.Pod) bool {
 	for i := range pod.Spec.InitContainers {
 		c := &pod.Spec.InitContainers[i]
-		if c.Name != adapterruntime.LMCacheKernelCheckContainerName {
+		if c.Name != enginebinding.LMCacheKernelCheckContainerName {
 			continue
 		}
 		for _, e := range c.Env {
-			if e.Name == adapterruntime.EnvKernelCheckStrict && e.Value == "1" {
+			if e.Name == enginebinding.EnvKernelCheckStrict && e.Value == "1" {
 				return true
 			}
 		}
@@ -248,7 +247,7 @@ func kernelCheckAdmittedStrict(pod *corev1.Pod) bool {
 // on pod, or nil if absent.
 func findKernelCheckStatus(pod *corev1.Pod) *corev1.ContainerStatus {
 	for i := range pod.Status.InitContainerStatuses {
-		if pod.Status.InitContainerStatuses[i].Name == adapterruntime.LMCacheKernelCheckContainerName {
+		if pod.Status.InitContainerStatuses[i].Name == enginebinding.LMCacheKernelCheckContainerName {
 			return &pod.Status.InitContainerStatuses[i]
 		}
 	}

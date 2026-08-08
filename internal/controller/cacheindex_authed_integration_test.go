@@ -21,8 +21,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
-	"github.com/cachebox-project/inference-cache/pkg/server/auth"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
+	"github.com/cachebox-project/inference-cache/internal/server/auth"
 )
 
 // TestIntegrationCacheIndexPollerAgainstAuthedSnapshot drives the full
@@ -31,13 +31,13 @@ import (
 //	CacheIndexPoller.refresh
 //	  -> bearerToken() reads the SA token from a tmpfile (kubelet-shape)
 //	  -> fetchSnapshot() sends Authorization: Bearer <token>
-//	  -> in-process httptest server wrapped in pkg/server/auth.Middleware
+//	  -> in-process httptest server wrapped in internal/server/auth.Middleware
 //	  -> Authenticator calls TokenReview against the envtest apiserver
 //	  -> apiserver validates the token it minted via TokenRequest
-//	  -> handler returns a synthetic index.Snapshot
+//	  -> handler returns a synthetic controlplaneapi.Snapshot
 //	  -> poller decodes it and writes CacheIndex.status against envtest
 //
-// pkg/server/auth/integration_test.go already covers the middleware in
+// internal/server/auth/integration_test.go already covers the middleware in
 // isolation with raw http requests. This test stitches the production
 // CLIENT code (the poller) onto the same backend, which is the surface
 // the bearer-token rollout actually changes for downstream callers.
@@ -90,9 +90,9 @@ func TestIntegrationCacheIndexPollerAgainstAuthedSnapshot(t *testing.T) {
 	// (the controller treats prefix-only replicas with no stats reported as
 	// hidden from the cluster-wide CacheIndex.status surface — see the
 	// per-backend CacheBackend.status.indexParticipation path for those).
-	served := index.Snapshot{
+	served := controlplaneapi.Snapshot{
 		TotalPrefixes: 7,
-		Replicas: []index.ReplicaSnapshot{
+		Replicas: []controlplaneapi.ReplicaSnapshot{
 			{ReplicaID: "r1", CacheMemoryBytes: 200, HitRate: 0.75, LastUpdate: time.Now()},
 		},
 	}
@@ -191,7 +191,7 @@ func TestIntegrationCacheIndexPollerAgainstAuthedSnapshot(t *testing.T) {
 	// rejects it under TokenReview.Audiences=[controller], so the middleware
 	// returns 401 even though the SA identity would otherwise be admitted.
 	// This is the over-the-wire complement to the in-process middleware
-	// envtest in pkg/server/auth and pins the same audience-binding contract
+	// envtest in internal/server/auth and pins the same audience-binding contract
 	// against the controller's actual poller code path. Fail-soft expectation
 	// matches the wrong-SA / no-token branches above.
 	wrongAudienceTokenFile := mintTokenFileWithAudience(controllerSA, "https://kubernetes.default.svc")

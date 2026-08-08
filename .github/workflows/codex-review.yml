@@ -85,7 +85,7 @@ jobs:
 
           STEP 1 — Enumerate. List every file changed by this PR, grouped by directory.
           Note (and skip review of) any generated files: anything under config/crd/,
-          config/rbac/role.yaml, pkg/server/proto/, any file named zz_generated*. These
+          config/rbac/role.yaml, gen/, any file named zz_generated*. These
           are regenerated, not hand-edited; findings on them are noise.
 
           STEP 2 — For each non-generated changed file, walk all four checks below. Even
@@ -148,7 +148,7 @@ jobs:
           4. Quality. New/changed behavior has tests (control-flow paths exercised, ideally
              over the wire); errors are wrapped not swallowed; code lands in the right
              package per the layout in CONTRIBUTING.md; generated code (config/crd,
-             zz_generated*, pkg/server/proto) is regenerated, not hand-edited.
+             zz_generated*, gen/) is regenerated, not hand-edited.
 
           ## Format constraints
 

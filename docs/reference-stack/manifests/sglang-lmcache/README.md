@@ -34,9 +34,9 @@ SGLang adopted vLLM's KV-event wire wholesale: `--kv-events-config` drives a ZMQ
 1. **The event-decode path is engine-agnostic and already covered by tests.** The
    shipped `kvevent-subscriber` decodes SGLang's stream unchanged; the only difference
    is the `--hash-scheme=sglang` tag. The Go decoder is exercised against a synthetic
-   SGLang-shaped frame in `pkg/adapters/engine/sglang_wire_test.go`, and the
+   SGLang-shaped frame in `internal/subscriber/sglang_wire_test.go`, and the
    cross-engine isolation (`hash_scheme` keeps SGLang and vLLM prefixes disjoint) in
-   `pkg/index` (`TestNoCrossEngineFalseHitVLLMvsSGLang`).
+   `internal/index` (`TestNoCrossEngineFalseHitVLLMvsSGLang`).
 2. **You can validate the wire off-GPU** (below): the Go test covers SGLang's exact
    wire shape; the Python synthetic tooling covers the shared decode/redaction logic.
 
@@ -292,7 +292,7 @@ Two complementary off-GPU checks, with an important scope distinction:
    shape — and that the subscriber's decoder tolerates the trailing `attn_dp_rank` and
    tags reports `hash_scheme=sglang` — is asserted by the Go fixture the shipped
    subscriber actually uses (from the repo root):
-   `go test ./pkg/adapters/engine/ -run SGLang`
+   `go test ./internal/subscriber/ -run SGLang`
    (`TestDecodeSGLangEventBatch` + `TestReporterTagsSGLangScheme`). The Python synthetic
    path above does **not** cover the 3-tuple; rely on the Go test for the
    SGLang-specific envelope.

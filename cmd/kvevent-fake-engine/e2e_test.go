@@ -7,9 +7,9 @@ package main
 // GPU-free, per-PR end-to-end gate for the content-fingerprint routing path:
 //
 //	fake engine (this package, real ZMQ PUB socket)
-//	  → kvevent-subscriber pipeline (engine.Subscriber → engine.Reporter —
+//	  → kvevent-subscriber pipeline (subscriber.Subscriber → subscriber.Reporter —
 //	    the same components cmd/kvevent-subscriber wires)
-//	  → inference-cache server (pkg/server, real gRPC over loopback TCP)
+//	  → inference-cache server (internal/server, real gRPC over loopback TCP)
 //	  → LookupRoute
 //
 // This is the regression lock for the all-NO_HINT bug: the engine's own KV
@@ -42,10 +42,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/cachebox-project/inference-cache/pkg/adapters/engine"
+	icpb "github.com/cachebox-project/inference-cache/gen/inferencecache/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/server"
+	"github.com/cachebox-project/inference-cache/internal/subscriber"
 	"github.com/cachebox-project/inference-cache/pkg/fingerprint"
-	"github.com/cachebox-project/inference-cache/pkg/server"
-	icpb "github.com/cachebox-project/inference-cache/pkg/server/proto/inferencecache/v1alpha1"
 )
 
 const (
@@ -155,20 +155,20 @@ func startSubscriberPipeline(t *testing.T, grpcAddr, endpoint, tenant string, lo
 	}
 	client := icpb.NewInferenceCacheClient(conn)
 
-	cfg := engine.Config{
+	cfg := subscriber.Config{
 		ReplicaID:  e2eReplica,
 		ModelID:    e2eModel,
 		TenantID:   tenant,
 		HashScheme: e2eScheme,
 	}
-	reporter := engine.NewReporter(client, cfg,
-		engine.WithWindow(10*time.Millisecond),
-		engine.WithLogger(logger))
-	sub := engine.NewSubscriber(endpoint, e2eTopic,
-		engine.WithSubscriberLogger(logger),
-		engine.WithSubscriberBackoff(50*time.Millisecond))
+	reporter := subscriber.NewReporter(client, cfg,
+		subscriber.WithWindow(10*time.Millisecond),
+		subscriber.WithLogger(logger))
+	sub := subscriber.NewSubscriber(endpoint, e2eTopic,
+		subscriber.WithSubscriberLogger(logger),
+		subscriber.WithSubscriberBackoff(50*time.Millisecond))
 
-	out := make(chan *engine.EventBatch, 256)
+	out := make(chan *subscriber.EventBatch, 256)
 	subCtx, cancelSub := context.WithCancel(context.Background())
 
 	// Run only exits via context cancellation (it reconnects forever, fail-soft)

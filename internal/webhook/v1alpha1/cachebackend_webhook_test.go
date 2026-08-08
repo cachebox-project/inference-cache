@@ -20,6 +20,7 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
@@ -53,9 +54,9 @@ func i32p(v int32) *int32 { return &v }
 
 func defaultShippingRegistry() *adapterruntime.Registry {
 	registry := adapterruntime.NewRegistry()
-	registry.Register(builtinruntime.NewVLLMLMCacheAdapter())
-	registry.Register(builtinruntime.NewSGLangLMCacheAdapter())
-	registry.Register(builtinruntime.NewSGLangHiCacheAdapter())
+	registry.Register(builtinruntime.NewVLLMLMCacheAdapter(builtinruntime.SubscriberConfig{}))
+	registry.Register(builtinruntime.NewSGLangLMCacheAdapter(builtinruntime.SubscriberConfig{}))
+	registry.Register(builtinruntime.NewSGLangHiCacheAdapter(builtinruntime.SubscriberConfig{}))
 	return registry
 }
 
@@ -1009,19 +1010,19 @@ func TestValidator_InvalidKernelCheckAnnotationRejected(t *testing.T) {
 	// A typo for "strict" would silently fall back to "auto" (report-only) and
 	// disable the fail-closed gate — reject it at admission instead.
 	bad := newBackend()
-	bad.Annotations = map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: "strcit"}
+	bad.Annotations = map[string]string{enginebinding.AnnotationLMCacheKernelCheck: "strcit"}
 	requireInvalidWithCause(t, v, bad, "metadata.annotations[inferencecache.io/lmcache-kernel-check]", "must be one of")
 
 	// Every known value — and an unset annotation — is accepted.
 	for _, val := range []string{
-		adapterruntime.KernelCheckModeAuto,
-		adapterruntime.KernelCheckModeReportOnly,
-		adapterruntime.KernelCheckModeStrict,
-		adapterruntime.KernelCheckModeOff,
+		enginebinding.KernelCheckModeAuto,
+		enginebinding.KernelCheckModeReportOnly,
+		enginebinding.KernelCheckModeStrict,
+		enginebinding.KernelCheckModeOff,
 		"", // explicit empty == unset
 	} {
 		ok := newBackend()
-		ok.Annotations = map[string]string{adapterruntime.AnnotationLMCacheKernelCheck: val}
+		ok.Annotations = map[string]string{enginebinding.AnnotationLMCacheKernelCheck: val}
 		if _, err := v.ValidateCreate(context.Background(), ok); err != nil {
 			t.Fatalf("valid kernel-check annotation %q rejected: %v", val, err)
 		}
@@ -2028,7 +2029,7 @@ func (stubVLLMLMCacheAdapter) EngineContainerName() string { return "vllm" }
 // it is a remote-storage binding property, not a separate cache type.
 func stubRegistry() *adapterruntime.Registry {
 	r := adapterruntime.NewRegistry()
-	r.Register(builtinruntime.NewVLLMLMCacheAdapter())
+	r.Register(builtinruntime.NewVLLMLMCacheAdapter(builtinruntime.SubscriberConfig{}))
 	return r
 }
 

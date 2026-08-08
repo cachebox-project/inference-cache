@@ -6,6 +6,6 @@
 // the inference-cache controller and server binaries.
 //
 // These types are not a supported external Go API. Their JSON representation
-// is the compatibility boundary for the controller-to-server /policy and
-// /probe endpoints.
+// is the compatibility boundary for the controller-to-server /snapshot,
+// /policy, and /probe endpoints.
 package controlplaneapi

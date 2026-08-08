@@ -333,7 +333,7 @@ in the upstream v0.18 docs page). Our alert and triage queries accept
 both the unsuffixed and `_total` forms via `{__name__=~"...(_total)?"}`.
 
 This operator has no in-process scrape of those upstream metrics — its
-own scraper (`pkg/adapters/engine/metrics_scraper.go`) only reads the T1
+own scraper (`internal/subscriber/metrics_scraper.go`) only reads the T1
 `vllm:prefix_cache_{hits,queries}` plus `vllm:*_cache_usage_perc`. That
 means the alert binds directly to vLLM's exposition, and an upstream
 rename, deprecation, or version skew can silently make the alert inert
@@ -450,7 +450,7 @@ curl -s localhost:8080/metrics | grep 'inferencecache_lookup_route_calls_total'
 
 # 4. Confirm the index has entries for the model and tenant.
 #    The snapshot endpoint is gated by a SA bearer with the
-#    `inferencecache.io/controller` audience (see pkg/server/auth/audience.go).
+#    `inferencecache.io/controller` audience (see internal/server/auth/audience.go).
 #    From a controller pod:
 #      TOKEN=$(cat /var/run/secrets/inferencecache.io/controller-token/token)
 #    Or generate a one-off via `kubectl create token` against the
@@ -593,8 +593,8 @@ Service-endpoint probe and Ready gate cannot catch:
 
 | `stage` label | What `failed` means |
 |---|---|
-| `ingest` | The probe wrote a synthetic prefix entry through the server's **in-process** `index.Ingest` path and the entry did not land. This pins the index ingest path; it does **NOT** exercise the gRPC `ReportCacheState` handler nor the `kvevent-subscriber` sidecar (subscriber wire bugs are invisible to Stage A by design — see the design doc and `pkg/server/probe.go` lead-in). A failure here means the index itself is dropping writes — a regression in `pkg/index` keying, scheme handling, or eviction. |
-| `routing` | The probe wrote the entry, the index recorded it, but `LookupRoute` returned `NO_HINT` for the probe's hash. Likely an index-key-scheme mismatch (the probe's `hashScheme` is derived from `spec.runtime`; an empty scheme fails open and produces `NO_HINT` on lookup) or a lookup-filter regression in `pkg/server`. |
+| `ingest` | The probe wrote a synthetic prefix entry through the server's **in-process** `index.Ingest` path and the entry did not land. This pins the index ingest path; it does **NOT** exercise the gRPC `ReportCacheState` handler nor the `kvevent-subscriber` sidecar (subscriber wire bugs are invisible to Stage A by design — see the design doc and `internal/server/probe.go` lead-in). A failure here means the index itself is dropping writes — a regression in `internal/index` keying, scheme handling, or eviction. |
+| `routing` | The probe wrote the entry, the index recorded it, but `LookupRoute` returned `NO_HINT` for the probe's hash. Likely an index-key-scheme mismatch (the probe's `hashScheme` is derived from `spec.runtime`; an empty scheme fails open and produces `NO_HINT` on lookup) or a lookup-filter regression in `internal/server`. |
 | `t2` | (When a `T2Prober` is wired into the server.) The tier-2 put/get cycle against the configured external backend (LMCache today) failed. No `T2Prober` is wired in this revision, so this stage reports `skipped` on every install — an alert here only fires once a follow-up registers a real `T2Prober`. |
 
 The alert uses `increase(...{result="failed"}[5m]) >= 2 for: 5m` — a
@@ -619,7 +619,7 @@ By `stage` label:
 
 - `ingest` — the in-process index ingest path is dropping writes. Check
   the server's `inferencecache_index_entries` gauge to see if the index
-  is accumulating entries at all; check server logs for `pkg/index`
+  is accumulating entries at all; check server logs for `internal/index`
   errors; verify `inferencecache_server_up == 1`. (A subscriber → server
   wire bug is **not** what causes this stage to fail — subscriber bugs
   show up as a missing-state pattern on real workload, not on this

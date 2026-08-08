@@ -14,7 +14,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
+	cacheserver "github.com/cachebox-project/inference-cache/internal/server"
 )
 
 // TestIntegrationCachePolicyAffinityRouting exercises the full
@@ -37,7 +38,7 @@ import (
 //   - A namespace with NO CachePolicy reports DefaultAffinityRoutingEnabled
 //     (the server-wide default fires for unconfigured tenants).
 //
-// Complements the pkg/server unit tests by exercising the real
+// Complements the internal/server unit tests by exercising the real
 // apiserver-side kubebuilder defaulting AND the controller→server
 // propagation path together.
 func TestIntegrationCachePolicyAffinityRouting(t *testing.T) {
@@ -88,9 +89,9 @@ func TestIntegrationCachePolicyAffinityRouting(t *testing.T) {
 	if got := store.AffinityRoutingEnabled(nsDisabled); got != false {
 		t.Fatalf("explicit-Disabled namespace = %v, want false (operator opt-out)", got)
 	}
-	if got := store.AffinityRoutingEnabled(nsUnconfigured); got != cacheserver.DefaultAffinityRoutingEnabled {
+	if got := store.AffinityRoutingEnabled(nsUnconfigured); got != controlplaneapi.DefaultAffinityRoutingEnabled {
 		t.Fatalf("unconfigured namespace = %v, want DefaultAffinityRoutingEnabled (%v) — server-wide fallback failed",
-			got, cacheserver.DefaultAffinityRoutingEnabled)
+			got, controlplaneapi.DefaultAffinityRoutingEnabled)
 	}
 
 	// Belt-and-braces: read the omitted-field CR back from the apiserver and

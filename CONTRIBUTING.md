@@ -223,13 +223,13 @@ See the README's "Repository layout" for the full map. In short:
 | Controller / reconciler logic | `internal/controller/` |
 | Controller ↔ server HTTP wire type | `internal/controlplaneapi/` |
 | Pod-binding annotation / metadata contract | `internal/enginebinding/` |
-| gRPC handlers, server wiring | `pkg/server/` |
-| Cache-state index logic | `pkg/index/` |
-| Mutable-slot rendering (the wedge) | `pkg/render/` |
+| gRPC handlers, server wiring | `internal/server/` |
+| Cache-state index logic | `internal/index/` |
+| Planned reusable rendering API (reserved; not implemented) | `pkg/render/` |
 | Stable adapter extension contract | `pkg/adapters/{backend,runtime}/` |
 | Shipping adapter implementation / registration | `internal/adapters/builtin/` |
-| Engine KV-event ingest implementation | `pkg/adapters/engine/` (pending the documented `internal/subscriber/` move) |
-| Engine egress client (pre-tokenized request → engine; harness / benchmark, no binary owner) | `pkg/adapters/engineclient/` |
+| Engine KV-event ingest implementation | `internal/subscriber/` |
+| Engine egress client (pre-tokenized request → engine; harness / benchmark, no binary owner) | `pkg/engineclient/` |
 | The gRPC contract | `proto/` → then `make proto-gen` |
 
 Each package's `doc.go` (or package comment) states which binary owns it or why
@@ -237,7 +237,7 @@ it is a supported external Go API. Follow
 [`docs/design/repository-boundaries.md`](docs/design/repository-boundaries.md)
 for dependency direction and the staged internal-package migration.
 
-**Generated code** — `config/crd/`, `config/rbac/role.yaml`, `api/**/zz_generated*.go`, `pkg/server/proto/` — is committed but never hand-edited. Regenerate and commit it with the source change (`make pre-pr` verifies there's no drift).
+**Generated code** — `config/crd/`, `config/rbac/role.yaml`, `api/**/zz_generated*.go`, `gen/` — is committed but never hand-edited. Regenerate and commit it with the source change (`make pre-pr` verifies there's no drift).
 
 **gRPC contract:** when you change `proto/`, update [`docs/design/grpc-contract.md`](docs/design/grpc-contract.md) in the same commit so the design doc stays accurate. The pre-commit hook blocks a commit that touches a `.proto` without touching that doc (override with `--no-verify` only if the change truly doesn't affect the contract).
 

@@ -1019,11 +1019,11 @@ positive routing assertion.
 
 ## 9. Where the code lives
 
-- Scoring + strategy orchestration: [`pkg/index/index.go`](../../pkg/index/index.go)
+- Scoring + strategy orchestration: [`internal/index/index.go`](../../internal/index/index.go)
   — see `Lookup`, `lookupExact`, `lookupChain` (§2.5 chain walk),
   `LookupRoute`, `tenantHotCandidates`, `RankerConfig`.
 - Handler glue (proto ↔ index, `Strategy` → `reason_code`):
-  [`pkg/server/inferencecache_service.go`](../../pkg/server/inferencecache_service.go).
+  [`internal/server/inferencecache_service.go`](../../internal/server/inferencecache_service.go).
 - Tests covering each strategy and the baseline-preservation invariant:
-  [`pkg/index/index_test.go`](../../pkg/index/index_test.go) and
-  [`pkg/server/server_test.go`](../../pkg/server/server_test.go).
+  [`internal/index/index_test.go`](../../internal/index/index_test.go) and
+  [`internal/server/server_test.go`](../../internal/server/server_test.go).

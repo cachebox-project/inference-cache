@@ -16,8 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
 
 // TestIntegrationEngineKernelHealthGate exercises the EngineKernelsHealthy
@@ -51,7 +51,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 		// strict Ready downgrade.
 		var initEnv []corev1.EnvVar
 		if strict {
-			initEnv = []corev1.EnvVar{{Name: adapterruntime.EnvKernelCheckStrict, Value: "1"}}
+			initEnv = []corev1.EnvVar{{Name: enginebinding.EnvKernelCheckStrict, Value: "1"}}
 		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -67,7 +67,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 			},
 			Spec: corev1.PodSpec{
 				InitContainers: []corev1.Container{{
-					Name:  adapterruntime.LMCacheKernelCheckContainerName,
+					Name:  enginebinding.LMCacheKernelCheckContainerName,
 					Image: "registry.example.com/lmcache-kernel-check:test",
 					Env:   initEnv,
 				}},
@@ -89,11 +89,11 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 		}
 		before := livePod.DeepCopy()
 		livePod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
-			Name: adapterruntime.LMCacheKernelCheckContainerName,
+			Name: enginebinding.LMCacheKernelCheckContainerName,
 			State: corev1.ContainerState{
 				Terminated: &corev1.ContainerStateTerminated{
 					ExitCode: 1,
-					Message:  adapterruntime.KernelCheckMsgFailPrefix + " lmcache c_ops CUDA kernel version mismatch",
+					Message:  enginebinding.KernelCheckMsgFailPrefix + " lmcache c_ops CUDA kernel version mismatch",
 				},
 			},
 		}}
@@ -170,7 +170,7 @@ func TestIntegrationEngineKernelHealthGate(t *testing.T) {
 
 		// Use a backend WITH the strict annotation: kernel mismatch must
 		// downgrade Ready to False.
-		cb := kernelCheckBackend("cache", ns, adapterruntime.KernelCheckModeStrict)
+		cb := kernelCheckBackend("cache", ns, enginebinding.KernelCheckModeStrict)
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -245,7 +245,7 @@ func kernelCheckBackend(name, ns, kernelCheckMode string) *cachev1alpha1.CacheBa
 		if cb.Annotations == nil {
 			cb.Annotations = map[string]string{}
 		}
-		cb.Annotations[adapterruntime.AnnotationLMCacheKernelCheck] = kernelCheckMode
+		cb.Annotations[enginebinding.AnnotationLMCacheKernelCheck] = kernelCheckMode
 	}
 	return cb
 }

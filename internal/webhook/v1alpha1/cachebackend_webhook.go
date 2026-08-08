@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
@@ -216,7 +217,7 @@ func validateCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 		if strings.TrimSpace(storage.Endpoint) == "" {
 			errs = append(errs, field.Required(storagePath.Child("endpoint"),
 				"required when remoteStorage.ownership=External"))
-		} else if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
+		} else if err := backendadapter.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 			errs = append(errs, field.Invalid(storagePath.Child("endpoint"), storage.Endpoint, err.Error()))
 		}
 	}
@@ -527,17 +528,17 @@ func rejectSGLangRedisL2ScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList
 // observability, with no signal to the operator. Validate it at admission
 // instead. An unset annotation (or an explicit empty value) is accepted.
 func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	v, ok := cb.Annotations[adapterruntime.AnnotationLMCacheKernelCheck]
-	if !ok || adapterruntime.IsValidKernelCheckMode(v) {
+	v, ok := cb.Annotations[enginebinding.AnnotationLMCacheKernelCheck]
+	if !ok || enginebinding.IsValidKernelCheckMode(v) {
 		return nil
 	}
 	return field.ErrorList{
 		field.Invalid(
-			field.NewPath("metadata", "annotations").Key(adapterruntime.AnnotationLMCacheKernelCheck),
+			field.NewPath("metadata", "annotations").Key(enginebinding.AnnotationLMCacheKernelCheck),
 			v,
 			fmt.Sprintf("must be one of %q, %q, %q, %q (or unset)",
-				adapterruntime.KernelCheckModeAuto, adapterruntime.KernelCheckModeReportOnly,
-				adapterruntime.KernelCheckModeStrict, adapterruntime.KernelCheckModeOff),
+				enginebinding.KernelCheckModeAuto, enginebinding.KernelCheckModeReportOnly,
+				enginebinding.KernelCheckModeStrict, enginebinding.KernelCheckModeOff),
 		),
 	}
 }
@@ -679,7 +680,7 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 	if !usesMooncakeStorage(cb) {
 		return nil
 	}
-	if adapterruntime.EngineHostNetworkRequested(cb) {
+	if enginebinding.EngineHostNetworkRequested(cb) {
 		// Opted in: the pod webhook moves engine pods onto the host network, so the
 		// data plane is complete and there is nothing left to warn about.
 		return nil
@@ -699,7 +700,7 @@ func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.War
 // changed the pod's networking. hostNetwork is a privilege — a no-op that *looks*
 // like it granted one is worse than a rejection, so reject at the door.
 func rejectEngineHostNetworkOnBackendThatDoesNotNeedIt(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if !adapterruntime.EngineHostNetworkRequested(cb) ||
+	if !enginebinding.EngineHostNetworkRequested(cb) ||
 		usesMooncakeStorage(cb) {
 		return nil
 	}

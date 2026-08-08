@@ -155,7 +155,7 @@ func run() error {
 	// intentionally NOT registered: its MutatingWebhookConfiguration uses
 	// failurePolicy=Ignore, so Pod creates (none in this suite anyway)
 	// would just bypass it; CacheBackend is what we need to exercise.
-	registries := builtinadapters.New()
+	registries := builtinadapters.New(builtinadapters.Options{})
 	if err := cachewebhookv1alpha1.SetupCacheBackendWebhookWithManager(mgr, registries.Runtime); err != nil {
 		return fmt.Errorf("register CacheBackend webhook: %w", err)
 	}

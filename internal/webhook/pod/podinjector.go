@@ -218,7 +218,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		extra := ""
 		if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
 			missingField = "spec.remoteStorage.endpoint"
-			if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
+			if err := backendadapter.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 				extra = ": " + err.Error()
 			}
 		}
@@ -323,11 +323,11 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// otherwise block an events-only engine in strict mode, or be trusted by
 	// the controller (which keys off the container name), both of which
 	// contradict the mode's "no connector, no kernel tier" contract.
-	if icp, ok := adapter.(adapterruntime.InitContainerProvider); ok {
+	if icp, ok := adapter.(enginebinding.InitContainerProvider); ok {
 		if cache.Spec.IsEventsOnly() {
-			if removed := removeContainerByName(&mutated.Spec.InitContainers, adapterruntime.LMCacheKernelCheckContainerName); removed {
+			if removed := removeContainerByName(&mutated.Spec.InitContainers, enginebinding.LMCacheKernelCheckContainerName); removed {
 				log.V(1).Info("kernel-check init container removed (events-only: no connector, no kernel tier)",
-					"runtime", string(runtimeID), "container", adapterruntime.LMCacheKernelCheckContainerName)
+					"runtime", string(runtimeID), "container", enginebinding.LMCacheKernelCheckContainerName)
 			}
 		} else if initC, iErr := icp.KernelCheckInitContainer(cache, mutated); iErr != nil {
 			log.V(1).Info("fail-open: kernel-check init container rejected",
@@ -340,7 +340,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			}
 			log.V(1).Info("kernel-check init container injected",
 				"runtime", string(runtimeID), "container", initC.Name)
-		} else if removed := removeContainerByName(&mutated.Spec.InitContainers, adapterruntime.LMCacheKernelCheckContainerName); removed {
+		} else if removed := removeContainerByName(&mutated.Spec.InitContainers, enginebinding.LMCacheKernelCheckContainerName); removed {
 			// The adapter DECLINED to inject (mode=off, or auto on a non-GPU /
 			// unresolvable pod). The webhook is authoritative for this
 			// container, so strip any pre-existing same-name init container: a
@@ -350,7 +350,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			// the explicit decline strips; a transient adapter error above is
 			// fail-open and leaves the pod untouched.
 			log.V(1).Info("kernel-check init container removed (adapter declined to inject)",
-				"runtime", string(runtimeID), "container", adapterruntime.LMCacheKernelCheckContainerName)
+				"runtime", string(runtimeID), "container", enginebinding.LMCacheKernelCheckContainerName)
 		}
 	}
 
@@ -616,7 +616,7 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 		if ep == "" {
 			return ""
 		}
-		if err := adapterruntime.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
+		if err := backendadapter.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 			return ""
 		}
 		return ep

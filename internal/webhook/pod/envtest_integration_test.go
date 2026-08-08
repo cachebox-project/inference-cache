@@ -27,7 +27,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
+	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
 
 // TestWebhookOnEnvtest_EndToEnd boots a real apiserver via envtest, installs
@@ -99,10 +100,8 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	// by passing --kvevent-subscriber-image to the controller.
 	mgr.GetWebhookServer().Register(WebhookPath, &webhook.Admission{
 		Handler: &EngineInjector{
-			Reader: mgr.GetAPIReader(),
-			Registry: newVLLMRegistry(
-				adapterruntime.WithSubscriberImage(adapterruntime.DefaultSubscriberImage),
-			),
+			Reader:   mgr.GetAPIReader(),
+			Registry: newVLLMRegistry(builtinruntime.SubscriberConfig{Image: testSubscriberImage}),
 		},
 	})
 
@@ -172,7 +171,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{
-				Name:  adapterruntime.EngineContainerName,
+				Name:  testVLLMEngineContainerName,
 				Image: "vllm/vllm-openai-cpu:latest",
 				Args:  []string{"--model", "Qwen/Qwen2.5-0.5B-Instruct"},
 			}},
@@ -187,8 +186,8 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("get pod after create: %v", err)
 	}
 
-	mustHaveContainerEnv(t, &got, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
-	mustHaveContainerEnv(t, &got, adapterruntime.EnvVLLMUseV1, "1")
+	mustHaveContainerEnv(t, &got, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveContainerEnv(t, &got, testEnvVLLMUseV1, "1")
 	if got.Annotations[AnnotationInjectedBy] != ns+"/"+cb.Name {
 		t.Fatalf("annotation %s: got %q want %q",
 			AnnotationInjectedBy, got.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name)
@@ -215,7 +214,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if len(got.Spec.Containers) != 2 {
 		t.Fatalf("expected 2 containers (engine + subscriber); got %d: %v", len(got.Spec.Containers), envtestContainerNames(&got))
 	}
-	sub := envtestFindContainer(&got, adapterruntime.SubscriberContainerName)
+	sub := envtestFindContainer(&got, enginebinding.SubscriberContainerName)
 	if sub == nil {
 		t.Fatalf("subscriber sidecar missing; containers = %v", envtestContainerNames(&got))
 	}
@@ -244,7 +243,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: pod2.Name}, &got2); err != nil {
 		t.Fatalf("get second pod: %v", err)
 	}
-	mustHaveContainerEnv(t, &got2, adapterruntime.EnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveContainerEnv(t, &got2, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
 
 	skipped := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -255,7 +254,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{
-				Name:  adapterruntime.EngineContainerName,
+				Name:  testVLLMEngineContainerName,
 				Image: "vllm/vllm-openai-cpu:latest",
 				Args:  []string{"--model", "Qwen/Qwen2.5-0.5B-Instruct"},
 			}},
@@ -274,9 +273,9 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if got := gotSkipped.Annotations[AnnotationInjectedBy]; got != "" {
 		t.Fatalf("annotation %s: got %q want absent on skipped pod", AnnotationInjectedBy, got)
 	}
-	if envtestHasContainerEnv(&gotSkipped, adapterruntime.EnvLMCacheRemoteURL) {
+	if envtestHasContainerEnv(&gotSkipped, testEnvLMCacheRemoteURL) {
 		t.Fatalf("skipped pod unexpectedly has %s env; webhook must not inject engine wiring when %s=true",
-			adapterruntime.EnvLMCacheRemoteURL, AnnotationSkip)
+			testEnvLMCacheRemoteURL, AnnotationSkip)
 	}
 }
 

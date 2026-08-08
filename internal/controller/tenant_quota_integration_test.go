@@ -6,21 +6,19 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	"github.com/cachebox-project/inference-cache/pkg/index"
-	cacheserver "github.com/cachebox-project/inference-cache/pkg/server"
+	controlplaneapi "github.com/cachebox-project/inference-cache/internal/controlplaneapi"
+	"github.com/cachebox-project/inference-cache/internal/index"
+	cacheserver "github.com/cachebox-project/inference-cache/internal/server"
 )
 
 // TestIntegrationCacheTenantQuota exercises the full CacheTenant quota loop
@@ -28,10 +26,10 @@ import (
 // APIs:
 //
 //   - a real PolicyStore + index.Index (the index's quota resolver IS the store,
-//     exactly as pkg/server.New wires it);
-//   - the real /policy push handler and a /snapshot handler over the index;
-//   - the real ControlPlaneReconciler (CRD → push) and CacheIndexPoller (snapshot
-//     → CacheTenant.status).
+//     exactly as internal/server.New wires it);
+//   - the real /policy push handler;
+//   - the real ControlPlaneReconciler (CRD → push) and CacheIndexPoller's
+//     snapshot-DTO projection into CacheTenant.status.
 //
 // That covers what the fake client can't: real CRD validation/defaulting and
 // real Status().Patch semantics on CacheTenant.
@@ -45,14 +43,8 @@ func TestIntegrationCacheTenantQuota(t *testing.T) {
 
 	policySrv := httptest.NewServer(cacheserver.NewPolicyHTTPHandler(store))
 	defer policySrv.Close()
-	snapSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(idx.Snapshot())
-	}))
-	defer snapSrv.Close()
-
 	reconciler := &ControlPlaneReconciler{Client: k8s, ServerPolicyURL: policySrv.URL, HTTPClient: policySrv.Client()}
-	poller := &CacheIndexPoller{Client: k8s, SnapshotURL: snapSrv.URL, HTTPClient: snapSrv.Client(), Log: logr.Discard()}
+	poller := &CacheIndexPoller{Client: k8s}
 	push := func() {
 		t.Helper()
 		if _, err := reconciler.Reconcile(ctx, ctrl.Request{}); err != nil {
@@ -61,7 +53,17 @@ func TestIntegrationCacheTenantQuota(t *testing.T) {
 	}
 	scrape := func() {
 		t.Helper()
-		if err := poller.reconcileTenantStatuses(ctx, idx.Snapshot()); err != nil {
+		domain := idx.Snapshot()
+		snap := controlplaneapi.Snapshot{TotalPrefixes: domain.TotalPrefixes, HotPrefixes: domain.HotPrefixes}
+		for _, tenant := range domain.Tenants {
+			snap.Tenants = append(snap.Tenants, controlplaneapi.TenantSnapshot{
+				TenantID:        tenant.TenantID,
+				IndexEntries:    tenant.IndexEntries,
+				HitRate:         tenant.HitRate,
+				HitRateReported: tenant.HitRateReported,
+			})
+		}
+		if err := poller.reconcileTenantStatuses(ctx, snap); err != nil {
 			t.Fatalf("scrape: %v", err)
 		}
 	}

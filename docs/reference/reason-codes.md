@@ -46,11 +46,11 @@ module — until then, treat `NO_HINT` as the only `LookupPDRoute` answer.
 
 **Constants in code:** `reasonPrefixMatch`, `reasonTenantHot`, `reasonNoHint`, `reasonTimeout`, `reasonPolicyRequiresChain`, `reasonAffinityHint`,
 `reasonUnknownTenant`, `reasonUnknownModel`, `reasonUnknownHashScheme` in
-`pkg/server/inferencecache_service.go`. See also [`../design/lookuproute-diagnostics.md`](../design/lookuproute-diagnostics.md) for the design rule and gateway-SDK guidance.
+`internal/server/inferencecache_service.go`. See also [`../design/lookuproute-diagnostics.md`](../design/lookuproute-diagnostics.md) for the design rule and gateway-SDK guidance.
 
 ### Ranking inputs beyond `matched_tokens × freshness`
 
-The server-side ranker (`pkg/index`) is configurable via `RankerConfig` (in-
+The server-side ranker (`internal/index`) is configurable via `RankerConfig` (in-
 binary knobs) and `CachePolicy.spec` (per-namespace knobs). Each `RankerConfig`
 knob defaults to a value that reduces the **pressure / SLO** layers to the
 baseline when its supporting signal is absent — so a deployment without replica
@@ -86,7 +86,7 @@ the cardinality factor and both floors still run.
 | `TEMPLATE_NOT_FOUND` | spec'd, not emitted | The referenced `template_ref` doesn't exist. | Promoted when D5 (`RenderTemplate` handler) lands. |
 | `RENDER_ERROR` | spec'd, not emitted | Template was found but rendering failed (missing/typed-wrong variables, runtime DSL error). | Promoted with D5. |
 
-**Constants in code:** `reasonOK` in `pkg/server/inferencecache_service.go`.
+**Constants in code:** `reasonOK` in `internal/server/inferencecache_service.go`.
 
 ---
 
@@ -135,7 +135,7 @@ See [metrics.md](metrics.md) for the full metric surface.
    [`proto/inferencecache/v1alpha1/inferencecache.proto`](../../proto/inferencecache/v1alpha1/inferencecache.proto)
    (already done for `TENANT_HOT`, `TIMEOUT`, `TEMPLATE_NOT_FOUND`,
    `RENDER_ERROR`). Run `make proto-gen` if the comment touched the schema.
-2. **Add a constant** in `pkg/server/inferencecache_service.go` next to
+2. **Add a constant** in `internal/server/inferencecache_service.go` next to
    `reasonPrefixMatch` / `reasonNoHint` / `reasonOK`. Keep the constant name
    `reason<CamelCase>`.
 3. **Emit it** from the handler at the relevant decision point. Keep handlers
