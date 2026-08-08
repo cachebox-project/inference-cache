@@ -539,33 +539,7 @@ internal/index/
 - [x] Keep all types and methods in package `index`.
 - [x] Do not change algorithms, locking, clock behavior, or metrics.
 
-### B2. Split the server gRPC implementation
-
-Proposed commit:
-
-```text
-refactor(server): split grpc handlers by responsibility
-```
-
-Target files:
-
-```text
-internal/server/
-├── server.go
-├── lookup.go
-├── ingest.go
-├── proto_mapping.go
-├── policy.go
-├── probe.go
-├── metrics.go
-└── auth/
-```
-
-- [ ] Separate RPC handlers from protobuf/domain mapping helpers.
-- [ ] Keep route policy and lookup response construction cohesive.
-- [ ] Preserve gRPC and HTTP wire behavior.
-
-### B3. Split the CacheBackend reconciler
+### B2. Split the CacheBackend reconciler
 
 Proposed commit:
 
@@ -589,12 +563,12 @@ Existing cohesive files such as `cachebackend_probe.go`,
 `cachebackend_kernelcheck.go`, and `cachebackend_server_restart.go` remain
 separate.
 
-- [ ] Keep one `controller` package.
-- [ ] Preserve reconcile ordering, ownership, status patching, events, and
+- [x] Keep one `controller` package.
+- [x] Preserve reconcile ordering, ownership, status patching, events, and
   requeue behavior.
-- [ ] Split large tests along the same responsibilities.
+- [x] Split large tests along the same responsibilities.
 
-### B4. Split CacheBackend admission rules
+### B3. Split CacheBackend admission rules
 
 Proposed commit:
 
@@ -617,7 +591,7 @@ internal/webhook/v1alpha1/
 - [ ] Preserve validation ordering, field paths, error messages, and defaults.
 - [ ] Split the large webhook test file by rule family.
 
-### B5. Split CacheBackend API definitions
+### B4. Split CacheBackend API definitions
 
 Proposed commit:
 
