@@ -59,3 +59,31 @@ func TestNewIncludesShippingStorageProviders(t *testing.T) {
 		}
 	}
 }
+
+func TestNewPassesLMCacheServerImageToStorageRegistry(t *testing.T) {
+	t.Parallel()
+
+	const image = "registry.example/lmcache:operator-default"
+	cache := &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
+		Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+		Type:    cachev1alpha1.CacheBackendTypeLMCache,
+		RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+			Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+		},
+	}}
+
+	registry := New(Options{LMCacheServerImage: image}).Storage
+	provider, err := registry.Select(cache.Spec.RemoteStorage)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	rendered, err := provider.Render(cache)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := rendered.PodSpec.Containers[0].Image; got != image {
+		t.Fatalf("container image = %q, want %q", got, image)
+	}
+}

@@ -352,10 +352,8 @@ The KV-event subscriber reads its model identity from
 
 ### LMCache server / client version alignment
 
-The standalone lmcache-server image
-(`spec.remoteStorage.lmCacheServer.image`, default
-`lmcache/standalone:v0.4.7`) and the **lmcache client** compiled into the engine
-image (operator-supplied, or pip-installed into the engine at runtime)
+The standalone lmcache-server image and the **lmcache client** compiled into the
+engine image (operator-supplied, or pip-installed into the engine at runtime)
 communicate over a versioned wire protocol. **They must be wire-compatible.** A
 mismatch does not fail loudly: remote KV stores fail (e.g. `[Errno 32] Broken
 pipe` / connection resets), the backend records 0 reload hits, and tier-2
@@ -363,13 +361,28 @@ pipe` / connection resets), the backend records 0 reload hits, and tier-2
 plane keeps serving and routing; it simply never gets a tier-2 hit, which is
 hard to distinguish from a cold cache.
 
+The controller resolves the managed server image in this order:
+
+1. `spec.remoteStorage.lmCacheServer.image`, for a per-CacheBackend override.
+2. The controller's `--lmcache-server-image` flag, for an operator-selected
+   deployment default.
+
+There is no image version compiled into the Go binary. When both settings are
+empty, managed LMCache rendering fails with a configuration error instead of
+creating a Pod with an empty image. The shipped Kustomize install sets
+`--lmcache-server-image=lmcache/standalone:v0.4.7` in
+`config/manager/manager.yaml` as its reproducible baseline. Operators should
+override that deployment argument (or the equivalent value in their Helm
+packaging) to match the client in their engine image; a CR-level image remains
+authoritative when one backend needs a different version.
+
 The **same silent store-failure signature can also come from an under-provisioned server that is OOMKilled under load** — the standalone server keeps KV in memory, and a default memory request far below a large model's working-set KV (e.g. a 32B model's KV is tens of GB) will OOM the server the moment stores begin, dropping every connection. Size the server's memory to the expected working set. (Surfacing tier-2 store-failure / hit-rate health so neither failure mode stays silent is a separate follow-up.)
 
 Because of this:
 
-- The default `serverImage` is **pinned to a specific, non-floating version**, never `:latest`. A floating tag can drift to a server build whose wire protocol no longer matches the client, reintroducing the silent-disable failure mode on an unrelated pull. (The default tag `v0.4.7` is version-aligned with the validated lmcache 0.4.7 client, but the standalone server image was not independently wire-tested; confirm against a tested build — ideally an `@sha256:` digest — before release. See the `TODO` on `defaultLMCacheServerImage` in `internal/adapters/builtin/storage/lmcache_server.go`.)
-- **Pin both sides.** When an operator overrides `remoteStorage.lmCacheServer.image`, they must choose an lmcache-server version that is wire-compatible with the lmcache client version their engine image carries, and pin the engine's client too (a `pip install lmcache` at engine startup is itself a floating reference). For non-local runs, prefer an `@sha256:` digest.
-- IC **cannot auto-match** these versions: it has no source of truth for the engine's client version (the engine image is operator-supplied and the client may be pip-installed at runtime), so it cannot detect or warn on a skew today. The mitigation is this alignment contract plus the pinned default; runtime detection / a tier-2 health signal is a separate follow-up.
+- The shipped deployment baseline is **pinned to a specific, non-floating version**, never `:latest`. A floating tag can drift to a server build whose wire protocol no longer matches the client, reintroducing the silent-disable failure mode on an unrelated pull. The baseline tag `v0.4.7` is version-aligned with the validated lmcache 0.4.7 client, but the standalone server image was not independently wire-tested; confirm against a tested build — ideally an `@sha256:` digest — before release.
+- **Pin both sides.** When an operator sets `--lmcache-server-image` or overrides `remoteStorage.lmCacheServer.image`, they must choose an lmcache-server version that is wire-compatible with the lmcache client version their engine image carries, and pin the engine's client too (a `pip install lmcache` at engine startup is itself a floating reference). For non-local runs, prefer an `@sha256:` digest.
+- IC **cannot auto-match** these versions: it has no source of truth for the engine's client version (the engine image is operator-supplied and the client may be pip-installed at runtime), so it cannot detect or warn on a skew today. The mitigation is this alignment contract plus an operator-selected pinned deployment baseline; runtime detection / a tier-2 health signal is a separate follow-up.
 
 ### LMCache client kernels ↔ engine-image CUDA / vLLM alignment
 

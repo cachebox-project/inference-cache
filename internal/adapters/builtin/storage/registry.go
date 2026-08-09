@@ -34,6 +34,19 @@ type externalProvider struct {
 	protocol backendadapter.Protocol
 }
 
+type options struct {
+	lmCacheServerImage string
+}
+
+// Option configures the shipping remote-storage provider adapters.
+type Option func(*options)
+
+// WithLMCacheServerImage sets the operator-selected fallback image for managed
+// LMCache servers. A per-CacheBackend image still takes precedence.
+func WithLMCacheServerImage(image string) Option {
+	return func(opts *options) { opts.lmCacheServerImage = image }
+}
+
 func (p externalProvider) Supports(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) bool {
 	return storage != nil &&
 		storage.Provider == p.provider &&
@@ -49,7 +62,12 @@ func (p externalProvider) Render(cache *cachev1alpha1.CacheBackend) (*backendada
 
 // DefaultRegistry returns the shipping provider capabilities. Engine/runtime
 // compatibility is intentionally not encoded here.
-func DefaultRegistry() *backendadapter.Registry {
+func DefaultRegistry(opts ...Option) *backendadapter.Registry {
+	var cfg options
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	registry := backendadapter.NewRegistry()
 	registry.Register(managedProvider{
 		provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
@@ -61,7 +79,7 @@ func DefaultRegistry() *backendadapter.Registry {
 	registry.Register(managedProvider{
 		provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
 		render: func(cache *cachev1alpha1.CacheBackend) (*backendadapter.RenderedStorage, error) {
-			pod, service, err := ResolveLMCacheServer(cache)
+			pod, service, err := ResolveLMCacheServer(cache, cfg.lmCacheServerImage)
 			return rendered(pod, service, backendadapter.ProtocolLMCache, err)
 		},
 	})

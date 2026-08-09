@@ -68,7 +68,9 @@ func configureTestRegistries(r *CacheBackendReconciler) {
 	if r.Registry != nil && r.BackendRegistry != nil {
 		return
 	}
-	registries := builtinadapters.New(builtinadapters.Options{})
+	registries := builtinadapters.New(builtinadapters.Options{
+		LMCacheServerImage: "lmcache/standalone:test",
+	})
 	if r.Registry == nil {
 		r.Registry = registries.Runtime
 	}

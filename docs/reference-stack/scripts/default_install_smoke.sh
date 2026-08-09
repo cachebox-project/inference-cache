@@ -63,6 +63,10 @@
 #      reconciler's self-RequeueAfter cadence (no CR or owned-workload
 #      event needed) within ~30s, the bound on stale-Matched the
 #      cadence guarantees.
+#   8a. The managed LMCache image is operator-configurable: the installed
+#      controller carries `--lmcache-server-image`, the smoke rewrites it to a
+#      locally built stand-in, and a CacheBackend with no CR-level image renders
+#      that configured image into its owned Deployment.
 #   8b. Provider resource fallback: the paired sample leaves
 #      remoteStorage.lmCacheServer.resources unset, while the provider renderer
 #      gives the cache-server container a 4Gi request / 8Gi limit. The smoke
@@ -658,6 +662,15 @@ kubectl -n cert-manager wait --for=condition=Available deployment --all --timeou
 # self-contained on a fresh laptop without the kustomize CLI installed.
 tmpdir="$(mktemp -d)"
 cp -r config "$tmpdir/config"
+escaped_sample_cache_server_image="$(printf '%s' "$SAMPLE_CACHE_SERVER_IMAGE" | sed 's/[&|\\]/\\&/g')"
+manager_manifest="$tmpdir/config/manager/manager.yaml"
+if ! grep -q '^        - --lmcache-server-image=lmcache/standalone:v0.4.7$' "$manager_manifest"; then
+  fail "fixture: config/manager/manager.yaml no longer carries the pinned --lmcache-server-image baseline"
+fi
+sed -i.bak \
+  "s|^        - --lmcache-server-image=lmcache/standalone:v0.4.7$|        - --lmcache-server-image=$escaped_sample_cache_server_image|" \
+  "$manager_manifest"
+rm -f "${manager_manifest}.bak"
 (
   cd "$tmpdir/config/default"
   if command -v kustomize >/dev/null 2>&1; then
@@ -690,6 +703,17 @@ kubectl -n "$NAMESPACE" wait --for=condition=Available --timeout="$READY_TIMEOUT
   deployment/inference-cache-controller-manager \
   deployment/inference-cache-server \
   || fail "controller and/or server did not reach Available within $READY_TIMEOUT"
+
+controller_args="$(kubectl -n "$NAMESPACE" get deployment/inference-cache-controller-manager \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].args}' 2>/dev/null || true)"
+case "$controller_args" in
+  *"--lmcache-server-image=$SAMPLE_CACHE_SERVER_IMAGE"*) ;;
+  *)
+    kubectl -n "$NAMESPACE" get deployment/inference-cache-controller-manager -o yaml || true
+    fail "controller args do not include --lmcache-server-image=$SAMPLE_CACHE_SERVER_IMAGE: $controller_args"
+    ;;
+esac
+log "controller LMCache server image flag=$SAMPLE_CACHE_SERVER_IMAGE"
 
 # --- server resources sized for DefaultMaxEntries ---------------------------
 # The default install MUST budget enough memory to actually hold the
@@ -1602,14 +1626,13 @@ sed -i.bak "s|vllm/vllm-openai-cpu:latest-x86_64|$SAMPLE_ENGINE_IMAGE|g" \
 rm -f "${sample_tmp_engine}.bak"
 
 build_sample_cache_server_image
-escaped_sample_cache_server_image="$(printf '%s' "$SAMPLE_CACHE_SERVER_IMAGE" | sed 's/[&|\\]/\\&/g')"
 if ! grep -q '^      image: lmcache/standalone:v0.4.7$' "$sample_tmp_cb"; then
   fail "fixture: cachebackend-with-engine.yaml no longer carries the pinned canonical remoteStorage.lmCacheServer.image"
 fi
-sed -i.bak "s|^      image: lmcache/standalone:v0.4.7$|      image: $escaped_sample_cache_server_image|g" "$sample_tmp_cb"
+sed -i.bak '/^      image: lmcache\/standalone:v0.4.7$/d' "$sample_tmp_cb"
 rm -f "${sample_tmp_cb}.bak"
-if ! grep -Fq "      image: $SAMPLE_CACHE_SERVER_IMAGE" "$sample_tmp_cb"; then
-  fail "fixture: failed to replace canonical remoteStorage.lmCacheServer.image with the smoke stand-in"
+if grep -q '^      image:' "$sample_tmp_cb"; then
+  fail "fixture: failed to remove the CR-level LMCache image before testing the controller flag"
 fi
 
 log "applying CacheBackend"
@@ -1629,6 +1652,21 @@ if [ -z "$endpoint" ]; then
   fail "CacheBackend.status.endpoint not populated after ${SAMPLE_ENDPOINT_TIMEOUT}s"
 fi
 log "status.endpoint=$endpoint"
+
+cb_provider_image="$(kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache \
+  -o jsonpath='{.spec.remoteStorage.lmCacheServer.image}' 2>/dev/null || true)"
+if [ -n "$cb_provider_image" ]; then
+  kubectl -n "$SAMPLE_NS" get cb qwen-demo-cache -o yaml || true
+  fail "cb.spec.remoteStorage.lmCacheServer.image=$cb_provider_image, want absent so the controller flag supplies it"
+fi
+dep_provider_image="$(kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="lmcache-server")].image}' \
+  2>/dev/null || true)"
+if [ "$dep_provider_image" != "$SAMPLE_CACHE_SERVER_IMAGE" ]; then
+  kubectl -n "$SAMPLE_NS" get deploy qwen-demo-cache -o yaml || true
+  fail "deploy.lmcache-server.image=$dep_provider_image, want controller flag image $SAMPLE_CACHE_SERVER_IMAGE"
+fi
+log "managed LMCache image resolved from controller flag: $dep_provider_image"
 
 log "applying engine Deployment (image=$SAMPLE_ENGINE_IMAGE)"
 kubectl -n "$SAMPLE_NS" apply -f "$sample_tmp_engine" >/dev/null
