@@ -32,13 +32,3 @@ lint:
     # PREFIX_EVICTED, REPLICA_UPDATED, ALL_CLEARED) instead of a TYPE_ prefix;
     # the zero value is TYPE_UNSPECIFIED (ENUM_ZERO_VALUE_SUFFIX still enforced).
     - ENUM_VALUE_PREFIX
-breaking:
-  use:
-    - FILE
-  ignore_only:
-    # The generated Go API intentionally moved out of the server implementation
-    # before the project was formally deployed. All other FILE compatibility
-    # rules remain enabled, while the repository boundary test pins this option
-    # to its new public gen/ path so a later import-path change still fails CI.
-    FILE_SAME_GO_PACKAGE:
-      - proto/inferencecache/v1alpha1/inferencecache.proto
