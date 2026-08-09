@@ -319,6 +319,29 @@ func TestHandle_MatchAndInject(t *testing.T) {
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
+func TestHandle_TypedLMCacheDoesNotFallThroughToLegacyAdapter(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
+		Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+	}
+	cb.Spec.RemoteStorage = nil
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("typed MP pod must fail open while its adapter is pending: %+v", resp.Result)
+	}
+	if len(resp.Patches) != 0 {
+		t.Fatalf("typed MP pod must not receive legacy injection; got %d patches", len(resp.Patches))
+	}
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "does not implement typed LMCache topology") {
+		t.Fatalf("response message = %v, want typed-topology adapter diagnostic", resp.Result)
+	}
+}
+
 func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	// Covers the production pod-webhook selection path for (sglang, LMCache):
 	// the nil-registry fallback now includes the SGLang adapter, so a SGLang

@@ -114,6 +114,21 @@ func validateCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 				fmt.Sprintf("configuration belongs to provider %s, but remoteStorage.provider=%s", config.provider, storage.Provider)))
 		}
 		if config.set && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+			if config.provider == cachev1alpha1.CacheBackendRemoteStorageProviderRedis {
+				// Redis combines connection settings (authentication/TLS/database),
+				// which apply to either ownership mode, with managed-workload
+				// settings. External bindings may retain the former but cannot ask
+				// this controller to choose an image or container resources.
+				if strings.TrimSpace(storage.Redis.Image) != "" {
+					errs = append(errs, field.Forbidden(config.path.Child("image"),
+						"valid only with Managed ownership"))
+				}
+				if storage.Redis.Resources != nil {
+					errs = append(errs, field.Forbidden(config.path.Child("resources"),
+						"valid only with Managed ownership"))
+				}
+				continue
+			}
 			errs = append(errs, field.Forbidden(config.path,
 				"provider workload configuration is valid only with Managed ownership"))
 		}

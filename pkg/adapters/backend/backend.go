@@ -30,6 +30,20 @@ const (
 type Binding struct {
 	Protocol Protocol
 	Endpoint string
+
+	// Redis carries typed RESP adapter configuration. Secret selectors remain
+	// references; credentials are never copied into the CacheBackend status or
+	// engine arguments. Nil for non-Redis bindings.
+	Redis *RedisBinding
+}
+
+// RedisBinding is the runtime-facing, provider-specific portion of a RESP
+// binding. It deliberately excludes managed-workload fields such as image and
+// resources.
+type RedisBinding struct {
+	Authentication *cachev1alpha1.RedisAuthenticationSpec
+	TLS            *cachev1alpha1.RemoteStorageTLSSpec
+	Database       *int32
 }
 
 // RenderedStorage is the provider-owned workload shape. PodSpec and Service are
@@ -87,7 +101,16 @@ func BindingFor(storage *cachev1alpha1.CacheBackendRemoteStorageSpec, protocol P
 	if storage == nil {
 		return nil
 	}
-	return &Binding{Protocol: protocol, Endpoint: resolvedEndpoint}
+	binding := &Binding{Protocol: protocol, Endpoint: resolvedEndpoint}
+	if storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderRedis && storage.Redis != nil {
+		redis := storage.Redis.DeepCopy()
+		binding.Redis = &RedisBinding{
+			Authentication: redis.Authentication,
+			TLS:            redis.TLS,
+			Database:       redis.Database,
+		}
+	}
+	return binding
 }
 
 // ProtocolFor returns the connection protocol associated with a provider.

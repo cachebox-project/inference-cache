@@ -173,6 +173,33 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			runtimeID, cache.Spec.Type, err))
 	}
 
+	// The typed LMCache topology is the Phase-1 boundary between the legacy
+	// in-process/flat-field wire and the final MP adapters. Never pass a typed MP
+	// object to a legacy adapter: doing so would silently inject the old vLLM IP
+	// connector or ignore the new PodLocal server settings. Until an adapter
+	// implements LMCacheMPRuntimeAdapter, admit the engine Pod untouched.
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology != "" {
+		mpAdapter, ok := adapter.(adapterruntime.LMCacheMPRuntimeAdapter)
+		if !ok {
+			log.V(1).Info("fail-open: selected adapter does not implement typed LMCache MP topology",
+				"runtime", string(runtimeID), "topology", string(cache.Spec.LMCache.Topology))
+			return failOpen(req, &pod, fmt.Sprintf(
+				"runtime=%q adapter does not implement typed LMCache topology=%q (fail-open, no legacy injection)",
+				runtimeID, cache.Spec.LMCache.Topology))
+		}
+		requirement := mpAdapter.ConnectorRequirement(cache)
+		if err := adapterruntime.ValidateConnectorDeclaration(&pod, requirement); err != nil {
+			log.V(1).Info("fail-open: engine connector capability is unverified",
+				"runtime", string(runtimeID), "error", err.Error())
+			return failOpen(req, &pod, fmt.Sprintf("engine connector capability is unverified (fail-open): %v", err))
+		}
+		if err := mpAdapter.ValidateMPEnginePod(&pod, cache); err != nil {
+			log.V(1).Info("fail-open: typed LMCache MP adapter rejected engine pod",
+				"runtime", string(runtimeID), "error", err.Error())
+			return failOpen(req, &pod, fmt.Sprintf("typed LMCache MP compatibility check failed (fail-open): %v", err))
+		}
+	}
+
 	endpoint := effectiveEndpoint(cache)
 	storage := cache.Spec.EffectiveRemoteStorage()
 	protocol, protocolErr := backendadapter.ProtocolFor(storage)

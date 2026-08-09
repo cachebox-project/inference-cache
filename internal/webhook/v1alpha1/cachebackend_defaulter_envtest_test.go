@@ -246,6 +246,37 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 		t.Errorf("operator replicas clobbered: got %v, want 5", explicit.Spec.Replicas)
 	}
 
+	// --- Final MP API CREATE/UPDATE compatibility ---
+	//
+	// The real apiserver must accept the new PodLocal shape, preserve it on an
+	// unrelated update, and reject an update that mixes a legacy flat field into
+	// the canonical MP contract.
+	mpCR := validPodLocalMPBackend()
+	mpCR.Name = "podlocal-mp"
+	mpCR.Namespace = "team-a"
+	if err := k8s.Create(ctx, mpCR); err != nil {
+		t.Fatalf("PodLocal MP CacheBackend should be admitted: %v", err)
+	}
+	var persistedMP cachev1alpha1.CacheBackend
+	if err := live.Get(ctx, client.ObjectKey{Name: mpCR.Name, Namespace: mpCR.Namespace}, &persistedMP); err != nil {
+		t.Fatalf("get back PodLocal MP CR: %v", err)
+	}
+	if persistedMP.Spec.LMCache == nil || persistedMP.Spec.LMCache.Topology != cachev1alpha1.LMCacheTopologyPodLocal ||
+		persistedMP.Spec.LMCache.PodLocal == nil || persistedMP.Spec.LMCache.PodLocal.Server == nil {
+		t.Fatalf("persisted PodLocal MP shape was lost: %+v", persistedMP.Spec.LMCache)
+	}
+	if persistedMP.Labels == nil {
+		persistedMP.Labels = map[string]string{}
+	}
+	persistedMP.Labels["phase"] = "one"
+	if err := k8s.Update(ctx, &persistedMP); err != nil {
+		t.Fatalf("unrelated update on PodLocal MP object should be admitted: %v", err)
+	}
+	persistedMP.Spec.LMCache.WorkerImage = "legacy-worker:test"
+	if err := k8s.Update(ctx, &persistedMP); err == nil {
+		t.Fatal("update mixing legacy workerImage into PodLocal MP should be rejected")
+	}
+
 	// --- Autoscaling defaulter-computed minReplicas ---
 	//
 	// Pins the one non-literal default: when an operator opts into

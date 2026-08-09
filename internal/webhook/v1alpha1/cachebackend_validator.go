@@ -50,6 +50,8 @@ type ValidationRule func(cb *cachev1alpha1.CacheBackend) field.ErrorList
 // handler changes.
 var DefaultValidationRules = []ValidationRule{
 	validateCacheHierarchy,
+	validateLMCacheTopology,
+	rejectUnimplementedRedisBindingFeatures,
 	rejectCrossNamespaceEndpointWithoutOptIn,
 	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
 	rejectMooncakeMasterScaleOut,

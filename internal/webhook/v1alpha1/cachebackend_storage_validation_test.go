@@ -146,6 +146,34 @@ func TestValidator_CanonicalCacheHierarchy(t *testing.T) {
 		}
 	})
 
+	t.Run("external Redis separates binding from managed workload settings", func(t *testing.T) {
+		cb := newBackend()
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+			Endpoint:  "redis.example:6379",
+			Redis: &cachev1alpha1.RedisRemoteStorageSpec{
+				Authentication: &cachev1alpha1.RedisAuthenticationSpec{
+					Password: corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"},
+						Key:                  "password",
+					},
+				},
+			},
+		}
+		errs := validateCacheHierarchy(cb)
+		if len(errs) != 0 {
+			t.Fatalf("external Redis connection settings should be structurally valid: %v", errs)
+		}
+
+		cb.Spec.RemoteStorage.Redis.Image = "redis:test"
+		errs = validateCacheHierarchy(cb)
+		if len(errs) != 1 || errs[0].Field != "spec.remoteStorage.redis.image" {
+			t.Fatalf("external Redis image errors = %v, want field-scoped managed-setting rejection", errs)
+		}
+	})
+
 	t.Run("managed provider resources are validated at their typed path", func(t *testing.T) {
 		cb := newBackend()
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang

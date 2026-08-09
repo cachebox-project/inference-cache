@@ -391,6 +391,17 @@ func (v *CacheBackendValidator) checkRuntimeAdapter(cb *cachev1alpha1.CacheBacke
 			),
 		}
 	}
+	// A declared LMCache topology uses the Phase-1 MP support matrix validated
+	// by validateLMCacheTopology. The currently shipping runtime adapters still
+	// describe the legacy data plane (vLLM IP and the SGLang-specific MP spike),
+	// so consulting SupportsBinding here would incorrectly reject the final
+	// vLLM+Redis contract before the shared PodLocal renderer lands in Phases
+	// 2-4. Pod admission remains fail-open until the matching MP adapter is
+	// implemented; this exception is removed when both adapters expose the final
+	// binding capabilities.
+	if cb.Spec.LMCache != nil && cb.Spec.LMCache.Topology != "" {
+		return nil
+	}
 	storage := cb.Spec.EffectiveRemoteStorage()
 	protocol, err := backendadapter.ProtocolFor(storage)
 	if err != nil {

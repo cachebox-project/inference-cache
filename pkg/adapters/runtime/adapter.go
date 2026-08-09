@@ -111,6 +111,60 @@ type KVCacheRuntimeAdapter interface {
 	EngineContainerName() string
 }
 
+const (
+	// AnnotationLMCacheConnectorProfile is the runtime-owner declaration of the
+	// engine-side LMCache connector API implemented by the workload image.
+	AnnotationLMCacheConnectorProfile = "inferencecache.io/lmcache-connector-profile"
+	// AnnotationLMCacheClientVersion declares the LMCache client package version
+	// validated by the runtime owner's image pipeline.
+	AnnotationLMCacheClientVersion = "inferencecache.io/lmcache-client-version"
+)
+
+// LMCacheConnectorRequirement is the capability contract an MP runtime adapter
+// requires from an inference workload. It names an interface profile rather
+// than an image, so any inference system can provide a compatible image without
+// CacheBackend owning or allowlisting that image.
+type LMCacheConnectorRequirement struct {
+	Profile       string
+	ClientVersion string
+}
+
+// LMCacheMPRuntimeAdapter is the Phase-1 gate for adapters that understand the
+// final typed LMCache topology. Legacy adapters intentionally do not implement
+// it: the Pod webhook then admits a new MP Pod unmodified instead of silently
+// applying the legacy in-process/flat-field wire. Phases 2-4 implement this
+// interface as the shared renderer and runtime-specific MP adapters land.
+type LMCacheMPRuntimeAdapter interface {
+	KVCacheRuntimeAdapter
+
+	// ConnectorRequirement returns the workload-owned capability declaration
+	// required by this adapter.
+	ConnectorRequirement(*cachev1alpha1.CacheBackend) LMCacheConnectorRequirement
+
+	// ValidateMPEnginePod validates version/parallelism/command/resource
+	// constraints visible only on the concrete engine Pod. An unclassifiable
+	// Pod returns an error and is never silently injected.
+	ValidateMPEnginePod(*corev1.Pod, *cachev1alpha1.CacheBackend) error
+}
+
+// ValidateConnectorDeclaration compares the runtime owner's Pod annotations
+// with an adapter's required connector contract. This is deliberately a
+// declaration check, not registry/image introspection; build-time probes and
+// digest pinning bind the claim to image contents outside the admission path.
+func ValidateConnectorDeclaration(pod *corev1.Pod, requirement LMCacheConnectorRequirement) error {
+	if pod == nil {
+		return fmt.Errorf("engine pod is nil")
+	}
+	annotations := pod.GetAnnotations()
+	if got := annotations[AnnotationLMCacheConnectorProfile]; got != requirement.Profile {
+		return fmt.Errorf("annotation %s=%q, want %q", AnnotationLMCacheConnectorProfile, got, requirement.Profile)
+	}
+	if got := annotations[AnnotationLMCacheClientVersion]; got != requirement.ClientVersion {
+		return fmt.Errorf("annotation %s=%q, want %q", AnnotationLMCacheClientVersion, got, requirement.ClientVersion)
+	}
+	return nil
+}
+
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter
 // supports a given (runtime, CacheBackend) pair. An admission validator can
 // translate this into a user-visible rejection; the reconciler logs and skips.

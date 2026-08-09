@@ -52,7 +52,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	// indexEntries was removed in #57 (it duplicated status.indexParticipation.prefixCount);
 	// health was removed in an earlier change; capacity is removed in this PR.
 	// All three are guarded by requireNoProperty checks below.
-	for _, field := range []string{"endpoint", "matchedEnginePods", "engineSelectorMessage", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
+	for _, field := range []string{"connector", "remoteStorage", "endpoint", "matchedEnginePods", "engineSelectorMessage", "failOpen", "conditions", "firstKVEventObservedAt", "firstAvailableAt"} {
 		if !hasProperty(statusSchema, field) {
 			t.Fatalf("status.%s is missing from CRD schema", field)
 		}
@@ -82,6 +82,22 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 		"StatefulSet",
 	})
 	lmCacheSchema := mustProperty(t, specSchema, "lmCache")
+	requireNoProperty(t, lmCacheSchema, "multiprocess")
+	requireEnum(t, mustProperty(t, lmCacheSchema, "topology"), []string{"PodLocal", "NodeLocal"})
+	podLocalSchema := mustProperty(t, lmCacheSchema, "podLocal")
+	requireRequired(t, podLocalSchema, "server")
+	podLocalServerSchema := mustProperty(t, podLocalSchema, "server")
+	for _, field := range []string{"image", "port", "l1Capacity", "maxWorkers", "resources"} {
+		requireRequired(t, podLocalServerSchema, field)
+	}
+	requireMinimum(t, mustProperty(t, podLocalServerSchema, "port"), 1)
+	requireMaximum(t, mustProperty(t, podLocalServerSchema, "port"), 65535)
+	requireMinimum(t, mustProperty(t, podLocalServerSchema, "maxWorkers"), 1)
+	nodeLocalSchema := mustProperty(t, lmCacheSchema, "nodeLocal")
+	requireRequired(t, nodeLocalSchema, "server")
+	nodeLocalServerSchema := mustProperty(t, nodeLocalSchema, "server")
+	requireMinimum(t, mustProperty(t, nodeLocalServerSchema, "maxGPUWorkers"), 1)
+	requireMinimum(t, mustProperty(t, nodeLocalServerSchema, "maxCPUWorkers"), 1)
 	requireMinimum(t, mustProperty(t, lmCacheSchema, "chunkSizeTokens"), 1)
 	requireMinimum(t, mustProperty(t, lmCacheSchema, "workerPort"), 1)
 	requireMaximum(t, mustProperty(t, lmCacheSchema, "workerPort"), 65535)
@@ -95,6 +111,22 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 			t.Fatalf("spec.remoteStorage.%s is missing from CRD schema", field)
 		}
 	}
+	redisSchema := mustProperty(t, remoteStorageSchema, "redis")
+	for _, field := range []string{"authentication", "tls", "database"} {
+		if !hasProperty(redisSchema, field) {
+			t.Fatalf("spec.remoteStorage.redis.%s is missing from CRD schema", field)
+		}
+	}
+	requireMinimum(t, mustProperty(t, redisSchema, "database"), 0)
+
+	connectorStatusSchema := mustProperty(t, statusSchema, "connector")
+	requireEnum(t, mustProperty(t, connectorStatusSchema, "mode"), []string{"Multiprocess"})
+	requireEnum(t, mustProperty(t, connectorStatusSchema, "topology"), []string{"PodLocal", "NodeLocal"})
+	for _, field := range []string{"matchedEnginePods", "readyEnginePods", "desiredServers", "readyServers", "coveredEnginePods", "uncoveredEnginePods"} {
+		requireMinimum(t, mustProperty(t, connectorStatusSchema, field), 0)
+	}
+	remoteStatusSchema := mustProperty(t, statusSchema, "remoteStorage")
+	requireEnum(t, mustProperty(t, remoteStatusSchema, "provider"), []string{"Redis", "LMCacheServer", "Mooncake"})
 	observationSchema := mustProperty(t, specSchema, "observation")
 	for _, field := range []string{"modelID", "firstEventTimeout"} {
 		if !hasProperty(observationSchema, field) {
@@ -197,6 +229,96 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireMinimum(t, mustProperty(t, autoscalingSchema, "maxReplicas"), 1)
 	requireMinimum(t, mustProperty(t, autoscalingSchema, "targetCPUUtilizationPercent"), 1)
 	requireMaximum(t, mustProperty(t, autoscalingSchema, "targetCPUUtilizationPercent"), 100)
+}
+
+func TestCacheBackendMPRoundTripAndDeepCopy(t *testing.T) {
+	database := int32(2)
+	l1 := resource.MustParse("32Gi")
+	backend := &CacheBackend{
+		Spec: CacheBackendSpec{
+			Runtime: CacheBackendRuntimeSGLang,
+			Type:    CacheBackendTypeLMCache,
+			LMCache: &LMCacheEngineSpec{
+				Topology: LMCacheTopologyPodLocal,
+				PodLocal: &LMCachePodLocalSpec{Server: &LMCachePodLocalServerSpec{
+					Image:      "registry.example/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					Port:       6555,
+					L1Capacity: l1,
+					MaxWorkers: 2,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("33Gi")},
+					},
+				}},
+				NodeLocal: &LMCacheNodeLocalSpec{Scheduling: &LMCacheNodeLocalSchedulingSpec{
+					NodeSelector: map[string]string{"pool": "cache"},
+					Tolerations:  []corev1.Toleration{{Key: "cache"}},
+				}},
+			},
+			RemoteStorage: &CacheBackendRemoteStorageSpec{
+				Provider:  CacheBackendRemoteStorageProviderRedis,
+				Ownership: CacheBackendRemoteStorageOwnershipExternal,
+				Endpoint:  "redis.example:6379",
+				Redis: &RedisRemoteStorageSpec{
+					Database: &database,
+					Authentication: &RedisAuthenticationSpec{
+						Password: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"}, Key: "password"},
+					},
+					TLS: &RemoteStorageTLSSpec{
+						CACertificate: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "redis-ca"}, Key: "ca.crt"},
+					},
+				},
+			},
+		},
+		Status: CacheBackendStatus{
+			Connector: &CacheBackendConnectorStatus{
+				Mode:              LMCacheConnectorModeMultiprocess,
+				Topology:          LMCacheTopologyPodLocal,
+				MatchedEnginePods: 2,
+				ReadyEnginePods:   1,
+				DesiredServers:    2,
+				ReadyServers:      1,
+			},
+			RemoteStorage: &CacheBackendRemoteStorageStatus{
+				Provider: CacheBackendRemoteStorageProviderRedis,
+				Endpoint: "redis.example:6379",
+				Ready:    metav1.ConditionTrue,
+			},
+		},
+	}
+
+	data, err := json.Marshal(backend)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var roundTripped CacheBackend
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(backend, &roundTripped) {
+		t.Fatalf("JSON round trip changed object\nwant: %#v\n got: %#v", backend, &roundTripped)
+	}
+
+	copied := backend.DeepCopy()
+	backend.Spec.LMCache.PodLocal.Server.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("64Gi")
+	backend.Spec.LMCache.NodeLocal.Scheduling.NodeSelector["pool"] = "general"
+	backend.Spec.LMCache.NodeLocal.Scheduling.Tolerations[0].Key = "general"
+	*backend.Spec.RemoteStorage.Redis.Database = 9
+	backend.Spec.RemoteStorage.Redis.Authentication.Password.Name = "changed"
+	backend.Status.Connector.ReadyServers = 2
+	backend.Status.RemoteStorage.Endpoint = "changed:6379"
+
+	if got := copied.Spec.LMCache.PodLocal.Server.Resources.Requests[corev1.ResourceMemory]; got.Cmp(resource.MustParse("33Gi")) != 0 {
+		t.Fatalf("podLocal server resources alias original: %s", got.String())
+	}
+	if copied.Spec.LMCache.NodeLocal.Scheduling.NodeSelector["pool"] != "cache" || copied.Spec.LMCache.NodeLocal.Scheduling.Tolerations[0].Key != "cache" {
+		t.Fatalf("nodeLocal scheduling was not deep-copied")
+	}
+	if *copied.Spec.RemoteStorage.Redis.Database != 2 || copied.Spec.RemoteStorage.Redis.Authentication.Password.Name != "redis-auth" {
+		t.Fatalf("Redis binding was not deep-copied")
+	}
+	if copied.Status.Connector.ReadyServers != 1 || copied.Status.RemoteStorage.Endpoint != "redis.example:6379" {
+		t.Fatalf("MP status was not deep-copied")
+	}
 }
 
 func TestCacheBackendCRDPrintColumns(t *testing.T) {
