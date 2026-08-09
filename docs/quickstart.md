@@ -34,6 +34,13 @@ identity, and remote provider are explicit; `spec.replicas` defaults to `1`,
 the readiness gate's `firstEventTimeout` defaults to `5m`, and
 `integration.failOpen` defaults to `true`.
 
+For a managed LMCache provider, the server image resolves from
+`spec.remoteStorage.lmCacheServer.image` first and the controller's
+`--lmcache-server-image` flag second. The shipped Kustomize install sets that
+flag to the documented `lmcache/standalone:v0.4.7` baseline; operators should
+replace it with a digest compatible with the lmcache client in their engine
+image.
+
 > **One label does the binding.** The value under
 > `engineSelector.matchLabels` must also appear on your engine pods'
 > template labels. That label match is what lets the mutating Pod webhook

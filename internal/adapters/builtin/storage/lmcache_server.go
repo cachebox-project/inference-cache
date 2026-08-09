@@ -14,19 +14,10 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
 
-// LMCache standalone-server defaults. Resources override them through
-// remoteStorage.lmCacheServer.
+// LMCache standalone-server defaults. Resources and command arguments override
+// them through remoteStorage.lmCacheServer; the image is supplied by the
+// CacheBackend or controller configuration.
 const (
-	// The server and the LMCache client compiled into the engine communicate
-	// over a versioned wire protocol, so this must never become a floating tag.
-	// Operators must keep an override compatible with the client in their
-	// engine image.
-	//
-	// TODO(cachebox): wire-test and digest-pin this image before production.
-	// v0.4.7 matches the client used in validation, but the standalone image
-	// was not independently wire-tested here. Do not substitute an invented
-	// digest.
-	defaultLMCacheServerImage    = "lmcache/standalone:v0.4.7"
 	defaultLMCacheServerPort     = int32(65432)
 	defaultLMCacheServerHost     = "0.0.0.0"
 	defaultLMCacheServerStorage  = "cpu"
@@ -35,15 +26,18 @@ const (
 
 // ResolveLMCacheServer renders the provider-owned standalone LMCache server.
 // The reconciler supplies identity, selectors, workload kind, and ownership.
-func ResolveLMCacheServer(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
+func ResolveLMCacheServer(cache *cachev1alpha1.CacheBackend, controllerImage string) (*corev1.PodSpec, *corev1.Service, error) {
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve cache server: cache is nil")
 	}
 	image := effectiveProviderImage(
 		cache,
 		cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-		defaultLMCacheServerImage,
+		controllerImage,
 	)
+	if image == "" {
+		return nil, nil, fmt.Errorf("resolve cache server: image is required; set spec.remoteStorage.lmCacheServer.image or controller --lmcache-server-image")
+	}
 
 	command, args := lmCacheServerCommand()
 	if typed := effectiveProviderCommand(cache, cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer); len(typed) > 0 {

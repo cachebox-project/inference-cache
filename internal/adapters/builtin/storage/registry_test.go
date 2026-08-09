@@ -5,6 +5,7 @@
 package storage
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -12,6 +13,8 @@ import (
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 )
+
+const testLMCacheServerImage = "registry.example/lmcache:controller-default"
 
 func TestManagedRedisProviderOwnsTypedWorkloadConfig(t *testing.T) {
 	memory := resource.MustParse("2Gi")
@@ -91,7 +94,7 @@ func TestProviderRetainsBoundedResourcesWithoutDefaulter(t *testing.T) {
 			},
 		},
 	}
-	rendered, _, err := ResolveLMCacheServer(cache)
+	rendered, _, err := ResolveLMCacheServer(cache, testLMCacheServerImage)
 	if err != nil {
 		t.Fatalf("ResolveLMCacheServer: %v", err)
 	}
@@ -103,5 +106,66 @@ func TestProviderRetainsBoundedResourcesWithoutDefaulter(t *testing.T) {
 	}
 	if got := resources.Requests[corev1.ResourceMemory]; got.Cmp(wantRequest) != 0 {
 		t.Fatalf("fallback memory request = %s, want %s", got.String(), wantRequest.String())
+	}
+}
+
+func TestLMCacheServerImageResolution(t *testing.T) {
+	t.Parallel()
+
+	newCache := func(image string) *cachev1alpha1.CacheBackend {
+		return &cachev1alpha1.CacheBackend{
+			Spec: cachev1alpha1.CacheBackendSpec{
+				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+				Type:    cachev1alpha1.CacheBackendTypeLMCache,
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+					LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{
+						Image: image,
+					},
+				},
+			},
+		}
+	}
+
+	for _, tc := range []struct {
+		name            string
+		cacheImage      string
+		controllerImage string
+		wantImage       string
+		wantErr         string
+	}{
+		{
+			name:            "controller fallback",
+			controllerImage: testLMCacheServerImage,
+			wantImage:       testLMCacheServerImage,
+		},
+		{
+			name:            "CacheBackend override",
+			cacheImage:      "registry.example/lmcache:per-cache",
+			controllerImage: testLMCacheServerImage,
+			wantImage:       "registry.example/lmcache:per-cache",
+		},
+		{
+			name:    "missing image",
+			wantErr: "set spec.remoteStorage.lmCacheServer.image or controller --lmcache-server-image",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pod, _, err := ResolveLMCacheServer(newCache(tc.cacheImage), tc.controllerImage)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ResolveLMCacheServer() error = %v, want containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveLMCacheServer(): %v", err)
+			}
+			if got := pod.Containers[0].Image; got != tc.wantImage {
+				t.Fatalf("container image = %q, want %q", got, tc.wantImage)
+			}
+		})
 	}
 }

@@ -75,7 +75,7 @@ func lmCacheBinding(endpoint string) *backendadapter.Binding {
 // resolveLMCacheServer keeps the provider-rendering assertions independent
 // from the runtime adapter now that provider lifecycle is a separate seam.
 func resolveLMCacheServer(_ runtimeadapter.KVCacheRuntimeAdapter, cb *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return provideradapter.ResolveLMCacheServer(cb)
+	return provideradapter.ResolveLMCacheServer(cb, "lmcache/standalone:v0.4.7")
 }
 
 // resolvePod unwraps the provider renderer for tests that only assert on the

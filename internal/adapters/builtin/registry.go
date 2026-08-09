@@ -18,15 +18,16 @@ type Registries struct {
 	Storage *backendadapter.Registry
 }
 
-// Options configures the runtime adapters shipped by the controller binary.
+// Options configures the adapters shipped by the controller binary.
 // It belongs to the built-in composition rather than the public adapter seam.
 type Options struct {
 	SubscriberImage         string
+	LMCacheServerImage      string
 	PolicyServerGRPCAddress string
 }
 
-// New constructs the complete built-in registries. Subscriber settings are applied
-// consistently to every adapter that injects the subscriber sidecar.
+// New constructs the complete built-in registries. Settings are applied
+// consistently to every adapter that consumes them.
 func New(opts Options) Registries {
 	subscriber := builtinruntime.SubscriberConfig{
 		Image:                   opts.SubscriberImage,
@@ -39,6 +40,8 @@ func New(opts Options) Registries {
 
 	return Registries{
 		Runtime: runtimeRegistry,
-		Storage: builtinstorage.DefaultRegistry(),
+		Storage: builtinstorage.DefaultRegistry(
+			builtinstorage.WithLMCacheServerImage(opts.LMCacheServerImage),
+		),
 	}
 }
