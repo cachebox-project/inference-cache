@@ -356,7 +356,7 @@ the legacy deprecation writer is only implemented if Phase 6 is activated.
 | 0 | Design freeze, consumer audit, version/Kubernetes baseline | none | complete |
 | 1 | MP-only API and admission/status contracts | Phase 0 | complete |
 | 2 | Engine-neutral PodLocal MP server renderer | Phase 1 | complete |
-| 3 | Production-credible SGLang PodLocal MP baseline | Phase 2 | not started |
+| 3 | Production-credible SGLang PodLocal MP baseline | Phase 2 | in progress — non-GPU baseline complete; GPU matrix pending |
 | 4 | vLLM PodLocal MP, host-only and Redis | Phase 3 | not started |
 | 5 | Repository consumer migration; migration tooling only if needed | Phase 4 | not started |
 | 6 | Conditional compatibility gate if legacy consumers appear | Phase 5 | not required by Phase 0 finding |
@@ -667,17 +667,56 @@ The exact LMCache 0.5.3 source constrains these runtime capability boundaries:
 Use the already working SGLang path to validate the common MP server under
 parallelism and failure before adding vLLM.
 
-### Functional scope
+Current state: the non-GPU control-plane and connector compatibility baseline
+is complete. No Phase 3 GPU data-path or runtime-failure result is claimed yet.
 
-- [ ] SGLang + PodLocal + no remote L3.
-- [ ] SGLang + PodLocal + managed Redis development profile.
-- [ ] SGLang + PodLocal + external Redis production profile.
-- [ ] ReadWrite role; reject unsupported role splits.
-- [ ] Pinned SGLang/LMCache/CUDA image tuple.
+### Completed non-GPU validation
+
+- [x] Add typed host-only, managed-Redis, and external-Redis SGLang PodLocal
+      samples; all three pass CRD defaulting and admission.
+- [x] Add the connector-ready SGLang fixture Dockerfile under
+      `test/fixtures/sglang-lmcache`, based on the pinned SGLang digest with
+      exactly `lmcache==0.5.3`.
+- [x] Build the fixture locally for linux/amd64 and verify SGLang
+      `0.5.13.post1`, CUDA 13.0.1, LMCache 0.5.3, `LMCacheMPConnector` import,
+      and CLI parsing for LMCache, explicit page size, and TP=2 flags. This is
+      compatibility preflight only; the image has not run inference.
+- [x] Require an explicit SGLang `--page-size` and reject missing, malformed,
+      duplicate, non-positive, and declared chunk-incompatible values before
+      rendering the MP wire. LMCache retains its authoritative runtime check
+      against the effective page size.
+- [x] Verify the Pod webhook renders the common MP server atomically and admits
+      an incompatible engine unchanged with an actionable fail-open diagnostic.
+- [x] Persist a typed SGLang Pod through an envtest kube-apiserver/etcd and
+      verify the native-sidecar schema/defaulting surface.
+- [x] Install the controller and webhooks in a Kubernetes 1.32 kind cluster,
+      create a matching SGLang Pod through the live mutating webhook, read the
+      persisted injected Pod back from the API server, and verify image,
+      restart policy, probes, resources, MP arguments, engine arguments,
+      annotations, labels, and shared mounts. The Pod was deliberately left
+      unscheduled, so no engine or sidecar container ran.
+- [x] Pass the repository regression gates: full Go tests, focused envtest,
+      sample verification (24 pass, 2 intentional skips), default-install
+      smoke, Go vet, Prometheus rules, docs sync, REUSE, and DCO.
+
+### GPU/runtime functional scope
+
+- [ ] SGLang + PodLocal + no remote L3. Typed sample and admission wire are
+      complete; GPU KV execution is pending.
+- [ ] SGLang + PodLocal + managed Redis development profile. Typed sample,
+      managed workload rendering, and admission pass; GPU KV execution is
+      pending.
+- [ ] SGLang + PodLocal + external Redis production profile. Typed sample and
+      credential binding admission pass; GPU KV execution is pending.
+- [x] ReadWrite role; reject unsupported role splits.
+- [ ] Pinned SGLang/LMCache/CUDA image tuple. Local build and compatibility
+      preflight pass; registry digest and GPU execution are pending.
 
 ### Correctness work
 
-- [ ] Validate LMCache chunk size against the effective SGLang page size.
+- [ ] Exercise LMCache's runtime chunk-size check against the effective SGLang
+      page size on the pinned GPU tuple. The explicit-value admission guard and
+      its edge-case tests are complete.
 - [ ] Validate TP=1 and TP=2 at minimum.
 - [ ] Prove store → engine-GPU flush → retrieve from MP L1.
 - [ ] Prove cross-Pod store/retrieve through Redis with fresh engine and MP L1.
@@ -697,12 +736,15 @@ parallelism and failure before adding vLLM.
 
 ### Operability work
 
-- [ ] `ConnectorReady` reflects MP server health.
-- [ ] `RemoteStorageReady` reflects Redis independently.
-- [ ] Metrics prove lookup/store/retrieve/hit behavior.
+- [ ] `ConnectorReady` reflects MP server health. Condition-transition tests
+      pass; live SGLang failure evidence is pending.
+- [ ] `RemoteStorageReady` reflects Redis independently. Condition-transition
+      tests pass; live Redis failure evidence is pending.
+- [ ] Metrics prove lookup/store/retrieve/hit behavior. Metrics discovery and
+      Pod labeling pass; real KV traffic evidence is pending.
 - [ ] Logs identify engine Pod, backend, model, MP instance, and L3 adapter
       without exposing credentials.
-- [ ] Default-install smoke creates a matching SGLang engine Pod through the
+- [x] Default-install smoke creates a matching SGLang engine Pod through the
       live webhook and inspects the actual injected wire.
 
 ### Exit criteria

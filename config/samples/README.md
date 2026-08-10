@@ -15,8 +15,12 @@ multi-tenant, Namespaces):
 - **`cachebackend-*.yaml`** — focused hand-curated canonical CacheBackend
   examples, including the
   [`cachebackend-sglang-hicache.yaml`](cachebackend-sglang-hicache.yaml)
-  engine-local example. The `recipe-*.yaml` catalog is the maintained entry
-  point for LMCache scenarios.
+  engine-local example and the typed SGLang PodLocal LMCache examples for
+  [host-only](cachebackend-sglang-podlocal-host-only.yaml),
+  [managed Redis](cachebackend-sglang-podlocal-managed-redis.yaml), and
+  [external Redis](cachebackend-sglang-podlocal-external-redis.yaml). The
+  `recipe-*.yaml` catalog remains the maintained entry point for legacy
+  in-process LMCache scenarios until the repository-wide Phase-5 migration.
 
 ## Recipe catalog
 

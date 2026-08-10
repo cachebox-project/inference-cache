@@ -77,6 +77,11 @@
 #      Deployment/Service/HPA and publishes no endpoint, while the committed
 #      SGLang+Managed-Redis sample explicitly creates a redis-l2 Deployment +
 #      Service and publishes its RESP endpoint. No engine traffic is required.
+#   8d. Typed SGLang PodLocal admission: a matching, connector-declared SGLang
+#      Pod is actually persisted through the installed mutating webhook while
+#      pinned to an impossible node selector. The smoke reads the persisted Pod
+#      back and asserts the common lmcache-mp-server native sidecar, probes,
+#      resources, shared mounts, engine flags/env, and injection identity.
 #   9. Canonical External ownership end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO
@@ -369,6 +374,8 @@ EXT_SMOKE_POD_NAME="${EXT_SMOKE_POD_NAME:-smoke-engine}"
 CANONICAL_SMOKE_NS="${CANONICAL_SMOKE_NS:-ic-smoke-canonical-cache}"
 CANONICAL_HOST_ONLY_CB="cachebackend-sglang-host-only"
 CANONICAL_REDIS_CB="cachebackend-sglang"
+CANONICAL_TYPED_CB="sglang-podlocal-host-only"
+CANONICAL_TYPED_POD="sglang-podlocal-admission"
 
 # Events-only-backend smoke fixture identifiers. Declared up front so the
 # diagnostics helper can reference them even if the smoke aborts before the
@@ -447,6 +454,8 @@ collect_diagnostics() {
     >"$LOG_DIR/canonical-cachebackends.yaml" 2>&1 || true
   kubectl -n "$CANONICAL_SMOKE_NS" get deploy,svc,hpa -o yaml \
     >"$LOG_DIR/canonical-provider-workloads.yaml" 2>&1 || true
+  kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" -o yaml \
+    >"$LOG_DIR/sglang-podlocal-admission.yaml" 2>&1 || true
   # External-backend smoke artefacts. Best-effort — the CR/pod may not
   # exist if the smoke aborted before that section.
   kubectl get cb -A -o wide \
@@ -2245,6 +2254,104 @@ if [ "$redis_provider" != "Redis" ] || [ "$redis_ownership" != "Managed" ] || \
   fail "canonical Managed Redis state is wrong: provider=$redis_provider ownership=$redis_ownership container=$redis_container port=$redis_port endpoint=$redis_endpoint"
 fi
 log "canonical Managed Redis hierarchy rendered redis-l2 and endpoint=$redis_endpoint"
+
+# Create (not only server-side dry-run) a matching SGLang Pod through the live
+# webhook and inspect the object persisted by the apiserver. The impossible node
+# selector keeps kubelet from pulling either large GPU image; admission still
+# executes the complete mutation and Kubernetes schema/defaulting path.
+kubectl -n "$CANONICAL_SMOKE_NS" apply \
+  -f config/samples/cachebackend-sglang-podlocal-host-only.yaml >/dev/null \
+  || fail "typed SGLang PodLocal CacheBackend sample failed to apply"
+
+typed_sglang_pod="$(mktemp "$tmpdir/sglang-podlocal-admission.XXXXXX.yaml")"
+cat >"$typed_sglang_pod" <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sglang-podlocal-admission
+  labels:
+    inferencecache.io/runtime: sglang-mp
+  annotations:
+    inferencecache.io/lmcache-connector-profile: sglang-lmcache-mp-v1
+    inferencecache.io/lmcache-client-version: "0.5.3"
+spec:
+  nodeSelector:
+    inferencecache.io/install-smoke-never-schedule: "true"
+  containers:
+    - name: sglang
+      image: example.invalid/sglang-lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      command: ["python3", "-m", "sglang.launch_server"]
+      args:
+        - --model-path=meta-llama/Meta-Llama-3-8B-Instruct
+        - --page-size=64
+        - --tensor-parallel-size=1
+EOF
+kubectl -n "$CANONICAL_SMOKE_NS" create -f "$typed_sglang_pod" >/dev/null \
+  || fail "matching typed SGLang Pod did not pass the live mutating webhook"
+
+typed_injected_by="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.metadata.annotations.inferencecache\.io/injected-by}' 2>/dev/null || true)"
+typed_metrics_label="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.metadata.labels.inferencecache\.io/lmcache-mp-metrics}' 2>/dev/null || true)"
+typed_server_image="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-mp-server")].image}' 2>/dev/null || true)"
+typed_server_restart="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-mp-server")].restartPolicy}' 2>/dev/null || true)"
+typed_server_args="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-mp-server")].args}' 2>/dev/null || true)"
+typed_server_memory_request="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-mp-server")].resources.requests.memory}' 2>/dev/null || true)"
+typed_server_memory_limit="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-mp-server")].resources.limits.memory}' 2>/dev/null || true)"
+typed_server_probe_path="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-mp-server")].readinessProbe.httpGet.path}' 2>/dev/null || true)"
+typed_engine_args="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.spec.containers[?(@.name=="sglang")].args}' 2>/dev/null || true)"
+typed_engine_experimental="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.spec.containers[?(@.name=="sglang")].env[?(@.name=="LMCACHE_USE_EXPERIMENTAL")].value}' 2>/dev/null || true)"
+typed_engine_mounts="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
+  -o jsonpath='{.spec.containers[?(@.name=="sglang")].volumeMounts[*].mountPath}' 2>/dev/null || true)"
+
+expected_mp_image="lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13"
+if [ "$typed_injected_by" != "$CANONICAL_SMOKE_NS/$CANONICAL_TYPED_CB" ] || \
+   [ "$typed_metrics_label" != "true" ] || \
+   [ "$typed_server_image" != "$expected_mp_image" ] || \
+   [ "$typed_server_restart" != "Always" ] || \
+   [ "$typed_server_memory_request" != "5Gi" ] || \
+   [ "$typed_server_memory_limit" != "6Gi" ] || \
+   [ "$typed_server_probe_path" != "/healthcheck" ] || \
+   [ "$typed_engine_experimental" != "True" ]; then
+  kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" -o yaml || true
+  fail "typed SGLang persisted wire metadata is wrong: injectedBy=$typed_injected_by metrics=$typed_metrics_label image=$typed_server_image restart=$typed_server_restart memory=$typed_server_memory_request/$typed_server_memory_limit probe=$typed_server_probe_path experimental=$typed_engine_experimental"
+fi
+if ! jq -e '
+    (index("--port") as $port | $port != null and .[$port + 1] == "5555") and
+    (index("--chunk-size") as $chunk | $chunk != null and .[$chunk + 1] == "256") and
+    index("--l2-adapter") == null
+  ' >/dev/null <<<"$typed_server_args"; then
+  kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" -o yaml || true
+  fail "typed host-only SGLang MP server args are wrong: $typed_server_args"
+fi
+if ! jq -e '
+    index("--page-size=64") != null and
+    index("--enable-lmcache") != null and
+    (index("--lmcache-config-file") as $config | $config != null and
+      .[$config + 1] == "/var/run/inference-cache/lmcache/client.yaml")
+  ' >/dev/null <<<"$typed_engine_args"; then
+  kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" -o yaml || true
+  fail "typed SGLang engine args are incomplete: $typed_engine_args"
+fi
+case " $typed_engine_mounts " in
+  *" /dev/shm "*) : ;;
+  *) kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" -o yaml || true
+     fail "typed SGLang engine /dev/shm mount is missing: $typed_engine_mounts" ;;
+esac
+case " $typed_engine_mounts " in
+  *" /var/run/inference-cache/lmcache "*) : ;;
+  *) kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" -o yaml || true
+     fail "typed SGLang engine config mount is missing: $typed_engine_mounts" ;;
+esac
+log "typed SGLang PodLocal Pod persisted with the common MP native sidecar and complete engine wire"
 
 kubectl delete namespace "$CANONICAL_SMOKE_NS" \
   --wait=false --ignore-not-found=true >/dev/null 2>&1 || true

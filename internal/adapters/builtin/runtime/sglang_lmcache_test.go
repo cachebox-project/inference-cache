@@ -285,7 +285,10 @@ func TestSGLangValidateTypedMPEnginePod(t *testing.T) {
 			runtimeadapter.AnnotationLMCacheConnectorProfile: sglangLMCacheMPConnectorProfile,
 			runtimeadapter.AnnotationLMCacheClientVersion:    sglangLMCacheMPClientVersion,
 		}},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName}}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: SGLangEngineContainerName,
+			Args: []string{"--page-size=1"},
+		}}},
 	}
 	if err := runtimeadapter.ValidateConnectorDeclaration(pod, adapter.ConnectorRequirement(cache)); err != nil {
 		t.Fatalf("ValidateConnectorDeclaration: %v", err)
@@ -297,6 +300,42 @@ func TestSGLangValidateTypedMPEnginePod(t *testing.T) {
 	pod.Spec.InitContainers = []corev1.Container{{Name: sglangMPWorkerContainerName}}
 	if err := adapter.ValidateMPEnginePod(pod, cache); err == nil || !strings.Contains(err.Error(), "legacy") {
 		t.Fatalf("legacy collision error = %v", err)
+	}
+}
+
+func TestSGLangValidateTypedMPEnginePodPageSize(t *testing.T) {
+	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{}).(runtimeadapter.LMCacheMPRuntimeAdapter)
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{name: "pair form", args: []string{"--page-size", "64"}},
+		{name: "equals form", args: []string{"--page-size=128"}},
+		{name: "missing", wantErr: "explicitly declare --page-size"},
+		{name: "not a divisor", args: []string{"--page-size=96"}, wantErr: "chunk size 256 must be a multiple"},
+		{name: "zero", args: []string{"--page-size=0"}, wantErr: "positive integer"},
+		{name: "not an integer", args: []string{"--page-size=large"}, wantErr: "positive integer"},
+		{name: "missing pair value", args: []string{"--page-size", "--model-path", "model"}, wantErr: "malformed"},
+		{name: "duplicate", args: []string{"--page-size=1", "--page-size", "64"}, wantErr: "duplicated"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name: SGLangEngineContainerName,
+				Args: tc.args,
+			}}}}
+			err := adapter.ValidateMPEnginePod(pod, newTypedSGLangMPBackend())
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateMPEnginePod: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateMPEnginePod error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 

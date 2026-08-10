@@ -326,7 +326,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 			},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{
-			Name: "sglang", Image: "sglang:connector-ready",
+			Name: "sglang", Image: "sglang:connector-ready", Args: []string{"--page-size=1"},
 		}}},
 	}
 	if err := mgr.GetClient().Create(ctx, typedPod); err != nil {

@@ -447,6 +447,7 @@ func TestHandle_TypedPodLocalSGLangUsesCommonMPServer(t *testing.T) {
 	}
 	pod.Annotations[adapterruntime.AnnotationLMCacheConnectorProfile] = "sglang-lmcache-mp-v1"
 	pod.Annotations[adapterruntime.AnnotationLMCacheClientVersion] = "0.5.3"
+	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--page-size=1")
 	req := newRequest(t, pod, ns)
 
 	resp := h.Handle(context.Background(), req)
@@ -475,6 +476,26 @@ func TestHandle_TypedPodLocalSGLangUsesCommonMPServer(t *testing.T) {
 	}
 	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-worker") != nil {
 		t.Fatalf("typed wire fell through to legacy worker: %+v", mutated.Spec.InitContainers)
+	}
+
+	// The compatibility guard must fail open atomically: an incompatible page
+	// size admits the inference Pod but renders neither the server nor half of
+	// the engine wire. The response message is the actionable admission trace;
+	// controller status subsequently counts the Pod as uncovered.
+	incompatible := sglangEnginePod("sg-engine-incompatible", map[string]string{"app": "sglang"})
+	incompatible.Annotations = map[string]string{
+		adapterruntime.AnnotationLMCacheConnectorProfile: "sglang-lmcache-mp-v1",
+		adapterruntime.AnnotationLMCacheClientVersion:    "0.5.3",
+	}
+	incompatible.Spec.Containers[0].Args = append(incompatible.Spec.Containers[0].Args, "--page-size=96")
+	incompatibleReq := newRequest(t, incompatible, ns)
+	incompatibleResp := h.Handle(context.Background(), incompatibleReq)
+	if !incompatibleResp.Allowed || len(incompatibleResp.Patches) != 0 {
+		t.Fatalf("incompatible page size must admit unchanged: Allowed=%v patches=%d result=%+v",
+			incompatibleResp.Allowed, len(incompatibleResp.Patches), incompatibleResp.Result)
+	}
+	if incompatibleResp.Result == nil || !strings.Contains(incompatibleResp.Result.Message, "chunk size 256 must be a multiple") {
+		t.Fatalf("incompatible page-size diagnostic = %+v", incompatibleResp.Result)
 	}
 }
 

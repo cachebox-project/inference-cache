@@ -6,6 +6,7 @@ package runtime
 
 import (
 	"fmt"
+	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -144,13 +145,56 @@ func (sglangLMCacheAdapter) ValidateMPEnginePod(pod *corev1.Pod, cache *cachev1a
 	if cache.Spec.LMCache.PodLocal == nil || cache.Spec.LMCache.PodLocal.Server == nil {
 		return fmt.Errorf("SGLang LMCache PodLocal server configuration is missing")
 	}
-	if _, err := EngineContainerIndexNamed(&pod.Spec, SGLangEngineContainerName); err != nil {
+	engineIndex, err := EngineContainerIndexNamed(&pod.Spec, SGLangEngineContainerName)
+	if err != nil {
+		return err
+	}
+	if err := validateSGLangMPPageSize(
+		pod.Spec.Containers[engineIndex].Args,
+		effectiveLMCacheChunkSize(cache.Spec.LMCache),
+	); err != nil {
 		return err
 	}
 	if findContainerByName(pod.Spec.InitContainers, sglangMPWorkerContainerName) != nil {
 		return fmt.Errorf("legacy LMCache MP sidecar %q is present; recreate the Pod from an un-injected template before enabling typed PodLocal", sglangMPWorkerContainerName)
 	}
 	return nil
+}
+
+// validateSGLangMPPageSize catches a launch-time incompatibility before the
+// webhook renders the MP wire. LMCache 0.5.3 also checks the effective page
+// size after SGLang has resolved model/backend-specific defaults; that runtime
+// check remains authoritative when SGLang rewrites an explicitly declared
+// value. Requiring the Pod template to declare --page-size makes the admission
+// preflight deterministic instead of guessing from an image tag or a moving
+// SGLang default.
+func validateSGLangMPPageSize(args []string, chunkSize int32) error {
+	const pageSizeFlag = "--page-size"
+	values, malformed := argValues(args, pageSizeFlag)
+	if malformed {
+		return fmt.Errorf("SGLang LMCache MP %s is malformed; declare one positive integer value", pageSizeFlag)
+	}
+	if len(values) == 0 {
+		return fmt.Errorf("SGLang LMCache MP engine must explicitly declare %s so chunk-size compatibility can be verified", pageSizeFlag)
+	}
+	if len(values) > 1 {
+		return fmt.Errorf("SGLang LMCache MP %s is duplicated", pageSizeFlag)
+	}
+	pageSize, err := strconv.ParseInt(values[0], 10, 32)
+	if err != nil || pageSize < 1 {
+		return fmt.Errorf("SGLang LMCache MP %s=%q must be a positive integer", pageSizeFlag, values[0])
+	}
+	if int64(chunkSize)%pageSize != 0 {
+		return fmt.Errorf("LMCache chunk size %d must be a multiple of SGLang page size %d", chunkSize, pageSize)
+	}
+	return nil
+}
+
+func effectiveLMCacheChunkSize(spec *cachev1alpha1.LMCacheEngineSpec) int32 {
+	if spec != nil && spec.ChunkSizeTokens != nil {
+		return *spec.ChunkSizeTokens
+	}
+	return 256
 }
 
 func injectSGLangLMCachePodLocal(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
@@ -162,10 +206,7 @@ func injectSGLangLMCachePodLocal(pod *corev1.PodSpec, binding *backendadapter.Bi
 		return fmt.Errorf("inject SGLang LMCache MP: typed PodLocal server configuration is required")
 	}
 	server := lm.PodLocal.Server
-	chunkSize := int32(256)
-	if lm.ChunkSizeTokens != nil {
-		chunkSize = *lm.ChunkSizeTokens
-	}
+	chunkSize := effectiveLMCacheChunkSize(lm)
 
 	// Compose the common server and SGLang launch surface on one copy. Although
 	// the post-render SGLang upserts cannot fail, keeping one commit point makes
