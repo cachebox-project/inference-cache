@@ -54,6 +54,7 @@ func newVLLMRegistry(configs ...builtinruntime.SubscriberConfig) *adapterruntime
 		config = configs[0]
 	}
 	registry := adapterruntime.NewRegistry()
+	registry.Register(builtinruntime.NewVLLMLMCacheMPAdapter(config))
 	registry.Register(builtinruntime.NewVLLMLMCacheAdapter(config))
 	return registry
 }
@@ -322,26 +323,100 @@ func TestHandle_MatchAndInject(t *testing.T) {
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
-func TestHandle_TypedLMCacheDoesNotFallThroughToLegacyAdapter(t *testing.T) {
-	const ns = "engines"
-	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+func typedVLLMPodLocalBackend(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
+	cb := readyCacheBackend(name, namespace, selector)
+	chunkSize := int32(256)
 	cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
-		Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+		Topology:        cachev1alpha1.LMCacheTopologyPodLocal,
+		ChunkSizeTokens: &chunkSize,
+		PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+			Image:      "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Port:       6500,
+			L1Capacity: resource.MustParse("4Gi"),
+			MaxWorkers: 2,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("6Gi")},
+			},
+		}},
 	}
 	cb.Spec.RemoteStorage = nil
+	cb.Status.Endpoint = ""
+	return cb
+}
+
+func TestHandle_TypedVLLMMissingCapabilityDoesNotFallThroughToLegacyAdapter(t *testing.T) {
+	const ns = "engines"
+	cb := typedVLLMPodLocalBackend("primary", ns, map[string]string{"app": "vllm"})
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
 
 	resp := h.Handle(context.Background(), req)
 	if !resp.Allowed {
-		t.Fatalf("typed MP pod must fail open while its adapter is pending: %+v", resp.Result)
+		t.Fatalf("typed MP pod with unverified connector must fail open: %+v", resp.Result)
 	}
 	if len(resp.Patches) != 0 {
 		t.Fatalf("typed MP pod must not receive legacy injection; got %d patches", len(resp.Patches))
 	}
-	if resp.Result == nil || !strings.Contains(resp.Result.Message, "does not implement typed LMCache topology") {
-		t.Fatalf("response message = %v, want typed-topology adapter diagnostic", resp.Result)
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "engine connector capability is unverified") {
+		t.Fatalf("response message = %v, want connector-capability diagnostic", resp.Result)
+	}
+}
+
+func TestHandle_TypedPodLocalVLLMUsesDedicatedMPAdapter(t *testing.T) {
+	const ns = "engines"
+	cb := typedVLLMPodLocalBackend("vllm-typed", ns, map[string]string{"app": "vllm-mp"})
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-mp", map[string]string{"app": "vllm-mp"})
+	pod.Annotations = map[string]string{
+		adapterruntime.AnnotationLMCacheConnectorProfile: "vllm-lmcache-mp-v1",
+		adapterruntime.AnnotationLMCacheClientVersion:    "0.5.3",
+	}
+	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--tensor-parallel-size=2")
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("typed vLLM MP injection: Allowed=%v patches=%d result=%+v", resp.Allowed, len(resp.Patches), resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	server := findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-server")
+	if server == nil || server.Image != cb.Spec.LMCache.PodLocal.Server.Image {
+		t.Fatalf("typed MP server = %+v", server)
+	}
+	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-worker") != nil {
+		t.Fatalf("typed vLLM wire fell through to legacy worker: %+v", mutated.Spec.InitContainers)
+	}
+	mustHaveArgFlag(t, mutated, "--disable-hybrid-kv-cache-manager")
+	config := testArgValue(mutated.Spec.Containers[0].Args, "--kv-transfer-config")
+	for _, want := range []string{
+		`"kv_connector":"LMCacheMPConnector"`,
+		`"kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector"`,
+		`"kv_role":"kv_both"`,
+		`"lmcache.mp.host":"tcp://127.0.0.1"`,
+		`"lmcache.mp.port":"6500"`,
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("kv-transfer-config %q missing %q", config, want)
+		}
+	}
+	mustHaveEnv(t, mutated, testEnvPythonHashSeed, "0")
+	if got := mutated.Labels[LabelLMCacheMPMetrics]; got != LabelLMCacheMPMetricsEnabled {
+		t.Fatalf("label %s = %q", LabelLMCacheMPMetrics, got)
+	}
+
+	incompatible := vllmEnginePod("engine-pp", map[string]string{"app": "vllm-mp"})
+	incompatible.Annotations = pod.Annotations
+	incompatible.Spec.Containers[0].Args = append(incompatible.Spec.Containers[0].Args, "--pipeline-parallel-size=2")
+	incompatibleReq := newRequest(t, incompatible, ns)
+	incompatibleResp := h.Handle(context.Background(), incompatibleReq)
+	if !incompatibleResp.Allowed || len(incompatibleResp.Patches) != 0 {
+		t.Fatalf("unsupported PP must admit unchanged: Allowed=%v patches=%d result=%+v",
+			incompatibleResp.Allowed, len(incompatibleResp.Patches), incompatibleResp.Result)
+	}
+	if incompatibleResp.Result == nil || !strings.Contains(incompatibleResp.Result.Message, "pipeline parallel size 2") {
+		t.Fatalf("unsupported PP diagnostic = %+v", incompatibleResp.Result)
 	}
 }
 
@@ -2297,6 +2372,18 @@ func mustHaveArgPair(t *testing.T, pod *corev1.Pod, flag, value string) {
 		}
 	}
 	t.Fatalf("arg pair %s %s missing; args = %v", flag, value, args)
+}
+
+func testArgValue(args []string, flag string) string {
+	for index, arg := range args {
+		if arg == flag && index+1 < len(args) {
+			return args[index+1]
+		}
+		if strings.HasPrefix(arg, flag+"=") {
+			return strings.TrimPrefix(arg, flag+"=")
+		}
+	}
+	return ""
 }
 
 func mustHaveArgFlag(t *testing.T, pod *corev1.Pod, flag string) {

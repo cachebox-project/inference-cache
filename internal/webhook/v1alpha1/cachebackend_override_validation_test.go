@@ -40,6 +40,20 @@ func TestValidator_EngineOverrides_SuppressReservedArgRejected(t *testing.T) {
 		"spec.integration.engineOverrides.suppressArgs[0]", "\"vllm\"")
 }
 
+func TestValidator_TypedVLLMMPReservedSurfaceRejected(t *testing.T) {
+	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
+	cb := validPodLocalMPBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
+		EngineOverrides: &cachev1alpha1.EngineInjectionOverrides{
+			SuppressArgs: []string{"--disable-hybrid-kv-cache-manager"},
+		},
+	}
+	requireInvalidWithCause(t, v, cb,
+		"spec.integration.engineOverrides.suppressArgs[0]",
+		"--disable-hybrid-kv-cache-manager")
+}
+
 func TestValidator_EngineOverrides_OverrideReservedArgRejected(t *testing.T) {
 	v := &CacheBackendValidator{Registry: stubRegistry()}
 	// Two forms: bare flag and equals form. Both must trip the rule, since

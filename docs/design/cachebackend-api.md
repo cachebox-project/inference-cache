@@ -188,9 +188,48 @@ Limits-only shapes admit unchanged for any resource — K8s auto-populates `requ
 **Resource names must match K8s container-resource rules.** `ResourceList` keys are opaque map keys at the CRD-schema layer; an invalid name like `"foo"` or `""` persists in etcd and only fails when the apiserver later rejects the child pod. The validating webhook (`rejectInvalidResourceNames`) applies the same rules the apiserver applies to a `Container.Resources` map: standard names (`cpu`, `memory`, `ephemeral-storage`) admit unconditionally; a `hugepages-<size>` name admits only when the size suffix parses as a strictly-positive `resource.Quantity` (e.g. `"hugepages-2Mi"`, `"hugepages-1Gi"` — a bare `"hugepages-"` or non-numeric `"hugepages-nope"` is rejected because the apiserver requires the size token); any other name must be **third-party vendor-prefixed** (e.g. `"nvidia.com/gpu"`) and pass `IsQualifiedName`. A bare unqualified `"foo"` is rejected even though `IsQualifiedName` alone admits it, because the apiserver's container-resource layer requires extended resources to carry a vendor identity. Names under the **K8s-reserved prefixes `kubernetes.io/` and `requests.kubernetes.io/`** are also rejected — those prefixes are reserved for native resources, so extended resources may not use them. The rejection names the offending key so multi-key errors surface together.
 
 **Inert without a controller-managed workload.** Host-only, externally owned,
-and `SGLangHiCache` configurations provision no cache-server workload of their
-own. HiCache host memory belongs to the user-owned engine container and must be
-sized on that workload instead.
+and `SGLangHiCache` configurations provision no provider Deployment or Service.
+Typed PodLocal LMCache still injects its server into each matching engine Pod as
+a native sidecar. HiCache host memory belongs to the user-owned engine container
+and must be sized on that workload instead.
+
+### vLLM typed PodLocal LMCache MP support
+
+The typed shape `spec.runtime: VLLM`, `spec.type: LMCache`, and
+`spec.lmCache.topology: PodLocal` selects a dedicated MP adapter; it does not
+reuse the legacy `LMCacheConnectorV1` / `lm://` path. The engine image remains
+owned by the inference runtime. To make that image's capability explicit, each
+matching Pod must declare:
+
+```yaml
+metadata:
+  annotations:
+    inferencecache.io/lmcache-connector-profile: vllm-lmcache-mp-v1
+    inferencecache.io/lmcache-client-version: "0.5.3"
+```
+
+The webhook injects a digest-pinned `lmcache-mp-server` native sidecar and adds
+the following vLLM launch contract:
+
+- `--kv-transfer-config` selects `LMCacheMPConnector` through
+  `lmcache.integration.vllm.lmcache_mp_connector`, points it at
+  `tcp://127.0.0.1:<podLocal.server.port>`, and maps the integration role to
+  `kv_consumer`, `kv_producer`, or `kv_both`;
+- `--disable-hybrid-kv-cache-manager` is required by the initial pinned
+  profile;
+- `PYTHONHASHSEED=0` stabilizes vLLM's cross-process hash chain;
+- `INFERENCECACHE_FAIL_OPEN` mirrors the API setting, although runtime-native
+  failure behavior still requires GPU validation.
+
+The typed adapter accepts host-only or RESP bindings. Redis credentials are
+mounted into the MP server from `SecretKeyRef`; they are not copied into the
+vLLM container. LMCache 0.5.3 TLS and logical-database selection remain rejected
+because that RESP adapter cannot consume them. The initial adapter admits TP
+but rejects PP/DP greater than one and external multi-process DP flags. These
+checks and persisted webhook injection are covered without GPU; the pinned
+vLLM image/version, KV reuse, TP determinism, and failure recovery remain Phase
+4 runtime gates. Canonical examples are the three
+`config/samples/cachebackend-vllm-podlocal-*.yaml` files.
 
 ### SGLang engine support
 
@@ -213,7 +252,7 @@ adapter configures the node-local MP worker and accepts either no binding
 Redis workload only when `spec.remoteStorage` explicitly selects
 `provider: Redis`, `ownership: Managed`.
 
-> **Cluster prerequisite — Kubernetes ≥ 1.29 (REQUIRED for the SGLang MP wire).** The MP worker is injected as a **native sidecar** — an `initContainers` entry with `restartPolicy: Always`, which K8s only understands from 1.29 (beta, on by default; stable 1.33). On an older cluster the apiserver does not recognize that field, so a `(sglang, LMCache)` engine pod **fails admission** (or the worker degrades to a plain init container that exits before the engine starts) rather than failing open — the one place this pair has a hard cluster-version floor. vLLM+LMCache and the routing-only path have no such floor. There is no in-webhook version gate today; operators on the SGLang pair must run 1.29+.
+> **Cluster prerequisite — Kubernetes ≥ 1.29 (REQUIRED for typed PodLocal LMCache).** The MP server is injected as a **native sidecar** — an `initContainers` entry with `restartPolicy: Always`, which K8s only understands from 1.29 (beta, on by default; stable 1.33). On an older cluster the apiserver does not recognize that field, so a typed SGLang or vLLM PodLocal engine pod fails admission (or the server degrades to a plain init container that exits before the engine starts). There is no in-webhook version gate today; operators using typed PodLocal LMCache must run 1.29+.
 
 > **Two more caveats on the SGLang support surface** (details below): (1) server-derived `LookupRoute` with raw `token_ids`/`prompt_text` only hits when the server's single global `--engine-block-size` matches SGLang's page size (see the "Block-size alignment" note later in this section); gateways that send pre-computed `prefix_hash`/`block_hashes` are unaffected. (2) The `lmcache-kernel-check` init container is vLLM-only today (the SGLang adapter does not implement `InitContainerProvider`), so `EngineKernelsHealthy` is not published for SGLang pods.
 
@@ -730,7 +769,7 @@ flag/env and the adapter. Warning-only would let a user silently un-wire the
 integration and discover it via a crashed engine; the hard-reject keeps the
 breadcrumb at admission time.
 
-The vLLM+LMCache adapter (`internal/adapters/builtin/runtime/vllm_lmcache.go`) reserves the args/env the integration cannot function without:
+The legacy vLLM+LMCache adapter (`internal/adapters/builtin/runtime/vllm_lmcache.go`) reserves the args/env the integration cannot function without:
 
 - `ReservedArgs()`: `--kv-transfer-config` (the LMCache connector wiring).
 - `ReservedEnv()`: `VLLM_USE_V1` (selects the engine codepath the connector targets), `LMCACHE_REMOTE_URL` (the resolved cache endpoint), `INFERENCECACHE_FAIL_OPEN` (mirror of `spec.integration.failOpen` — overriding it would silently desync the pod from the CR contract), `PYTHONHASHSEED` (pins the deterministic `NONE_HASH` so LMCache reload matches under TP>1 — overriding or suppressing it silently 0-hits reload).
@@ -742,6 +781,12 @@ binding's protocol and endpoint. Admission therefore rejects
 an override that would remove connector wiring regardless of provider
 ownership. See
 [Mooncake provider configuration](#mooncake-provider-configuration).
+
+The typed PodLocal vLLM MP adapter reserves a narrower and different set:
+`ReservedArgs()` = `--kv-transfer-config`,
+`--disable-hybrid-kv-cache-manager`; `ReservedEnv()` = `PYTHONHASHSEED`,
+`INFERENCECACHE_FAIL_OPEN`. It does not inject or reserve
+`LMCACHE_REMOTE_URL`, `VLLM_USE_V1`, or the legacy serde/local-CPU variables.
 
 The SGLang+LMCache adapter (`internal/adapters/builtin/runtime`) reserves a **different** set, because SGLang's engine-side wire is the LMCache MP wire, not the `lm://` one (see [SGLang engine support](#sglang-engine-support)): `ReservedArgs()` = `--enable-lmcache`, `--lmcache-config-file`; `ReservedEnv()` = `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN`. Suppressing `--lmcache-config-file` un-wires MP mode (the engine aborts at startup without it), hence its reservation. In MP mode the lm:// `LMCACHE_REMOTE_URL` is neither injected nor reserved, and `VLLM_USE_V1` / `PYTHONHASHSEED` are never injected for SGLang. Reservation is per-adapter precisely so each engine guards only the flags/env its own integration cannot function without.
 

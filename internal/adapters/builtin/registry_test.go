@@ -37,6 +37,36 @@ func TestNewIncludesEveryShippingRuntimeAdapter(t *testing.T) {
 	}
 }
 
+func TestNewSelectsTypedVLLMMPBeforeLegacyAdapter(t *testing.T) {
+	t.Parallel()
+
+	registry := New(Options{}).Runtime
+	typed := &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
+		Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+		Type:    cachev1alpha1.CacheBackendTypeLMCache,
+		LMCache: &cachev1alpha1.LMCacheEngineSpec{Topology: cachev1alpha1.LMCacheTopologyPodLocal},
+	}}
+	adapter, err := registry.Select(adapterruntime.RuntimeVLLM, typed)
+	if err != nil {
+		t.Fatalf("Select typed vLLM adapter: %v", err)
+	}
+	if _, ok := adapter.(adapterruntime.LMCacheMPRuntimeAdapter); !ok {
+		t.Fatalf("typed vLLM adapter = %T, want LMCacheMPRuntimeAdapter", adapter)
+	}
+
+	legacy := &cachev1alpha1.CacheBackend{Spec: cachev1alpha1.CacheBackendSpec{
+		Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+		Type:    cachev1alpha1.CacheBackendTypeLMCache,
+	}}
+	adapter, err = registry.Select(adapterruntime.RuntimeVLLM, legacy)
+	if err != nil {
+		t.Fatalf("Select legacy vLLM adapter: %v", err)
+	}
+	if _, ok := adapter.(adapterruntime.LMCacheMPRuntimeAdapter); ok {
+		t.Fatalf("legacy vLLM adapter = %T, unexpectedly implements LMCacheMPRuntimeAdapter", adapter)
+	}
+}
+
 func TestNewIncludesShippingStorageProviders(t *testing.T) {
 	t.Parallel()
 

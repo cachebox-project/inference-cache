@@ -356,6 +356,101 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("typed native sidecar metrics label %s = %q, want %q",
 			LabelLMCacheMPMetrics, got, LabelLMCacheMPMetricsEnabled)
 	}
+
+	// Typed vLLM PodLocal smoke: prove the dedicated MP adapter, external
+	// connector module path, deterministic hash seed, and common native sidecar
+	// survive real apiserver admission/defaulting. This remains a control-plane
+	// test; envtest has no kubelet or GPU runtime.
+	vllmMPCB := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "vllm-mp", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{
+				"app": "vllm-mp-test",
+			}},
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+				PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+					Image:      "registry.example.com/lmcache@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+					Port:       6555,
+					L1Capacity: resource.MustParse("1Gi"),
+					MaxWorkers: 2,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("3Gi")},
+					},
+				}},
+			},
+		},
+	}
+	if err := mgr.GetClient().Create(ctx, vllmMPCB); err != nil {
+		t.Fatalf("create typed vLLM CacheBackend: %v", err)
+	}
+	vllmMPPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vllm-mp-engine",
+			Namespace: ns,
+			Labels:    map[string]string{"app": "vllm-mp-test"},
+			Annotations: map[string]string{
+				"inferencecache.io/lmcache-connector-profile": "vllm-lmcache-mp-v1",
+				"inferencecache.io/lmcache-client-version":    "0.5.3",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "vllm", Image: "vllm:connector-ready", Args: []string{"--model", "model-a", "--tensor-parallel-size=2"},
+		}}},
+	}
+	if err := mgr.GetClient().Create(ctx, vllmMPPod); err != nil {
+		t.Fatalf("create typed vLLM Pod: %v", err)
+	}
+	var gotVLLMMP corev1.Pod
+	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: vllmMPPod.Name}, &gotVLLMMP); err != nil {
+		t.Fatalf("get typed vLLM Pod: %v", err)
+	}
+	var vllmMPServer *corev1.Container
+	for index := range gotVLLMMP.Spec.InitContainers {
+		if gotVLLMMP.Spec.InitContainers[index].Name == "lmcache-mp-server" {
+			vllmMPServer = &gotVLLMMP.Spec.InitContainers[index]
+			break
+		}
+	}
+	if vllmMPServer == nil || vllmMPServer.RestartPolicy == nil || *vllmMPServer.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("typed vLLM native sidecar = %+v", vllmMPServer)
+	}
+	vllmConfig := envtestArgValue(gotVLLMMP.Spec.Containers[0].Args, "--kv-transfer-config")
+	if !strings.Contains(vllmConfig, `"kv_connector":"LMCacheMPConnector"`) ||
+		!strings.Contains(vllmConfig, `"kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector"`) ||
+		!strings.Contains(vllmConfig, `"lmcache.mp.host":"tcp://127.0.0.1"`) {
+		t.Fatalf("typed vLLM kv-transfer-config = %q", vllmConfig)
+	}
+	if !envtestHasContainerEnvValue(&gotVLLMMP, "PYTHONHASHSEED", "0") {
+		t.Fatalf("typed vLLM Pod is missing PYTHONHASHSEED=0: %+v", gotVLLMMP.Spec.Containers[0].Env)
+	}
+}
+
+func envtestArgValue(args []string, flag string) string {
+	for index, arg := range args {
+		if arg == flag && index+1 < len(args) {
+			return args[index+1]
+		}
+		if strings.HasPrefix(arg, flag+"=") {
+			return strings.TrimPrefix(arg, flag+"=")
+		}
+	}
+	return ""
+}
+
+func envtestHasContainerEnvValue(pod *corev1.Pod, name, value string) bool {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return false
+	}
+	for _, entry := range pod.Spec.Containers[0].Env {
+		if entry.Name == name && entry.Value == value {
+			return true
+		}
+	}
+	return false
 }
 
 // mustHaveContainerEnv fails the test if the first container's env array

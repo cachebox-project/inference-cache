@@ -82,6 +82,10 @@
 #      pinned to an impossible node selector. The smoke reads the persisted Pod
 #      back and asserts the common lmcache-mp-server native sidecar, probes,
 #      resources, shared mounts, engine flags/env, and injection identity.
+#   8e. Typed vLLM PodLocal admission: a matching, connector-declared vLLM Pod
+#      is persisted through the same live webhook and carries the dedicated
+#      LMCacheMPConnector module path, loopback MP endpoint, deterministic hash
+#      seed, hybrid-manager guard, and no legacy lm:// environment.
 #   9. Canonical External ownership end-to-end: applying the committed
 #      config/samples/cachebackend-external.yaml drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO
@@ -376,6 +380,8 @@ CANONICAL_HOST_ONLY_CB="cachebackend-sglang-host-only"
 CANONICAL_REDIS_CB="cachebackend-sglang"
 CANONICAL_TYPED_CB="sglang-podlocal-host-only"
 CANONICAL_TYPED_POD="sglang-podlocal-admission"
+CANONICAL_TYPED_VLLM_CB="vllm-podlocal-host-only"
+CANONICAL_TYPED_VLLM_POD="vllm-podlocal-admission"
 
 # Events-only-backend smoke fixture identifiers. Declared up front so the
 # diagnostics helper can reference them even if the smoke aborts before the
@@ -456,6 +462,8 @@ collect_diagnostics() {
     >"$LOG_DIR/canonical-provider-workloads.yaml" 2>&1 || true
   kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" -o yaml \
     >"$LOG_DIR/sglang-podlocal-admission.yaml" 2>&1 || true
+  kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" -o yaml \
+    >"$LOG_DIR/vllm-podlocal-admission.yaml" 2>&1 || true
   # External-backend smoke artefacts. Best-effort — the CR/pod may not
   # exist if the smoke aborted before that section.
   kubectl get cb -A -o wide \
@@ -2352,6 +2360,93 @@ case " $typed_engine_mounts " in
      fail "typed SGLang engine config mount is missing: $typed_engine_mounts" ;;
 esac
 log "typed SGLang PodLocal Pod persisted with the common MP native sidecar and complete engine wire"
+
+kubectl -n "$CANONICAL_SMOKE_NS" apply \
+  -f config/samples/cachebackend-vllm-podlocal-host-only.yaml >/dev/null \
+  || fail "typed vLLM PodLocal CacheBackend sample failed to apply"
+
+typed_vllm_pod="$(mktemp "$tmpdir/vllm-podlocal-admission.XXXXXX.yaml")"
+cat >"$typed_vllm_pod" <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-podlocal-admission
+  labels:
+    inferencecache.io/runtime: vllm-mp
+  annotations:
+    inferencecache.io/lmcache-connector-profile: vllm-lmcache-mp-v1
+    inferencecache.io/lmcache-client-version: "0.5.3"
+spec:
+  nodeSelector:
+    inferencecache.io/install-smoke-never-schedule: "true"
+  containers:
+    - name: vllm
+      image: example.invalid/vllm-lmcache@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+      args:
+        - --model=meta-llama/Meta-Llama-3-8B-Instruct
+        - --tensor-parallel-size=2
+EOF
+kubectl -n "$CANONICAL_SMOKE_NS" create -f "$typed_vllm_pod" >/dev/null \
+  || fail "matching typed vLLM Pod did not pass the live mutating webhook"
+
+typed_vllm_injected_by="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" \
+  -o jsonpath='{.metadata.annotations.inferencecache\.io/injected-by}' 2>/dev/null || true)"
+typed_vllm_metrics_label="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" \
+  -o jsonpath='{.metadata.labels.inferencecache\.io/lmcache-mp-metrics}' 2>/dev/null || true)"
+typed_vllm_server_image="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" \
+  -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-mp-server")].image}' 2>/dev/null || true)"
+typed_vllm_server_restart="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" \
+  -o jsonpath='{.spec.initContainers[?(@.name=="lmcache-mp-server")].restartPolicy}' 2>/dev/null || true)"
+typed_vllm_engine_args="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" \
+  -o jsonpath='{.spec.containers[?(@.name=="vllm")].args}' 2>/dev/null || true)"
+typed_vllm_config="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" -o json \
+  | jq -r '.spec.containers[] | select(.name == "vllm") | .args as $args | ($args | index("--kv-transfer-config")) as $index | if $index == null then "" else $args[$index + 1] end')"
+typed_vllm_hash_seed="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" \
+  -o jsonpath='{.spec.containers[?(@.name=="vllm")].env[?(@.name=="PYTHONHASHSEED")].value}' 2>/dev/null || true)"
+typed_vllm_legacy_url="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" \
+  -o jsonpath='{.spec.containers[?(@.name=="vllm")].env[?(@.name=="LMCACHE_REMOTE_URL")].value}' 2>/dev/null || true)"
+typed_vllm_engine_mounts="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" \
+  -o jsonpath='{.spec.containers[?(@.name=="vllm")].volumeMounts[*].mountPath}' 2>/dev/null || true)"
+
+if [ "$typed_vllm_injected_by" != "$CANONICAL_SMOKE_NS/$CANONICAL_TYPED_VLLM_CB" ] || \
+   [ "$typed_vllm_metrics_label" != "true" ] || \
+   [ "$typed_vllm_server_image" != "$expected_mp_image" ] || \
+   [ "$typed_vllm_server_restart" != "Always" ] || \
+   [ "$typed_vllm_hash_seed" != "0" ] || \
+   [ -n "$typed_vllm_legacy_url" ]; then
+  kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" -o yaml || true
+  fail "typed vLLM persisted wire metadata is wrong: injectedBy=$typed_vllm_injected_by metrics=$typed_vllm_metrics_label image=$typed_vllm_server_image restart=$typed_vllm_server_restart hashSeed=$typed_vllm_hash_seed legacyURL=$typed_vllm_legacy_url"
+fi
+if ! jq -e '
+    .kv_connector == "LMCacheMPConnector" and
+    .kv_connector_module_path == "lmcache.integration.vllm.lmcache_mp_connector" and
+    .kv_role == "kv_both" and
+    .kv_connector_extra_config["lmcache.mp.host"] == "tcp://127.0.0.1" and
+    .kv_connector_extra_config["lmcache.mp.port"] == "5555"
+  ' >/dev/null <<<"$typed_vllm_config"; then
+  kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" -o yaml || true
+  fail "typed vLLM connector JSON is wrong: $typed_vllm_config"
+fi
+if ! jq -e '
+    index("--tensor-parallel-size=2") != null and
+    index("--disable-hybrid-kv-cache-manager") != null and
+    index("--kv-transfer-config") != null
+  ' >/dev/null <<<"$typed_vllm_engine_args"; then
+  kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" -o yaml || true
+  fail "typed vLLM engine args are incomplete: $typed_vllm_engine_args"
+fi
+case " $typed_vllm_engine_mounts " in
+  *" /dev/shm "*) : ;;
+  *) kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" -o yaml || true
+     fail "typed vLLM engine /dev/shm mount is missing: $typed_vllm_engine_mounts" ;;
+esac
+case " $typed_vllm_engine_mounts " in
+  *" /var/run/inference-cache/lmcache "*)
+    kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_VLLM_POD" -o yaml || true
+    fail "typed vLLM unexpectedly received the SGLang YAML config mount: $typed_vllm_engine_mounts" ;;
+esac
+log "typed vLLM PodLocal Pod persisted with the dedicated external MP connector wire"
 
 kubectl delete namespace "$CANONICAL_SMOKE_NS" \
   --wait=false --ignore-not-found=true >/dev/null 2>&1 || true

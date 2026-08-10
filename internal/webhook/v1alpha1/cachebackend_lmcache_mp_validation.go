@@ -293,9 +293,10 @@ func validateMPServerResourceRequirements(resources corev1.ResourceRequirements,
 	return errs
 }
 
-// rejectUnimplementedRedisBindingFeatures permits the Phase-2 SGLang MP auth
-// path while keeping every unsupported LMCache 0.5.3 RESP feature explicit.
-// That adapter supports username/password, but not TLS or logical database
+// rejectUnimplementedRedisBindingFeatures permits authentication for typed
+// PodLocal LMCache MP adapters while keeping every unsupported LMCache 0.5.3
+// RESP feature explicit. The common MP server renderer supports
+// username/password for both SGLang and vLLM, but not TLS or logical database
 // selection. Managed Redis currently provisions the default user, so its
 // password may be configured but an ACL username may not.
 func rejectUnimplementedRedisBindingFeatures(cb *cachev1alpha1.CacheBackend) field.ErrorList {
@@ -307,11 +308,14 @@ func rejectUnimplementedRedisBindingFeatures(cb *cachev1alpha1.CacheBackend) fie
 	var errs field.ErrorList
 	if redis.Authentication != nil {
 		authPath := path.Child("authentication")
-		isSGLangMP := cb.Spec.Runtime == cachev1alpha1.CacheBackendRuntimeSGLang &&
-			cb.Spec.LMCache != nil && cb.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal
-		if !isSGLangMP {
+		isTypedPodLocalMP := cb.Spec.LMCache != nil &&
+			cb.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache &&
+			cb.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal &&
+			(cb.Spec.Runtime == cachev1alpha1.CacheBackendRuntimeSGLang ||
+				cb.Spec.Runtime == cachev1alpha1.CacheBackendRuntimeVLLM)
+		if !isTypedPodLocalMP {
 			errs = append(errs, field.Forbidden(authPath,
-				"Redis authentication is currently rendered only by the SGLang PodLocal LMCache MP adapter"))
+				"Redis authentication is currently rendered only by a typed PodLocal LMCache MP adapter"))
 		} else {
 			if redis.Authentication.Username != nil {
 				errs = append(errs, validateRedisSecretKeySelector(*redis.Authentication.Username, authPath.Child("username"))...)

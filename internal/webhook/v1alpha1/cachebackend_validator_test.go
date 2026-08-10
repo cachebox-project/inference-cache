@@ -49,6 +49,7 @@ func i32p(v int32) *int32 { return &v }
 
 func defaultShippingRegistry() *adapterruntime.Registry {
 	registry := adapterruntime.NewRegistry()
+	registry.Register(builtinruntime.NewVLLMLMCacheMPAdapter(builtinruntime.SubscriberConfig{}))
 	registry.Register(builtinruntime.NewVLLMLMCacheAdapter(builtinruntime.SubscriberConfig{}))
 	registry.Register(builtinruntime.NewSGLangLMCacheAdapter(builtinruntime.SubscriberConfig{}))
 	registry.Register(builtinruntime.NewSGLangHiCacheAdapter(builtinruntime.SubscriberConfig{}))

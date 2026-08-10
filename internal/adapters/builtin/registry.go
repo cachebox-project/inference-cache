@@ -34,6 +34,7 @@ func New(opts Options) Registries {
 		PolicyServerGRPCAddress: opts.PolicyServerGRPCAddress,
 	}
 	runtimeRegistry := adapterruntime.NewRegistry()
+	runtimeRegistry.Register(builtinruntime.NewVLLMLMCacheMPAdapter(subscriber))
 	runtimeRegistry.Register(builtinruntime.NewVLLMLMCacheAdapter(subscriber))
 	runtimeRegistry.Register(builtinruntime.NewSGLangLMCacheAdapter(subscriber))
 	runtimeRegistry.Register(builtinruntime.NewSGLangHiCacheAdapter(subscriber))

@@ -297,7 +297,7 @@ func TestRejectUnimplementedRedisBindingFeatures(t *testing.T) {
 	}
 }
 
-func TestValidateRedisAuthenticationForSGLangPodLocal(t *testing.T) {
+func TestValidateRedisAuthenticationForTypedPodLocal(t *testing.T) {
 	newAuthBackend := func(ownership cachev1alpha1.CacheBackendRemoteStorageOwnership) *cachev1alpha1.CacheBackend {
 		cb := validPodLocalMPBackend()
 		cb.Name = "mp"
@@ -376,12 +376,34 @@ func TestValidateRedisAuthenticationForSGLangPodLocal(t *testing.T) {
 		}
 	})
 
-	t.Run("vLLM remains rejected until its MP adapter lands", func(t *testing.T) {
+	t.Run("vLLM PodLocal admitted", func(t *testing.T) {
 		cb := newAuthBackend(cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal)
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		if errs := rejectUnimplementedRedisBindingFeatures(cb); len(errs) != 0 {
+			t.Fatalf("authentication errors = %v", errs)
+		}
+		if _, err := shippingValidator().ValidateCreate(context.Background(), cb); err != nil {
+			t.Fatalf("ValidateCreate: %v", err)
+		}
+	})
+
+	t.Run("legacy vLLM remains rejected", func(t *testing.T) {
+		cb := newAuthBackend(cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal)
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		cb.Spec.LMCache.Topology = ""
+		cb.Spec.LMCache.PodLocal = nil
 		errs := rejectUnimplementedRedisBindingFeatures(cb)
-		if len(errs) != 1 || !strings.Contains(errs[0].Error(), "SGLang PodLocal") {
-			t.Fatalf("errors = %v, want runtime-scoped rejection", errs)
+		if len(errs) != 1 || !strings.Contains(errs[0].Error(), "typed PodLocal LMCache MP") {
+			t.Fatalf("errors = %v, want topology-scoped rejection", errs)
+		}
+	})
+
+	t.Run("non-LMCache type remains rejected", func(t *testing.T) {
+		cb := newAuthBackend(cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal)
+		cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+		errs := rejectUnimplementedRedisBindingFeatures(cb)
+		if len(errs) != 1 || !strings.Contains(errs[0].Error(), "typed PodLocal LMCache MP") {
+			t.Fatalf("errors = %v, want cache-type-scoped rejection", errs)
 		}
 	})
 }

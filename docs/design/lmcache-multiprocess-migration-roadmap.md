@@ -357,7 +357,7 @@ the legacy deprecation writer is only implemented if Phase 6 is activated.
 | 1 | MP-only API and admission/status contracts | Phase 0 | complete |
 | 2 | Engine-neutral PodLocal MP server renderer | Phase 1 | complete |
 | 3 | Production-credible SGLang PodLocal MP baseline | Phase 2 | in progress — non-GPU baseline complete; GPU matrix pending |
-| 4 | vLLM PodLocal MP, host-only and Redis | Phase 3 | not started |
+| 4 | vLLM PodLocal MP, host-only and Redis | Phase 3 | in progress — non-GPU control-plane baseline complete; engine/GPU matrix pending |
 | 5 | Repository consumer migration; migration tooling only if needed | Phase 4 | not started |
 | 6 | Conditional compatibility gate if legacy consumers appear | Phase 5 | not required by Phase 0 finding |
 | 7 | Remove IP, `lm://`, and LMCacheServer provider | Phase 5; Phase 6 only when applicable | not started |
@@ -763,32 +763,94 @@ is complete. No Phase 3 GPU data-path or runtime-failure result is claimed yet.
 Provide the complete replacement for the current vLLM IP path before any IP
 consumer is forced to migrate.
 
+Current state: the dedicated adapter and non-GPU control-plane baseline are
+complete. No vLLM process has loaded the connector and no GPU KV operation or
+runtime failure/recovery result is claimed yet. Phase 3's remaining GPU work
+does not block this independent adapter work, but both phases retain their GPU
+exit gates.
+
+### Completed non-GPU validation
+
+- [x] Inspect the exact LMCache 0.5.3 source and its operator golden config.
+      The required vLLM wire is the external `LMCacheMPConnector` module
+      `lmcache.integration.vllm.lmcache_mp_connector`, with
+      `lmcache.mp.host` and `lmcache.mp.port` in
+      `kv_connector_extra_config`. This is source-level contract evidence, not
+      proof that the pinned vLLM reference image contains a compatible vLLM.
+- [x] Add a dedicated typed vLLM MP adapter and register it before the legacy
+      vLLM adapter. Registry tests prove typed PodLocal objects select MP while
+      topology-less objects retain the legacy adapter during the compatibility
+      window.
+- [x] Require the engine owner to declare connector profile
+      `vllm-lmcache-mp-v1` and LMCache client version `0.5.3`; a missing or
+      mismatched declaration admits the Pod unchanged with a fail-open
+      diagnostic rather than guessing from its image name.
+- [x] Render the exact connector module, loopback address, configured port, and
+      role mapping (`ReadOnly`/`WriteOnly`/`ReadWrite` to
+      `kv_consumer`/`kv_producer`/`kv_both`).
+- [x] Reuse the engine-neutral PodLocal renderer for the digest-pinned native
+      sidecar, bounded `/dev/shm`, probes, resources, and optional RESP L2.
+      Redis username/password remain `SecretKeyRef` values on the MP server and
+      are never copied into engine arguments or environment variables.
+- [x] Remove legacy `LMCACHE_REMOTE_URL`, serde, chunk, and local-CPU env from
+      the typed wire; vLLM consumes connector JSON instead of SGLang's client
+      YAML volume.
+- [x] Inject `PYTHONHASHSEED=0`, reserve the connector/hybrid arguments and
+      correctness-critical env, and preserve atomic/idempotent mutation.
+- [x] Accept positive TP declarations, reject PP or DP greater than one,
+      external/multi-process DP flags, malformed/duplicate parallel flags, and
+      inject `--disable-hybrid-kv-cache-manager` for the initial profile.
+- [x] Add typed host-only, managed-Redis, and external-Redis vLLM samples. All
+      three pass real envtest API-server admission; the external profile's
+      Secret-backed authentication is accepted while TLS/database remain
+      explicitly unsupported by LMCache 0.5.3.
+- [x] Persist a typed vLLM Pod through envtest kube-apiserver/etcd and verify
+      the external connector module, loopback MP address, deterministic hash
+      seed, and common native-sidecar schema.
+- [x] Install the controller and webhooks in a Kubernetes 1.32 kind cluster,
+      create a connector-declared vLLM Pod through the live mutating webhook,
+      read the persisted object back from etcd, and verify the exact MP wire.
+      An impossible node selector kept the Pod unscheduled, so neither the
+      engine nor MP server ran and no engine image was pulled.
+- [x] Pass the non-GPU regression gates: full Go tests, focused envtest,
+      sample verification (27 pass, 2 intentional skips), default-install
+      smoke, Go vet, Prometheus rules, naming/internal-reference checks, docs
+      sync, and REUSE lint.
+
+The pinned 29 GiB vLLM reference image was deliberately not pulled or built for
+this non-GPU baseline. Recording its exact `vllm.__version__`, importing the
+connector inside that image, and exercising the engine CLI remain the first
+runtime preflight before GPU testing.
+
 ### Engine wire
 
-- [ ] Add a dedicated vLLM MP adapter; do not mutate the legacy adapter in place.
-- [ ] Render `LMCacheMPConnector` with:
-  - `kv_connector_module_path` selecting the pinned implementation required by
-    D11;
-  - `kv_role` derived from `integration.role`;
-  - `lmcache.mp.host=127.0.0.1`;
-  - the configured MP port;
-  - validated MQ timeout/heartbeat settings when exposed;
-  - runtime-native load-failure recompute/fail-open behavior.
-- [ ] Preserve `PYTHONHASHSEED=0` across scheduler and worker processes.
-- [ ] Reserve only correctness-critical args/env owned by the adapter.
-- [ ] Reject hybrid/parallelism combinations not supported by the pinned
-      vLLM/LMCache tuple.
+- [x] Add a dedicated vLLM MP adapter; do not mutate the legacy adapter in place.
+- [x] Render the connector module path, role, loopback host, and configured MP
+      port in `LMCacheMPConnector` JSON.
+- [ ] Add MQ timeout/heartbeat fields only when a pinned public configuration
+      surface exists. LMCache 0.5.3 currently supplies internal defaults, so
+      the API and renderer do not invent unsupported knobs.
+- [ ] Prove runtime-native load-failure recompute/fail-open behavior.
+- [x] Inject `PYTHONHASHSEED=0`; cross-process hash determinism still requires
+      the GPU/runtime test below.
+- [x] Reserve only correctness-critical args/env owned by the typed adapter.
+- [ ] Complete hybrid/parallelism classification for the pinned tuple. The
+      deterministic Pod-visible PP/DP restrictions and hybrid-manager guard are
+      implemented; MLA/model-specific behavior remains runtime validation.
 
 ### Functional scope
 
 - [ ] vLLM + PodLocal + no remote L3.
 - [ ] vLLM + PodLocal + managed Redis development profile.
 - [ ] vLLM + PodLocal + external Redis production profile.
-- [ ] ReadOnly, WriteOnly, and ReadWrite roles.
+- [x] ReadOnly, WriteOnly, and ReadWrite connector JSON rendering. Runtime KV
+      behavior remains part of the GPU matrix.
 - [ ] TP=1 and TP=2; TP=4 before recommending the topology for common multi-GPU
       production workloads.
 - [ ] Multi-server, DP + multi-server, and unsupported PP/MLA combinations are
-      rejected, not silently attempted.
+      rejected, not silently attempted. PP>1, DP>1, and external DP flags are
+      already rejected from Pod-visible arguments; multi-server and MLA
+      classification remain pending.
 
 ### Correctness and failure tests
 
