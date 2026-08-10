@@ -355,7 +355,7 @@ the legacy deprecation writer is only implemented if Phase 6 is activated.
 |---|---|---|---|
 | 0 | Design freeze, consumer audit, version/Kubernetes baseline | none | complete |
 | 1 | MP-only API and admission/status contracts | Phase 0 | complete |
-| 2 | Engine-neutral PodLocal MP server renderer | Phase 1 | not started |
+| 2 | Engine-neutral PodLocal MP server renderer | Phase 1 | complete |
 | 3 | Production-credible SGLang PodLocal MP baseline | Phase 2 | not started |
 | 4 | vLLM PodLocal MP, host-only and Redis | Phase 3 | not started |
 | 5 | Repository consumer migration; migration tooling only if needed | Phase 4 | not started |
@@ -481,8 +481,10 @@ minimum compatibility surface needed to migrate existing IP objects.
 - [x] Define structured remote-provider bindings that can grow beyond
       `Binding{Protocol, Endpoint}` to carry credentials, TLS, and adapter
       parameters without stringly typed engine overrides. Typed Redis
-      credential/TLS/database fields are rejected until Phase 2 renders them,
-      so credentials cannot be accepted and silently ignored.
+      credential/TLS/database fields initially reject unsupported use, so they
+      cannot be accepted and silently ignored; Phase 2 enables Secret-backed
+      SGLang RESP authentication while retaining explicit TLS/database
+      rejections for the pinned adapter.
 - [x] Define connector and remote-storage status separately.
 - [x] Define how a workload declares or exposes its engine and LMCache-client
       capability/version without allowing CacheBackend to rewrite the engine
@@ -510,6 +512,10 @@ the required connector import/entry point and record the package version before
 publishing that declaration. At Pod admission, the selected typed MP adapter
 compares the declaration with its required profile and validates observable
 engine args/resources; admission never pulls the image or contacts a registry.
+Successful mutation also stamps the CacheBackend generation rendered into the
+immutable Pod. `ConnectorReady` treats an older generation as unverified until
+the inference owner recreates or rolls that Pod; a CacheBackend spec update
+cannot retroactively rewrite a running engine Pod.
 An absent/mismatched declaration, an adapter that has not implemented the typed
 MP contract, or an unclassifiable engine topology is admitted fail-open without
 cache mutation and with an actionable diagnostic. CacheBackend never rewrites
@@ -576,53 +582,75 @@ depends on it.
 
 ### Refactoring work
 
-- [ ] Introduce an engine-neutral internal MP server configuration model.
-- [ ] Extract native-sidecar, config-volume, `/dev/shm`, resources, probes,
+- [x] Introduce an engine-neutral internal MP server configuration model.
+- [x] Extract native-sidecar, config-volume, `/dev/shm`, resources, probes,
       security context, and L3 adapter rendering from
       `sglang_lmcache_wire.go`.
-- [ ] Keep engine launch surfaces separate:
+- [x] Keep engine launch surfaces separate:
   - SGLang config file and `--enable-lmcache`;
   - vLLM `LMCacheMPConnector` JSON and deterministic hash settings.
-- [ ] Preserve atomic and idempotent Pod mutation.
-- [ ] Preserve reserved-name and mount-collision checks.
+- [x] Preserve atomic and idempotent Pod mutation.
+- [x] Preserve reserved-name and mount-collision checks.
 
 ### Runtime work
 
-- [ ] Replace `python3 -m lmcache.v1.multiprocess.server` with the supported
+- [x] Replace `python3 -m lmcache.v1.multiprocess.server` with the supported
       `lmcache server` entry point for the pinned LMCache version.
-- [ ] Add HTTP startup, readiness, and liveness probes.
-- [ ] Expose/scrape Prometheus metrics.
-- [ ] Add typed worker-pool sizing (`maxWorkers` initially; split GPU/CPU pools
+- [x] Add HTTP startup, readiness, and liveness probes.
+- [x] Expose/scrape Prometheus metrics.
+- [x] Add typed worker-pool sizing (`maxWorkers` initially; split GPU/CPU pools
       when required by the pinned version and test matrix).
-- [ ] Add explicit CPU, memory, and optional ephemeral-storage resources.
-- [ ] Stop defaulting the MP sidecar to the engine image. Select the
+- [x] Add explicit CPU, memory, and optional ephemeral-storage resources.
+- [x] Stop defaulting the MP sidecar to the engine image. Select the
       CacheBackend-owned standalone server image by digest without modifying the
       engine container image.
-- [ ] Let each runtime adapter declare its required engine-side connector
+- [x] Let each runtime adapter declare its required engine-side connector
       capability and supported client/server profiles. Surface an explicit
       warning/condition when the observed runtime cannot be verified.
-- [ ] Render Redis credentials/TLS through structured binding before calling the
-      managed Redis path production-ready.
+- [x] Render the Redis features supported by the pinned RESP adapter through
+      structured binding: Secret-backed authentication is wired on both ends;
+      unsupported TLS/database fields remain rejected instead of being silently
+      ignored.
+
+The exact LMCache 0.5.3 source constrains these runtime capability boundaries:
+
+- its `resp` adapter supports username/password (rendered from `SecretKeyRef`;
+  managed Redis supports the default user plus password), but it does not
+  support TLS or logical database selection. Admission therefore keeps
+  TLS/database rejected instead of accepting inert configuration. A future
+  validated Valkey adapter/image profile is required before those fields can be
+  used;
+- `lmcache server` disables the separate Prometheus listener because its
+  FastAPI HTTP frontend already registers `/metrics` on `--http-port` (8080).
+  The renderer exposes the named `lmcache-http` port, successful typed PodLocal
+  injection stamps a stable metrics label, and the optional observability
+  overlay ships a cross-namespace `PodMonitor` for that label and route.
 
 ### Lifecycle work
 
-- [ ] Add MP native-sidecar health observation from
+- [x] Add MP native-sidecar health observation from
       `status.initContainerStatuses`.
-- [ ] Stop treating every managed provider restart as an engine-restart event.
-- [ ] Introduce capability-specific restart behavior for:
+- [x] Stop treating every managed provider restart as an engine-restart event.
+- [x] Introduce capability-specific restart behavior for:
   - MP server restart;
   - Redis L3 restart;
   - legacy `lm://` restart during the compatibility window.
-- [ ] Define engine recovery behavior when the MP server restarts mid-flight.
+- [x] Define the Phase 2 recovery boundary: report a native-sidecar outage
+      through `ConnectorReady` and rely on kubelet liveness restart. Phase 3
+      GPU-validates whether the pinned SGLang connector re-registers without an
+      engine restart.
 
 ### Tests
 
-- [ ] Renderer unit tests independent of SGLang.
-- [ ] Golden Pod tests for resources, probes, security, mounts, and L3 args.
-- [ ] Re-injection/idempotence tests.
-- [ ] Foreign volume/container collision tests.
-- [ ] Kubernetes-version admission smoke for native-sidecar fields.
-- [ ] Connector/remote-storage status condition-transition tests.
+- [x] Renderer unit tests independent of SGLang.
+- [x] Golden Pod tests for resources, probes, security, mounts, and L3 args.
+- [x] Re-injection/idempotence tests.
+- [x] Foreign volume/container collision tests.
+- [x] Kubernetes 1.31 envtest admission smoke for native-sidecar fields.
+- [x] Connector/remote-storage status condition-transition tests.
+- [x] Pinned LMCache 0.5.3 standalone-image smoke: the exact Phase 0 digest
+      starts `lmcache server` through its CPU fallback, `/healthcheck` returns
+      healthy, and `/metrics` returns Prometheus text on HTTP port 8080.
 
 ### Exit criteria
 

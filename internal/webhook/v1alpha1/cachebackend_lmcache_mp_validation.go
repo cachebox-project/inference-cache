@@ -12,10 +12,14 @@ import (
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	kvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-const lmcacheKVEventPort int32 = 5557
+const (
+	lmcacheKVEventPort int32 = 5557
+	lmcacheMPHTTPPort  int32 = 8080
+)
 
 var sha256ImagePattern = regexp.MustCompile(`^[^[:space:]@]+@sha256:[a-f0-9]{64}$`)
 
@@ -182,6 +186,9 @@ func validateMPServer(
 	} else if port == lmcacheKVEventPort {
 		errs = append(errs, field.Invalid(path.Child("port"), port,
 			fmt.Sprintf("collides with the engine KV-event publisher port %d", lmcacheKVEventPort)))
+	} else if port == lmcacheMPHTTPPort {
+		errs = append(errs, field.Invalid(path.Child("port"), port,
+			fmt.Sprintf("collides with the LMCache MP HTTP health/control port %d", lmcacheMPHTTPPort)))
 	}
 
 	if l1Capacity == nil || l1Capacity.Sign() <= 0 {
@@ -286,9 +293,11 @@ func validateMPServerResourceRequirements(resources corev1.ResourceRequirements,
 	return errs
 }
 
-// rejectUnimplementedRedisBindingFeatures keeps the newly typed credential/TLS
-// contract from becoming accepted-but-ignored configuration. Phase 2 removes
-// this gate when the structured runtime binding and secret mounts are rendered.
+// rejectUnimplementedRedisBindingFeatures permits the Phase-2 SGLang MP auth
+// path while keeping every unsupported LMCache 0.5.3 RESP feature explicit.
+// That adapter supports username/password, but not TLS or logical database
+// selection. Managed Redis currently provisions the default user, so its
+// password may be configured but an ACL username may not.
 func rejectUnimplementedRedisBindingFeatures(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if cb == nil || cb.Spec.RemoteStorage == nil || cb.Spec.RemoteStorage.Redis == nil {
 		return nil
@@ -297,16 +306,51 @@ func rejectUnimplementedRedisBindingFeatures(cb *cachev1alpha1.CacheBackend) fie
 	path := field.NewPath("spec", "remoteStorage", "redis")
 	var errs field.ErrorList
 	if redis.Authentication != nil {
-		errs = append(errs, field.Forbidden(path.Child("authentication"),
-			"Redis authentication is typed but not rendered until Phase 2; refusing inert credentials"))
+		authPath := path.Child("authentication")
+		isSGLangMP := cb.Spec.Runtime == cachev1alpha1.CacheBackendRuntimeSGLang &&
+			cb.Spec.LMCache != nil && cb.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal
+		if !isSGLangMP {
+			errs = append(errs, field.Forbidden(authPath,
+				"Redis authentication is currently rendered only by the SGLang PodLocal LMCache MP adapter"))
+		} else {
+			if redis.Authentication.Username != nil {
+				errs = append(errs, validateRedisSecretKeySelector(*redis.Authentication.Username, authPath.Child("username"))...)
+			}
+			errs = append(errs, validateRedisSecretKeySelector(redis.Authentication.Password, authPath.Child("password"))...)
+			if cb.Spec.RemoteStorage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged && redis.Authentication.Username != nil {
+				errs = append(errs, field.Forbidden(authPath.Child("username"),
+					"managed Redis provisions the default user and currently supports password authentication only"))
+			}
+		}
 	}
 	if redis.TLS != nil {
 		errs = append(errs, field.Forbidden(path.Child("tls"),
-			"Redis TLS is typed but not rendered until Phase 2; refusing inert TLS configuration"))
+			"the pinned LMCache 0.5.3 resp adapter does not support TLS; refusing inert TLS configuration"))
 	}
 	if redis.Database != nil {
 		errs = append(errs, field.Forbidden(path.Child("database"),
-			"Redis database selection is typed but not rendered until Phase 2; refusing inert adapter configuration"))
+			"the pinned LMCache 0.5.3 resp adapter does not support database selection; refusing inert adapter configuration"))
+	}
+	return errs
+}
+
+func validateRedisSecretKeySelector(selector corev1.SecretKeySelector, path *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	name := strings.TrimSpace(selector.Name)
+	if name == "" {
+		errs = append(errs, field.Required(path.Child("name"), "a namespace-local Secret name is required"))
+	} else if messages := kvalidation.IsDNS1123Subdomain(name); len(messages) > 0 {
+		errs = append(errs, field.Invalid(path.Child("name"), selector.Name, strings.Join(messages, "; ")))
+	}
+	key := strings.TrimSpace(selector.Key)
+	if key == "" {
+		errs = append(errs, field.Required(path.Child("key"), "a Secret data key is required"))
+	} else if messages := kvalidation.IsConfigMapKey(key); len(messages) > 0 {
+		errs = append(errs, field.Invalid(path.Child("key"), selector.Key, strings.Join(messages, "; ")))
+	}
+	if selector.Optional != nil && *selector.Optional {
+		errs = append(errs, field.Forbidden(path.Child("optional"),
+			"authentication Secret keys are required; optional credentials could start the cache plane unauthenticated or unusable"))
 	}
 	return errs
 }

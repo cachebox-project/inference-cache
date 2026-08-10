@@ -17,6 +17,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -98,10 +99,12 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	// the registry with a subscriber image — the integration test exists
 	// to gate that end-to-end behaviour. Production operators do the same
 	// by passing --kvevent-subscriber-image to the controller.
+	registry := newVLLMRegistry(builtinruntime.SubscriberConfig{Image: testSubscriberImage})
+	registry.Register(builtinruntime.NewSGLangLMCacheAdapter(builtinruntime.SubscriberConfig{Image: testSubscriberImage}))
 	mgr.GetWebhookServer().Register(WebhookPath, &webhook.Admission{
 		Handler: &EngineInjector{
 			Reader:   mgr.GetAPIReader(),
-			Registry: newVLLMRegistry(builtinruntime.SubscriberConfig{Image: testSubscriberImage}),
+			Registry: registry,
 		},
 	})
 
@@ -201,6 +204,9 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("annotation %s: got %q want %q (live CacheBackend UID)",
 			AnnotationInjectedByUID, got.Annotations[AnnotationInjectedByUID], string(cb.UID))
 	}
+	if got.Annotations[AnnotationInjectedGeneration] != "1" {
+		t.Fatalf("annotation %s: got %q want %q", AnnotationInjectedGeneration, got.Annotations[AnnotationInjectedGeneration], "1")
+	}
 	if !containsArgFlag(got.Spec.Containers[0].Args, "--kv-transfer-config") {
 		t.Fatalf("--kv-transfer-config flag not injected; args = %v", got.Spec.Containers[0].Args)
 	}
@@ -236,6 +242,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	// the apiserver would actually see it.
 	delete(pod2.Annotations, AnnotationInjectedBy)
 	delete(pod2.Annotations, AnnotationInjectedByUID)
+	delete(pod2.Annotations, AnnotationInjectedGeneration)
 	if err := mgr.GetClient().Create(ctx, pod2); err != nil {
 		t.Fatalf("create second Pod: %v", err)
 	}
@@ -276,6 +283,78 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if envtestHasContainerEnv(&gotSkipped, testEnvLMCacheRemoteURL) {
 		t.Fatalf("skipped pod unexpectedly has %s env; webhook must not inject engine wiring when %s=true",
 			testEnvLMCacheRemoteURL, AnnotationSkip)
+	}
+
+	// Typed SGLang PodLocal smoke: this goes through a real apiserver so the
+	// native-sidecar restartPolicy, probes, ports, resource quantities, mounts,
+	// and SecretKeyRef-capable env shape are schema/defaulting checked rather
+	// than only compared as Go structs.
+	typedCB := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "sglang-mp", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{
+				"app": "sglang-mp-test",
+			}},
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+				PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+					Image:      "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					Port:       6500,
+					L1Capacity: resource.MustParse("1Gi"),
+					MaxWorkers: 2,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("3Gi")},
+					},
+				}},
+			},
+		},
+	}
+	if err := mgr.GetClient().Create(ctx, typedCB); err != nil {
+		t.Fatalf("create typed SGLang CacheBackend: %v", err)
+	}
+	typedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sglang-mp-engine",
+			Namespace: ns,
+			Labels:    map[string]string{"app": "sglang-mp-test"},
+			Annotations: map[string]string{
+				"inferencecache.io/lmcache-connector-profile": "sglang-lmcache-mp-v1",
+				"inferencecache.io/lmcache-client-version":    "0.5.3",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "sglang", Image: "sglang:connector-ready",
+		}}},
+	}
+	if err := mgr.GetClient().Create(ctx, typedPod); err != nil {
+		t.Fatalf("create typed SGLang Pod: %v", err)
+	}
+	var gotTyped corev1.Pod
+	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: typedPod.Name}, &gotTyped); err != nil {
+		t.Fatalf("get typed SGLang Pod: %v", err)
+	}
+	var mpServer *corev1.Container
+	for i := range gotTyped.Spec.InitContainers {
+		if gotTyped.Spec.InitContainers[i].Name == "lmcache-mp-server" {
+			mpServer = &gotTyped.Spec.InitContainers[i]
+			break
+		}
+	}
+	if mpServer == nil {
+		t.Fatalf("typed native sidecar missing: %+v", gotTyped.Spec.InitContainers)
+	}
+	if mpServer.RestartPolicy == nil || *mpServer.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("native sidecar restartPolicy = %v, want Always", mpServer.RestartPolicy)
+	}
+	if mpServer.StartupProbe == nil || mpServer.ReadinessProbe == nil || mpServer.LivenessProbe == nil {
+		t.Fatalf("typed native sidecar probes missing: %+v", mpServer)
+	}
+	if got := gotTyped.Labels[LabelLMCacheMPMetrics]; got != LabelLMCacheMPMetricsEnabled {
+		t.Fatalf("typed native sidecar metrics label %s = %q, want %q",
+			LabelLMCacheMPMetrics, got, LabelLMCacheMPMetricsEnabled)
 	}
 }
 

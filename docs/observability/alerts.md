@@ -20,7 +20,7 @@ There are two distribution shapes, same rule set, drift-gated by
   kubectl apply -k config/observability
   ```
 
-  Ships THREE CRs together — `kubectl apply -k` applies all three:
+  Ships FOUR CRs together — `kubectl apply -k` applies all four:
   1. A [`ServiceMonitor`](../../config/observability/servicemonitor.yaml)
      that tells Prometheus to scrape `inference-cache-server:8080/metrics`.
      Without this, kube-prometheus installs will load the rules but
@@ -35,10 +35,13 @@ There are two distribution shapes, same rule set, drift-gated by
      `inferencecache_backend_server_restart_cascades_total` is also
      controller-emitted). Without this, those rules load but never
      have a series to evaluate.
-  3. The [`PrometheusRule`](../../config/observability/prometheus-rules.yaml)
+  3. A second [`PodMonitor`](../../config/observability/lmcache-podmonitor.yaml)
+     that discovers successfully injected PodLocal LMCache native sidecars
+     across workload namespaces and scrapes their named `lmcache-http` port.
+  4. The [`PrometheusRule`](../../config/observability/prometheus-rules.yaml)
      carrying the alerts.
 
-  All three CRs are pinned to namespace `inference-cache-system`. The
+  All four CRs are pinned to namespace `inference-cache-system`. The
   example selector labels each CR carries are:
   - `PrometheusRule` →
     `prometheus: k8s`, `role: alert-rules` (matched by
@@ -46,11 +49,11 @@ There are two distribution shapes, same rule set, drift-gated by
   - `ServiceMonitor` →
     `prometheus: k8s` (matched by
     `Prometheus.spec.serviceMonitorSelector`).
-  - `PodMonitor` →
+  - both `PodMonitor` resources →
     `prometheus: k8s` (matched by
     `Prometheus.spec.podMonitorSelector`).
 
-  All three target the **upstream kube-prometheus stack**, whose default
+  All four target the **upstream kube-prometheus stack**, whose default
   `Prometheus` is named `k8s`. The `prometheus-community/kube-prometheus-stack`
   Helm chart uses a DIFFERENT convention — its selector matches
   `release: <helm-release-name>` (no `prometheus:` label). Custom
@@ -75,11 +78,12 @@ There are two distribution shapes, same rule set, drift-gated by
   [`alerting-rules.yaml`](../../config/observability/alerting-rules.yaml) into
   Prometheus via the `rule_files:` config block, a ConfigMap, or the Helm
   `prometheus.serverFiles` value (depending on your install). You ALSO
-  need `scrape_configs:` entries for BOTH targets — the
+  need `scrape_configs:` entries for all applicable targets — the
   `inference-cache-server` pod (server-side series: index, lookup, auth)
   AND the `inference-cache-controller-manager` pod (controller-side
   series: per-stage probe-result counter, cache-server restart-cascade
-  counter). Server-only scrape leaves the controller-side alerts
+  counter) and each injected PodLocal LMCache sidecar (`:8080/metrics`).
+  Server-only scrape leaves the controller-side alerts
   (`ServerProbeFail` today) loaded but inert — they read
   `inferencecache_backend_probe_result_total` which is controller-emitted.
   To keep the alerts' per-install scoping working, both scrapes must
@@ -101,9 +105,9 @@ There are two distribution shapes, same rule set, drift-gated by
      scrapes one inference-cache install; do not use it for shared
      Prometheus deployments.
 
-  ServiceMonitor (server) + PodMonitor (controller) in the operator
-  bundle is the prometheus-operator equivalent of shape (1); both
-  shapes (1) and (2) require you to wire BOTH scrape entries
+  ServiceMonitor (server) + PodMonitors (controller and LMCache MP) in the operator
+  bundle are the prometheus-operator equivalent of shape (1); both
+  shapes (1) and (2) require you to wire all applicable scrape entries
   explicitly when you are not on prometheus-operator.
 
 Both files contain the same six active alerts (five Stage 1 alerts plus
@@ -113,8 +117,8 @@ alerts](#deferred-alerts) below).
 
 > **One alert depends on a separate scrape this bundle does NOT ship.**
 > [`LMCacheT2NoHits`](#lmcachet2nohits) reads `vllm:external_prefix_cache_*`,
-> which vLLM exposes on its own `/metrics`. The included `ServiceMonitor`
-> covers only `inference-cache-server`. To make `LMCacheT2NoHits` light
+> which vLLM exposes on its own `/metrics`. The included scrape configs do
+> not collect vLLM's own metrics. To make `LMCacheT2NoHits` light
 > up, your install must also scrape engine pods — typically a separate
 > **`PodMonitor`** for your vLLM Deployment, or a `ServiceMonitor` on
 > a headless / per-pod Service (Endpoints discovery), or

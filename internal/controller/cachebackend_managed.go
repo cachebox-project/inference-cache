@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"time"
 )
 
 // reconcileManaged renders the cache-server PodSpec + Service via the runtime
@@ -126,12 +127,29 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	// recovery from a cache-server outage. A non-zero cascadeWait means
 	// the rate-limit window suppressed the cascade; honor it on the
 	// requeue so we retry exactly at the boundary.
-	cascadeWait := r.reconcileServerInstance(ctx, logger, backend)
+	cascadeWait := time.Duration(0)
+	if isTypedLMCachePodLocal(backend) {
+		// In the typed MP hierarchy this managed workload is Redis L3, not the
+		// engine's connector endpoint. Redis failure/recovery belongs to the MP
+		// server's L2 adapter; rolling every engine on a Redis restart creates
+		// serving disruption without repairing that adapter. MP native-sidecar
+		// restarts are observed separately through ConnectorReady.
+		r.clearServerInstanceLatchShadow(backend)
+		if backend.Status.ObservedServerInstance != "" {
+			if clearErr := r.patchStatus(ctx, backend, func() { backend.Status.ObservedServerInstance = "" }); clearErr != nil && statusErr == nil {
+				statusErr = clearErr
+			}
+		}
+	} else {
+		cascadeWait = r.reconcileServerInstance(ctx, logger, backend)
+	}
 	if cascadeWait > 0 && (requeueAfter == 0 || cascadeWait < requeueAfter) {
 		requeueAfter = cascadeWait
 	}
-	// Schedule an unconditional periodic re-poll of the cache-server
-	// pod set on managed backends. Reason: an in-place container
+	// Schedule an unconditional periodic health re-poll on managed backends.
+	// Typed MP uses it to refresh engine-Pod native-sidecar health; legacy
+	// server-backed paths use it to observe the cache-server pod set. For the
+	// latter, an in-place container
 	// restart (kubelet respawning a crashed cache-server container
 	// without bumping pod.UID) does NOT change owned-Deployment status
 	// counts, and the controller deliberately does not watch Pods

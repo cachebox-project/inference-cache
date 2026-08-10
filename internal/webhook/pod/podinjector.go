@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -68,6 +69,20 @@ const AnnotationInjectedBy = enginebinding.AnnotationInjectedBy
 // (which only the webhook writes) is absent or stale, so the controller skips
 // the event.
 const AnnotationInjectedByUID = enginebinding.AnnotationInjectedByUID
+
+// AnnotationInjectedGeneration records the CacheBackend generation rendered
+// into this immutable Pod. The MP status writer uses it to avoid reporting an
+// old sidecar configuration as current after the CacheBackend changes.
+const AnnotationInjectedGeneration = enginebinding.AnnotationInjectedGeneration
+
+// LabelLMCacheMPMetrics is stamped only after a typed PodLocal LMCache server
+// has been successfully rendered. The optional observability overlay uses it
+// to discover the native sidecar's lmcache-http port across engine namespaces.
+const LabelLMCacheMPMetrics = enginebinding.LabelLMCacheMPMetrics
+
+// LabelLMCacheMPMetricsEnabled is the stable selector value for
+// [LabelLMCacheMPMetrics].
+const LabelLMCacheMPMetricsEnabled = enginebinding.LabelLMCacheMPMetricsEnabled
 
 // AnnotationInjectSkipped is stamped when the webhook intentionally skips
 // injection because the operator set [AnnotationSkip]. It lets a persisted pod
@@ -434,6 +449,13 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	delete(mutated.Annotations, AnnotationInjectSkipped)
 	mutated.Annotations[AnnotationInjectedBy] = cache.Namespace + "/" + cache.Name
 	mutated.Annotations[AnnotationInjectedByUID] = string(cache.UID)
+	mutated.Annotations[AnnotationInjectedGeneration] = strconv.FormatInt(cache.Generation, 10)
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal {
+		if mutated.Labels == nil {
+			mutated.Labels = map[string]string{}
+		}
+		mutated.Labels[LabelLMCacheMPMetrics] = LabelLMCacheMPMetricsEnabled
+	}
 
 	mutatedRaw, err := json.Marshal(mutated)
 	if err != nil {
@@ -519,7 +541,8 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 
 // failOpen builds the admission response for any fail-open return path
 // AFTER the pod has been decoded. The webhook's contract is that
-// AnnotationInjectedBy and AnnotationInjectSkipped on the persisted pod mean
+// The injected-by identity/generation annotations and AnnotationInjectSkipped
+// on the persisted pod mean
 // "the webhook successfully made this decision" — those are what the
 // engine-pod-events controller keys `InjectedByCacheBackend` and
 // `SkippedByOperator` off of. The annotations are user-controllable (anyone
@@ -536,13 +559,15 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 func failOpen(req admission.Request, pod *corev1.Pod, reason string) admission.Response {
 	hasInjectedBy := pod.Annotations[AnnotationInjectedBy] != ""
 	hasInjectedByUID := pod.Annotations[AnnotationInjectedByUID] != ""
+	hasInjectedGeneration := pod.Annotations[AnnotationInjectedGeneration] != ""
 	hasInjectSkipped := pod.Annotations[AnnotationInjectSkipped] != ""
-	if !hasInjectedBy && !hasInjectedByUID && !hasInjectSkipped {
+	if !hasInjectedBy && !hasInjectedByUID && !hasInjectedGeneration && !hasInjectSkipped {
 		return admission.Allowed(reason)
 	}
 	cleared := pod.DeepCopy()
 	delete(cleared.Annotations, AnnotationInjectedBy)
 	delete(cleared.Annotations, AnnotationInjectedByUID)
+	delete(cleared.Annotations, AnnotationInjectedGeneration)
 	delete(cleared.Annotations, AnnotationInjectSkipped)
 	if len(cleared.Annotations) == 0 {
 		// Avoid emitting an empty-map annotations field; absent is the
@@ -568,11 +593,13 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 	}
 	delete(mutated.Annotations, AnnotationInjectedBy)
 	delete(mutated.Annotations, AnnotationInjectedByUID)
+	delete(mutated.Annotations, AnnotationInjectedGeneration)
 	mutated.Annotations[AnnotationInjectSkipped] = InjectSkippedReasonSkipAnnotation
 
 	if pod.Annotations[AnnotationInjectSkipped] == InjectSkippedReasonSkipAnnotation &&
 		pod.Annotations[AnnotationInjectedBy] == "" &&
-		pod.Annotations[AnnotationInjectedByUID] == "" {
+		pod.Annotations[AnnotationInjectedByUID] == "" &&
+		pod.Annotations[AnnotationInjectedGeneration] == "" {
 		return admission.Allowed("skipped via " + AnnotationSkip)
 	}
 	raw, err := json.Marshal(mutated)
@@ -647,6 +674,9 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 			return ""
 		}
 		return ep
+	}
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology != "" && cache.Status.RemoteStorage != nil {
+		return strings.TrimSpace(cache.Status.RemoteStorage.Endpoint)
 	}
 	return strings.TrimSpace(cache.Status.Endpoint)
 }

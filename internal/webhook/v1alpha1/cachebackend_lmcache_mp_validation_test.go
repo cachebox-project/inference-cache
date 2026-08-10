@@ -211,6 +211,13 @@ func TestValidateLMCacheTopology(t *testing.T) {
 			wantField: "spec.lmCache.podLocal.server.port",
 		},
 		{
+			name: "HTTP health port collision",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.LMCache.PodLocal.Server.Port = lmcacheMPHTTPPort
+			},
+			wantField: "spec.lmCache.podLocal.server.port",
+		},
+		{
 			name: "memory request has no headroom",
 			mutate: func(cb *cachev1alpha1.CacheBackend) {
 				cb.Spec.LMCache.PodLocal.Server.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1Gi")
@@ -282,10 +289,99 @@ func TestRejectUnimplementedRedisBindingFeatures(t *testing.T) {
 		t.Fatalf("errors = %v, want database rejection", errs)
 	}
 	_, err := shippingValidator().ValidateCreate(context.Background(), cb)
-	if err == nil || !strings.Contains(err.Error(), "not rendered until Phase 2") {
-		t.Fatalf("ValidateCreate error = %v, want inert-binding rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "does not support database selection") {
+		t.Fatalf("ValidateCreate error = %v, want pinned-adapter capability rejection", err)
 	}
 	if strings.Contains(err.Error(), "provider workload configuration") {
 		t.Fatalf("external Redis connection settings were misclassified as managed workload config: %v", err)
 	}
+}
+
+func TestValidateRedisAuthenticationForSGLangPodLocal(t *testing.T) {
+	newAuthBackend := func(ownership cachev1alpha1.CacheBackendRemoteStorageOwnership) *cachev1alpha1.CacheBackend {
+		cb := validPodLocalMPBackend()
+		cb.Name = "mp"
+		cb.Namespace = "default"
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Ownership: ownership,
+			Redis: &cachev1alpha1.RedisRemoteStorageSpec{Authentication: &cachev1alpha1.RedisAuthenticationSpec{
+				Password: corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"},
+					Key:                  "password",
+				},
+			}},
+		}
+		if ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
+			cb.Spec.RemoteStorage.Endpoint = "redis.example:6379"
+		} else {
+			cb.Spec.RemoteStorage.Redis.Image = "redis:7.4-alpine"
+		}
+		return cb
+	}
+
+	for _, ownership := range []cachev1alpha1.CacheBackendRemoteStorageOwnership{
+		cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+	} {
+		t.Run(string(ownership)+" password", func(t *testing.T) {
+			cb := newAuthBackend(ownership)
+			if errs := rejectUnimplementedRedisBindingFeatures(cb); len(errs) != 0 {
+				t.Fatalf("authentication errors = %v", errs)
+			}
+			if _, err := shippingValidator().ValidateCreate(context.Background(), cb); err != nil {
+				t.Fatalf("ValidateCreate: %v", err)
+			}
+		})
+	}
+
+	t.Run("external ACL username", func(t *testing.T) {
+		cb := newAuthBackend(cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal)
+		cb.Spec.RemoteStorage.Redis.Authentication.Username = &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"}, Key: "username",
+		}
+		if errs := rejectUnimplementedRedisBindingFeatures(cb); len(errs) != 0 {
+			t.Fatalf("external ACL authentication errors = %v", errs)
+		}
+	})
+
+	t.Run("managed ACL username rejected", func(t *testing.T) {
+		cb := newAuthBackend(cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged)
+		cb.Spec.RemoteStorage.Redis.Authentication.Username = &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"}, Key: "username",
+		}
+		errs := rejectUnimplementedRedisBindingFeatures(cb)
+		if len(errs) != 1 || !strings.Contains(errs[0].Field, "username") {
+			t.Fatalf("errors = %v, want managed username rejection", errs)
+		}
+	})
+
+	t.Run("optional password rejected", func(t *testing.T) {
+		cb := newAuthBackend(cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal)
+		optional := true
+		cb.Spec.RemoteStorage.Redis.Authentication.Password.Optional = &optional
+		errs := rejectUnimplementedRedisBindingFeatures(cb)
+		if len(errs) != 1 || !strings.Contains(errs[0].Field, "optional") {
+			t.Fatalf("errors = %v, want optional rejection", errs)
+		}
+	})
+
+	t.Run("empty selector rejected", func(t *testing.T) {
+		cb := newAuthBackend(cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal)
+		cb.Spec.RemoteStorage.Redis.Authentication.Password = corev1.SecretKeySelector{}
+		errs := rejectUnimplementedRedisBindingFeatures(cb)
+		if len(errs) != 2 {
+			t.Fatalf("errors = %v, want name and key rejections", errs)
+		}
+	})
+
+	t.Run("vLLM remains rejected until its MP adapter lands", func(t *testing.T) {
+		cb := newAuthBackend(cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal)
+		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
+		errs := rejectUnimplementedRedisBindingFeatures(cb)
+		if len(errs) != 1 || !strings.Contains(errs[0].Error(), "SGLang PodLocal") {
+			t.Fatalf("errors = %v, want runtime-scoped rejection", errs)
+		}
+	})
 }

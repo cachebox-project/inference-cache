@@ -14,7 +14,7 @@ This section covers the operational concerns of running inference-cache in produ
 ### [Observability & Alerts]({{< relref "/docs/administration/observability-and-alerts/" >}})
 
 The opt-in Prometheus alert bundle, what each alert means and when it fires, and the
-scraping you must configure for both the server and the controller pod.
+scraping you must configure for the server, controller, and injected LMCache MP sidecars.
 
 ### [Index sizing]({{< relref "/docs/administration/index-sizing/" >}})
 

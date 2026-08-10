@@ -10,6 +10,16 @@ import (
 )
 
 const (
+	// LabelLMCacheMPMetrics marks an engine Pod whose successfully injected
+	// PodLocal LMCache native sidecar exposes Prometheus metrics. The optional
+	// observability overlay selects this label and scrapes the sidecar directly;
+	// it is deliberately not applied to legacy in-process connectors.
+	LabelLMCacheMPMetrics = "inferencecache.io/lmcache-mp-metrics"
+
+	// LabelLMCacheMPMetricsEnabled is the selector value used by the shipped
+	// LMCache PodMonitor.
+	LabelLMCacheMPMetricsEnabled = "true"
+
 	// AnnotationSkip lets an operator explicitly opt a pod out of injection.
 	AnnotationSkip = "inferencecache.io/skip-inject"
 
@@ -20,6 +30,12 @@ const (
 	// AnnotationInjectedByUID records the UID of the CacheBackend observed at
 	// admission time and prevents stale name-only binding claims.
 	AnnotationInjectedByUID = "inferencecache.io/injected-by-uid"
+
+	// AnnotationInjectedGeneration records the CacheBackend generation whose
+	// connector/server configuration was rendered into the immutable Pod. It
+	// lets status distinguish current wiring from Pods that predate a spec
+	// update and therefore require recreation.
+	AnnotationInjectedGeneration = "inferencecache.io/injected-generation"
 
 	// AnnotationInjectSkipped marks an intentional operator opt-out.
 	AnnotationInjectSkipped = "inferencecache.io/inject-skipped"

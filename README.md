@@ -219,13 +219,13 @@ For prometheus-operator / kube-prometheus installs:
 kubectl apply -k config/observability
 ```
 
-This ships THREE resources: a `ServiceMonitor` (so Prometheus scrapes
-`inference-cache-server:8080/metrics`), a `PodMonitor` (so Prometheus
-scrapes the controller pod's `:8080/metrics` — required for the
-controller-side alerts like `ServerProbeFail` to have a series to
-evaluate), and the `PrometheusRule` carrying the alerts.
+This ships FOUR resources: a `ServiceMonitor` for
+`inference-cache-server:8080/metrics`, one `PodMonitor` for the controller
+pod's `:8080/metrics`, one cross-namespace `PodMonitor` for successfully
+injected PodLocal LMCache sidecars on their named `lmcache-http` port, and
+the `PrometheusRule` carrying the alerts.
 
-> **Caveat — Prometheus Operator selectors.** All three CRs carry
+> **Caveat — Prometheus Operator selectors.** All four CRs carry
 > example labels (`prometheus: k8s`, plus `role: alert-rules` on the
 > PrometheusRule) that match the upstream kube-prometheus stack
 > (default `Prometheus` named `k8s`). The `kube-prometheus-stack`
@@ -250,7 +250,7 @@ expressions) and only fire when the conditions are met.
 > **The fifth alert needs a vLLM scrape this bundle does NOT ship.**
 > [`LMCacheT2NoHits`](docs/observability/alerts.md#lmcachet2nohits) reads
 > `vllm:external_prefix_cache_*` from vLLM engine pods directly. The
-> shipped `ServiceMonitor` covers only `inference-cache-server`. To make
+> shipped scrape configs do not collect vLLM's own metrics. To make
 > that alert effective, add a separate `PodMonitor` for your vLLM
 > Deployment (or `kubernetes_sd_configs: pod` for vanilla Prometheus)
 > so engine `/metrics` is scraped with both `namespace` and `pod` labels
@@ -258,11 +258,12 @@ expressions) and only fire when the conditions are met.
 
 For vanilla Prometheus, ConfigMap mounts, or Helm `prometheus.serverFiles`,
 use the flat [`alerting-rules.yaml`](config/observability/alerting-rules.yaml).
-**You must also configure scraping yourself, for BOTH the server AND
-the controller pod.** The server's `:8080` exposes the index, lookup,
+**You must also configure scraping yourself for the server, the controller
+pod, and every injected PodLocal LMCache sidecar.** The server's `:8080` exposes the index, lookup,
 and auth series; the controller pod's `:8080` exposes the per-stage
 probe-result counter (`inferencecache_backend_probe_result_total`)
-and the cache-server restart-cascade counter — the controller-side
+and the cache-server restart-cascade counter; each LMCache sidecar exposes
+its own `lmcache_mp_*` series on `:8080/metrics` — the controller-side
 alerts (`ServerProbeFail` today) load against the controller's
 series, so a server-only scrape leaves them inert.
 

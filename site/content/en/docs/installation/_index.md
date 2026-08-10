@@ -97,12 +97,12 @@ For prometheus-operator / kube-prometheus installs:
 kubectl apply -k config/observability
 ```
 
-This ships three resources: a `ServiceMonitor` (scrapes `inference-cache-server:8080`), a
-`PodMonitor` (scrapes the controller pod's `:8080` — required for the controller-side
-alerts to have a series to evaluate), and a `PrometheusRule` carrying the alerts.
+This ships four resources: a `ServiceMonitor` for `inference-cache-server:8080`, a
+`PodMonitor` for the controller pod's `:8080`, a cross-namespace `PodMonitor` for
+successfully injected PodLocal LMCache sidecars, and a `PrometheusRule` carrying the alerts.
 
 {{% alert title="Caveat — Prometheus Operator selectors" color="warning" %}}
-All three custom resources carry example labels (`prometheus: k8s`) that match the upstream
+All four custom resources carry example labels (`prometheus: k8s`) that match the upstream
 kube-prometheus stack. If your `Prometheus` custom resource's selectors use a different
 label set (for example `release: my-prom` from the `kube-prometheus-stack` Helm chart),
 `kubectl apply -k` succeeds but Prometheus silently ignores the resources. See

@@ -53,6 +53,8 @@ const (
 	// It matches the provider's 8Gi memory default.
 	redisMaxmemoryDefaultBytes = int64(8) * 1024 * 1024 * 1024 // 8Gi
 
+	redisPasswordEnv = "REDIS_PASSWORD"
+	redisCLIAuthEnv  = "REDISCLI_AUTH"
 )
 
 // ResolveRedisL2Server renders the managed Redis L2 store's container set and the
@@ -70,11 +72,13 @@ const (
 // CacheBackend), added alongside the wiring that consumes this render — before it
 // provisions anything.
 //
-// Security posture matches the lm:// lmcache-server this replaces: an
-// unauthenticated, non-TLS ClusterIP holding KV blocks, trusted to the in-cluster
-// network — any pod that can reach the Service can read, overwrite, or flush
-// cached KV. Hardening (a NetworkPolicy scoping access to engine pods, Redis AUTH,
-// or TLS) is a follow-up carried at the same posture as the existing server.
+// Security posture is explicit: without an authentication binding this is an
+// unauthenticated, non-TLS ClusterIP holding KV blocks, so any pod that can
+// reach the Service can read, overwrite, or flush cached KV. Secret-backed
+// password authentication is supported below and configures both Redis and the
+// LMCache RESP client. TLS remains rejected because the pinned LMCache 0.5.3
+// RESP adapter does not implement it; NetworkPolicy scoping is still required
+// for production defense in depth.
 func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve redis L2: cache is nil")
@@ -127,6 +131,39 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 		// request fallback. The memory limit here is also what --maxmemory is
 		// derived from, so the two stay consistent.
 		Resources: defaultServerResources(cache),
+	}
+
+	// Managed authentication configures BOTH ends of the binding: this Redis
+	// process requires the Secret-backed password, while the MP renderer maps
+	// the same selector to LMCACHE_RESP_PASSWORD. The secret value never enters
+	// the PodSpec or CacheBackend status. The shell expands it only inside the
+	// container and then explicitly invokes the official image entrypoint, which
+	// preserves its root-to-redis privilege drop.
+	if storage := cache.Spec.EffectiveRemoteStorage(); storage != nil && storage.Redis != nil && storage.Redis.Authentication != nil {
+		redis := storage.Redis
+		auth := redis.Authentication
+		if auth.Username != nil {
+			return nil, nil, fmt.Errorf("resolve redis L2: managed Redis supports password authentication with the default user only")
+		}
+		passwordRef := auth.Password.DeepCopy()
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: redisPasswordEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: passwordRef}},
+			corev1.EnvVar{Name: redisCLIAuthEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: auth.Password.DeepCopy()}},
+		)
+		const authScript = `set -eu
+exec /usr/local/bin/docker-entrypoint.sh "$@" --requirepass "$REDIS_PASSWORD"`
+		container.Command = []string{"/bin/sh", "-c"}
+		container.Args = append([]string{authScript, "inference-cache-redis-auth"}, container.Args...)
+		// REDISCLI_AUTH lets redis-cli authenticate without placing the password
+		// in the probe command. A TCP-only probe would declare a server Ready even
+		// if AUTH setup were unusable.
+		container.ReadinessProbe = &corev1.Probe{
+			ProbeHandler:        corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"redis-cli", "ping"}}},
+			InitialDelaySeconds: 3,
+			PeriodSeconds:       10,
+			FailureThreshold:    6,
+			TimeoutSeconds:      2,
+		}
 	}
 
 	pod := &corev1.PodSpec{

@@ -6,6 +6,7 @@ package storage
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -196,6 +197,61 @@ func TestResolveRedisL2ServerImageOverride(t *testing.T) {
 	}
 	if got := pod.Containers[0].Image; got != "registry.example/redis@sha256:deadbeef" {
 		t.Errorf("image = %q, want the typed Redis override", got)
+	}
+}
+
+func TestResolveRedisL2ServerPasswordAuthentication(t *testing.T) {
+	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang")
+	cb.Spec.RemoteStorage.Redis.Authentication = &cachev1alpha1.RedisAuthenticationSpec{
+		Password: corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "credential-source"},
+			Key:                  "password",
+		},
+	}
+	pod, _, err := ResolveRedisL2Server(cb)
+	if err != nil {
+		t.Fatalf("ResolveRedisL2Server: %v", err)
+	}
+	c := pod.Containers[0]
+	if len(c.Command) != 2 || c.Command[0] != "/bin/sh" || c.Command[1] != "-c" {
+		t.Fatalf("authenticated Redis command = %v", c.Command)
+	}
+	joined := strings.Join(c.Args, " ")
+	if !strings.Contains(joined, "/usr/local/bin/docker-entrypoint.sh") || !strings.Contains(joined, `--requirepass "$REDIS_PASSWORD"`) {
+		t.Fatalf("authenticated Redis args = %s", joined)
+	}
+	if strings.Contains(joined, "credential-source") {
+		t.Fatalf("secret name leaked into args: %s", joined)
+	}
+	for _, name := range []string{redisPasswordEnv, redisCLIAuthEnv} {
+		found := false
+		for i := range c.Env {
+			if c.Env[i].Name != name {
+				continue
+			}
+			found = true
+			ref := c.Env[i].ValueFrom
+			if ref == nil || ref.SecretKeyRef == nil || ref.SecretKeyRef.Name != "credential-source" || ref.SecretKeyRef.Key != "password" {
+				t.Fatalf("%s = %+v", name, c.Env[i])
+			}
+		}
+		if !found {
+			t.Fatalf("%s missing", name)
+		}
+	}
+	if c.ReadinessProbe == nil || c.ReadinessProbe.Exec == nil || !strings.Contains(strings.Join(c.ReadinessProbe.Exec.Command, " "), "redis-cli ping") {
+		t.Fatalf("authenticated readiness probe = %+v", c.ReadinessProbe)
+	}
+}
+
+func TestResolveRedisL2ServerRejectsManagedACLUsername(t *testing.T) {
+	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang")
+	cb.Spec.RemoteStorage.Redis.Authentication = &cachev1alpha1.RedisAuthenticationSpec{
+		Username: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"}, Key: "username"},
+		Password: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"}, Key: "password"},
+	}
+	if _, _, err := ResolveRedisL2Server(cb); err == nil || !strings.Contains(err.Error(), "default user only") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

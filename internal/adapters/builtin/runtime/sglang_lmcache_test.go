@@ -60,6 +60,32 @@ func newSGLangBackend(cfg map[string]string) *cachev1alpha1.CacheBackend {
 	return cb
 }
 
+func newTypedSGLangMPBackend() *cachev1alpha1.CacheBackend {
+	chunkSize := int32(256)
+	return &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: "ns1"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology:        cachev1alpha1.LMCacheTopologyPodLocal,
+				ChunkSizeTokens: &chunkSize,
+				PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+					Image:      testLMCacheServerImage,
+					Port:       6500,
+					L1Capacity: resource.MustParse("4Gi"),
+					MaxWorkers: 2,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("6Gi")},
+					},
+				}},
+			},
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{},
+		},
+	}
+}
+
 func respBinding(endpoint string) *backendadapter.Binding {
 	return &backendadapter.Binding{Protocol: backendadapter.ProtocolRESP, Endpoint: endpoint}
 }
@@ -200,6 +226,77 @@ func TestSGLangCanonicalHostOnlyBindingDoesNotSelectRedis(t *testing.T) {
 	}
 	if !strings.Contains(script, "--chunk-size 128") || !strings.Contains(script, "--l1-size-gb 6") {
 		t.Fatalf("worker command did not consume typed LMCache config: %q", script)
+	}
+}
+
+func TestSGLangTypedPodLocalUsesCommonRenderer(t *testing.T) {
+	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{})
+	mpAdapter, ok := adapter.(runtimeadapter.LMCacheMPRuntimeAdapter)
+	if !ok {
+		t.Fatalf("adapter %T does not implement LMCacheMPRuntimeAdapter", adapter)
+	}
+	requirement := mpAdapter.ConnectorRequirement(newTypedSGLangMPBackend())
+	if requirement.Profile != sglangLMCacheMPConnectorProfile || requirement.ClientVersion != "0.5.3" {
+		t.Fatalf("connector requirement = %+v", requirement)
+	}
+
+	cache := newTypedSGLangMPBackend()
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name: SGLangEngineContainerName, Image: "sglang:connector-ready", Args: []string{"--model", "gemma"},
+	}}}
+	if err := adapter.InjectEngineConfig(pod, respBinding("redis.ns1.svc:6379"), cache); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	server := findInitContainer(pod.InitContainers, lmCacheMPServerContainerName)
+	if server == nil {
+		t.Fatalf("typed MP server missing: %+v", pod.InitContainers)
+	}
+	if server.Image != testLMCacheServerImage || server.Image == pod.Containers[0].Image {
+		t.Fatalf("server image = %q, engine image = %q", server.Image, pod.Containers[0].Image)
+	}
+	joined := strings.Join(append(server.Command, server.Args...), " ")
+	if !strings.Contains(joined, "lmcache server") || strings.Contains(joined, "python3 -m") {
+		t.Fatalf("typed server entrypoint = %s", joined)
+	}
+	engine := pod.Containers[0]
+	if !containsArg(engine.Args, SGLangEnableLMCacheArg) || !containsArg(engine.Args, SGLangConfigFileArg) {
+		t.Fatalf("SGLang typed launch args missing: %v", engine.Args)
+	}
+	configIndex := -1
+	for i := range engine.Args {
+		if engine.Args[i] == SGLangConfigFileArg {
+			configIndex = i
+			break
+		}
+	}
+	if configIndex < 0 || configIndex+1 >= len(engine.Args) || engine.Args[configIndex+1] != lmCacheMPConfigFilePath {
+		t.Fatalf("SGLang config path = %v, want %q", engine.Args, lmCacheMPConfigFilePath)
+	}
+	if findInitContainer(pod.InitContainers, sglangMPWorkerContainerName) != nil {
+		t.Fatalf("typed path also injected legacy worker: %+v", pod.InitContainers)
+	}
+}
+
+func TestSGLangValidateTypedMPEnginePod(t *testing.T) {
+	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{}).(runtimeadapter.LMCacheMPRuntimeAdapter)
+	cache := newTypedSGLangMPBackend()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			runtimeadapter.AnnotationLMCacheConnectorProfile: sglangLMCacheMPConnectorProfile,
+			runtimeadapter.AnnotationLMCacheClientVersion:    sglangLMCacheMPClientVersion,
+		}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName}}},
+	}
+	if err := runtimeadapter.ValidateConnectorDeclaration(pod, adapter.ConnectorRequirement(cache)); err != nil {
+		t.Fatalf("ValidateConnectorDeclaration: %v", err)
+	}
+	if err := adapter.ValidateMPEnginePod(pod, cache); err != nil {
+		t.Fatalf("ValidateMPEnginePod: %v", err)
+	}
+
+	pod.Spec.InitContainers = []corev1.Container{{Name: sglangMPWorkerContainerName}}
+	if err := adapter.ValidateMPEnginePod(pod, cache); err == nil || !strings.Contains(err.Error(), "legacy") {
+		t.Fatalf("legacy collision error = %v", err)
 	}
 }
 

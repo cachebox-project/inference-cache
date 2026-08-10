@@ -315,6 +315,9 @@ func TestHandle_MatchAndInject(t *testing.T) {
 	if got, want := mutated.Annotations[AnnotationInjectedByUID], string(cb.UID); got != want {
 		t.Fatalf("annotation %s: got %q, want %q (matched CR UID)", AnnotationInjectedByUID, got, want)
 	}
+	if got, want := mutated.Annotations[AnnotationInjectedGeneration], fmt.Sprint(cb.Generation); got != want {
+		t.Fatalf("annotation %s: got %q, want %q", AnnotationInjectedGeneration, got, want)
+	}
 	mustHaveArgPair(t, mutated, "--model", "Qwen/Qwen2.5-0.5B-Instruct")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
@@ -407,6 +410,71 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	}
 	if !hasWorker {
 		t.Fatalf("MP-worker sidecar not injected; initContainers = %+v", mutated.Spec.InitContainers)
+	}
+	if got := mutated.Labels[LabelLMCacheMPMetrics]; got != "" {
+		t.Fatalf("legacy topology-less SGLang pod got typed MP metrics label %s=%q", LabelLMCacheMPMetrics, got)
+	}
+}
+
+func TestHandle_TypedPodLocalSGLangUsesCommonMPServer(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("sg-typed", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+	}
+	chunkSize := int32(256)
+	cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
+		Topology:        cachev1alpha1.LMCacheTopologyPodLocal,
+		ChunkSizeTokens: &chunkSize,
+		PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+			Image:      "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Port:       6500,
+			L1Capacity: resource.MustParse("4Gi"),
+			MaxWorkers: 2,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("6Gi")},
+			},
+		}},
+	}
+	h := newHandler(t, cb)
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[adapterruntime.AnnotationLMCacheConnectorProfile] = "sglang-lmcache-mp-v1"
+	pod.Annotations[adapterruntime.AnnotationLMCacheClientVersion] = "0.5.3"
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("typed SGLang injection: Allowed=%v patches=%d result=%+v", resp.Allowed, len(resp.Patches), resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveArgFlag(t, mutated, "--enable-lmcache")
+	mustHaveArgPair(t, mutated, "--lmcache-config-file", "/var/run/inference-cache/lmcache/client.yaml")
+	server := findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-server")
+	if server == nil {
+		t.Fatalf("typed MP server missing: %+v", mutated.Spec.InitContainers)
+	}
+	if server.Image != cb.Spec.LMCache.PodLocal.Server.Image || server.Image == mutated.Spec.Containers[0].Image {
+		t.Fatalf("server image = %q, engine image = %q", server.Image, mutated.Spec.Containers[0].Image)
+	}
+	joined := strings.Join(append(server.Command, server.Args...), " ")
+	if !strings.Contains(joined, "lmcache server") || !strings.Contains(joined, "--http-port 8080") || strings.Contains(joined, "python3 -m") {
+		t.Fatalf("typed server command = %s", joined)
+	}
+	if server.StartupProbe == nil || server.ReadinessProbe == nil || server.LivenessProbe == nil {
+		t.Fatalf("typed server probes missing: %+v", server)
+	}
+	if got := mutated.Labels[LabelLMCacheMPMetrics]; got != LabelLMCacheMPMetricsEnabled {
+		t.Fatalf("label %s = %q, want %q", LabelLMCacheMPMetrics, got, LabelLMCacheMPMetricsEnabled)
+	}
+	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-worker") != nil {
+		t.Fatalf("typed wire fell through to legacy worker: %+v", mutated.Spec.InitContainers)
 	}
 }
 
@@ -1050,8 +1118,9 @@ func TestHandle_EventsOnly_NoSubscriber_StripsForgedInjectedBy(t *testing.T) {
 	h := newHandler(t, cb) // no subscriber image → nothing to wire
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Annotations = map[string]string{
-		AnnotationInjectedBy:    ns + "/routing-only",
-		AnnotationInjectedByUID: string(cb.UID),
+		AnnotationInjectedBy:         ns + "/routing-only",
+		AnnotationInjectedByUID:      string(cb.UID),
+		AnnotationInjectedGeneration: fmt.Sprint(cb.Generation),
 	}
 	req := newRequest(t, pod, ns)
 
@@ -1065,6 +1134,9 @@ func TestHandle_EventsOnly_NoSubscriber_StripsForgedInjectedBy(t *testing.T) {
 	}
 	if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
 		t.Fatalf("forged %s must be stripped on no-wiring fail-open; got %q", AnnotationInjectedByUID, got)
+	}
+	if got := mutated.Annotations[AnnotationInjectedGeneration]; got != "" {
+		t.Fatalf("forged %s must be stripped on no-wiring fail-open; got %q", AnnotationInjectedGeneration, got)
 	}
 }
 
@@ -1726,6 +1798,15 @@ func findContainer(pod *corev1.Pod, name string) *corev1.Container {
 	return nil
 }
 
+func findInitContainerByName(containers []corev1.Container, name string) *corev1.Container {
+	for i := range containers {
+		if containers[i].Name == name {
+			return &containers[i]
+		}
+	}
+	return nil
+}
+
 func containerNames(pod *corev1.Pod) []string {
 	out := make([]string, len(pod.Spec.Containers))
 	for i, c := range pod.Spec.Containers {
@@ -2143,9 +2224,10 @@ func TestHandle_SkipAnnotationStampsSkippedReasonAndClearsInjectedBy(t *testing.
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Annotations = map[string]string{
-		AnnotationSkip:          "true",
-		AnnotationInjectedBy:    ns + "/" + cb.Name,
-		AnnotationInjectedByUID: string(cb.UID),
+		AnnotationSkip:               "true",
+		AnnotationInjectedBy:         ns + "/" + cb.Name,
+		AnnotationInjectedByUID:      string(cb.UID),
+		AnnotationInjectedGeneration: fmt.Sprint(cb.Generation),
 	}
 	req := newRequest(t, pod, ns)
 
@@ -2162,6 +2244,9 @@ func TestHandle_SkipAnnotationStampsSkippedReasonAndClearsInjectedBy(t *testing.
 	}
 	if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
 		t.Fatalf("annotation %s = %q, want cleared on skip path", AnnotationInjectedByUID, got)
+	}
+	if got := mutated.Annotations[AnnotationInjectedGeneration]; got != "" {
+		t.Fatalf("annotation %s = %q, want cleared on skip path", AnnotationInjectedGeneration, got)
 	}
 }
 

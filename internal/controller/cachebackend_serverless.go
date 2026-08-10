@@ -18,11 +18,11 @@ import (
 )
 
 // reconcileExternal mirrors an externally owned backend's configured endpoint
-// to status and marks the backend Ready: there is no Service to wait on, so
-// admission acceptance of spec.remoteStorage.endpoint is the only readiness
-// signal the controller has. The Ready condition flips to True in lock step so
-// the Ready printcolumn (kubectl get cb) reflects the accepted endpoint for
-// externally owned resources that admission has already accepted.
+// to status. For legacy backends, admission acceptance of the endpoint remains
+// the only readiness signal because there is no Service to wait on. Typed
+// PodLocal MP additionally aggregates the independently observed connector;
+// endpoint acceptance alone must not report a missing/unhealthy native sidecar
+// as Ready.
 //
 // Three terminal states, each driven by the SAME shape rule the
 // validating webhook applies on CREATE/UPDATE — so the reconciler is
@@ -116,11 +116,23 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 			readyMsg = "External endpoint accepted; controller does not provision cache pods for External backends"
 		}
 
+		remoteReason := readyReason
+		remoteMessage := readyMsg
+		if readyStatus == metav1.ConditionTrue {
+			remoteReason = reasonRemoteStorageReady
+			remoteMessage = "external remote-storage binding was accepted; reachability is owned by the operator"
+		}
+		remoteStatus := readyStatus
+		setRemoteStorageStatus(backend, endpoint, remoteStatus, remoteReason, remoteMessage, backend.Generation)
+		if isTypedLMCachePodLocal(backend) {
+			readyStatus, readyReason, readyMsg = lmCacheMPReadyBase(backend, remoteStatus, remoteReason, remoteMessage)
+		}
+		progressingStatus, progressingReason, progressingMessage := progressingFromReady(readyStatus, readyReason, readyMsg)
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeProgressing,
-			Status:             metav1.ConditionFalse,
-			Reason:             readyReason,
-			Message:            "External backends complete admission immediately",
+			Status:             progressingStatus,
+			Reason:             progressingReason,
+			Message:            progressingMessage,
 			ObservedGeneration: backend.Generation,
 		})
 		meta.SetStatusCondition(&backend.Status.Conditions, metav1.Condition{
@@ -213,15 +225,19 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 	// so also bypass any sticky NoKVEventsObserved carried over from the prior
 	// mode — otherwise the flip would inherit that timed-out verdict and stay
 	// Degraded despite the fresh window.
-	gate := evaluateKVEventReadiness(backend, metav1.ConditionTrue,
-		activeReason,
-		activeMessage,
+	eventsOnly := backend.Spec.IsEventsOnly()
+	baseStatus, baseReason, baseMessage := metav1.ConditionTrue, activeReason, activeMessage
+	if !eventsOnly {
+		baseStatus, baseReason, baseMessage = lmCacheMPReadyBase(backend, baseStatus, baseReason, baseMessage)
+	}
+	gate := evaluateKVEventReadiness(backend, baseStatus,
+		baseReason,
+		baseMessage,
 		anchor, now, transitionedFromServerMode)
 	kernelVerdict := kernelHealthVerdict{}
 	engineCompatMsg := ""
 	engineCompatObserved := false
 	previousEngineIncompatible := false
-	eventsOnly := backend.Spec.IsEventsOnly()
 	if !eventsOnly {
 		kernelReader := client.Reader(r.APIReader)
 		if kernelReader == nil {
@@ -247,6 +263,13 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 		backend.Status.Endpoint = ""
 		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
+		if eventsOnly {
+			backend.Status.RemoteStorage = nil
+			meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeRemoteStorageReady)
+		} else {
+			setRemoteStorageStatus(backend, "", metav1.ConditionTrue, reasonRemoteStorageAbsent,
+				"no remote storage is configured; the MP server operates with Pod-local L1 only", backend.Generation)
+		}
 		// Latch the first KV-event observation + first-Available time write-once,
 		// the same contract as updateManagedStatus (the gate reads both).
 		if backend.Status.FirstKVEventObservedAt == nil {
@@ -254,10 +277,15 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 				backend.Status.FirstKVEventObservedAt = at.DeepCopy()
 			}
 		}
-		// Latch the first-Available time write-once, OR re-anchor it on the
-		// server-mode→events-only transition (where the prior value is the old
-		// mode's availability, not the events-only start — see above).
-		if backend.Status.FirstAvailableAt == nil || transitionedFromServerMode {
+		// Latch the first-Available time write-once, OR re-anchor it on a
+		// server-bearing→serverless transition. A typed PodLocal backend is not
+		// available merely because it has no separately managed workload: wait
+		// for the connector observation, otherwise a Pod that appears after the
+		// timeout window would be declared NoKVEventsObserved immediately.
+		canAnchorAvailability := eventsOnly || !isTypedLMCachePodLocal(backend) || baseStatus == metav1.ConditionTrue
+		if transitionedFromServerMode && !canAnchorAvailability {
+			backend.Status.FirstAvailableAt = nil
+		} else if canAnchorAvailability && (backend.Status.FirstAvailableAt == nil || transitionedFromServerMode) {
 			t := metav1.NewTime(now)
 			backend.Status.FirstAvailableAt = &t
 		}
@@ -347,6 +375,8 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 	return r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = ""
+		backend.Status.Connector = nil
+		backend.Status.RemoteStorage = nil
 		// Clear the cache-server-instance latch — cleanupOwnedWorkload
 		// above has just deleted any prior managed Deployment and we
 		// no longer provision one, so a retained UID would advertise
@@ -365,6 +395,8 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		// is no longer evaluated for injected engine-pod crash-loops, so clear
 		// any left over from a prior managed state.
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeEngineCompatibility)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeConnectorReady)
+		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeRemoteStorageReady)
 		// Reset the KV-event-gate timeout ANCHOR. Unlike firstKVEventObservedAt
 		// (a monotonic observation marker, deliberately kept — see godoc),
 		// firstAvailableAt records when the backend became "up" for the gate's

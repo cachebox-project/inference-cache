@@ -191,7 +191,7 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 		// Not every mount can be reused — a read-only or projection-backed one breaks
 		// the MP data path at runtime, deep inside LMCache. Reject at admission and
 		// let the webhook fail open.
-		if err := sglangCheckShmReusable(work.Volumes, *existing); err != nil {
+		if err := checkLMCacheMPShmReusable(work.Volumes, *existing); err != nil {
 			return err
 		}
 		// Mirror the engine's subPath. Both containers must land on the SAME
@@ -349,7 +349,7 @@ func sglangMPWorkerContainer(engineImage string, engineSC *corev1.SecurityContex
 			PeriodSeconds:    3,
 			FailureThreshold: 40,
 		},
-		// Restricted-compatible securityContext (see sglangWorkerSecurityContext). This
+		// Restricted-compatible securityContext (see lmCacheMPServerSecurityContext). This
 		// mutation lands BEFORE Pod Security admission, so a worker that did NOT carry
 		// the container-only Restricted requirements (allowPrivilegeEscalation: false,
 		// drop ALL capabilities) would get the whole engine pod REJECTED in a
@@ -358,31 +358,27 @@ func sglangMPWorkerContainer(engineImage string, engineSC *corev1.SecurityContex
 		// carried it over from the RDMA reference manifests; the MP wire moves KV over
 		// CUDA-IPC and /dev/shm, not RDMA, so no capability is needed — and an added
 		// capability is itself a Restricted violation).
-		SecurityContext: sglangWorkerSecurityContext(engineSC),
+		SecurityContext: lmCacheMPServerSecurityContext(engineSC),
 	}
 }
 
-// sglangWorkerSecurityContext builds the MP worker's securityContext so the worker
+// lmCacheMPServerSecurityContext builds an MP server's securityContext so it
 // never turns an admissible engine pod into a Pod-Security-rejected one.
 //
 // It always sets the two container-only Restricted requirements — these cannot be
-// inherited from the pod, so the worker must carry them itself:
+// inherited from the pod, so the server must carry them itself:
 //   - AllowPrivilegeEscalation=false,
-//   - Capabilities.Drop=[ALL] (the worker needs no capabilities; GPU access is via
+//   - Capabilities.Drop=[ALL] (the server needs no capabilities; GPU access is via
 //     device files + /dev/shm, not caps).
 //
 // It also sets seccompProfile=RuntimeDefault (Restricted-required; harmless, and GPU
 // workloads run under it). It deliberately does NOT set RunAsNonRoot / RunAsUser /
-// ReadOnlyRootFilesystem to fixed values the way the distroless subscriber sidecar
-// does: the worker runs the operator's engine/worker image, whose user and writable
-// paths this adapter must not override (forcing a UID or a read-only rootfs can break
-// CUDA-IPC or the image's own writes). Instead it MIRRORS the engine container's user
-// identity (RunAsNonRoot / RunAsUser / RunAsGroup) when the engine sets it — the
-// worker defaults to the same image, so the same user is valid, and matching the
-// engine keeps the worker exactly as (non-)root as the pod was admitted to be. When
-// the engine leaves those unset, they are inherited from the pod securityContext (the
-// usual restricted-namespace shape), so the worker inherits the same.
-func sglangWorkerSecurityContext(engineSC *corev1.SecurityContext) *corev1.SecurityContext {
+// ReadOnlyRootFilesystem to fixed values: the selected LMCache image owns its
+// user and writable-path requirements, and forcing a UID or read-only rootfs can
+// break CUDA-IPC or image startup. The legacy renderer passes engineSC so its
+// same-image worker mirrors the engine identity; the standalone typed renderer
+// passes nil and inherits any Pod-level identity instead.
+func lmCacheMPServerSecurityContext(engineSC *corev1.SecurityContext) *corev1.SecurityContext {
 	no := false
 	sc := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: &no,
@@ -549,7 +545,7 @@ func adoptContainer(cs []corev1.Container, want corev1.Container, owned bool) ([
 			continue
 		}
 		if !owned {
-			return nil, fmt.Errorf("inject engine config: pod already has a container named %q that this adapter did not render; that name is reserved for the LMCache MP worker — rename your container", want.Name)
+			return nil, fmt.Errorf("inject engine config: pod already has a container named %q that this adapter did not render; that name is reserved for the LMCache MP native sidecar — rename your container", want.Name)
 		}
 		cs[i] = want // our own prior injection — converge on the current render
 		return cs, nil
@@ -574,8 +570,8 @@ func adoptVolume(vs []corev1.Volume, want corev1.Volume, owned bool) ([]corev1.V
 	return append(vs, want), nil
 }
 
-// sglangCheckShmReusable rejects an engine-owned /dev/shm mount the worker cannot
-// safely share. The engine and the worker exchange KV through this volume, so it
+// checkLMCacheMPShmReusable rejects an engine-owned /dev/shm mount the MP server cannot
+// safely share. The engine and the server exchange KV through this volume, so it
 // must be WRITABLE and both containers must resolve it to the SAME directory —
 // neither of which the kubelet reports back at admission; getting it wrong surfaces
 // as a silent no-transfer at runtime, deep inside LMCache.
@@ -587,9 +583,9 @@ func adoptVolume(vs []corev1.Volume, want corev1.Volume, owned bool) ([]corev1.V
 // downwardAPI / projected) AND every in-tree source carrying its own readOnly flag.
 // Sources with no such flag (emptyDir, hostPath, ephemeral, …) are writable, or
 // their writability is the operator's to configure, so they pass.
-func sglangCheckShmReusable(vs []corev1.Volume, m corev1.VolumeMount) error {
+func checkLMCacheMPShmReusable(vs []corev1.Volume, m corev1.VolumeMount) error {
 	if m.ReadOnly {
-		return fmt.Errorf("inject engine config: engine container mounts %q read-only (volume %q), but the LMCache MP data path writes there — drop readOnly or mount it elsewhere", sglangShmMountPath, m.Name)
+		return fmt.Errorf("inject engine config: engine container mounts %q read-only (volume %q), but the LMCache MP data path writes there — drop readOnly or mount it elsewhere", lmCacheMPShmMountPath, m.Name)
 	}
 	// subPath is mirrorable (the caller copies it onto the worker's mount);
 	// subPathExpr is NOT: it expands $(VAR) from the mounting CONTAINER's env, and the
@@ -598,7 +594,7 @@ func sglangCheckShmReusable(vs []corev1.Volume, m corev1.VolumeMount) error {
 	// containers on different directories is exactly the failure this guard exists to
 	// prevent, so reject rather than guess.
 	if m.SubPathExpr != "" {
-		return fmt.Errorf("inject engine config: engine container mounts %q with subPathExpr %q (volume %q); the LMCache MP worker cannot reproduce that expansion in its own env — use a literal subPath, or mount %[1]q without it", sglangShmMountPath, m.SubPathExpr, m.Name)
+		return fmt.Errorf("inject engine config: engine container mounts %q with subPathExpr %q (volume %q); the LMCache MP server cannot reproduce that expansion in its own env — use a literal subPath, or mount %[1]q without it", lmCacheMPShmMountPath, m.SubPathExpr, m.Name)
 	}
 	for i := range vs {
 		if vs[i].Name != m.Name {
@@ -667,7 +663,7 @@ func sglangCheckShmReusable(vs []corev1.Volume, m corev1.VolumeMount) error {
 		default:
 			return nil
 		}
-		return fmt.Errorf("inject engine config: engine container mounts %q from a %s volume (%q) %s, but the LMCache MP data path writes there — use an emptyDir (medium: Memory) instead", sglangShmMountPath, kind, m.Name, why)
+		return fmt.Errorf("inject engine config: engine container mounts %q from a %s volume (%q) %s, but the LMCache MP data path writes there — use an emptyDir (medium: Memory) instead", lmCacheMPShmMountPath, kind, m.Name, why)
 	}
 	return nil
 }

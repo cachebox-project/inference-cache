@@ -197,6 +197,9 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// transient List/Patch errors so it never escalates a transient
 	// apiserver hiccup into a Reconcile error.
 	matchedRefresh := r.refreshMatchedEnginePods(ctx, &backend)
+	// Typed LMCache PodLocal health comes from the injected native sidecars in
+	// engine Pod status, independently from managed/external Redis readiness.
+	r.refreshLMCacheMPConnectorStatus(ctx, &backend)
 	// Self-requeue when there's matchedEnginePods work to keep doing on
 	// the next tick:
 	//

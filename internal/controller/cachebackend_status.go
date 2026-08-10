@@ -158,9 +158,30 @@ const (
 func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) (time.Duration, error) {
 	now := time.Now()
 	readyStatus, reason, message := managedReadiness(backend, dep)
+	remoteStatus, remoteReason, remoteMessage := readyStatus, reason, message
+	if reason == conditionReasonRolloutInProgress {
+		remoteStatus = metav1.ConditionUnknown
+		remoteReason = reasonRemoteStoragePending
+		remoteMessage = "managed remote-storage rollout is still converging"
+	} else if endpoint == "" {
+		remoteStatus = metav1.ConditionFalse
+		remoteReason = reasonRemoteStorageUnavailable
+		remoteMessage = "managed remote storage has no live Service endpoint"
+	} else if readyStatus == metav1.ConditionTrue {
+		remoteReason = reasonRemoteStorageReady
+		remoteMessage = "managed remote storage workload is Available and its Service endpoint is published"
+	} else {
+		remoteReason = reasonRemoteStorageUnavailable
+	}
+	if isTypedLMCachePodLocal(backend) {
+		readyStatus, reason, message = lmCacheMPReadyBase(backend, remoteStatus, remoteReason, remoteMessage)
+	}
 	// Resolve the stable timeout anchor: the latched FirstAvailableAt, or — the
-	// first time the workload is Available — now. Using a latched value (not the
-	// live Deployment Available condition, which resets on a flap) keeps the
+	// first time the effective backend is Ready — now. For typed PodLocal MP,
+	// effective readiness is connector health (plus L3 only in fail-closed
+	// mode), not the optional managed Redis Deployment by itself. Using a
+	// latched value (not the live Deployment Available condition, which resets
+	// on a flap) keeps the
 	// firstEventTimeout window monotonic so Degraded stays sticky.
 	anchor := time.Time{}
 	if backend.Status.FirstAvailableAt != nil {
@@ -208,6 +229,7 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	prevEngineIncompatible := meta.IsStatusConditionFalse(backend.Status.Conditions, conditionTypeEngineCompatibility)
 	err := r.patchStatus(ctx, backend, func() {
 		backend.Status.Endpoint = endpoint
+		setRemoteStorageStatus(backend, endpoint, remoteStatus, remoteReason, remoteMessage, publishedGen)
 		backend.Status.ObservedGeneration = publishedGen
 		// Latch the first KV-event observation write-once. The poller can later
 		// clear indexParticipation.lastEventAt on a drain, so this durable
@@ -906,6 +928,15 @@ type stateSnapshot struct {
 	// rather than re-firing every time a rollout takes an already-event-seen
 	// backend through RolloutInProgress and back to KVEventsObserved.
 	firstEventLatched bool
+	connector         conditionSnapshot
+	remoteStorage     conditionSnapshot
+}
+
+type conditionSnapshot struct {
+	present            bool
+	status             metav1.ConditionStatus
+	reason             string
+	observedGeneration int64
 }
 
 // snapshotState captures the prior status values that drive transition events.
@@ -918,6 +949,21 @@ func snapshotState(cb *cachev1alpha1.CacheBackend) stateSnapshot {
 		failOpen:          statusFailOpen(cb.Status.FailOpen),
 		readyReason:       readyConditionReason(cb),
 		firstEventLatched: cb.Status.FirstKVEventObservedAt != nil,
+		connector:         snapshotCondition(cb, conditionTypeConnectorReady),
+		remoteStorage:     snapshotCondition(cb, conditionTypeRemoteStorageReady),
+	}
+}
+
+func snapshotCondition(cb *cachev1alpha1.CacheBackend, conditionType string) conditionSnapshot {
+	condition := meta.FindStatusCondition(cb.Status.Conditions, conditionType)
+	if condition == nil {
+		return conditionSnapshot{}
+	}
+	return conditionSnapshot{
+		present:            true,
+		status:             condition.Status,
+		reason:             condition.Reason,
+		observedGeneration: condition.ObservedGeneration,
 	}
 }
 
@@ -979,6 +1025,8 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 		return
 	}
 	after := snapshotState(cb)
+	r.emitMPConditionTransition(cb, before.connector, after.connector, conditionTypeConnectorReady)
+	r.emitMPConditionTransition(cb, before.remoteStorage, after.remoteStorage, conditionTypeRemoteStorageReady)
 
 	// Generic Conditions[Degraded] transitions. The KV-event gate's Degraded
 	// and Ready flavors carry their own, more specific events below, so
@@ -1045,6 +1093,21 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonFailOpenRestored, eventReasonFailOpenRestored,
 			"fail-open mode restored — cache is again an optimization, not a serving dependency")
 	}
+}
+
+func (r *CacheBackendReconciler) emitMPConditionTransition(cb *cachev1alpha1.CacheBackend, before, after conditionSnapshot, conditionType string) {
+	if !after.present || (before.present && before.status == after.status && before.reason == after.reason && before.observedGeneration == after.observedGeneration) {
+		return
+	}
+	condition := meta.FindStatusCondition(cb.Status.Conditions, conditionType)
+	if condition == nil {
+		return
+	}
+	eventType := corev1.EventTypeWarning
+	if condition.Status == metav1.ConditionTrue {
+		eventType = corev1.EventTypeNormal
+	}
+	r.Recorder.Eventf(cb, nil, eventType, condition.Reason, condition.Reason, "%s", condition.Message)
 }
 
 // degradedMessage surfaces the Ready=False condition's message (set by

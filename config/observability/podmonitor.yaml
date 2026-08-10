@@ -15,8 +15,8 @@
 # controller binary does not front its /metrics endpoint with a Service —
 # the manager pod listens on :8080 directly. Loaded by the same
 # `kubectl apply -k config/observability` as the PrometheusRule and the
-# server ServiceMonitor, so the alert bundle and BOTH scrape configs ship
-# together.
+# server ServiceMonitor and LMCache MP PodMonitor, so the alert bundle and all
+# scrape configs ship together.
 #
 # Selector matches the controller Deployment in config/manager/manager.yaml.
 # The endpoint binds by port-NAME (`metrics`), not number, so this stays
