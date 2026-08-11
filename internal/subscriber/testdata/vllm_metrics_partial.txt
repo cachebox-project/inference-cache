@@ -1,3 +1,10 @@
+# Both load gauges present (running + waiting) but cache-usage and prefix-cache
+# counters absent — a vLLM scrape where load-aware routing works while the cache
+# metrics degrade gracefully. The scraper requires both load gauges, so omitting
+# either would fail loud instead.
 # HELP vllm:num_requests_running Number of requests currently running.
 # TYPE vllm:num_requests_running gauge
 vllm:num_requests_running{model_name="m"} 0
+# HELP vllm:num_requests_waiting Number of requests waiting.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model_name="m"} 0

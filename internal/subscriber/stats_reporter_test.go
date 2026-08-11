@@ -35,8 +35,15 @@ func (s *stubScraper) Scrape(_ context.Context) (*icpb.ReplicaStats, error) {
 }
 
 // startRecordingReporter wires a recordingServer + StatsReporter over bufconn
-// and returns both with a cleanup hook.
+// and returns both with a cleanup hook, using the default vLLM testConfig().
 func startRecordingReporter(t *testing.T, scraper statsScraper, interval time.Duration) (*recordingServer, *StatsReporter, func()) {
+	t.Helper()
+	return startRecordingReporterWithConfig(t, scraper, interval, testConfig())
+}
+
+// startRecordingReporterWithConfig is startRecordingReporter with an explicit
+// subscriber Config, so a test can exercise a non-vLLM identity/scheme.
+func startRecordingReporterWithConfig(t *testing.T, scraper statsScraper, interval time.Duration, cfg Config) (*recordingServer, *StatsReporter, func()) {
 	t.Helper()
 
 	lis := bufconn.Listen(1 << 20)
@@ -52,7 +59,7 @@ func startRecordingReporter(t *testing.T, scraper statsScraper, interval time.Du
 		t.Fatalf("dial: %v", err)
 	}
 
-	r := NewStatsReporter(icpb.NewInferenceCacheClient(conn), scraper, testConfig(),
+	r := NewStatsReporter(icpb.NewInferenceCacheClient(conn), scraper, cfg,
 		WithStatsInterval(interval),
 		WithStatsRPCTimeout(time.Second),
 	)
@@ -112,6 +119,67 @@ func TestStatsReporterEmitsStatsOnlyCSU(t *testing.T) {
 		if st.GetReplicaId() != "vllm-0" {
 			t.Errorf("nested stats.replica_id = %q, want %q (mirrored from CSU)", st.GetReplicaId(), "vllm-0")
 		}
+	}
+}
+
+func TestStatsReporterEmitsSGLangStatsEndToEnd(t *testing.T) {
+	// End-to-end subscriber stats path for SGLang: a real MetricsScraper reads an
+	// sglang:* exposition with Scheme:"sglang", the StatsReporter forwards the
+	// derived ReplicaStats, and the CSU reaching the server carries the
+	// sglang-derived pressure/hit_rate — load-aware routing gets a real SGLang
+	// signal, not fabricated zeros.
+	fx := fixtureServer(t, "sglang_metrics.txt")
+	defer fx.Close()
+	scraper := NewMetricsScraper(fx.Client(), ScraperConfig{
+		URL: fx.URL, Scheme: "sglang", Tier: CacheTierAuto,
+		CacheSizeBytes: 1 << 30, MaxConcurrencyCeiling: 256,
+	}, nil)
+
+	cfg := Config{ReplicaID: "sglang-0", ModelID: "medgemma", TenantID: "tenant-b", HashScheme: "sglang"}
+	rec, r, stop := startRecordingReporterWithConfig(t, scraper, 10*time.Millisecond, cfg)
+	defer stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rec.mu.Lock()
+		n := len(rec.updates)
+		rec.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned: %v", err)
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.updates) == 0 {
+		t.Fatal("no CacheStateUpdates reached the server (SGLang stats path is dark)")
+	}
+	u := rec.updates[0]
+	// Delivered under the SGLang identity/scheme, not vLLM.
+	if u.GetHashScheme() != "sglang" || u.GetReplicaId() != "sglang-0" || u.GetModelId() != "medgemma" || u.GetTenantId() != "tenant-b" {
+		t.Errorf("identity = %s/%s/%s/%s, want sglang-0/medgemma/tenant-b/sglang",
+			u.GetReplicaId(), u.GetModelId(), u.GetTenantId(), u.GetHashScheme())
+	}
+	st := u.GetStats()
+	if st == nil {
+		t.Fatal("CSU.stats nil — SGLang stats path dark")
+	}
+	// sglang:num_running_reqs 3 + num_queue_reqs 5 → pressure = 8/256.
+	if got, want := st.GetPressure(), float32(8.0/256.0); got < want-1e-4 || got > want+1e-4 {
+		t.Errorf("delivered pressure = %v, want %v (sglang load gauges)", got, want)
+	}
+	// sglang:cache_hit_rate direct gauge = 0.75.
+	if got, want := st.GetHitRate(), float32(0.75); got < want-1e-4 || got > want+1e-4 {
+		t.Errorf("delivered hit_rate = %v, want %v (sglang:cache_hit_rate)", got, want)
 	}
 }
 

@@ -231,6 +231,9 @@ func TestSGLangInjectEngineConfig(t *testing.T) {
 	if !containsArg(engine.Args, SGLangEnableLMCacheArg) {
 		t.Fatalf("engine args missing %s: %v", SGLangEnableLMCacheArg, engine.Args)
 	}
+	if !containsArg(engine.Args, SGLangEnableMetricsArg) {
+		t.Fatalf("engine args missing %s (SGLang metrics must be on for the scraper): %v", SGLangEnableMetricsArg, engine.Args)
+	}
 	if !containsArg(engine.Args, SGLangConfigFileArg) {
 		t.Fatalf("engine args missing %s: %v", SGLangConfigFileArg, engine.Args)
 	}
@@ -1110,6 +1113,7 @@ func TestSGLangObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testing.T)
 	fs.String("model-id", "", "")
 	fs.String("tenant-id", "", "")
 	fs.String("hash-scheme", "", "")
+	fs.String("engine-metrics-url", "", "")
 	fs.Duration("window", 0, "")
 	fs.Bool("ignore-block-removed", false, "")
 	if err := fs.Parse(c.Args); err != nil {
@@ -1190,7 +1194,7 @@ func TestSGLangObservationSidecarBadInput(t *testing.T) {
 
 func TestSGLangReservedArgs(t *testing.T) {
 	got := NewSGLangLMCacheAdapter(SubscriberConfig{}).ReservedArgs()
-	want := []string{SGLangEnableLMCacheArg, SGLangConfigFileArg}
+	want := []string{SGLangEnableLMCacheArg, SGLangConfigFileArg, SGLangEnableMetricsArg}
 	if len(got) != len(want) {
 		t.Fatalf("ReservedArgs = %v, want %v", got, want)
 	}

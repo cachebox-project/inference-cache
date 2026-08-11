@@ -1,6 +1,13 @@
 # Engine exposing tier-2 (external offload / LMCache) cache counters alongside
 # the native (T1) prefix-cache counters. Used to verify the scraper forwards
-# the external counters as cumulative t2_hit_tokens / t2_query_tokens.
+# the external counters as cumulative t2_hit_tokens / t2_query_tokens. The load
+# gauges are present (the scraper requires both before emitting stats).
+# HELP vllm:num_requests_running Number of requests currently running.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="m"} 0
+# HELP vllm:num_requests_waiting Number of requests waiting.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model_name="m"} 0
 # HELP vllm:prefix_cache_hits_total Counter of cached blocks reused.
 # TYPE vllm:prefix_cache_hits_total counter
 vllm:prefix_cache_hits_total{model_name="m"} 10

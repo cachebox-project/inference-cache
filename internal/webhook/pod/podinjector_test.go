@@ -545,6 +545,9 @@ func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
 	if !argPresent(sub.Args, "--hash-scheme=vllm") {
 		t.Fatalf("subscriber must tag events hash-scheme=vllm; args = %v", sub.Args)
 	}
+	if !argPresent(sub.Args, "--engine-metrics-url=http://127.0.0.1:8000/metrics") {
+		t.Fatalf("vLLM subscriber must scrape :8000/metrics; args = %v", sub.Args)
+	}
 	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
 		t.Fatalf("subscriber --model-id derived from observation.modelID missing; args = %v", sub.Args)
 	}
@@ -801,6 +804,9 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 	}
 	if !argPresent(sub.Args, "--hash-scheme=sglang") {
 		t.Fatalf("SGLang subscriber MUST tag --hash-scheme=sglang; args = %v", sub.Args)
+	}
+	if !argPresent(sub.Args, "--engine-metrics-url=http://127.0.0.1:30000/metrics") {
+		t.Fatalf("SGLang subscriber must scrape :30000/metrics (not vLLM's :8000); args = %v", sub.Args)
 	}
 	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
 		t.Fatalf("--model-id derived from cb.spec.observation.modelID missing; args = %v", sub.Args)

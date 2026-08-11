@@ -1215,10 +1215,10 @@ func TestVLLMLMCacheObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testi
 
 	fs := flag.NewFlagSet("kvevent-subscriber", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	// Subset of cmd/kvevent-subscriber/main.go's flag surface (the
-	// event-path flags every shipped subscriber accepts). Stats-path
-	// flags are intentionally absent here AND in the rendered args; both
-	// land in the same follow-up.
+	// Subset of cmd/kvevent-subscriber/main.go's flag surface (the flags the
+	// renderer emits). --engine-metrics-url is now wired; the remaining
+	// stats-path flags (--stats-interval, --engine-cache-size-bytes, …) still
+	// take binary defaults and are intentionally absent from the rendered args.
 	fs.String("engine-endpoint", "", "")
 	fs.String("topic", "", "")
 	fs.String("server", "", "")
@@ -1226,6 +1226,7 @@ func TestVLLMLMCacheObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testi
 	fs.String("model-id", "", "")
 	fs.String("tenant-id", "", "")
 	fs.String("hash-scheme", "", "")
+	fs.String("engine-metrics-url", "", "")
 	fs.Duration("window", 0, "")
 	fs.Bool("ignore-block-removed", false, "")
 
@@ -1237,6 +1238,99 @@ func TestVLLMLMCacheObservationSidecarArgsParseAgainstSubscriberFlagSet(t *testi
 	// being a tautology if someone passes the wrong FlagSet mode).
 	if err := fs.Parse(append(c.Args, "--definitely-not-a-real-flag=x")); err == nil {
 		t.Fatalf("control: FlagSet must reject unknown flag --definitely-not-a-real-flag")
+	}
+}
+
+func TestEnginePortFromContainer(t *testing.T) {
+	mk := func(args ...string) *corev1.Pod {
+		return &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: EngineContainerName, Args: args},
+		}}}
+	}
+	mkCmd := func(cmd ...string) *corev1.Pod {
+		return &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: EngineContainerName, Command: cmd},
+		}}}
+	}
+	mkBoth := func(cmd, args []string) *corev1.Pod {
+		return &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: EngineContainerName, Command: cmd, Args: args},
+		}}}
+	}
+	mkArgsEnv := func(env []corev1.EnvVar, args ...string) *corev1.Pod {
+		return &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: EngineContainerName, Args: args, Env: env},
+		}}}
+	}
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		want string
+	}{
+		{"space form", mk("--model", "m", "--port", "40000"), "40000"},
+		{"equals form", mk("--port=41000"), "41000"},
+		{"absent", mk("--model", "m"), ""},
+		{"malformed", mk("--port", "abc"), ""},
+		{"out of range", mk("--port", "70000"), ""},
+		{"trailing --port", mk("--port"), ""},
+		{"duplicate: last wins", mk("--port=30000", "--port=31000"), "31000"},
+		{"duplicate space+equals: last wins", mk("--port", "30000", "--port=32000"), "32000"},
+		{"last invalid falls back to prior valid", mk("--port=33000", "--port", "abc"), "33000"},
+		{"normalizes accepted form", mk("--port=+31000"), "31000"},
+		// --port may live in Command (the entrypoint), not Args.
+		{"port in command (space)", mkCmd("python", "-m", "launch", "--port", "40000"), "40000"},
+		{"port in command (equals)", mkCmd("launch", "--port=42000"), "42000"},
+		{"command + args: args wins (later in argv)", mkBoth([]string{"launch", "--port=30000"}, []string{"--port=31000"}), "31000"},
+		{"command sets port, args unrelated", mkBoth([]string{"launch", "--port", "43000"}, []string{"--model", "m"}), "43000"},
+		// $(VAR) references resolve against the container's literal env.
+		{"env ref (equals)", mkArgsEnv([]corev1.EnvVar{{Name: "ENGINE_PORT", Value: "40000"}}, "--port=$(ENGINE_PORT)"), "40000"},
+		{"env ref (space)", mkArgsEnv([]corev1.EnvVar{{Name: "P", Value: "45000"}}, "--port", "$(P)"), "45000"},
+		{"env ref undefined falls back", mkArgsEnv(nil, "--port=$(MISSING)"), ""},
+		{"env ref valueFrom-only unresolvable", mkArgsEnv([]corev1.EnvVar{{Name: "SEC", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}}, "--port=$(SEC)"), ""},
+	}
+	for _, c := range cases {
+		if got := enginePortFromContainer(c.pod, EngineContainerName); got != c.want {
+			t.Errorf("%s: enginePortFromContainer = %q, want %q", c.name, got, c.want)
+		}
+	}
+	// Single-container pod: EngineContainerIndexNamed falls back to the lone
+	// container even when the queried name doesn't match (the engine IS the only
+	// container), so its --port is still derived.
+	if got := enginePortFromContainer(mk("--port", "50000"), "some-other-name"); got != "50000" {
+		t.Errorf("single-container fallback should derive --port; got %q", got)
+	}
+	// Multi-container pod with no matching engine container: the lookup errors
+	// rather than guess, so we fall back to the default port.
+	multi := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Name: "sidecar-a", Args: []string{"--port", "40000"}},
+		{Name: "sidecar-b"},
+	}}}
+	if got := enginePortFromContainer(multi, "nonexistent-container"); got != "" {
+		t.Errorf("multi-container pod with no matching container must yield \"\"; got %q", got)
+	}
+	if got := enginePortFromContainer(nil, EngineContainerName); got != "" {
+		t.Errorf("nil pod must yield \"\"; got %q", got)
+	}
+}
+
+func TestVLLMObservationSidecarDerivesMetricsPortFromEngineArgs(t *testing.T) {
+	// P1: an operator running the engine on a custom --port must be scraped there,
+	// not the hardcoded default. The --engine-metrics-url derives from the engine
+	// container's --port.
+	a := NewVLLMLMCacheAdapter(SubscriberConfig{Image: DefaultSubscriberImage})
+	cb := newLMCacheBackend(map[string]string{"model": "Qwen/Qwen2.5-0.5B-Instruct"})
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine-a", Namespace: "engines"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: EngineContainerName, Args: []string{"--model", "m", "--port", "40000"}},
+		}},
+	}
+	c, err := a.ObservationSidecar(cb, pod)
+	if err != nil || c == nil {
+		t.Fatalf("ObservationSidecar: (%v, %v)", c, err)
+	}
+	if got, ok := testArgValue(c.Args, "--engine-metrics-url"); !ok || got != "http://127.0.0.1:40000/metrics" {
+		t.Fatalf("metrics URL must derive from engine --port 40000; got %q (ok=%t), args = %v", got, ok, c.Args)
 	}
 }
 

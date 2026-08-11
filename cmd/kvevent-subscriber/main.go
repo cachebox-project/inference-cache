@@ -2,10 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Command kvevent-subscriber runs as a sidecar next to a vLLM engine replica:
-// it subscribes to the engine's KV-cache events over ZMQ and reports cache state
-// to the inferencecache-server over gRPC. Metadata only — never tokens or prompt
-// text. Fail-soft: engine/server outages are retried and never stall the engine.
+// Command kvevent-subscriber runs as a sidecar next to a vLLM or SGLang engine
+// replica: it subscribes to the engine's KV-cache events over ZMQ and reports
+// cache state to the inferencecache-server over gRPC. Metadata only — never
+// tokens or prompt text. Fail-soft: engine/server outages are retried and never
+// stall the engine. The stats path reads the engine's metric profile selected by
+// --hash-scheme (vLLM vllm:* vs SGLang sglang:*).
 //
 // Two independent paths share the gRPC client:
 //   - Event path: ZMQ → decoded EventBatch → ReportCacheState (prefix adds) +
@@ -49,9 +51,9 @@ func main() {
 		window             = flag.Duration("window", 100*time.Millisecond, "add-batching/debounce flush window")
 		metricsURL         = flag.String("engine-metrics-url", "http://127.0.0.1:8000/metrics", "engine Prometheus /metrics URL")
 		statsInterval      = flag.Duration("stats-interval", 10*time.Second, "ReplicaStats scrape/emit cadence")
-		cacheSizeBytes     = flag.Int64("engine-cache-size-bytes", 0, "engine total KV-cache capacity in bytes (multiplied by usage_perc to derive cacheMemoryBytes; 0 emits cacheMemoryBytes=0)")
-		ceiling            = flag.Int("max-concurrency-ceiling", 256, "denominator for the pressure proxy = clamp01((num_requests_running+num_requests_waiting)/ceiling)")
-		cacheTier          = flag.String("cache-tier", "auto", `which vLLM cache-usage gauge to read: "auto" (kv→gpu→cpu fallback) | "kv" | "gpu" | "cpu"`)
+		cacheSizeBytes     = flag.Int64("engine-cache-size-bytes", 0, "engine total KV-cache capacity in bytes, multiplied by the usage ratio (vLLM vllm:kv_cache_usage_perc / SGLang sglang:token_usage) to derive cacheMemoryBytes; 0 emits cacheMemoryBytes=0")
+		ceiling            = flag.Int("max-concurrency-ceiling", 256, "denominator for the pressure proxy = clamp01((running+waiting)/ceiling); running/waiting are the engine's scheduler gauges (vLLM num_requests_* / SGLang num_running_reqs+num_queue_reqs)")
+		cacheTier          = flag.String("cache-tier", "auto", `which cache-usage gauge to read (applies to vLLM's tiered gauges): "auto" (kv→gpu→cpu fallback) | "kv" | "gpu" | "cpu". SGLang exposes a single usage gauge (token_usage) read under "auto"; explicit "gpu"/"cpu" yield unknown/zero usage for SGLang.`)
 		engineModel        = flag.String("engine-model-name", "", `value of the engine's `+"`model_name`"+` Prometheus label to filter /metrics by (e.g. "Qwen/Qwen2.5-0.5B-Instruct"). Distinct from --model-id (the cache-plane index key). Empty = no label filter (aggregates every series — fine when the engine serves one model).`)
 		ignoreBlockRemoved = flag.Bool("ignore-block-removed", false, `declare that this engine is paired with an L2 offload tier (e.g. LMCache): a BlockRemoved is re-reported as a T2 (reload-from-L2) entry instead of a PREFIX_EVICTED delete, so the routing hint survives the HBM eviction but is honestly tagged colder. Default off for single-tier deployments (BlockRemoved → PREFIX_EVICTED). Name kept for compatibility. See docs/design/kvevent-subscriber-wiring.md "L2 cache tier semantics".`)
 		adapterNames       = flag.String("lora-adapter-names", "", `comma-separated `+"`id=name`"+` map from the engine's internal LoRA id (BlockStored.lora_id, assigned in --lora-modules load order) to the stable adapter identity used as the index partition — the same string the gateway sends as LookupRouteRequest.adapter_id (e.g. "1=sql-lora,2=chat-lora"). An unmapped non-nil lora_id is FAIL-CLOSED: its blocks are dropped (not cached) rather than indexed under a replica-local "lora:<id>" that could alias different adapters across replicas — so LoRA caching REQUIRES this map. Omit ONLY for base-model / non-LoRA traffic (nil lora_id → the default "" partition). The identity mapped here MUST match the gateway's LookupRoute query adapter_id end-to-end or every lookup silently misses (the same agreement --hash-scheme requires).`)
@@ -107,6 +109,7 @@ func main() {
 		&http.Client{Timeout: 5 * time.Second},
 		subscriber.ScraperConfig{
 			URL:                   *metricsURL,
+			Scheme:                *scheme,
 			Tier:                  tier,
 			ModelLabel:            *engineModel,
 			CacheSizeBytes:        *cacheSizeBytes,

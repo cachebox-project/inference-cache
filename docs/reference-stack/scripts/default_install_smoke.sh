@@ -2812,7 +2812,7 @@ if ! hc_pod_args="$(kubectl create --dry-run=server --request-timeout=30s \
   -o go-template='{{range (index .spec.containers 0).args}}{{println .}}{{end}}' 2>/dev/null)"; then
   fail "matching SGLang Pod did not pass server-side dry-run admission"
 fi
-hc_expected_args=$'sleep\n3600\n--enable-hierarchical-cache\n--hicache-ratio\n2.0\n--hicache-write-policy\nwrite_through\n--hicache-io-backend\nkernel\n--hicache-mem-layout\nlayer_first'
+hc_expected_args=$'sleep\n3600\n--enable-hierarchical-cache\n--hicache-ratio\n2.0\n--hicache-write-policy\nwrite_through\n--hicache-io-backend\nkernel\n--hicache-mem-layout\nlayer_first\n--enable-metrics'
 if [ "$hc_pod_args" != "$hc_expected_args" ]; then
   printf '[install-smoke] admitted SGLang args:\n%s\n' "$hc_pod_args" >&2
   fail "native HiCache Pod mutation did not produce the expected complete argument contract"

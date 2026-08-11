@@ -97,6 +97,9 @@ func TestHiCacheInjectsOnlyRequestedFlags(t *testing.T) {
 	if !containsArg(args, SGLangEnableHiCacheArg) {
 		t.Fatalf("args missing %s: %v", SGLangEnableHiCacheArg, args)
 	}
+	if !containsArg(args, SGLangEnableMetricsArg) {
+		t.Fatalf("args missing %s (SGLang metrics must be on for the scraper): %v", SGLangEnableMetricsArg, args)
+	}
 	if _, ok := testArgValue(args, SGLangHiCacheRatioArg); ok {
 		t.Fatalf("%s was injected with sizeGB: %v", SGLangHiCacheRatioArg, args)
 	}
@@ -134,6 +137,7 @@ func TestHiCacheMatchingArgsArePreserved(t *testing.T) {
 	originalArgs := []string{
 		"--model-path", "model",
 		SGLangEnableHiCacheArg,
+		SGLangEnableMetricsArg,
 		SGLangHiCacheRatioArg + "=2",
 		SGLangHiCacheWritePolicyArg, "write_through",
 		"--hicache-io-backend=kernel",
@@ -305,6 +309,7 @@ func TestHiCacheReservedArgs(t *testing.T) {
 		SGLangHiCacheWritePolicyArg,
 		SGLangHiCacheIOBackendArg,
 		SGLangHiCacheMemoryLayoutArg,
+		SGLangEnableMetricsArg,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReservedArgs = %v, want %v", got, want)

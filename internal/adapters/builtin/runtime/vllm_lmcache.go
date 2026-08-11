@@ -25,6 +25,11 @@ const (
 	// without touching the webhook.
 	vllmDefaultEngineZMQPortStr = "5557"
 
+	// vllmDefaultMetricsPortStr is the port vLLM serves Prometheus /metrics on by
+	// default (:8000). Fed to --engine-metrics-url so the stats scraper hits the
+	// right endpoint.
+	vllmDefaultMetricsPortStr = "8000"
+
 	// subscriberHashScheme is the canonical hash-scheme tag the vLLM subscriber
 	// carries. Hard-coded for this adapter (vLLM's block-hash scheme is distinct
 	// from SGLang's, and the cache plane keys on the scheme to keep them from
@@ -185,11 +190,13 @@ func (vllmLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, binding *backe
 // Mooncake) because the KV-event stream comes from vLLM itself, not the L2 store.
 func (a vllmLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
 	return renderSubscriberSidecar(subscriberSidecarParams{
-		Config:           a.subscriber,
-		Cache:            cache,
-		Pod:              pod,
-		HashScheme:       vllmSubscriberHashScheme,
-		EngineZMQPortStr: vllmDefaultEngineZMQPortStr,
+		Config:               a.subscriber,
+		Cache:                cache,
+		Pod:                  pod,
+		HashScheme:           vllmSubscriberHashScheme,
+		EngineZMQPortStr:     vllmDefaultEngineZMQPortStr,
+		EngineMetricsPortStr: vllmDefaultMetricsPortStr,
+		EngineContainerName:  a.EngineContainerName(),
 	})
 }
 
