@@ -823,40 +823,47 @@ func TestValidator_RuntimeAdapter_VLLMPlusMooncakeAdmittedViaShippingRegistry(t 
 	}
 }
 
-func TestValidator_SGLangRoleRejected(t *testing.T) {
-	// SGLang's LMCache integration has no producer/consumer split, so a
-	// non-ReadWrite role can't be honored — admission rejects it loudly rather
-	// than silently treating it as ReadWrite. Uses the real shipping registry
-	// (the role rule is registry-independent, but this keeps the adapter-pair
-	// check happy for the (sglang, LMCache) CR).
+func TestValidator_LMCacheDirectionalRolesRejected(t *testing.T) {
+	// Neither shipping LMCache integration can currently honor directional
+	// roles: SGLang has no split, while the validated vLLM MP connector ignores
+	// kv_consumer/kv_producer behaviorally.
 	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
-	for _, role := range []cachev1alpha1.CacheBackendIntegrationRole{
-		cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
-		cachev1alpha1.CacheBackendIntegrationRoleWriteOnly,
+	for _, runtime := range []cachev1alpha1.CacheBackendRuntime{
+		cachev1alpha1.CacheBackendRuntimeVLLM,
+		cachev1alpha1.CacheBackendRuntimeSGLang,
 	} {
-		t.Run(string(role), func(t *testing.T) {
-			cb := newBackend() // type=LMCache
-			cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
-			cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Role: role}
-			requireInvalidWithCause(t, v, cb, "spec.integration.role", "sglang")
-		})
+		for _, role := range []cachev1alpha1.CacheBackendIntegrationRole{
+			cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
+			cachev1alpha1.CacheBackendIntegrationRoleWriteOnly,
+		} {
+			t.Run(string(runtime)+"/"+string(role), func(t *testing.T) {
+				cb := newBackend() // type=LMCache
+				cb.Spec.Runtime = runtime
+				cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{Role: role}
+				requireInvalidWithCause(t, v, cb, "spec.integration.role", "directional cache access")
+			})
+		}
 	}
 }
 
-func TestValidator_SGLangRoleReadWriteAndUnsetAdmitted(t *testing.T) {
-	// ReadWrite (and unset, which defaults to ReadWrite) are the honored
-	// SGLang role; both must admit.
+func TestValidator_LMCacheReadWriteAndUnsetAdmitted(t *testing.T) {
+	// ReadWrite (and unset, which defaults to ReadWrite) are the only currently
+	// honored LMCache roles for both engines.
 	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
-	cases := []*cachev1alpha1.CacheBackendIntegrationSpec{
-		{}, // role unset
-		{Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite},
-	}
-	for _, integ := range cases {
-		cb := newBackend()
-		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
-		cb.Spec.Integration = integ
-		if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-			t.Fatalf("sglang role=%q rejected: %v", integ.Role, err)
+	for _, runtime := range []cachev1alpha1.CacheBackendRuntime{
+		cachev1alpha1.CacheBackendRuntimeVLLM,
+		cachev1alpha1.CacheBackendRuntimeSGLang,
+	} {
+		for _, integ := range []*cachev1alpha1.CacheBackendIntegrationSpec{
+			{}, // role unset
+			{Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite},
+		} {
+			cb := newBackend()
+			cb.Spec.Runtime = runtime
+			cb.Spec.Integration = integ
+			if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
+				t.Fatalf("runtime=%q role=%q rejected: %v", runtime, integ.Role, err)
+			}
 		}
 	}
 }

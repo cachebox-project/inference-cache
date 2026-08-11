@@ -53,7 +53,7 @@ func (sglangHiCacheAdapter) SupportsBinding(binding *backendadapter.Binding) boo
 	return binding == nil
 }
 
-func (sglangHiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+func (a sglangHiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	if binding != nil {
 		return fmt.Errorf("SGLang HiCache adapter does not support remote binding protocol %q", binding.Protocol)
 	}

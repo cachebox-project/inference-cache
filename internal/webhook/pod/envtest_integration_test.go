@@ -320,10 +320,6 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 			Name:      "sglang-mp-engine",
 			Namespace: ns,
 			Labels:    map[string]string{"app": "sglang-mp-test"},
-			Annotations: map[string]string{
-				"inferencecache.io/lmcache-connector-profile": "sglang-lmcache-mp-v1",
-				"inferencecache.io/lmcache-client-version":    "0.5.3",
-			},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{
 			Name: "sglang", Image: "sglang:connector-ready", Args: []string{"--page-size=1"},
@@ -392,10 +388,6 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 			Name:      "vllm-mp-engine",
 			Namespace: ns,
 			Labels:    map[string]string{"app": "vllm-mp-test"},
-			Annotations: map[string]string{
-				"inferencecache.io/lmcache-connector-profile": "vllm-lmcache-mp-v1",
-				"inferencecache.io/lmcache-client-version":    "0.5.3",
-			},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{
 			Name: "vllm", Image: "vllm:connector-ready", Args: []string{"--model", "model-a", "--tensor-parallel-size=2"},

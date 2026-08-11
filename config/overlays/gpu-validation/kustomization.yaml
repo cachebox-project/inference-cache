@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Shared-cluster GPU validation overlay. Keep the shipped default install
+# cluster-wide for its CRD/controller surfaces, but ask the API server to send
+# Pod CREATE admission requests to the inference-cache mutator only from the
+# dedicated test namespace. CacheBackend/CachePolicy/CacheTenant admission is
+# intentionally unchanged.
+resources:
+- ../../default
+
+images:
+- name: ghcr.io/cachebox-project/inference-cache-controller
+  newName: sjc.ocir.io/idqj093njucb/inference-cache-controller
+  digest: sha256:6dcab2344027ef8ac3db2ab22352cdaa77d80202ec11df49dddeeefe08095b18
+- name: ghcr.io/cachebox-project/inference-cache-server
+  newName: sjc.ocir.io/idqj093njucb/inference-cache-server
+  digest: sha256:f735a5e69280411995f1e15d1a19b40c462e450bcf7ea0012a0c5520fb778d46
+
+patches:
+- target:
+    group: apps
+    version: v1
+    kind: Deployment
+    name: inference-cache-controller-manager
+  patch: |
+    - op: replace
+      path: /spec/template/spec/containers/0/args/1
+      value: --lmcache-server-image=lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+    - op: add
+      path: /spec/template/spec/containers/0/args/-
+      value: --kvevent-subscriber-image=sjc.ocir.io/idqj093njucb/inference-cache-subscriber@sha256:2fdaa611642a0f2c48b6c7a7257ff28d75030e4bf6df3cebb589319f2e48e504
+- target:
+    group: admissionregistration.k8s.io
+    version: v1
+    kind: MutatingWebhookConfiguration
+    name: inference-cache-mutating-webhook-configuration
+  patch: |
+    - op: add
+      path: /webhooks/0/namespaceSelector
+      value:
+        matchLabels:
+          kubernetes.io/metadata.name: inference-cache-gpu-test

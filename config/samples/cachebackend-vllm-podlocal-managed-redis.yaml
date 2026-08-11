@@ -21,7 +21,7 @@ spec:
     chunkSizeTokens: 256
     podLocal:
       server:
-        image: lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
         port: 5555
         l1Capacity: 4Gi
         maxWorkers: 4
@@ -36,7 +36,7 @@ spec:
     provider: Redis
     ownership: Managed
     redis:
-      image: redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+      image: docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
       resources:
         requests:
           cpu: 500m

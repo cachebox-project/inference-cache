@@ -55,8 +55,8 @@ spec:
   deploymentKind: Deployment
   replicas: 1
   integration:
-    # Only ReadWrite is supported for (sglang, LMCache): SGLang's --enable-lmcache
-    # has no producer/consumer split, so admission rejects ReadOnly / WriteOnly.
+    # LMCache currently admits only ReadWrite for every engine; directional
+    # roles require a connector that has been validated to enforce them.
     role: ReadWrite
   engineSelector:
     matchLabels:

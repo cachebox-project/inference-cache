@@ -2279,9 +2279,6 @@ metadata:
   name: sglang-podlocal-admission
   labels:
     inferencecache.io/runtime: sglang-mp
-  annotations:
-    inferencecache.io/lmcache-connector-profile: sglang-lmcache-mp-v1
-    inferencecache.io/lmcache-client-version: "0.5.3"
 spec:
   nodeSelector:
     inferencecache.io/install-smoke-never-schedule: "true"
@@ -2320,7 +2317,7 @@ typed_engine_experimental="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICA
 typed_engine_mounts="$(kubectl -n "$CANONICAL_SMOKE_NS" get pod "$CANONICAL_TYPED_POD" \
   -o jsonpath='{.spec.containers[?(@.name=="sglang")].volumeMounts[*].mountPath}' 2>/dev/null || true)"
 
-expected_mp_image="lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13"
+expected_mp_image="docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13"
 if [ "$typed_injected_by" != "$CANONICAL_SMOKE_NS/$CANONICAL_TYPED_CB" ] || \
    [ "$typed_metrics_label" != "true" ] || \
    [ "$typed_server_image" != "$expected_mp_image" ] || \
@@ -2373,9 +2370,6 @@ metadata:
   name: vllm-podlocal-admission
   labels:
     inferencecache.io/runtime: vllm-mp
-  annotations:
-    inferencecache.io/lmcache-connector-profile: vllm-lmcache-mp-v1
-    inferencecache.io/lmcache-client-version: "0.5.3"
 spec:
   nodeSelector:
     inferencecache.io/install-smoke-never-schedule: "true"

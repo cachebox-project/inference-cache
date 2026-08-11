@@ -24,7 +24,7 @@ spec:
     chunkSizeTokens: 256
     podLocal:
       server:
-        image: lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
         port: 5555
         l1Capacity: 4Gi
         maxWorkers: 4

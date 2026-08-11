@@ -117,7 +117,7 @@ and [`config/samples/cachebackend-mooncake.yaml`](../../config/samples/cacheback
 | `autoscaling.maxReplicas` | integer | Upper bound for HPA replica count. Required when `autoscaling` is set. Minimum `1`. Cross-field validation: `minReplicas <= maxReplicas`. |
 | `autoscaling.targetCPUUtilizationPercent` | integer | Target average per-pod CPU utilization for the HPA. Defaults to `80` when unset. Range `[1, 100]`. |
 | `integration.mode` | enum | Which cache tiers the engine is wired for: `Offload` (default) or `EventsOnly`. `Offload` is full participation — cache-aware routing (tier-1) plus the KV-offload connector (tier-2). It may remain host-only, connect to externally owned remote storage, or provision a provider workload when `remoteStorage.ownership` is `Managed`. `EventsOnly` wires routing only: the kvevent-subscriber sidecar is injected when the controller runs with `--kvevent-subscriber-image` set and `observation.modelID` is present; otherwise the append is skipped fail-open. No KV connector or backend server is created. See [Events-only mode](#events-only-mode-specintegrationmode--eventsonly). |
-| `integration.role` | enum | Engine participation mode: `ReadOnly`, `WriteOnly`, or `ReadWrite`. Defaults to `ReadWrite`. |
+| `integration.role` | enum | Engine participation mode: `ReadOnly`, `WriteOnly`, or `ReadWrite`. Defaults to `ReadWrite`. LMCache currently admits only `ReadWrite`; directional roles remain reserved for a connector that demonstrably enforces them. |
 | `integration.failOpen` | boolean | Default `true`. When `true`, engine pods fall back to local prefill on cache unreachability — the cache is an optimization, never a serving dependency. Setting it to `false` is an advanced opt-in to fail-closed serving (the cache becomes a serving dependency); the controller surfaces this as a Warning Kubernetes Event on the owning `CacheBackend`. **Pair-specific exception — `(sglang, LMCache)`:** SGLang has no cacheless code path while `--enable-lmcache` is on, so its co-scheduled MP worker is a *serving prerequisite* (a worker that never starts wedges the engine), not a remote dependency that degrades to local prefill. `failOpen` is still honored at the tier that can actually be "unavailable" — the shared L2 (the worker comes up L1-only when Redis is unreachable). This is a documented, accepted boundary; see the fail-open semantics in [`sglang-lmcache-mp-mode.md`](sglang-lmcache-mp-mode.md) and [SGLang engine support](#sglang-engine-support). |
 | `integration.engineOverrides` | object | Optional engine-injection overrides applied to the args/env the pod-mutating webhook would otherwise inject into the engine container. See [Engine-injection overrides](#engine-injection-overrides-specintegrationengineoverrides). |
 | `engineSelector.matchLabels` | map | Equality-based label selector matched against engine **pod** labels (the pod template's `metadata.labels`, not Deployment, DaemonSet, or any other workload-level labels). Every key/value here must appear on the pod for it to match. `matchExpressions` is intentionally not exposed in v1alpha1 — the surface is `matchLabels` only. |
@@ -198,25 +198,22 @@ and must be sized on that workload instead.
 The typed shape `spec.runtime: VLLM`, `spec.type: LMCache`, and
 `spec.lmCache.topology: PodLocal` selects a dedicated MP adapter; it does not
 reuse the legacy `LMCacheConnectorV1` / `lm://` path. The engine image remains
-owned by the inference runtime. To make that image's capability explicit, each
-matching Pod must declare:
-
-```yaml
-metadata:
-  annotations:
-    inferencecache.io/lmcache-connector-profile: vllm-lmcache-mp-v1
-    inferencecache.io/lmcache-client-version: "0.5.3"
-```
+owned by the inference runtime. No connector-profile annotation or image
+allowlist is required: this CacheBackend shape is the only enablement switch.
+The webhook validates Pod-visible topology and arguments, then injects the MP
+wire. The engine's normal initialization loads the connector and fails before
+serving if its image does not contain a compatible LMCache client/API;
+admission does not pull, execute, or otherwise introspect the engine image.
 
 The webhook injects a digest-pinned `lmcache-mp-server` native sidecar and adds
 the following vLLM launch contract:
 
 - `--kv-transfer-config` selects `LMCacheMPConnector` through
   `lmcache.integration.vllm.lmcache_mp_connector`, points it at
-  `tcp://127.0.0.1:<podLocal.server.port>`, and maps the integration role to
-  `kv_consumer`, `kv_producer`, or `kv_both`;
-- `--disable-hybrid-kv-cache-manager` is required by the initial pinned
-  profile;
+  `tcp://127.0.0.1:<podLocal.server.port>`, and sets `kv_role: kv_both` for the
+  only currently admitted LMCache role, `ReadWrite`;
+- `--disable-hybrid-kv-cache-manager` is required by the initial validated
+  integration;
 - `PYTHONHASHSEED=0` stabilizes vLLM's cross-process hash chain;
 - `INFERENCECACHE_FAIL_OPEN` mirrors the API setting, although runtime-native
   failure behavior still requires GPU validation.
@@ -230,6 +227,15 @@ checks and persisted webhook injection are covered without GPU; the pinned
 vLLM image/version, KV reuse, TP determinism, and failure recovery remain Phase
 4 runtime gates. Canonical examples are the three
 `config/samples/cachebackend-vllm-podlocal-*.yaml` files.
+
+For both typed vLLM and SGLang PodLocal adapters, `l1Capacity` is the usable L1
+target, not the complete container budget. The common renderer creates a
+memory-backed `/dev/shm` with `sizeLimit: l1Capacity + 1Gi`; admission requires
+both the MP-server memory request and memory limit to be at least that value. If
+the engine already mounts `/dev/shm`, the adapter reuses it only when it is a
+memory-backed `emptyDir` with a `sizeLimit` at least as large as that budget.
+This keeps scheduling/cgroup accounting aligned with the tmpfs and leaves room
+for LMCache metadata and shared-memory allocator overhead.
 
 ### SGLang engine support
 
@@ -296,7 +302,7 @@ The old lm:// `LMCACHE_REMOTE_URL` / serde / chunk-size / local-CPU env is
 
 Deliberately **not** injected for SGLang (a real engine difference, not an omission): `VLLM_USE_V1` (a vLLM-internal codepath with no SGLang analogue) and `PYTHONHASHSEED` (vLLM pins it to stabilise its builtin-`hash()`-seeded block-hash chain across TP workers; SGLang derives its prefix hash with `hashlib.sha256` over the token-id bytes, independent of `PYTHONHASHSEED`).
 
-**`spec.integration.role` support.** vLLM maps the role onto its LMCache connector's `kv_role` (ReadOnly→`kv_consumer`, WriteOnly→`kv_producer`, ReadWrite→`kv_both`). SGLang's `--enable-lmcache` integration has **no `kv_role` split** — it always both stores and retrieves — so a `(sglang, LMCache)` backend supports only `ReadWrite` (the default). Admission **rejects** `ReadOnly` / `WriteOnly` for SGLang (`rejectUnsupportedSGLangRole`) rather than silently treating them as ReadWrite; the rule lifts if SGLang's LMCache integration gains a producer/consumer split.
+**`spec.integration.role` support.** Every LMCache backend currently supports only `ReadWrite` (the default), and admission rejects `ReadOnly` / `WriteOnly` through `rejectUnsupportedLMCacheRole`. SGLang's `--enable-lmcache` path has no role split. vLLM can render `kv_consumer` / `kv_producer`, but live GPU validation found that LMCache 0.5.3 still stored in consumer mode and retrieved in producer mode. Directional roles remain in the generic API for other backends and a future validated LMCache connector, but inference-cache does not claim semantics the selected data plane cannot enforce.
 
 **Reserved set** (`internal/adapters/builtin/runtime`): `ReservedArgs()` = `--enable-lmcache`, `--lmcache-config-file`; `ReservedEnv()` = `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN`. In MP mode the old lm:// `LMCACHE_REMOTE_URL` is neither injected nor reserved. `VLLM_USE_V1` / `PYTHONHASHSEED` are not reserved because they are never injected.
 
@@ -438,15 +444,19 @@ wire-protocol skew above, in its **local-kernel** variant.
 Because `import lmcache.c_ops` is overridden to a fallback shim on load failure
 (so it always succeeds and cannot be used as a health check), the control plane
 detects this at **deploy time** with an injected `lmcache-kernel-check` init
-container that force-loads the native extension from disk in the engine's own
-image. It reports onto the CacheBackend `EngineKernelsHealthy` condition (see
+container that force-loads LMCache `c_ops` from disk and imports the vLLM core
+native extension shipped by the engine image (`vllm._C_stable_libtorch` in
+current stable-ABI builds, falling back to legacy `vllm._C`). Checking both
+LMCache and vLLM matters because their `libcudart` dependencies can differ. It
+reports onto the CacheBackend
+`EngineKernelsHealthy` condition (see
 [Conditions](#conditions)) and is configured per-CacheBackend via the
 `inferencecache.io/lmcache-kernel-check` annotation:
 
 | Annotation value | Behavior |
 |---|---|
 | `auto` (default / unset) | Inject in report-only mode **only** when the engine container requests a GPU (the kernels are GPU-only; a CPU build legitimately has none). |
-| `report-only` | Always inject; a `c_ops` load failure makes the detector exit 0, so it does not block the engine pod (best-effort fail-open — see the residual cases in [Boundaries](#boundaries-what-the-check-does-and-does-not-prove)). The condition surfaces the result. |
+| `report-only` | Always inject; a native LMCache/vLLM load failure makes the detector exit 0, so it does not block the engine pod (best-effort fail-open — see the residual cases in [Boundaries](#boundaries-what-the-check-does-and-does-not-prove)). The condition surfaces the result. |
 | `strict` | Always inject; on failure the engine pod stays in `Init` and never serves (fail-closed), and the managed CacheBackend `Ready` is downgraded with reason `EngineKernelDegraded`. |
 | `off` | Never inject. |
 
@@ -479,13 +489,13 @@ Extending the check to SGLang is a follow-up.
   kernel launch. That residual is caught only at runtime.
 - **Strict-mode GPU cost:** a pod stuck in `Init` (failing the check in strict
   mode) still holds its `nvidia.com/gpu` reservation while serving nothing.
-  Reclaim it by fixing the engine image's lmcache/CUDA alignment or switching
+  Reclaim it by fixing the engine image's vLLM/LMCache/CUDA alignment or switching
   the annotation to `report-only`.
 - The check runs `import torch` (the native extension links libtorch), adding a
   few seconds to GPU engine-pod startup. The engine imports torch anyway.
 - **Report-only fail-open is best-effort.** The init container runs the engine
   image's own `python3`; in report-only mode the detector always exits 0, so a
-  `c_ops` failure never blocks the pod. The init container declares small CPU/
+  native-extension failure never blocks the pod. The init container declares small CPU/
   memory requests and no limits — the most broadly-compatible shape, but note
   that *no* resource shape is fail-open under every namespace policy: a
   `ResourceQuota`/`LimitRange` that requires per-container requests rejects a

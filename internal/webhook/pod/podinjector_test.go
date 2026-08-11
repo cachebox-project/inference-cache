@@ -345,7 +345,7 @@ func typedVLLMPodLocalBackend(name, namespace string, selector map[string]string
 	return cb
 }
 
-func TestHandle_TypedVLLMMissingCapabilityDoesNotFallThroughToLegacyAdapter(t *testing.T) {
+func TestHandle_TypedVLLMWithoutCapabilityAnnotationsUsesDedicatedMPAdapter(t *testing.T) {
 	const ns = "engines"
 	cb := typedVLLMPodLocalBackend("primary", ns, map[string]string{"app": "vllm"})
 	h := newHandler(t, cb)
@@ -353,14 +353,9 @@ func TestHandle_TypedVLLMMissingCapabilityDoesNotFallThroughToLegacyAdapter(t *t
 	req := newRequest(t, pod, ns)
 
 	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("typed MP pod with unverified connector must fail open: %+v", resp.Result)
-	}
-	if len(resp.Patches) != 0 {
-		t.Fatalf("typed MP pod must not receive legacy injection; got %d patches", len(resp.Patches))
-	}
-	if resp.Result == nil || !strings.Contains(resp.Result.Message, "engine connector capability is unverified") {
-		t.Fatalf("response message = %v, want connector-capability diagnostic", resp.Result)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("typed MP pod should be injected without capability annotations: allowed=%v patches=%d result=%+v",
+			resp.Allowed, len(resp.Patches), resp.Result)
 	}
 }
 
@@ -369,10 +364,6 @@ func TestHandle_TypedPodLocalVLLMUsesDedicatedMPAdapter(t *testing.T) {
 	cb := typedVLLMPodLocalBackend("vllm-typed", ns, map[string]string{"app": "vllm-mp"})
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-mp", map[string]string{"app": "vllm-mp"})
-	pod.Annotations = map[string]string{
-		adapterruntime.AnnotationLMCacheConnectorProfile: "vllm-lmcache-mp-v1",
-		adapterruntime.AnnotationLMCacheClientVersion:    "0.5.3",
-	}
 	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--tensor-parallel-size=2")
 	req := newRequest(t, pod, ns)
 
@@ -517,11 +508,6 @@ func TestHandle_TypedPodLocalSGLangUsesCommonMPServer(t *testing.T) {
 	}
 	h := newHandler(t, cb)
 	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
-	if pod.Annotations == nil {
-		pod.Annotations = map[string]string{}
-	}
-	pod.Annotations[adapterruntime.AnnotationLMCacheConnectorProfile] = "sglang-lmcache-mp-v1"
-	pod.Annotations[adapterruntime.AnnotationLMCacheClientVersion] = "0.5.3"
 	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--page-size=1")
 	req := newRequest(t, pod, ns)
 
@@ -558,10 +544,6 @@ func TestHandle_TypedPodLocalSGLangUsesCommonMPServer(t *testing.T) {
 	// the engine wire. The response message is the actionable admission trace;
 	// controller status subsequently counts the Pod as uncovered.
 	incompatible := sglangEnginePod("sg-engine-incompatible", map[string]string{"app": "sglang"})
-	incompatible.Annotations = map[string]string{
-		adapterruntime.AnnotationLMCacheConnectorProfile: "sglang-lmcache-mp-v1",
-		adapterruntime.AnnotationLMCacheClientVersion:    "0.5.3",
-	}
 	incompatible.Spec.Containers[0].Args = append(incompatible.Spec.Containers[0].Args, "--page-size=96")
 	incompatibleReq := newRequest(t, incompatible, ns)
 	incompatibleResp := h.Handle(context.Background(), incompatibleReq)

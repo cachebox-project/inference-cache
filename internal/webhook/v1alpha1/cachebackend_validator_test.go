@@ -390,18 +390,15 @@ func withSGLangOverrides(o cachev1alpha1.EngineInjectionOverrides) *cachev1alpha
 	return cb
 }
 
-func TestValidator_VLLMRoleReadOnlyStillAdmitted(t *testing.T) {
-	// The SGLang role rule must not bleed onto vLLM: vLLM maps ReadOnly onto
-	// its connector (kv_consumer), so a (vllm, LMCache) backend with ReadOnly
-	// must still admit.
+func TestValidator_VLLMRoleReadOnlyRejected(t *testing.T) {
+	// vLLM renders ReadOnly as kv_consumer, but LMCache 0.5.3 does not enforce
+	// that directionality. Admission must reject the unsupported API promise.
 	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
 	cb := newBackend()
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
 		Role: cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
 	}
-	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-		t.Fatalf("vllm role=ReadOnly rejected by the sglang role rule: %v", err)
-	}
+	requireInvalidWithCause(t, v, cb, "spec.integration.role", "directional cache access")
 }
 
 // eventsOnlyIntegration returns an integration spec wired for the events-only

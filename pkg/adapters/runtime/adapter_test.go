@@ -344,58 +344,6 @@ func TestResolveRuntimeID(t *testing.T) {
 	}
 }
 
-func TestValidateConnectorDeclaration(t *testing.T) {
-	requirement := LMCacheConnectorRequirement{
-		Profile:       "sglang-lmcache-mp-v1",
-		ClientVersion: "0.5.3",
-	}
-	tests := []struct {
-		name        string
-		annotations map[string]string
-		wantErr     bool
-	}{
-		{
-			name: "matching declaration",
-			annotations: map[string]string{
-				AnnotationLMCacheConnectorProfile: "sglang-lmcache-mp-v1",
-				AnnotationLMCacheClientVersion:    "0.5.3",
-			},
-		},
-		{name: "missing declaration", wantErr: true},
-		{
-			name: "profile mismatch",
-			annotations: map[string]string{
-				AnnotationLMCacheConnectorProfile: "vllm-lmcache-mp-v1",
-				AnnotationLMCacheClientVersion:    "0.5.3",
-			},
-			wantErr: true,
-		},
-		{
-			name: "version mismatch",
-			annotations: map[string]string{
-				AnnotationLMCacheConnectorProfile: "sglang-lmcache-mp-v1",
-				AnnotationLMCacheClientVersion:    "0.5.2",
-			},
-			wantErr: true,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations}}
-			err := ValidateConnectorDeclaration(pod, requirement)
-			if tc.wantErr && err == nil {
-				t.Fatal("expected declaration error")
-			}
-			if !tc.wantErr && err != nil {
-				t.Fatalf("unexpected declaration error: %v", err)
-			}
-		})
-	}
-	if err := ValidateConnectorDeclaration(nil, requirement); err == nil {
-		t.Fatal("nil pod should be rejected")
-	}
-}
-
 func lookupEnv(env []corev1.EnvVar, name string) (string, bool) {
 	for _, e := range env {
 		if e.Name == name {

@@ -123,6 +123,7 @@ func TestHiCacheOptionalFieldsStayOmitted(t *testing.T) {
 		SGLangHiCacheWritePolicyArg,
 		SGLangHiCacheIOBackendArg,
 		SGLangHiCacheMemoryLayoutArg,
+		SGLangEnableMetricsArg,
 	} {
 		if _, ok := testArgValue(pod.Containers[0].Args, flag); ok {
 			t.Errorf("unset optional field injected %s: %v", flag, pod.Containers[0].Args)

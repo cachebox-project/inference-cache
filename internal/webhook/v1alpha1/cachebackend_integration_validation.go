@@ -174,17 +174,15 @@ func validHiCacheMemoryLayout(value cachev1alpha1.SGLangHiCacheMemoryLayout) boo
 	}
 }
 
-// rejectUnsupportedSGLangRole rejects a non-ReadWrite spec.integration.role on a
-// (sglang, LMCache) backend. SGLang's --enable-lmcache integration has no
-// kv_role split equivalent to vLLM's LMCache connector — it always both stores
-// and retrieves — so a ReadOnly / WriteOnly role cannot be honored by the
-// engine. Rejecting at admission makes that loud rather than silently treating
-// the role as ReadWrite. Scoped to (sglang, LMCache): other engines map all
-// roles onto their connector (vLLM), and the rule must not fire on an
-// already-unsupported pair (e.g. sglang+External, which checkRuntimeAdapter
-// rejects on its own). If SGLang's LMCache integration gains a
-// producer/consumer split, lift this rule.
-func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+// rejectUnsupportedLMCacheRole rejects a non-ReadWrite spec.integration.role
+// on every LMCache backend. SGLang's integration has no producer/consumer
+// split. vLLM accepts kv_consumer/kv_producer, but the validated LMCache 0.5.3
+// MP connector still stores as a consumer and retrieves as a producer. Until a
+// pinned connector enforces directionality and passes GPU validation, accepting
+// ReadOnly or WriteOnly would expose an API promise the data plane does not
+// honor. Keep the rule scoped to LMCache so other backend implementations can
+// define and validate their own role semantics independently.
+func rejectUnsupportedLMCacheRole(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if cb.Spec.Integration == nil {
 		return nil
 	}
@@ -192,15 +190,14 @@ func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList
 	if role == "" || role == cachev1alpha1.CacheBackendIntegrationRoleReadWrite {
 		return nil // unset defaults to ReadWrite; ReadWrite is honored
 	}
-	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
-		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
 		return nil
 	}
 	return field.ErrorList{
 		field.Invalid(
 			field.NewPath("spec", "integration", "role"),
 			role,
-			fmt.Sprintf("the sglang engine's LMCache integration has no producer/consumer split, so only %q (the default) is honored today; %q / %q are not yet wired for SGLang",
+			fmt.Sprintf("LMCache integrations currently support only %q (the default); %q / %q are rejected until a validated connector enforces directional cache access",
 				cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 				cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
 				cachev1alpha1.CacheBackendIntegrationRoleWriteOnly),

@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	lmcacheKVEventPort int32 = 5557
-	lmcacheMPHTTPPort  int32 = 8080
+	lmcacheKVEventPort      int32 = 5557
+	lmcacheMPHTTPPort       int32 = 8080
+	lmcacheMPMemoryHeadroom       = "1Gi"
 )
 
 var sha256ImagePattern = regexp.MustCompile(`^[^[:space:]@]+@sha256:[a-f0-9]{64}$`)
@@ -205,13 +206,20 @@ func validateMPServer(
 		errs = append(errs, field.Required(path.Child("resources", "requests").Key(string(corev1.ResourceCPU)),
 			"a positive CPU request is required for the MP server"))
 	}
+	var memoryBudget *resource.Quantity
+	if l1Capacity != nil && l1Capacity.Sign() > 0 {
+		budget := l1Capacity.DeepCopy()
+		budget.Add(resource.MustParse(lmcacheMPMemoryHeadroom))
+		memoryBudget = &budget
+	}
+
 	memoryRequest, hasMemoryRequest := resources.Requests[corev1.ResourceMemory]
 	if !hasMemoryRequest || memoryRequest.Sign() <= 0 {
 		errs = append(errs, field.Required(path.Child("resources", "requests").Key(string(corev1.ResourceMemory)),
 			"a positive memory request is required for the MP server"))
-	} else if l1Capacity != nil && l1Capacity.Sign() > 0 && memoryRequest.Cmp(*l1Capacity) <= 0 {
+	} else if memoryBudget != nil && memoryRequest.Cmp(*memoryBudget) < 0 {
 		errs = append(errs, field.Invalid(path.Child("resources", "requests").Key(string(corev1.ResourceMemory)),
-			memoryRequest.String(), fmt.Sprintf("must be greater than l1Capacity %s so the server has explicit memory headroom", l1Capacity.String())))
+			memoryRequest.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) so scheduling accounts for the memory-backed /dev/shm", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
 	}
 
 	memoryLimit, hasMemoryLimit := resources.Limits[corev1.ResourceMemory]
@@ -223,9 +231,9 @@ func validateMPServer(
 			errs = append(errs, field.Invalid(path.Child("resources", "limits").Key(string(corev1.ResourceMemory)),
 				memoryLimit.String(), fmt.Sprintf("must be greater than or equal to the memory request %s", memoryRequest.String())))
 		}
-		if l1Capacity != nil && l1Capacity.Sign() > 0 && memoryLimit.Cmp(*l1Capacity) <= 0 {
+		if memoryBudget != nil && memoryLimit.Cmp(*memoryBudget) < 0 {
 			errs = append(errs, field.Invalid(path.Child("resources", "limits").Key(string(corev1.ResourceMemory)),
-				memoryLimit.String(), fmt.Sprintf("must be greater than l1Capacity %s so the server has explicit memory headroom", l1Capacity.String())))
+				memoryLimit.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) to bound the memory-backed /dev/shm", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
 		}
 	}
 

@@ -16,17 +16,20 @@ import (
 // it wants a GPU. Auto mode skips CPU-only engines.
 const gpuResourceName = corev1.ResourceName("nvidia.com/gpu")
 
-// kernelCheckScript is the Python the init container runs against the engine
-// image. It locates the package dir WITHOUT executing lmcache.__init__ (which
-// swallows the c_ops failure into a WARNING and overrides
+// kernelCheckScript is the Python the init container runs against the vLLM
+// engine image. It first locates LMCache WITHOUT executing lmcache.__init__
+// (which swallows the c_ops failure into a WARNING and overrides
 // sys.modules["lmcache.c_ops"] with a fallback shim, so a naive
 // `import lmcache.c_ops` ALWAYS succeeds — a silent no-op). Instead it
 // dlopens the native c_ops*.so from disk via ctypes.CDLL, which re-does the
-// real dynamic load and raises on a missing/mismatched libcudart (empirically:
-// "OSError: libcudart.so.13: cannot open shared object file"). torch MUST be
-// imported first — the extension DT_NEEDs libtorch's libc10.so.
+// real dynamic load and raises on a missing/mismatched dependency. It then
+// imports the vLLM core extension used by the installed vLLM generation:
+// vllm._C_stable_libtorch in current stable-ABI builds, with vllm._C as the
+// legacy fallback. This covers the engine's own CUDA dependency boundary too
+// (empirically, that extension alone can require libcudart.so.13). torch MUST
+// be imported first — the extensions DT_NEED libtorch's libc10.so.
 const kernelCheckScript = `
-import sys, os, glob, importlib.util, ctypes
+import sys, os, glob, importlib, importlib.util, ctypes
 STRICT = os.environ.get("KERNEL_CHECK_STRICT") == "1"
 MSG = "/dev/termination-log"
 def emit(s):
@@ -56,6 +59,18 @@ try:
     # CDLL needs no init symbol — it tests exactly the dlopen/DT_NEEDED
     # resolution where the kernel/CUDA mismatch lives.
     ctypes.CDLL(sos[0])
+    # LMCache c_ops loading alone does not certify the surrounding vLLM image:
+    # vLLM's core extension can carry a different libcudart dependency. Stable
+    # ABI wheels use _C_stable_libtorch; older wheels use _C. Probe in that
+    # order and import the first extension actually shipped by the image.
+    core = None
+    for candidate in ("vllm._C_stable_libtorch", "vllm._C"):
+        if importlib.util.find_spec(candidate) is not None:
+            core = candidate
+            break
+    if core is None:
+        fail("no supported vLLM native core extension present (tried vllm._C_stable_libtorch, vllm._C)")
+    importlib.import_module(core)
     emit("OK")
 except SystemExit:
     raise

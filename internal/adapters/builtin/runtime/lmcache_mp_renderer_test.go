@@ -109,8 +109,8 @@ func TestRenderLMCachePodLocalServerGolden(t *testing.T) {
 		t.Fatalf("server ports = %+v", server.Ports)
 	}
 	shm := findVolume(pod.Volumes, lmCacheMPShmVolumeName)
-	if shm == nil || shm.EmptyDir == nil || shm.EmptyDir.Medium != corev1.StorageMediumMemory || shm.EmptyDir.SizeLimit == nil || shm.EmptyDir.SizeLimit.Cmp(resource.MustParse("4Gi")) != 0 {
-		t.Fatalf("shared-memory volume = %+v, want bounded 4Gi tmpfs", shm)
+	if shm == nil || shm.EmptyDir == nil || shm.EmptyDir.Medium != corev1.StorageMediumMemory || shm.EmptyDir.SizeLimit == nil || shm.EmptyDir.SizeLimit.Cmp(resource.MustParse("5Gi")) != 0 {
+		t.Fatalf("shared-memory volume = %+v, want bounded 5Gi tmpfs (4Gi L1 + 1Gi headroom)", shm)
 	}
 	if findVolume(pod.Volumes, lmCacheMPConfigVolumeName) == nil {
 		t.Fatalf("client config volume missing: %+v", pod.Volumes)
@@ -216,7 +216,10 @@ func TestRenderLMCachePodLocalServerReusesWritableShm(t *testing.T) {
 				Name: "engine-shm", MountPath: "/dev/shm", SubPath: "shared",
 			}},
 		}},
-		Volumes: []corev1.Volume{{Name: "engine-shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}}},
+		Volumes: []corev1.Volume{{Name: "engine-shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			Medium:    corev1.StorageMediumMemory,
+			SizeLimit: func() *resource.Quantity { q := resource.MustParse("6Gi"); return &q }(),
+		}}}},
 	}
 	if _, err := renderLMCachePodLocalServer(pod, "engine", testLMCacheMPConfig()); err != nil {
 		t.Fatalf("renderLMCachePodLocalServer: %v", err)
@@ -227,6 +230,51 @@ func TestRenderLMCachePodLocalServerReusesWritableShm(t *testing.T) {
 	server := findContainerByName(pod.InitContainers, lmCacheMPServerContainerName)
 	if server == nil || len(server.VolumeMounts) == 0 || server.VolumeMounts[0].Name != "engine-shm" || server.VolumeMounts[0].SubPath != "shared" {
 		t.Fatalf("server did not mirror engine shm mount: %+v", server)
+	}
+}
+
+func TestRenderLMCachePodLocalServerRejectsUnsafeExistingShmBudget(t *testing.T) {
+	tests := []struct {
+		name   string
+		source corev1.VolumeSource
+		want   string
+	}{
+		{
+			name:   "unbounded memory emptyDir",
+			source: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}},
+			want:   "sizeLimit unbounded",
+		},
+		{
+			name: "undersized memory emptyDir",
+			source: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				Medium:    corev1.StorageMediumMemory,
+				SizeLimit: func() *resource.Quantity { q := resource.MustParse("4Gi"); return &q }(),
+			}},
+			want: "need at least 5Gi",
+		},
+		{
+			name: "disk-backed emptyDir",
+			source: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				SizeLimit: func() *resource.Quantity { q := resource.MustParse("6Gi"); return &q }(),
+			}},
+			want: "memory-backed emptyDir",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "engine", VolumeMounts: []corev1.VolumeMount{{Name: "engine-shm", MountPath: "/dev/shm"}}}},
+				Volumes:    []corev1.Volume{{Name: "engine-shm", VolumeSource: tc.source}},
+			}
+			before := pod.DeepCopy()
+			_, err := renderLMCachePodLocalServer(pod, "engine", testLMCacheMPConfig())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+			if !reflect.DeepEqual(pod, before) {
+				t.Fatalf("failed render mutated pod\nbefore=%+v\nafter=%+v", before, pod)
+			}
+		})
 	}
 }
 

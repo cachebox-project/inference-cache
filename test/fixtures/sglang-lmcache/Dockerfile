@@ -13,5 +13,4 @@ RUN python3 -m pip install --no-cache-dir "lmcache==0.5.3" \
 
 LABEL org.opencontainers.image.title="inference-cache SGLang LMCache connector fixture" \
       org.opencontainers.image.description="SGLang v0.5.13.post1-cu130 with LMCache 0.5.3 for PodLocal MP validation" \
-      io.inferencecache.lmcache-connector-profile="sglang-lmcache-mp-v1" \
       io.inferencecache.lmcache-client-version="0.5.3"

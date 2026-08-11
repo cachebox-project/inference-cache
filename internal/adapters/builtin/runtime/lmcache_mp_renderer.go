@@ -31,6 +31,7 @@ const (
 
 	lmCacheMPShmVolumeName = "lmcache-mp-shm"
 	lmCacheMPShmMountPath  = "/dev/shm"
+	lmCacheMPShmHeadroom   = "1Gi"
 
 	lmCacheMPServerPortName = "lmcache-mp"
 	lmCacheMPHTTPPortName   = "lmcache-http"
@@ -112,10 +113,14 @@ func renderLMCachePodLocalServer(pod *corev1.PodSpec, engineContainerName string
 		})
 	}
 
+	shmBudget := lmCacheMPMemoryBudget(cfg.L1Capacity)
 	shmMount := corev1.VolumeMount{Name: lmCacheMPShmVolumeName, MountPath: lmCacheMPShmMountPath}
 	if existing := mountAtPath(engine.VolumeMounts, lmCacheMPShmMountPath); existing != nil &&
 		!(owned && existing.Name == lmCacheMPShmVolumeName) {
 		if err := checkLMCacheMPShmReusable(work.Volumes, *existing); err != nil {
+			return "", err
+		}
+		if err := checkLMCacheMPShmBudget(work.Volumes, *existing, shmBudget); err != nil {
 			return "", err
 		}
 		shmMount = corev1.VolumeMount{
@@ -124,12 +129,11 @@ func renderLMCachePodLocalServer(pod *corev1.PodSpec, engineContainerName string
 			SubPath:   existing.SubPath,
 		}
 	} else {
-		l1 := cfg.L1Capacity.DeepCopy()
 		work.Volumes, err = adoptVolume(work.Volumes, corev1.Volume{
 			Name: lmCacheMPShmVolumeName,
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 				Medium:    corev1.StorageMediumMemory,
-				SizeLimit: &l1,
+				SizeLimit: &shmBudget,
 			}},
 		}, owned)
 		if err != nil {
@@ -152,6 +156,38 @@ func renderLMCachePodLocalServer(pod *corev1.PodSpec, engineContainerName string
 		return lmCacheMPConfigFilePath, nil
 	}
 	return "", nil
+}
+
+func lmCacheMPMemoryBudget(l1Capacity resource.Quantity) resource.Quantity {
+	budget := l1Capacity.DeepCopy()
+	budget.Add(resource.MustParse(lmCacheMPShmHeadroom))
+	return budget
+}
+
+// checkLMCacheMPShmBudget validates an engine-owned /dev/shm volume without
+// mutating it. A larger operator-owned tmpfs is safe to share; an unbounded,
+// disk-backed, or undersized volume cannot satisfy the typed L1 contract.
+func checkLMCacheMPShmBudget(volumes []corev1.Volume, mount corev1.VolumeMount, budget resource.Quantity) error {
+	for i := range volumes {
+		if volumes[i].Name != mount.Name {
+			continue
+		}
+		emptyDir := volumes[i].EmptyDir
+		if emptyDir == nil || emptyDir.Medium != corev1.StorageMediumMemory {
+			return fmt.Errorf("render LMCache MP server: engine container mounts %q from volume %q, but PodLocal L1 requires a memory-backed emptyDir", lmCacheMPShmMountPath, mount.Name)
+		}
+		if emptyDir.SizeLimit == nil || emptyDir.SizeLimit.Cmp(budget) < 0 {
+			var got string
+			if emptyDir.SizeLimit == nil {
+				got = "unbounded"
+			} else {
+				got = emptyDir.SizeLimit.String()
+			}
+			return fmt.Errorf("render LMCache MP server: engine /dev/shm volume %q has sizeLimit %s, need at least %s (l1Capacity + %s headroom)", mount.Name, got, budget.String(), lmCacheMPShmHeadroom)
+		}
+		return nil
+	}
+	return fmt.Errorf("render LMCache MP server: engine /dev/shm mount references missing volume %q", mount.Name)
 }
 
 func validateLMCacheMPServerConfig(cfg lmCacheMPServerConfig) error {

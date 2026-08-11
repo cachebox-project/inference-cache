@@ -18,9 +18,6 @@ import (
 )
 
 const (
-	vllmLMCacheMPConnectorProfile = "vllm-lmcache-mp-v1"
-	vllmLMCacheMPClientVersion    = "0.5.3"
-
 	vllmLMCacheMPConnectorName       = "LMCacheMPConnector"
 	vllmLMCacheMPConnectorModulePath = "lmcache.integration.vllm.lmcache_mp_connector"
 	vllmDisableHybridKVCacheArg      = "--disable-hybrid-kv-cache-manager"
@@ -53,13 +50,6 @@ func (vllmLMCacheMPAdapter) SupportsBinding(binding *backendadapter.Binding) boo
 	return binding == nil || binding.Protocol == backendadapter.ProtocolRESP
 }
 
-func (vllmLMCacheMPAdapter) ConnectorRequirement(*cachev1alpha1.CacheBackend) runtimeadapter.LMCacheConnectorRequirement {
-	return runtimeadapter.LMCacheConnectorRequirement{
-		Profile:       vllmLMCacheMPConnectorProfile,
-		ClientVersion: vllmLMCacheMPClientVersion,
-	}
-}
-
 // ValidateMPEnginePod rejects only constraints that can be classified from the
 // concrete Pod. The pinned LMCache connector fixes one MP server per vLLM
 // instance, and the initial production profile does not claim pipeline or
@@ -85,17 +75,17 @@ func (vllmLMCacheMPAdapter) ValidateMPEnginePod(pod *corev1.Pod, cache *cachev1a
 		return err
 	}
 	args := pod.Spec.Containers[engineIndex].Args
-	if _, err := vllmPositiveParallelSize(args, []string{"--tensor-parallel-size", "-tp"}, 1); err != nil {
+	if _, err := positiveParallelSize(args, []string{"--tensor-parallel-size", "-tp"}, 1); err != nil {
 		return fmt.Errorf("vLLM LMCache MP tensor parallelism: %w", err)
 	}
-	pp, err := vllmPositiveParallelSize(args, []string{"--pipeline-parallel-size", "-pp"}, 1)
+	pp, err := positiveParallelSize(args, []string{"--pipeline-parallel-size", "-pp"}, 1)
 	if err != nil {
 		return fmt.Errorf("vLLM LMCache MP pipeline parallelism: %w", err)
 	}
 	if pp != 1 {
 		return fmt.Errorf("vLLM LMCache MP pipeline parallel size %d is not supported by the initial PodLocal profile; use 1", pp)
 	}
-	dp, err := vllmPositiveParallelSize(args, []string{"--data-parallel-size", "-dp"}, 1)
+	dp, err := positiveParallelSize(args, []string{"--data-parallel-size", "-dp"}, 1)
 	if err != nil {
 		return fmt.Errorf("vLLM LMCache MP data parallelism: %w", err)
 	}
@@ -123,7 +113,7 @@ func (vllmLMCacheMPAdapter) ValidateMPEnginePod(pod *corev1.Pod, cache *cachev1a
 	return nil
 }
 
-func vllmPositiveParallelSize(args, flags []string, fallback int64) (int64, error) {
+func positiveParallelSize(args, flags []string, fallback int64) (int64, error) {
 	var values []string
 	var seenFlags []string
 	for index := 0; index < len(args); index++ {

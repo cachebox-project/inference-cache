@@ -202,12 +202,6 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 				"runtime=%q adapter does not implement typed LMCache topology=%q (fail-open, no legacy injection)",
 				runtimeID, cache.Spec.LMCache.Topology))
 		}
-		requirement := mpAdapter.ConnectorRequirement(cache)
-		if err := adapterruntime.ValidateConnectorDeclaration(&pod, requirement); err != nil {
-			log.V(1).Info("fail-open: engine connector capability is unverified",
-				"runtime", string(runtimeID), "error", err.Error())
-			return failOpen(req, &pod, fmt.Sprintf("engine connector capability is unverified (fail-open): %v", err))
-		}
 		if err := mpAdapter.ValidateMPEnginePod(&pod, cache); err != nil {
 			log.V(1).Info("fail-open: typed LMCache MP adapter rejected engine pod",
 				"runtime", string(runtimeID), "error", err.Error())

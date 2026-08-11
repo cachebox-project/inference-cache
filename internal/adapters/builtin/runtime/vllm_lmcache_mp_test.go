@@ -77,14 +77,6 @@ func TestVLLMLMCacheMPRegistrySelectionDoesNotChangeLegacy(t *testing.T) {
 	}
 }
 
-func TestVLLMLMCacheMPConnectorRequirement(t *testing.T) {
-	adapter := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(runtimeadapter.LMCacheMPRuntimeAdapter)
-	requirement := adapter.ConnectorRequirement(newTypedVLLMMPBackend())
-	if requirement.Profile != "vllm-lmcache-mp-v1" || requirement.ClientVersion != "0.5.3" {
-		t.Fatalf("connector requirement = %+v", requirement)
-	}
-}
-
 func TestVLLMLMCacheMPReservedSurface(t *testing.T) {
 	adapter := NewVLLMLMCacheMPAdapter(SubscriberConfig{})
 	if got, want := adapter.ReservedArgs(), []string{defaultEngineKVTransferConfigArg, vllmDisableHybridKVCacheArg}; !reflect.DeepEqual(got, want) {

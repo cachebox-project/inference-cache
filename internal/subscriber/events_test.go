@@ -7,6 +7,7 @@ package subscriber
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -26,6 +27,88 @@ func encodeVLLMBatch(t *testing.T, ts float64, events ...[]interface{}) []byte {
 		t.Fatalf("encode fixture: %v", err)
 	}
 	return b
+}
+
+func encodeVLLMMapBatch(t *testing.T, ts float64, events ...map[string]interface{}) []byte {
+	t.Helper()
+	evs := make([]interface{}, len(events))
+	for i, event := range events {
+		evs[i] = event
+	}
+	b, err := msgpack.Marshal([]interface{}{ts, evs, 0})
+	if err != nil {
+		t.Fatalf("encode map fixture: %v", err)
+	}
+	return b
+}
+
+func TestDecodeVLLMTaggedMapEventBatch(t *testing.T) {
+	payload := encodeVLLMMapBatch(t, 1779901681.5,
+		map[string]interface{}{
+			"type":                         "BlockStored",
+			"block_hashes":                 []uint64{10, 11},
+			"parent_block_hash":            uint64(7),
+			"token_ids":                    []int64{0, 1, 2, 3},
+			"block_size":                   int32(128),
+			"lora_id":                      int64(4),
+			"medium":                       "GPU",
+			"group_idx":                    0,
+			"kv_cache_spec_kind":           "full",
+			"kv_cache_spec_sliding_window": nil,
+			"locality":                     "LOCAL", // vLLM 0.26 additive field
+		},
+		map[string]interface{}{
+			"type":         "BlockRemoved",
+			"block_hashes": []uint64{10},
+			"medium":       "GPU",
+			"group_idx":    0,
+			"locality":     "LOCAL",
+		},
+		map[string]interface{}{"type": "AllBlocksCleared"},
+		map[string]interface{}{"type": "SomeFutureEvent", "value": 42},
+	)
+
+	batch, err := DecodeEventBatch(payload)
+	if err != nil {
+		t.Fatalf("DecodeEventBatch: %v", err)
+	}
+	if len(batch.Events) != 3 {
+		t.Fatalf("got %d events, want 3 (unknown skipped)", len(batch.Events))
+	}
+	stored, ok := batch.Events[0].(BlockStored)
+	if !ok {
+		t.Fatalf("event[0] = %T, want BlockStored", batch.Events[0])
+	}
+	if len(stored.BlockHashes) != 2 || binary.BigEndian.Uint64(stored.BlockHashes[1]) != 11 {
+		t.Errorf("BlockHashes = %v, want big-endian [10 11]", stored.BlockHashes)
+	}
+	if binary.BigEndian.Uint64(stored.ParentBlockHash) != 7 {
+		t.Errorf("ParentBlockHash = %x, want big-endian 7", stored.ParentBlockHash)
+	}
+	if stored.BlockSize != 128 || len(stored.TokenIDs) != 4 || stored.TokenIDs[3] != 3 {
+		t.Errorf("stored = %+v, want blockSize=128 and tokenIDs=[0 1 2 3]", stored)
+	}
+	if stored.LoRAID == nil || *stored.LoRAID != 4 {
+		t.Errorf("LoRAID = %v, want 4", stored.LoRAID)
+	}
+	if _, ok := batch.Events[1].(BlockRemoved); !ok {
+		t.Errorf("event[1] = %T, want BlockRemoved", batch.Events[1])
+	}
+	if _, ok := batch.Events[2].(AllBlocksCleared); !ok {
+		t.Errorf("event[2] = %T, want AllBlocksCleared", batch.Events[2])
+	}
+}
+
+func TestDecodeVLLMTaggedMapRequiresBlockSize(t *testing.T) {
+	payload := encodeVLLMMapBatch(t, 1, map[string]interface{}{
+		"type":              "BlockStored",
+		"block_hashes":      []uint64{1},
+		"parent_block_hash": nil,
+		"token_ids":         []int64{1, 2},
+	})
+	if _, err := DecodeEventBatch(payload); err == nil || !strings.Contains(err.Error(), "block_size is required") {
+		t.Fatalf("error = %v, want missing block_size", err)
+	}
 }
 
 func TestDecodeEventBatch(t *testing.T) {

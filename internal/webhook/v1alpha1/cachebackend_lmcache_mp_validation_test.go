@@ -218,11 +218,25 @@ func TestValidateLMCacheTopology(t *testing.T) {
 			wantField: "spec.lmCache.podLocal.server.port",
 		},
 		{
-			name: "memory request has no headroom",
+			name: "memory request below shm budget",
 			mutate: func(cb *cachev1alpha1.CacheBackend) {
-				cb.Spec.LMCache.PodLocal.Server.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1Gi")
+				cb.Spec.LMCache.PodLocal.Server.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1536Mi")
 			},
 			wantField: "spec.lmCache.podLocal.server.resources.requests[memory]",
+		},
+		{
+			name: "memory limit below shm budget",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.LMCache.PodLocal.Server.Resources.Limits[corev1.ResourceMemory] = resource.MustParse("1536Mi")
+			},
+			wantField: "spec.lmCache.podLocal.server.resources.limits[memory]",
+		},
+		{
+			name: "memory request and limit equal shm budget",
+			mutate: func(cb *cachev1alpha1.CacheBackend) {
+				cb.Spec.LMCache.PodLocal.Server.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("2Gi")
+				cb.Spec.LMCache.PodLocal.Server.Resources.Limits[corev1.ResourceMemory] = resource.MustParse("2Gi")
+			},
 		},
 		{
 			name: "fractional extended resource",

@@ -209,8 +209,9 @@ type LMCachePodLocalServerSpec struct {
 	// +kubebuilder:validation:Maximum=65535
 	Port int32 `json:"port"`
 
-	// L1Capacity is the server's host-memory cache capacity. Container memory
-	// requests and limits must leave positive headroom above this value.
+	// L1Capacity is the server's host-memory cache capacity. The renderer sizes
+	// /dev/shm to this value plus 1Gi; container memory requests and limits must
+	// each cover that complete budget.
 	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0'))",message="l1Capacity must be greater than zero"
 	L1Capacity resource.Quantity `json:"l1Capacity"`
 
@@ -219,8 +220,8 @@ type LMCachePodLocalServerSpec struct {
 	MaxWorkers int32 `json:"maxWorkers"`
 
 	// Resources are applied to the injected MP server container. Admission
-	// requires positive CPU and memory requests plus a memory limit that leaves
-	// headroom above l1Capacity.
+	// requires a positive CPU request and requires both the memory request and
+	// memory limit to cover l1Capacity plus 1Gi of /dev/shm headroom.
 	Resources corev1.ResourceRequirements `json:"resources"`
 }
 
@@ -652,12 +653,11 @@ type CacheBackendIntegrationSpec struct {
 	// ReadOnly / WriteOnly are specialised producer/consumer roles operators
 	// opt into explicitly.
 	//
-	// Engine support is per-adapter: vLLM maps the role onto its LMCache
-	// connector's kv_role (ReadOnly→kv_consumer, WriteOnly→kv_producer,
-	// ReadWrite→kv_both). The SGLang LMCache integration has no kv_role split
-	// (--enable-lmcache always both stores and retrieves), so a (sglang,
-	// LMCache) backend supports only ReadWrite — admission rejects ReadOnly /
-	// WriteOnly there rather than silently ignoring them.
+	// Support is backend-specific. LMCache currently supports only ReadWrite:
+	// SGLang has no directional role split, and the validated LMCache 0.5.3
+	// vLLM MP connector does not enforce kv_consumer / kv_producer. Admission
+	// rejects ReadOnly / WriteOnly for every LMCache backend rather than expose
+	// directionality the data plane does not honor.
 	// +optional
 	// +kubebuilder:default=ReadWrite
 	Role CacheBackendIntegrationRole `json:"role,omitempty"`

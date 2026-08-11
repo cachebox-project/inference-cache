@@ -527,12 +527,11 @@ spec:
                       ReadOnly / WriteOnly are specialised producer/consumer roles operators
                       opt into explicitly.
 
-                      Engine support is per-adapter: vLLM maps the role onto its LMCache
-                      connector's kv_role (ReadOnly→kv_consumer, WriteOnly→kv_producer,
-                      ReadWrite→kv_both). The SGLang LMCache integration has no kv_role split
-                      (--enable-lmcache always both stores and retrieves), so a (sglang,
-                      LMCache) backend supports only ReadWrite — admission rejects ReadOnly /
-                      WriteOnly there rather than silently ignoring them.
+                      Support is backend-specific. LMCache currently supports only ReadWrite:
+                      SGLang has no directional role split, and the validated LMCache 0.5.3
+                      vLLM MP connector does not enforce kv_consumer / kv_producer. Admission
+                      rejects ReadOnly / WriteOnly for every LMCache backend rather than expose
+                      directionality the data plane does not honor.
                     enum:
                     - ReadOnly
                     - WriteOnly
@@ -1672,8 +1671,9 @@ spec:
                             - type: integer
                             - type: string
                             description: |-
-                              L1Capacity is the server's host-memory cache capacity. Container memory
-                              requests and limits must leave positive headroom above this value.
+                              L1Capacity is the server's host-memory cache capacity. The renderer sizes
+                              /dev/shm to this value plus 1Gi; container memory requests and limits must
+                              each cover that complete budget.
                             pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                             x-kubernetes-int-or-string: true
                             x-kubernetes-validations:
@@ -1695,8 +1695,8 @@ spec:
                           resources:
                             description: |-
                               Resources are applied to the injected MP server container. Admission
-                              requires positive CPU and memory requests plus a memory limit that leaves
-                              headroom above l1Capacity.
+                              requires a positive CPU request and requires both the memory request and
+                              memory limit to cover l1Capacity plus 1Gi of /dev/shm headroom.
                             properties:
                               claims:
                                 description: |-

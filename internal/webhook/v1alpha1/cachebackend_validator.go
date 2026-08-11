@@ -67,7 +67,7 @@ var DefaultValidationRules = []ValidationRule{
 	rejectEventsOnlyMisconfiguration,
 	validateSGLangHiCache,
 	rejectInvalidKernelCheckAnnotation,
-	rejectUnsupportedSGLangRole,
+	rejectUnsupportedLMCacheRole,
 	rejectSGLangRedisL2ScaleOut,
 }
 

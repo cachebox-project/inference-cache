@@ -25,7 +25,7 @@ const (
 	conditionTypeRemoteStorageReady = "RemoteStorageReady"
 
 	reasonConnectorReady           = "ConnectorReady"
-	reasonConnectorUnverified      = "ConnectorCapabilityUnverified"
+	reasonConnectorUnverified      = "ConnectorInjectionUnverified"
 	reasonNoEnginePods             = "NoEnginePods"
 	reasonMPServersNotReady        = "MPServersNotReady"
 	reasonRemoteStorageReady       = "RemoteStorageReady"
@@ -128,7 +128,7 @@ func (r *CacheBackendReconciler) refreshLMCacheMPConnectorStatus(ctx context.Con
 	} else if verified != matched {
 		status = metav1.ConditionUnknown
 		reason = reasonConnectorUnverified
-		message = fmt.Sprintf("%d/%d selected engine Pods carry the webhook-authenticated connector declaration; unverified Pods are left un-injected", verified, matched)
+		message = fmt.Sprintf("%d/%d selected engine Pods carry the webhook-authenticated injection record for this CacheBackend generation; unverified Pods are left un-injected", verified, matched)
 	} else if readyServers == desiredServers && readyEngines == matched {
 		status = metav1.ConditionTrue
 		reason = reasonConnectorReady

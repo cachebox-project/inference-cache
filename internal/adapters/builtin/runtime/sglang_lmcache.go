@@ -16,13 +16,6 @@ import (
 )
 
 const (
-	// sglangLMCacheMPConnectorProfile is the runtime-owner capability contract
-	// required before the webhook applies the typed PodLocal MP wire. The image
-	// pipeline owns this declaration; CacheBackend does not inspect or replace
-	// the engine image.
-	sglangLMCacheMPConnectorProfile = "sglang-lmcache-mp-v1"
-	sglangLMCacheMPClientVersion    = "0.5.3"
-
 	// subscriberHashScheme is the canonical hash-scheme tag the SGLang
 	// subscriber carries. Kept distinct from the runtime id and from vLLM's
 	// "vllm" tag: the cache plane keys the index on (tenant, model,
@@ -104,28 +97,39 @@ func (sglangLMCacheAdapter) SupportsBinding(binding *backendadapter.Binding) boo
 
 // InjectEngineConfig renders SGLang's LMCache MP-mode launch surface from a
 // host-only nil binding or a RESP binding for Redis L2 storage.
-func (sglangLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+func (a sglangLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+	var err error
 	if cache != nil && cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology != "" {
-		return injectSGLangLMCachePodLocal(pod, binding, cache)
-	}
-	endpoint := ""
-	if binding != nil {
-		if binding.Protocol != backendadapter.ProtocolRESP {
-			return fmt.Errorf("SGLang LMCache adapter does not support remote binding protocol %q", binding.Protocol)
+		err = injectSGLangLMCachePodLocal(pod, binding, cache)
+	} else {
+		endpoint := ""
+		if binding != nil {
+			if binding.Protocol != backendadapter.ProtocolRESP {
+				return fmt.Errorf("SGLang LMCache adapter does not support remote binding protocol %q", binding.Protocol)
+			}
+			endpoint = binding.Endpoint
 		}
-		endpoint = binding.Endpoint
+		err = InjectSGLangLMCache(pod, endpoint, cache)
 	}
-	return InjectSGLangLMCache(pod, endpoint, cache)
+	if err != nil {
+		return err
+	}
+	return ensureSGLangMetricsForSubscriber(pod, cache, a.subscriber)
 }
 
-// ConnectorRequirement declares the engine-image-owned connector profile used
-// by the typed SGLang MP adapter. Admission compares this with Pod annotations;
-// it does not infer capability from an image name.
-func (sglangLMCacheAdapter) ConnectorRequirement(*cachev1alpha1.CacheBackend) runtimeadapter.LMCacheConnectorRequirement {
-	return runtimeadapter.LMCacheConnectorRequirement{
-		Profile:       sglangLMCacheMPConnectorProfile,
-		ClientVersion: sglangLMCacheMPClientVersion,
+// ensureSGLangMetricsForSubscriber makes the subscriber contract complete:
+// SGLang does not expose /metrics unless --enable-metrics is present. Only add
+// the flag when this CacheBackend will actually receive an observation sidecar.
+func ensureSGLangMetricsForSubscriber(pod *corev1.PodSpec, cache *cachev1alpha1.CacheBackend, subscriber SubscriberConfig) error {
+	if subscriber.Image == "" || cache == nil || cache.Spec.EffectiveObservationModelID() == "" {
+		return nil
 	}
+	engineIndex, err := EngineContainerIndexNamed(pod, SGLangEngineContainerName)
+	if err != nil {
+		return err
+	}
+	pod.Containers[engineIndex].Args = UpsertFlag(pod.Containers[engineIndex].Args, SGLangEnableMetricsArg)
+	return nil
 }
 
 // ValidateMPEnginePod checks the concrete Pod constraints needed before the

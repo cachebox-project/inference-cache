@@ -231,13 +231,8 @@ func TestSGLangCanonicalHostOnlyBindingDoesNotSelectRedis(t *testing.T) {
 
 func TestSGLangTypedPodLocalUsesCommonRenderer(t *testing.T) {
 	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{})
-	mpAdapter, ok := adapter.(runtimeadapter.LMCacheMPRuntimeAdapter)
-	if !ok {
+	if _, ok := adapter.(runtimeadapter.LMCacheMPRuntimeAdapter); !ok {
 		t.Fatalf("adapter %T does not implement LMCacheMPRuntimeAdapter", adapter)
-	}
-	requirement := mpAdapter.ConnectorRequirement(newTypedSGLangMPBackend())
-	if requirement.Profile != sglangLMCacheMPConnectorProfile || requirement.ClientVersion != "0.5.3" {
-		t.Fatalf("connector requirement = %+v", requirement)
 	}
 
 	cache := newTypedSGLangMPBackend()
@@ -277,21 +272,40 @@ func TestSGLangTypedPodLocalUsesCommonRenderer(t *testing.T) {
 	}
 }
 
+func TestSGLangInjectsMetricsOnlyWhenSubscriberWillAttach(t *testing.T) {
+	cache := newTypedSGLangMPBackend()
+	cache.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "gemma"}
+	pod := &corev1.PodSpec{Containers: []corev1.Container{{
+		Name: SGLangEngineContainerName, Image: "sglang:connector-ready", Args: []string{"--model", "gemma"},
+	}}}
+	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{Image: "subscriber:pinned"})
+	if err := adapter.InjectEngineConfig(pod, nil, cache); err != nil {
+		t.Fatalf("InjectEngineConfig: %v", err)
+	}
+	if !containsArg(pod.Containers[0].Args, SGLangEnableMetricsArg) {
+		t.Fatalf("engine args missing %s required by subscriber: %v", SGLangEnableMetricsArg, pod.Containers[0].Args)
+	}
+
+	withoutSubscriber := newTypedSGLangMPBackend()
+	pod = &corev1.PodSpec{Containers: []corev1.Container{{
+		Name: SGLangEngineContainerName, Image: "sglang:connector-ready", Args: []string{"--model", "gemma"},
+	}}}
+	if err := NewSGLangLMCacheAdapter(SubscriberConfig{}).InjectEngineConfig(pod, nil, withoutSubscriber); err != nil {
+		t.Fatalf("InjectEngineConfig without subscriber: %v", err)
+	}
+	if containsArg(pod.Containers[0].Args, SGLangEnableMetricsArg) {
+		t.Fatalf("engine args unexpectedly enabled metrics without a subscriber: %v", pod.Containers[0].Args)
+	}
+}
+
 func TestSGLangValidateTypedMPEnginePod(t *testing.T) {
 	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{}).(runtimeadapter.LMCacheMPRuntimeAdapter)
 	cache := newTypedSGLangMPBackend()
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
-			runtimeadapter.AnnotationLMCacheConnectorProfile: sglangLMCacheMPConnectorProfile,
-			runtimeadapter.AnnotationLMCacheClientVersion:    sglangLMCacheMPClientVersion,
-		}},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{
 			Name: SGLangEngineContainerName,
 			Args: []string{"--page-size=1"},
 		}}},
-	}
-	if err := runtimeadapter.ValidateConnectorDeclaration(pod, adapter.ConnectorRequirement(cache)); err != nil {
-		t.Fatalf("ValidateConnectorDeclaration: %v", err)
 	}
 	if err := adapter.ValidateMPEnginePod(pod, cache); err != nil {
 		t.Fatalf("ValidateMPEnginePod: %v", err)
