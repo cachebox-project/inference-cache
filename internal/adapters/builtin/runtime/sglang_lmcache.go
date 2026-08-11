@@ -34,6 +34,13 @@ const (
 	// --kv-events-config on the engine; the subscriber sidecar dials it over
 	// 127.0.0.1 since it shares the engine pod's network namespace.
 	sglangDefaultEngineZMQPortStr = "5557"
+
+	// sglangDefaultMetricsPortStr is the port SGLang serves Prometheus /metrics
+	// on by default (:30000, distinct from vLLM's :8000). Requires the engine to
+	// be launched with --enable-metrics; fed to --engine-metrics-url so the stats
+	// scraper reads sglang:* names off the right endpoint. Shared by the SGLang
+	// HiCache adapter.
+	sglangDefaultMetricsPortStr = "30000"
 )
 
 // sglangLMCacheAdapter wires SGLang engine pods to LMCache for the (SGLang, LMCache)
@@ -123,11 +130,13 @@ func (sglangLMCacheAdapter) InjectRouterConfig(pod *corev1.PodSpec, binding *bac
 // same msgspec BlockStored/BlockRemoved/AllBlocksCleared wire vLLM does.
 func (a sglangLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
 	return renderSubscriberSidecar(subscriberSidecarParams{
-		Config:           a.subscriber,
-		Cache:            cache,
-		Pod:              pod,
-		HashScheme:       sglangSubscriberHashScheme,
-		EngineZMQPortStr: sglangDefaultEngineZMQPortStr,
+		Config:               a.subscriber,
+		Cache:                cache,
+		Pod:                  pod,
+		HashScheme:           sglangSubscriberHashScheme,
+		EngineZMQPortStr:     sglangDefaultEngineZMQPortStr,
+		EngineMetricsPortStr: sglangDefaultMetricsPortStr,
+		EngineContainerName:  a.EngineContainerName(),
 	})
 }
 
@@ -141,11 +150,14 @@ func (a sglangLMCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBacke
 //   - "--lmcache-config-file" points the engine at the MP config file the worker
 //     sidecar writes (mp_host/mp_port); without it SGLang's MP mode aborts at
 //     startup, so suppressing it breaks the engine, not just the cache.
+//   - "--enable-metrics" exposes SGLang's /metrics endpoint (off by default);
+//     this adapter injects it, and suppressing it would silently defeat the
+//     load-aware stats path without breaking the engine.
 //
 // (Distinct from the vLLM adapter, which reserves --kv-transfer-config — the
 // two engines turn LMCache on through different launch surfaces.)
 func (sglangLMCacheAdapter) ReservedArgs() []string {
-	return []string{SGLangEnableLMCacheArg, SGLangConfigFileArg}
+	return []string{SGLangEnableLMCacheArg, SGLangConfigFileArg, SGLangEnableMetricsArg}
 }
 
 // ReservedEnv returns the env var names this adapter injects and blocks

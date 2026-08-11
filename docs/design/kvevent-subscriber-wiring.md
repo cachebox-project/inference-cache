@@ -43,7 +43,7 @@ to turn it on.**
 Concretely:
 
 * `KVCacheRuntimeAdapter` gains `ObservationSidecar(cb, pod) (*corev1.Container, error)`.
-  The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return the `kvevent-subscriber`
+  The vLLM/LMCache, vLLM/Mooncake, SGLang/LMCache, and SGLang/HiCache adapters return the `kvevent-subscriber`
   container spec (via their shared internal subscriber renderer — the KV-event stream is the
   engine's own ZMQ publisher, independent of the L2 store; each adapter pins its engine's
   `--hash-scheme` tag + ZMQ port); the reference adapter returns `(nil, nil)`.
@@ -52,7 +52,7 @@ Concretely:
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
   fail open, matching the rest of the webhook.
-* **The vLLM/LMCache, vLLM/Mooncake, and SGLang/LMCache adapters return nil unless the
+* **The vLLM/LMCache, vLLM/Mooncake, SGLang/LMCache, and SGLang/HiCache adapters return nil unless the
   controller's `--kvevent-subscriber-image` flag is set** (all go through the same shared
   internal renderer, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
   container into `ImagePullBackOff`, which keeps the engine pod from going Ready — the
@@ -66,11 +66,24 @@ Concretely:
   admission picks it up once the operator sets the field), `--hash-scheme` ← the
   adapter's runtime convention (`"vllm"` or `"sglang"`), `--server` ← the policy-server
   in-cluster Service DNS (operator-configurable via a controller flag),
-  `--engine-endpoint` ← `tcp://127.0.0.1:<engine ZMQ port>`. The stats-path flags
-  (`--engine-metrics-url`, `--stats-interval`, etc.) are added by the adapter when the
-  shipped subscriber binary learns to scrape and emit `ReplicaStats`; passing flags the
-  binary doesn't recognise would crash the sidecar at startup. No operator-supplied
-  `--replica-id` / `--model-id` on the demo path.
+  `--engine-endpoint` ← `tcp://127.0.0.1:<engine ZMQ port>`,
+  `--engine-metrics-url` ← `http://127.0.0.1:<engine metrics port>/metrics`. The
+  port is derived from the engine container's own `--port` (scanned across
+  `command`+`args`; both vLLM and SGLang serve `/metrics` on their HTTP port; the
+  last valid `--port` wins), falling back to the per-engine default when unset
+  (vLLM `:8000`, SGLang `:30000`) — so a custom engine port is still scraped. A
+  `$(VAR)` port reference resolves against the container's literal env; a
+  `valueFrom`-backed or undefined var can't be resolved at admission and falls
+  back to the default (a wrong port then fails loud on scrape). The scraper's
+  per-engine metric profile
+  (`vllm:*` counters vs `sglang:*` gauges) is selected by `--hash-scheme`; a
+  scheme/port mismatch fails loud rather than reporting fabricated zeros. SGLang
+  must be launched with `--enable-metrics` (the managed adapters inject it) or
+  `:30000/metrics` 404s and the stats path surfaces a loud stale signal. The
+  remaining stats-path flags (`--stats-interval`, `--engine-cache-size-bytes`)
+  still take the binary defaults. Passing flags the binary doesn't recognise would
+  crash the sidecar at startup. No operator-supplied `--replica-id` / `--model-id`
+  on the demo path.
 
 ### Why this combination
 

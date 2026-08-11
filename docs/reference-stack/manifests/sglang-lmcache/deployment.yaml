@@ -229,6 +229,11 @@ spec:
             - "--model-path=meta-llama/Meta-Llama-3-8B-Instruct"
             - "--host=0.0.0.0"
             - "--port=30000"
+            # Prometheus /metrics on :30000 (store_true flag). SGLang defaults it
+            # OFF (unlike vLLM), so without it the kvevent-subscriber's stats path
+            # has nothing to scrape and load-aware routing goes dark. The managed
+            # path injects this automatically; the reference sets it explicitly.
+            - "--enable-metrics"
             # SGLang's LMCache connector (store_true flag — no value). Replaces
             # vLLM's --kv-transfer-config.
             - "--enable-lmcache"

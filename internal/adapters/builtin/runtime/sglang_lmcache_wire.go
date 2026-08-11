@@ -41,6 +41,15 @@ const (
 	// mode).
 	SGLangConfigFileArg = "--lmcache-config-file"
 
+	// SGLangEnableMetricsArg turns on SGLang's Prometheus /metrics endpoint (a
+	// store_true flag). SGLang defaults metrics OFF, unlike vLLM, so without this
+	// the stats scraper has nothing to read and load-aware routing goes dark.
+	// The managed LMCache and HiCache paths inject it (both mutate the engine
+	// container) so the operator need not remember the flag. EventsOnly SGLang
+	// gets no engine mutation, so an operator running that mode must set it (its
+	// absence then surfaces as a loud stale signal, not silent zeros).
+	SGLangEnableMetricsArg = "--enable-metrics"
+
 	// sglangMPWorkerContainerName is the node-local MP worker native sidecar.
 	sglangMPWorkerContainerName = "lmcache-mp-worker"
 	// envSGLangMPWorkerManaged marks the MP worker as adapter-rendered, so a
@@ -204,6 +213,7 @@ func InjectSGLangLMCache(pod *corev1.PodSpec, endpoint string, cache *cachev1alp
 	}
 
 	c.Args = UpsertFlag(c.Args, SGLangEnableLMCacheArg)
+	c.Args = UpsertFlag(c.Args, SGLangEnableMetricsArg)
 	c.Args = UpsertArgPair(c.Args, SGLangConfigFileArg, sglangConfigMountPath+"/"+sglangConfigFileName)
 	c.Env = UpsertEnv(c.Env, corev1.EnvVar{Name: EnvLMCacheUseExperimental, Value: lmcacheUseExperimentalVal})
 	c.Env = UpsertEnv(c.Env, corev1.EnvVar{Name: EnvInferenceCacheFailOpen, Value: FailOpenString(cache)})

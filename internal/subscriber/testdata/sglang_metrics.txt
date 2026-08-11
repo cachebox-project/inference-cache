@@ -1,0 +1,43 @@
+# SGLang /metrics exposition (--enable-metrics, served on :30000 — NOT vLLM's :8000).
+# None of these names are recognized by the vLLM-oriented scraper (which reads vllm:*
+# only), so Scrape must fail loud rather than emit fabricated zeros.
+#
+# Metric names, gauge types, and the priority="" total / priority="<int>" breakdown
+# convention were verified against SGLang's SchedulerMetricsCollector at the image
+# pinned in docs/reference-stack/VERSIONS.md; this file doubles as the reference name
+# set for the per-engine extractor. Re-verify on a version bump — names have shifted
+# across releases.
+#
+# What the scraper actually consumes (SGLang -> ReplicaStats):
+#   sglang:num_running_reqs   (gauge)      -> pressure numerator (running)
+#   sglang:num_queue_reqs     (gauge)      -> pressure numerator (waiting)
+#   sglang:token_usage        (gauge 0-1)  -> cache_memory_bytes (usage x CacheSizeBytes)
+#   sglang:cache_hit_rate     (gauge 0-1)  -> hit_rate, read DIRECTLY (NOT hits/queries delta)
+# Present in a real exposition but NOT consumed today: sglang:gen_throughput,
+# sglang:num_used_tokens (token_usage is used for the usage ratio instead).
+# GAP: no core sglang:* external/T2-tier hit counters (vLLM has vllm:external_prefix_cache_*);
+#      SGLang+LMCache T2 stats live in LMCache's own metrics — leave T2 unknown, do not fabricate.
+# HELP sglang:num_running_reqs The number of running requests.
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{model_name="m"} 3
+# HELP sglang:num_queue_reqs The number of requests in the waiting queue.
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{model_name="m"} 5
+# HELP sglang:token_usage The token usage ratio (0-1).
+# TYPE sglang:token_usage gauge
+sglang:token_usage{model_name="m"} 0.63
+# HELP sglang:num_used_tokens The number of used tokens.
+# TYPE sglang:num_used_tokens gauge
+sglang:num_used_tokens{model_name="m"} 1024
+# HELP sglang:cache_hit_rate The prefix cache hit rate.
+# TYPE sglang:cache_hit_rate gauge
+sglang:cache_hit_rate{model_name="m"} 0.75
+# HELP sglang:gen_throughput The generation throughput (token/s).
+# TYPE sglang:gen_throughput gauge
+sglang:gen_throughput{model_name="m"} 1500
+# HELP sglang:prompt_tokens_total Number of prefill tokens processed.
+# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{model_name="m"} 120000
+# HELP sglang:generation_tokens_total Number of generation tokens processed.
+# TYPE sglang:generation_tokens_total counter
+sglang:generation_tokens_total{model_name="m"} 45000

@@ -166,6 +166,9 @@ func (sglangHiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *bac
 			updated = append(updated, want.flag, want.value)
 		}
 	}
+	// SGLang defaults /metrics OFF; enable it so the observation sidecar's stats
+	// scraper has an endpoint to read.
+	updated = UpsertFlag(updated, SGLangEnableMetricsArg)
 	work.Containers[engineIndex].Args = updated
 	*pod = *work
 	return nil
@@ -177,11 +180,13 @@ func (sglangHiCacheAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.
 
 func (a sglangHiCacheAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
 	return renderSubscriberSidecar(subscriberSidecarParams{
-		Config:           a.subscriber,
-		Cache:            cache,
-		Pod:              pod,
-		HashScheme:       sglangSubscriberHashScheme,
-		EngineZMQPortStr: sglangDefaultEngineZMQPortStr,
+		Config:               a.subscriber,
+		Cache:                cache,
+		Pod:                  pod,
+		HashScheme:           sglangSubscriberHashScheme,
+		EngineZMQPortStr:     sglangDefaultEngineZMQPortStr,
+		EngineMetricsPortStr: sglangDefaultMetricsPortStr,
+		EngineContainerName:  a.EngineContainerName(),
 	})
 }
 
@@ -197,6 +202,9 @@ func hiCacheReservedArgs() []string {
 		SGLangHiCacheWritePolicyArg,
 		SGLangHiCacheIOBackendArg,
 		SGLangHiCacheMemoryLayoutArg,
+		// Injected by this adapter (SGLang defaults /metrics off); reserving it
+		// stops engineOverrides from suppressing the load-aware stats path.
+		SGLangEnableMetricsArg,
 	}
 }
 
