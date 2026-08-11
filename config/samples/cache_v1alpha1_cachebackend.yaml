@@ -6,10 +6,11 @@
 # applies cleanly against the current schema + admission webhook. Hand-curated,
 # scenario-specific recipes live in the sibling cachebackend-*.yaml files.
 #
-# The runtime, engine cache, and remote provider are explicit so this minimum
-# sample also demonstrates the canonical API hierarchy. Admission still
-# defaults deploymentKind=Deployment, replicas=1, integration.role=ReadWrite,
-# integration.failOpen=true, and observation.firstEventTimeout=5m.
+# The runtime and typed PodLocal LMCache topology are explicit. Omitting
+# remoteStorage intentionally selects host-only MP; no provider workload or
+# cross-Pod sharing is implied. Admission still defaults integration.role to
+# ReadWrite, integration.failOpen to true, and observation.firstEventTimeout to
+# 5m.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -23,9 +24,20 @@ spec:
   engineSelector:
     matchLabels:
       inferencecache.io/cache-enabled: "true"
+  lmCache:
+    topology: PodLocal
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
   observation:
     modelID: meta-llama/Meta-Llama-3-8B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer: {}

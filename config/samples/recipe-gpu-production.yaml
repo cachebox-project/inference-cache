@@ -7,30 +7,27 @@
 # images (digest-pin them) and tune the model / resources / quotas for your
 # cluster before applying.
 #
-# Scenario: a real model on GPU engine pods, a managed LMCache backend that
-# autoscales under load, and a per-namespace CachePolicy with production-grade
-# TTLs. This file carries three objects: the CacheBackend (with an autoscaling
-# block), a CachePolicy for the namespace, and the GPU engine Deployment.
+# Scenario: a real model on GPU engine pods, typed PodLocal LMCache MP with an
+# explicitly selected managed Redis L3 for cross-Pod sharing, and a
+# per-namespace CachePolicy with production-grade TTLs.
 #
 # Differences from the CPU dev recipe:
 #   * The engine Deployment requests a GPU (`nvidia.com/gpu: 1`) and uses the
 #     CUDA vLLM image — schedule it onto GPU nodes.
-#   * `spec.autoscaling` is set, so the controller reconciles a
-#     HorizontalPodAutoscaler that drives the MANAGED lmcache-server workload's
-#     replica count (it overrides spec.replicas while active). This autoscales
-#     the cache server, not the engine — scale the engine via its own HPA.
+#   * Redis is intentionally a singleton soft-state L3; this recipe does not
+#     map the legacy LMCacheServer autoscaling shape because independent Redis
+#     replicas would partition the keyspace rather than preserve semantics.
 #   * A CachePolicy tunes eviction for the namespace (see the CachePolicy doc
 #     pointer in config/samples/README.md).
 #
 # Binding works exactly as in recipe-cpu-dev.yaml: the `app: prod-llm` label on
 # the engine pod template matches `spec.engineSelector.matchLabels`. Same
-# fail-open-on-empty-endpoint apply race applies — wait for status.endpoint and
-# `kubectl rollout restart deploy/prod-llm-engine` if the first pod comes up
-# unwired. See docs/concepts/cachebackend-engine-binding.md.
+# binding remains CREATE-time; apply the CacheBackend before the engine
+# Deployment. See docs/concepts/cachebackend-engine-binding.md.
 #
 # IMAGES ARE PLACEHOLDERS — replace before production. The engine image below
 # uses a moving `:latest` tag so the recipe stays self-contained; the managed
-# cache-server image is pinned to a version (not `:latest`). Pin each to
+# MP server and Redis images are pinned. Pin the engine to
 # an immutable digest for a real deployment.
 #
 # READY/OBSERVABILITY PREREQUISITE: the backend reaches Ready=True and reports
@@ -59,48 +56,41 @@ metadata:
 spec:
   runtime: VLLM
   type: LMCache
-  # Baseline replica count for the managed lmcache-server. The autoscaling
-  # block below takes over once the HPA is reconciled.
-  replicas: 2
-  autoscaling:
-    minReplicas: 2
-    maxReplicas: 6
-    targetCPUUtilizationPercent: 70
-  # Per-replica resource budget for the lmcache-server container. Omit
-  # remoteStorage.lmCacheServer.resources and the provider fallback supplies
-  # `requests.memory=4Gi`, `limits.memory=8Gi` — adequate for a small
-  # workload, conservative enough that the kubelet does not OOM-kill the
-  # cache pod from node-level memory pressure. The cgroup memory limit
-  # is still a hard ceiling: a working set larger than the configured
-  # limit will trigger an in-cgroup OOM-kill, so size the limit to your
-  # KV footprint. Production workloads should override the request/limit
-  # explicitly so the cache pod's cgroup matches what it will actually
-  # hold (and so the cluster-autoscaler reasons about correct headroom).
-  # 16Gi/24Gi below sizes for a Qwen2.5-7B prod shape — tune to yours.
-  #
-  # NOTE: this override is memory-only. The autoscaling block above
-  # requests a CPU-utilization HPA, so the controller fills in a 250m
-  # CPU request fallback automatically (an HPA needs a CPU request as
-  # its utilization denominator). Add `cpu: …` under requests below to
-  # pin the denominator explicitly if you want a different baseline.
   integration:
     role: ReadWrite
   engineSelector:
     matchLabels:
       app: prod-llm
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 16Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "2"
+            memory: 17Gi
+          limits:
+            cpu: "4"
+            memory: 20Gi
   observation:
     # Real, ungated model (Apache-2.0) — no auth token required.
     modelID: Qwen/Qwen2.5-7B-Instruct
   remoteStorage:
-    provider: LMCacheServer
+    provider: Redis
     ownership: Managed
-    lmCacheServer:
-      # PLACEHOLDER — replace with a digest-pinned reference before production.
-      image: lmcache/standalone:v0.4.7
+    redis:
+      image: docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
       resources:
         requests:
+          cpu: "2"
           memory: "16Gi"
         limits:
+          cpu: "4"
           memory: "24Gi"
 ---
 apiVersion: inferencecache.io/v1alpha1
@@ -195,4 +185,4 @@ spec:
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: 8Gi
+            sizeLimit: 17Gi

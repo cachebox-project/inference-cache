@@ -4,6 +4,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# Phase-5 classification: typed PodLocal MP checks in this script are current.
+# Every LMCacheServer, LMCacheConnectorV1/LMCACHE_REMOTE_URL, lm://, or Mooncake
+# case is an intentional legacy-IP compatibility assertion retained only until
+# Phase 7; none is a production fixture or recommended deployment path.
+
 # Per-PR install smoke for `kubectl apply -k config/default`.
 #
 # Builds controller + server images at a deterministic tag, loads them into a
@@ -67,7 +72,7 @@
 #      controller carries `--lmcache-server-image`, the smoke rewrites it to a
 #      locally built stand-in, and a CacheBackend with no CR-level image renders
 #      that configured image into its owned Deployment.
-#   8b. Provider resource fallback: the paired sample leaves
+#   8b. Legacy-IP compatibility: an inline fixture leaves
 #      remoteStorage.lmCacheServer.resources unset, while the provider renderer
 #      gives the cache-server container a 4Gi request / 8Gi limit. The smoke
 #      asserts the CR remains unchanged and the rendered pod is still bounded
@@ -86,8 +91,7 @@
 #      is persisted through the same live webhook and carries the dedicated
 #      LMCacheMPConnector module path, loopback MP endpoint, deterministic hash
 #      seed, hybrid-manager guard, and no legacy lm:// environment.
-#   9. Canonical External ownership end-to-end: applying the committed
-#      config/samples/cachebackend-external.yaml drives the CacheBackend
+#   9. Legacy-IP External compatibility: an inline fixture drives the CacheBackend
 #      mutating webhook default (spec.replicas=1), renders NO
 #      Deployment/Service in its namespace, status.endpoint mirrors
 #      spec.remoteStorage.endpoint, observedGeneration is set, the CR goes
@@ -312,8 +316,8 @@ KERNEL_CHECK_POD_TIMEOUT="${KERNEL_CHECK_POD_TIMEOUT:-120}"
 # and publish EngineKernelsHealthy=False. One reconcile cycle + poll buffer.
 KERNEL_CHECK_COND_TIMEOUT="${KERNEL_CHECK_COND_TIMEOUT:-60}"
 
-# Sample-smoke tunables — apply config/samples/cachebackend-with-engine.yaml,
-# assert the operator-facing signals, exercise the RequeueAfter drift case.
+# Legacy-IP paired-binding smoke tunables. The current paired sample contributes
+# only the engine scaffold; the legacy CacheBackend fixture is inline.
 #
 # Default namespace is dedicated to this smoke so re-runs against an existing
 # cluster (KEEP_CLUSTER=1) don't mutate or delete a developer's own resources
@@ -1587,8 +1591,14 @@ log "routingFloorScore=0.1 restored: same 64-token match flipped back to PREFIX_
 
 kubectl delete namespace "$POLICY_SMOKE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
-# --- paired-sample smoke ---------------------------------------------------
-# Applies config/samples/cachebackend-with-engine.yaml and asserts the
+# --- legacy IP paired-binding compatibility smoke --------------------------
+# INTENTIONAL LEGACY FIXTURE: this section exercises the LMCacheServer/IP
+# implementation retained until Phase 7. It is not a production reference.
+# The current config/samples/cachebackend-with-engine.yaml supplies only the
+# inference-system-owned engine scaffold; the legacy CacheBackend is written
+# inline below. The current typed MP path is exercised in the canonical section.
+#
+# Asserts the
 # CacheBackend ↔ engine-pod binding's operator-facing signals materialize
 # end-to-end:
 #   - status.matchedEnginePods → 1
@@ -1617,7 +1627,7 @@ log "creating sample namespace $SAMPLE_NS"
 kubectl create namespace "$SAMPLE_NS" --dry-run=client -o yaml \
   | kubectl apply -f - >/dev/null
 
-log "splitting paired sample into CacheBackend doc and engine Deployment doc"
+log "splitting the current paired sample to reuse its engine scaffold"
 sample_file="config/samples/cachebackend-with-engine.yaml"
 # Place the split files under the trapped $tmpdir so an early failure
 # between split and apply (or a SIGINT mid-run) does not leak temp files
@@ -1634,6 +1644,33 @@ awk -v cb="$sample_tmp_cb" -v engine="$sample_tmp_engine" '
   sep     { print > engine }
 ' "$sample_file"
 
+# Replace the typed MP CacheBackend document with an explicitly isolated legacy
+# fixture. Keeping it inline prevents a repository-owned sample from presenting
+# LMCacheServer as a supported deployment choice.
+cat >"$sample_tmp_cb" <<'EOF'
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: qwen-demo-cache
+spec:
+  runtime: VLLM
+  type: LMCache
+  deploymentKind: Deployment
+  replicas: 1
+  integration:
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: qwen-demo
+  observation:
+    modelID: Qwen/Qwen2.5-0.5B-Instruct
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: Managed
+    lmCacheServer:
+      image: lmcache/standalone:v0.4.7
+EOF
+
 # Patch the engine container's image to the lightweight stand-in. The
 # Deployment's metadata stays untouched (still qwen-engine, still
 # labeled app=qwen-demo), so the binding label flow is exercised exactly
@@ -1644,7 +1681,7 @@ rm -f "${sample_tmp_engine}.bak"
 
 build_sample_cache_server_image
 if ! grep -q '^      image: lmcache/standalone:v0.4.7$' "$sample_tmp_cb"; then
-  fail "fixture: cachebackend-with-engine.yaml no longer carries the pinned canonical remoteStorage.lmCacheServer.image"
+  fail "legacy inline fixture no longer carries remoteStorage.lmCacheServer.image"
 fi
 sed -i.bak '/^      image: lmcache\/standalone:v0.4.7$/d' "$sample_tmp_cb"
 rm -f "${sample_tmp_cb}.bak"
@@ -2445,8 +2482,12 @@ log "typed vLLM PodLocal Pod persisted with the dedicated external MP connector 
 kubectl delete namespace "$CANONICAL_SMOKE_NS" \
   --wait=false --ignore-not-found=true >/dev/null 2>&1 || true
 
-# --- External CacheBackend end-to-end ---------------------------------------
-# Exercises the committed External passthrough sample on the running cluster:
+# --- legacy IP External compatibility --------------------------------------
+# INTENTIONAL LEGACY FIXTURE: this section exercises External LMCacheServer/IP
+# validation and injection retained until Phase 7. It is not a production
+# reference. Current External Redis is covered by typed schema/sample checks.
+#
+# Exercises External passthrough on the running cluster:
 # the mutating webhook should stamp spec.replicas, the reconciler should NOT
 # render a Deployment/Service, status.endpoint should mirror
 # spec.remoteStorage.endpoint,
@@ -2458,11 +2499,28 @@ kubectl delete namespace "$CANONICAL_SMOKE_NS" \
 log "exercising External CacheBackend end-to-end in namespace $EXT_SMOKE_NS"
 kubectl create namespace "$EXT_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Apply the committed External CR sample. The sample intentionally omits
-# spec.replicas so the smoke drives the mutating webhook defaulter instead of
-# only proving the CRD accepts already-defaulted YAML.
-kubectl -n "$EXT_SMOKE_NS" apply -f config/samples/cachebackend-external.yaml >/dev/null \
-  || fail "kubectl apply config/samples/cachebackend-external.yaml failed"
+# The inline fixture intentionally omits spec.replicas so the smoke drives the
+# mutating webhook defaulter instead of only proving the CRD accepts already-
+# defaulted YAML.
+cat <<EOF | kubectl -n "$EXT_SMOKE_NS" apply -f - >/dev/null \
+  || fail "kubectl apply legacy External LMCacheServer fixture failed"
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: $EXT_SMOKE_CB_NAME
+spec:
+  runtime: VLLM
+  type: LMCache
+  integration:
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  remoteStorage:
+    provider: LMCacheServer
+    ownership: External
+    endpoint: my-cache.example.com:8200
+EOF
 
 defaulted_replicas="$(kubectl -n "$EXT_SMOKE_NS" get cb "$EXT_SMOKE_CB_NAME" \
   -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
@@ -4048,9 +4106,12 @@ if ! grep -q "\"exitCode\": $doctor_rc" "$LOG_DIR/doctor.json"; then
 fi
 log "inferencecache doctor ran against the live install (exit $doctor_rc; JSON envelope + CB finding present)"
 
-# --- managed Mooncake backend smoke ----------------------------------------
-# Canonical CacheBackend{runtime: VLLM, type: LMCache,
-# remoteStorage.provider: Mooncake} is an operator-facing surface, so it needs
+# --- legacy IP managed Mooncake compatibility smoke ------------------------
+# INTENTIONAL LEGACY FIXTURE: Mooncake-through-LMCache/IP remains implemented
+# until Phase 7, but is not a current production path or sample. This section
+# keeps compatibility coverage without presenting it as a recommended backend.
+# CacheBackend{runtime: VLLM, type: LMCache,
+# remoteStorage.provider: Mooncake} is still an operator-facing alpha surface, so it needs
 # a real-install assertion, not just unit/envtest. The kvcacheai/mooncake image
 # is intentionally NOT pulled here (heavy, and its entrypoint/ports are pending
 # reference-stack validation); instead a busybox stand-in named `mooncake_master`
@@ -4087,10 +4148,33 @@ log "creating namespace $MOONCAKE_SMOKE_NS"
 kubectl create namespace "$MOONCAKE_SMOKE_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 mc_cb_tmp="$(mktemp "$tmpdir/mooncake-cb.XXXXXX")"
-cp config/samples/cachebackend-mooncake.yaml "$mc_cb_tmp"
+cat >"$mc_cb_tmp" <<'EOF'
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: cachebackend-mooncake
+spec:
+  runtime: VLLM
+  type: LMCache
+  deploymentKind: Deployment
+  replicas: 1
+  integration:
+    role: ReadWrite
+    engineHostNetwork: true
+  engineSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  observation:
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct
+  remoteStorage:
+    provider: Mooncake
+    ownership: Managed
+    mooncake:
+      image: docker.io/kvcacheai/mooncake:0.3.11.post1
+EOF
 mc_escaped_image="$(printf '%s' "$MOONCAKE_MASTER_IMAGE" | sed 's/[&|\\]/\\&/g')"
 if ! grep -q '^      image: docker.io/kvcacheai/mooncake:0.3.11.post1$' "$mc_cb_tmp"; then
-  fail "fixture: cachebackend-mooncake.yaml no longer carries the pinned canonical remoteStorage.mooncake.image"
+  fail "legacy inline Mooncake fixture no longer carries remoteStorage.mooncake.image"
 fi
 sed -i.bak "s|^      image: docker.io/kvcacheai/mooncake:0.3.11.post1$|      image: $mc_escaped_image|g" "$mc_cb_tmp"
 rm -f "${mc_cb_tmp}.bak"
@@ -4114,7 +4198,7 @@ log "applying Mooncake CacheBackend"
 # re-indented, the sed below silently no-ops and the first assertion then fails
 # with "did not warn" — blaming the webhook for a broken test fixture.
 if ! grep -q '^    engineHostNetwork: true$' "$mc_cb_tmp"; then
-  fail "fixture: cachebackend-mooncake.yaml no longer carries 'engineHostNetwork: true' at the expected indent; the no-opt-in copy would be a no-op"
+  fail "legacy inline Mooncake fixture no longer carries 'engineHostNetwork: true' at the expected indent; the no-opt-in copy would be a no-op"
 fi
 mc_nooptin_tmp="$(mktemp "$tmpdir/mooncake-cb-nooptin.XXXXXX")"
 sed 's/^    engineHostNetwork: true$//' "$mc_cb_tmp" >"$mc_nooptin_tmp"
@@ -4136,15 +4220,15 @@ case "$mc_apply_out" in
     log "Mooncake with the opt-in applies without the engine-hostNetwork warning" ;;
 esac
 
-# Pin the fixture to the canonical hierarchy.
+# Pin the fixture to the retained legacy hierarchy.
 mc_runtime="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.runtime}')"
 mc_type="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.type}')"
 mc_provider="$(kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o jsonpath='{.spec.remoteStorage.provider}')"
 if [ "$mc_runtime" != "VLLM" ] || [ "$mc_type" != "LMCache" ] || [ "$mc_provider" != "Mooncake" ]; then
   kubectl -n "$MOONCAKE_SMOKE_NS" get cb "$MOONCAKE_CB_NAME" -o yaml || true
-  fail "Mooncake smoke fixture is not canonical: runtime=$mc_runtime type=$mc_type remoteStorage.provider=$mc_provider"
+  fail "Mooncake compatibility fixture changed shape: runtime=$mc_runtime type=$mc_type remoteStorage.provider=$mc_provider"
 fi
-log "canonical Mooncake CacheBackend admitted (runtime=VLLM, type=LMCache, provider=Mooncake)"
+log "legacy Mooncake CacheBackend admitted (runtime=VLLM, type=LMCache, provider=Mooncake)"
 
 # Reuses SAMPLE_ENDPOINT_TIMEOUT deliberately: the reconcile-to-status.endpoint
 # latency is a per-managed-backend property (the reconciler publishes it from

@@ -2,6 +2,12 @@
 
 Status: implemented · Tracks: InferenceCache tech spec §4.1 · API group: `inferencecache.io/v1alpha1`
 
+> **Current production contract:** LMCache uses typed
+> `spec.lmCache.topology: PodLocal` multiprocess wiring for both vLLM and
+> SGLang, with optional Redis selected explicitly. Topology-less LMCacheServer,
+> Mooncake, `lm://`, and IP-connector descriptions below are retained only as
+> legacy compatibility/history until Phase 7; they are not recommended paths.
+
 `CacheBackend` is the namespaced CRD that describes an engine-side cache
 implementation, an optional remote-storage tier, and the engine integration
 policy that should use them. Provider lifecycle belongs to storage-provider
@@ -19,7 +25,7 @@ adapters; runtime adapters own engine Pod wiring only.
 
 The `v1alpha1` contract is pre-launch and explicitly unstable (see the carve-out paragraph below for the precise terms); after the v1beta1 promotion, new fields must be additive and tightening validation on existing fields requires a versioned migration path.
 
-**Pre-launch carve-out (active until v1beta1).** The project is pre-launch and `v1alpha1` is explicitly unstable: where keeping an inert, unidiomatic, or operator-confusing field through to `v1beta1` would compound the cleanup work, a per-change waiver allows in-place removal during alpha. Each such removal is gated on (1) a locked design decision naming the field and the reason, (2) zero current consumers (no external operator manifests, no cross-component code), and (3) replacement of the operator-facing surface where one existed. Closed precedent: `CacheTenant.spec.quota.maxMemoryBytes` and `status.memoryUsed` removed (we cannot enforce per-tenant byte budgets on shared engines, and the underlying observation would be double-counted across tenants). The cluster-aggregate sibling `CacheIndex.status.tenants[].memoryUsed` has the same honesty problem (summing per-tenant memory across replicas on a shared engine double-counts the same bytes once per tenant), but because it is a published v1alpha1 *status* field it is **deprecated and zeroed in place** rather than removed: the controller stops populating it (always `0`) and operators are redirected to the per-replica `CacheIndex.status.replicas[].cacheMemoryBytes` (engine total per replica, honest at that altitude), while the field stays in the schema for wire/shape compatibility until its removal at v1beta1. Current applied removals: `CacheBackend.status.health` and the `CacheBackendHealth` enum removed in favour of the standard `status.conditions[Ready|Degraded|Progressing]` surface (the old `Degraded` health value is replaced by `Conditions[Degraded]`), which the new `Ready` printer column displays; and `CacheBackend.spec.storage{,.pvc}` + `status.capacity` removed — the `lm://` LMCache server we provision is in-memory, so a local PVC could not honestly back it, and durability is expressed as a backend choice (the Mooncake backend, now implemented — see [Mooncake provider configuration](#mooncake-provider-configuration)) rather than a generic volume knob (locked decision: `docs/design/lmcache-server-persistence.md`; replacement surface: backend-type selection). Once `v1beta1` is promoted, this carve-out is closed: subsequent breaking changes require a versioned migration.
+**Pre-launch carve-out (active until v1beta1).** The project is pre-launch and `v1alpha1` is explicitly unstable: where keeping an inert, unidiomatic, or operator-confusing field through to `v1beta1` would compound the cleanup work, a per-change waiver allows in-place removal during alpha. Each such removal is gated on (1) a locked design decision naming the field and the reason, (2) zero current consumers (no external operator manifests, no cross-component code), and (3) replacement of the operator-facing surface where one existed. Closed precedent: `CacheTenant.spec.quota.maxMemoryBytes` and `status.memoryUsed` removed (we cannot enforce per-tenant byte budgets on shared engines, and the underlying observation would be double-counted across tenants). The cluster-aggregate sibling `CacheIndex.status.tenants[].memoryUsed` has the same honesty problem (summing per-tenant memory across replicas on a shared engine double-counts the same bytes once per tenant), but because it is a published v1alpha1 *status* field it is **deprecated and zeroed in place** rather than removed: the controller stops populating it (always `0`) and operators are redirected to the per-replica `CacheIndex.status.replicas[].cacheMemoryBytes` (engine total per replica, honest at that altitude), while the field stays in the schema for wire/shape compatibility until its removal at v1beta1. Current applied removals: `CacheBackend.status.health` and the `CacheBackendHealth` enum removed in favour of the standard `status.conditions[Ready|Degraded|Progressing]` surface (the old `Degraded` health value is replaced by `Conditions[Degraded]`), which the new `Ready` printer column displays; and `CacheBackend.spec.storage{,.pvc}` + `status.capacity` removed. The original rationale referenced the now-legacy in-memory `lm://` server and Mooncake provider; current durability/sharing is an explicit typed MP L3 choice, normally Redis (historical rationale: `docs/design/lmcache-server-persistence.md`). Once `v1beta1` is promoted, this carve-out is closed: subsequent breaking changes require a versioned migration.
 
 ## Cache hierarchy and ownership
 
@@ -29,10 +35,20 @@ The canonical API assigns one architectural dimension to each field:
 spec:
   runtime: SGLang
   type: LMCache
+  integration:
+    role: ReadWrite
   lmCache:
+    topology: PodLocal
     chunkSizeTokens: 256
-    hostMemory:
-      capacity: 32Gi
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:...
+        port: 5555
+        l1Capacity: 32Gi
+        maxWorkers: 4
+        resources:
+          requests: {cpu: "1", memory: 33Gi}
+          limits: {memory: 33Gi}
   remoteStorage:
     provider: Redis
     ownership: Managed
@@ -60,13 +76,21 @@ spec:
   runtime: SGLang
   type: LMCache
   lmCache:
-    hostMemory:
-      capacity: 32Gi
+    topology: PodLocal
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:...
+        port: 5555
+        l1Capacity: 32Gi
+        maxWorkers: 4
+        resources:
+          requests: {cpu: "1", memory: 33Gi}
+          limits: {memory: 33Gi}
 ```
 
-This requests `SGLang -> LMCache host memory` only. The controller creates no
-provider Deployment or Service, and the engine adapter injects the node-local
-LMCache MP worker without an L2 adapter.
+This requests SGLang typed PodLocal MP with host-only L1. The controller creates
+no remote-provider Deployment or Service; the webhook injects the MP server
+native sidecar without an L3 adapter.
 
 Capability resolution is deliberately two-dimensional:
 
@@ -79,10 +103,11 @@ engine-wire adapter              storage-provider adapter
       +--------- optional Binding -------+
 ```
 
-The provider adapter owns workload and Service rendering and emits a structured
-binding (`lm`, `resp`, or `mooncakestore`). The engine adapter declares which
-bindings it accepts. Admission rejects unsupported combinations before an
-engine Pod is created.
+The current Redis provider adapter owns workload and Service rendering and
+emits a structured RESP binding. The engine adapter declares which bindings it
+accepts. Admission rejects unsupported combinations before an engine Pod is
+created. Legacy `lm` and `mooncakestore` bindings remain implemented only so
+old alpha objects stay reconcilable until Phase 7.
 
 ### Cache type validation
 
@@ -92,9 +117,9 @@ Mooncake is selected through `remoteStorage.provider`, and externally managed
 infrastructure through `remoteStorage.ownership`. The API server rejects the
 old `type: Mooncake` and `type: External` spellings before admission.
 
-The canonical External and Mooncake examples are available in
-[`config/samples/cachebackend-external.yaml`](../../config/samples/cachebackend-external.yaml)
-and [`config/samples/cachebackend-mooncake.yaml`](../../config/samples/cachebackend-mooncake.yaml).
+Current managed and external Redis examples are available in
+[`config/samples/cachebackend-lmcache.yaml`](../../config/samples/cachebackend-lmcache.yaml)
+and [`config/samples/cachebackend-external.yaml`](../../config/samples/cachebackend-external.yaml).
 
 ## Spec
 
@@ -102,14 +127,14 @@ and [`config/samples/cachebackend-mooncake.yaml`](../../config/samples/cacheback
 |---|---|---|
 | `runtime` | enum | Required inference runtime: `VLLM` or `SGLang`. Values are case-sensitive. |
 | `type` | enum | Engine-side cache implementation: `LMCache` or `SGLangHiCache`. Defaults to `LMCache`. |
-| `lmCache` | object | Typed LMCache engine configuration: chunk size, host-memory capacity, MP-worker image/port, and remote serde. |
+| `lmCache` | object | Typed LMCache MP configuration: topology, chunk size, and PodLocal server image/port/L1/resources. |
 | `remoteStorage` | object | Optional remote tier. Omitting it means host-only and provisions no provider workload. |
-| `remoteStorage.provider` | enum | `Redis`, `LMCacheServer`, or `Mooncake`. |
+| `remoteStorage.provider` | enum | Current MP provider: `Redis`. `LMCacheServer` and `Mooncake` remain in the alpha schema only for legacy compatibility until Phase 7. |
 | `remoteStorage.ownership` | enum | `Managed` or `External`. |
-| `remoteStorage.endpoint` | string | Required for `External`, rejected for `Managed`; managed endpoints are controller-observed in status. Bare `host:port` is portable across all providers. `LMCacheServer` also accepts `lm://host:port`, `Mooncake` also accepts `mooncakestore://host:port`, and `Redis` accepts only bare `host:port`. Every provider requires a numeric port in `1-65535`; admission rejects schemes belonging to another provider. |
+| `remoteStorage.endpoint` | string | Required for `External`, rejected for `Managed`; managed endpoints are controller-observed in status. Current Redis requires bare `host:port`. Legacy providers retain their old scheme validation only while the compatibility implementation exists. |
 | `remoteStorage.redis` | object | Redis-owned image and resource configuration. |
-| `remoteStorage.lmCacheServer` | object | Standalone LMCache-server-owned image, command, and resource configuration. |
-| `remoteStorage.mooncake` | object | Mooncake-owned image, command, and resource configuration. |
+| `remoteStorage.lmCacheServer` | object | Legacy IP compatibility field; not a current MP backend. Removed in Phase 7. |
+| `remoteStorage.mooncake` | object | Legacy IP compatibility field; not a current MP backend. Removed in Phase 7. |
 | `observation` | object | Observation-owned `modelID` and `firstEventTimeout`. |
 | `deploymentKind` | enum | Managed workload kind: `Deployment` or `StatefulSet`. Defaults to `Deployment`. |
 | `replicas` | integer | Desired managed backend replicas. Defaults to `1`. Minimum `0`. See [Defaulting](#defaulting-mutating) for the interaction with `spec.autoscaling.minReplicas` (first-apply-only). |
@@ -151,12 +176,12 @@ It intentionally does not expose `containers`; requiring users to provide contai
 
 ### Resources
 
-Canonical resources place `corev1.ResourceRequirements` under the provider that
-owns the workload: `remoteStorage.redis.resources`,
-`remoteStorage.lmCacheServer.resources`, or
-`remoteStorage.mooncake.resources`. The provider renderer deep-copies that
-block onto its managed container. If the typed block is omitted, the provider
-uses a bounded 4Gi request / 8Gi limit without persisting a default into the CR.
+Current resources live with the workload owner:
+`lmCache.podLocal.server.resources` for the MP native sidecar and
+`remoteStorage.redis.resources` for managed Redis. Legacy
+`remoteStorage.lmCacheServer.resources` and `remoteStorage.mooncake.resources`
+remain renderer inputs only until Phase 7. Provider renderers deep-copy the
+selected block onto their managed container.
 
 **Pass-through to the rendered container.** The provider adapter `DeepCopy`'s
 the selected typed resource block onto `Container.Resources`. The deep copy is
@@ -243,13 +268,13 @@ SGLang supports two peer cache integrations:
 
 | Runtime/backend pair | Data plane | Controller-managed workload |
 |---|---|---|
-| `(SGLang, LMCache)` without `remoteStorage` | Node-local LMCache MP worker, host-only | None |
-| `(SGLang, LMCache)` with Managed Redis | Node-local LMCache MP worker with a shared Redis remote tier | Redis Deployment and Service |
+| `(SGLang, LMCache)` without `remoteStorage` | PodLocal LMCache MP server, host-only | Native sidecar in each selected engine Pod |
+| `(SGLang, LMCache)` with Managed Redis | PodLocal LMCache MP server with a shared Redis remote tier | Native sidecar plus Redis Deployment and Service |
 | `(sglang, SGLangHiCache)` | Native engine-local host cache | None |
 
 #### SGLang LMCache MP mode
 
-> **SGLang drives LMCache in multiprocess (MP) mode (implemented, GPU-validated end to end).** Unlike vLLM, SGLang reads LMCache config from a **`--lmcache-config-file`** (carrying `mp_host`/`mp_port`), attaches to a **node-local MP worker** over ZMQ + a shared-memory data path, and offloads to a shared **L2 store** (the worker's `--l2-adapter`) — it does NOT use a cluster-reachable `lm://` server (`lm://` is not even a valid MP `--l2-adapter` type). So the `(sglang, LMCache)` data plane differs from vLLM's on **both** halves, and the sections below reflect that. Authoritative design + validation evidence: [`sglang-lmcache-mp-mode.md`](sglang-lmcache-mp-mode.md).
+> **SGLang drives LMCache in multiprocess mode (implemented and GPU-validated).** SGLang reads the generated client config through `--lmcache-config-file` and attaches to the PodLocal `lmcache server` over loopback plus shared memory. Optional Redis is an L3 adapter selected explicitly. It does not use the legacy cluster-reachable IP server.
 
 SGLang is the second runtime the cache plane supports (`spec.runtime: SGLang`,
 `spec.type: LMCache`; adapter at `internal/adapters/builtin/runtime`). Its engine
@@ -260,15 +285,19 @@ Redis workload only when `spec.remoteStorage` explicitly selects
 
 > **Cluster prerequisite — Kubernetes ≥ 1.29 (REQUIRED for typed PodLocal LMCache).** The MP server is injected as a **native sidecar** — an `initContainers` entry with `restartPolicy: Always`, which K8s only understands from 1.29 (beta, on by default; stable 1.33). On an older cluster the apiserver does not recognize that field, so a typed SGLang or vLLM PodLocal engine pod fails admission (or the server degrades to a plain init container that exits before the engine starts). There is no in-webhook version gate today; operators using typed PodLocal LMCache must run 1.29+.
 
-> **Two more caveats on the SGLang support surface** (details below): (1) server-derived `LookupRoute` with raw `token_ids`/`prompt_text` only hits when the server's single global `--engine-block-size` matches SGLang's page size (see the "Block-size alignment" note later in this section); gateways that send pre-computed `prefix_hash`/`block_hashes` are unaffected. (2) The `lmcache-kernel-check` init container is vLLM-only today (the SGLang adapter does not implement `InitContainerProvider`), so `EngineKernelsHealthy` is not published for SGLang pods.
+> **Lookup caveat:** server-derived `LookupRoute` with raw
+> `token_ids`/`prompt_text` only hits when the server's global
+> `--engine-block-size` matches SGLang's page size. Gateways that send
+> pre-computed hashes are unaffected. CacheBackend does not inspect or replace
+> the engine image and does not add a package-verifier init container.
 
 The webhook renders the MP data plane on the SGLang engine pod. Alongside the
-engine container it adds a **node-local MP-worker native sidecar** (an init
-container with `restartPolicy: Always`) that writes the `--lmcache-config-file`
-then runs the LMCache MP server on `127.0.0.1`. With a RESP binding it appends
-`--l2-adapter` and offloads to Redis; without a binding it runs host-only.
+engine container it adds a **PodLocal `lmcache-mp-server` native sidecar** (an
+init container with `restartPolicy: Always`) that runs the supported
+`lmcache server` entry point on `127.0.0.1` and writes the client configuration.
+With a RESP binding it offloads to Redis; without a binding it runs host-only.
 `NVIDIA_VISIBLE_DEVICES=all`
-lets the GPU-less sidecar CUDA-IPC the engine's GPU with no device-plugin
+lets the GPU-less sidecar use CUDA-IPC with no device-plugin
 allocation, an `exec` startup-probe on the loopback ZMQ port gates the engine's
 start, and a shared `emptyDir` carries the config file. For `/dev/shm` (the L1 tier)
 it reuses the engine's own volume when the engine already mounts one (a duplicate
@@ -287,7 +316,13 @@ reserved-names note below for the reuse/reject rules. On the engine container (n
 >
 > **Scope of what the adapter adds.** This is the engine image's own posture rather than something the adapter introduces: sglang images ship `NVIDIA_VISIBLE_DEVICES=all` in their `ENV`, and the device plugin overrides it only for containers that request a GPU (the engine gets a specific UUID; a request-less sidecar keeps the image default). The adapter sets it explicitly so the wire also works on a `workerImage` that lacks that default, instead of depending on an image side effect. Operators who need hard GPU isolation between tenants should not co-schedule those tenants on one node — the same guidance that applies to any CUDA-IPC sidecar.
 
-**Names the MP wire reserves on the engine pod.** The init container `lmcache-mp-worker`, the volumes `lmcache-config` + `lmcache-dshm`, and the mount path `/etc/lmcache` are adapter-owned. If the pod already carries one of them and the adapter did not render it, admission **rejects the injection** — which the pod webhook turns into a fail-open admit, so the pod starts **un-wired** (no cache) rather than with its own container silently overwritten. The same applies when the engine mounts `/dev/shm` read-only or from a `configMap`/`secret`/`downwardAPI`/`projected` volume: the MP data path writes there, so it is rejected at admission instead of failing deep inside LMCache at runtime. Rename the colliding object (or drop the `readOnly`) to get the pod wired. Re-injecting an already-wired pod is **not** a collision — the adapter recognises its own worker and converges it on the current render.
+**Names the MP wire reserves on the engine pod.** The init container
+`lmcache-mp-server`, volumes `lmcache-mp-config` and `lmcache-mp-shm`, and mount
+path `/var/run/inference-cache/lmcache` are adapter-owned. A foreign collision
+rejects injection, which the pod webhook reports while admitting the pod
+unwired under fail-open semantics. Re-injecting an operator-rendered pod is
+idempotent. An incompatible existing `/dev/shm` mount is rejected rather than
+failing later inside LMCache.
 
 The old lm:// `LMCACHE_REMOTE_URL` / serde / chunk-size / local-CPU env is
 **NOT** injected — SGLang MP mode ignores it. New manifests use typed
@@ -295,10 +330,13 @@ The old lm:// `LMCACHE_REMOTE_URL` / serde / chunk-size / local-CPU env is
 
 | Field | Default | Bounds | Purpose |
 |---|---|---|---|
-| `lmCache.chunkSizeTokens` | `256` | `>=1` | The worker's `--chunk-size` and config-file `chunk_size`. |
-| `lmCache.hostMemory.capacity` | `4Gi` | positive quantity | Host-memory budget; rendered to the worker's whole-GiB L1 allocation. |
-| `lmCache.workerPort` | `5555` | `1`–`65535` | Loopback ZMQ port used by the engine and worker. |
-| `lmCache.workerImage` | engine image | — | Optional MP-worker image override. |
+| `lmCache.chunkSizeTokens` | `256` | `>=1` | Server chunk size and client config. |
+| `lmCache.topology` | required | `PodLocal` | `NodeLocal` is a future shape and is rejected. |
+| `lmCache.podLocal.server.image` | required | digest-pinned reference | Independently owned LMCache server image; never copied from or into the engine image. |
+| `lmCache.podLocal.server.port` | required | `1`–`65535` | Loopback MP port. |
+| `lmCache.podLocal.server.l1Capacity` | required | positive quantity | Usable L1; `/dev/shm` and memory resources must cover this plus 1Gi. |
+| `lmCache.podLocal.server.maxWorkers` | required | `>=1` | Server worker bound. |
+| `lmCache.podLocal.server.resources` | required | validated K8s resources | Positive CPU request and sufficient memory request/limit. |
 
 Deliberately **not** injected for SGLang (a real engine difference, not an omission): `VLLM_USE_V1` (a vLLM-internal codepath with no SGLang analogue) and `PYTHONHASHSEED` (vLLM pins it to stabilise its builtin-`hash()`-seeded block-hash chain across TP workers; SGLang derives its prefix hash with `hashlib.sha256` over the token-id bytes, independent of `PYTHONHASHSEED`).
 
@@ -306,7 +344,7 @@ Deliberately **not** injected for SGLang (a real engine difference, not an omiss
 
 **Reserved set** (`internal/adapters/builtin/runtime`): `ReservedArgs()` = `--enable-lmcache`, `--lmcache-config-file`; `ReservedEnv()` = `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN`. In MP mode the old lm:// `LMCACHE_REMOTE_URL` is neither injected nor reserved. `VLLM_USE_V1` / `PYTHONHASHSEED` are not reserved because they are never injected.
 
-The two override surfaces are separate: `spec.lmCache` shapes the worker
+The two override surfaces are separate: `spec.lmCache` shapes the server
 sidecar, while `spec.integration.engineOverrides` edits the engine container's
 args/env only.
 
@@ -517,17 +555,21 @@ Extending the check to SGLang is a follow-up.
 server-side cache path): the kernel check catches the engine-side load cause
 that the round-trip probe cannot see.
 
-### Mooncake provider configuration
+### Legacy IP Mooncake provider configuration (compatibility only)
+
+> This section documents implementation retained until Phase 7 so old alpha
+> objects remain diagnosable. Mooncake-through-LMCache/IP is not a current
+> production path, is not a sample, and must not be translated to Redis
+> automatically. Operators must explicitly choose typed host-only MP or Redis.
 
 `spec.remoteStorage.mooncake` selects the Mooncake provider adapter
 (`internal/adapters/builtin/storage/mooncake.go`) to reconcile the standalone
 **Mooncake master** workload. The vLLM runtime adapter
 separately wires engine pods to it through the LMCache remote-binding contract. Mooncake is
-the durable / shared cache path — the backend-type expression of the persistence
-decision in
+historically represented a durable/shared cache path in
 [`docs/design/lmcache-server-persistence.md`](lmcache-server-persistence.md)
-(the in-memory `lm://` lmcache-server is the simple default; Mooncake is the
-scalable one — durability is a backend choice, not a generic volume knob).
+(the old in-memory IP server and Mooncake mapping are both legacy; this text is
+preserved only to explain the compatibility renderer).
 
 > **Operator requirement — the Mooncake master runs on the host network.** Unlike LMCache's `lm://` (one server, one port, one connection — a virtual ClusterIP suffices), Mooncake is a **peer-to-peer transfer-engine mesh**: the master on `:50051` returns only a directory pointer ("this block lives on node B"), and the engine then dials that node's real IP on a **dynamically negotiated port** to move the KV bytes. A ClusterIP Service forwards only the ports declared on it, and CNI overlay pod IPs are not reachable for the mesh — so the adapter renders the master with `hostNetwork: true` behind a **headless** Service (`clusterIP: None`), whose DNS name (published as `status.endpoint`) therefore resolves straight to the master's node IP with every port reachable. Consequences you must plan for:
 >
@@ -747,7 +789,13 @@ Inference-cache has not been formally deployed, so this version does not ship a 
 
 ### Engine-injection overrides (`spec.integration.engineOverrides`)
 
-`spec.integration.engineOverrides` lets the operator amend the non-reserved args/env the pod-mutating webhook injects into the engine container — without forking an adapter. It is the user-facing seam that today's CPU-vLLM-with-LMCache use case and the SGLang+LMCache adapter reach to tune adapter-injected knobs (chunk size, max model length, serdes) that the canonical injection would otherwise hard-code. The reserved set (per locked decision #5/#6 below) makes this surface unsuitable for turning the integration *off*: operators who need to skip injection entirely on a pod should use the `inferencecache.io/skip-inject` annotation instead.
+`spec.integration.engineOverrides` lets the operator amend non-reserved
+engine-container args/env without forking an adapter. Current LMCache server
+capacity, chunk size, port, image, and resources belong in typed
+`spec.lmCache`; overrides are not a second configuration surface for those
+fields. The reserved set makes this surface unsuitable for turning the
+integration *off*: operators who need to skip injection entirely on a pod use
+the `inferencecache.io/skip-inject` annotation instead.
 
 Shape, in `corev1` vocabulary:
 
@@ -784,7 +832,7 @@ The legacy vLLM+LMCache adapter (`internal/adapters/builtin/runtime/vllm_lmcache
 - `ReservedArgs()`: `--kv-transfer-config` (the LMCache connector wiring).
 - `ReservedEnv()`: `VLLM_USE_V1` (selects the engine codepath the connector targets), `LMCACHE_REMOTE_URL` (the resolved cache endpoint), `INFERENCECACHE_FAIL_OPEN` (mirror of `spec.integration.failOpen` — overriding it would silently desync the pod from the CR contract), `PYTHONHASHSEED` (pins the deterministic `NONE_HASH` so LMCache reload matches under TP>1 — overriding or suppressing it silently 0-hits reload).
 
-The same reserved set applies when the canonical vLLM/LMCache engine cache has
+The same reserved set applies when a legacy vLLM/LMCache object has
 an External LMCacheServer binding or a Mooncake binding: the selected runtime
 adapter still runs the LMCache connector and varies only the structured
 binding's protocol and endpoint. Admission therefore rejects
@@ -800,7 +848,10 @@ The typed PodLocal vLLM MP adapter reserves a narrower and different set:
 
 The SGLang+LMCache adapter (`internal/adapters/builtin/runtime`) reserves a **different** set, because SGLang's engine-side wire is the LMCache MP wire, not the `lm://` one (see [SGLang engine support](#sglang-engine-support)): `ReservedArgs()` = `--enable-lmcache`, `--lmcache-config-file`; `ReservedEnv()` = `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN`. Suppressing `--lmcache-config-file` un-wires MP mode (the engine aborts at startup without it), hence its reservation. In MP mode the lm:// `LMCACHE_REMOTE_URL` is neither injected nor reserved, and `VLLM_USE_V1` / `PYTHONHASHSEED` are never injected for SGLang. Reservation is per-adapter precisely so each engine guards only the flags/env its own integration cannot function without.
 
-`LMCACHE_CHUNK_SIZE`, `LMCACHE_REMOTE_SERDE`, `LMCACHE_LOCAL_CPU`, `LMCACHE_MAX_LOCAL_CPU_SIZE` are deliberately NOT reserved — they are perf/mode tunables the operator may legitimately want to change. Canonical chunk size, serializer, and host-memory capacity use `spec.lmCache`; `engineOverrides.env` remains the engine-agnostic seam for explicit environment-level tuning.
+`LMCACHE_CHUNK_SIZE`, `LMCACHE_REMOTE_SERDE`, `LMCACHE_LOCAL_CPU`, and
+`LMCACHE_MAX_LOCAL_CPU_SIZE` belong only to the legacy IP adapter. They remain
+unreserved while that compatibility adapter exists, but current MP manifests
+must use the typed `spec.lmCache` hierarchy instead.
 
 #### Shape rationale (A vs. B)
 

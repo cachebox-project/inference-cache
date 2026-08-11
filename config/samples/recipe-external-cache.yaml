@@ -2,22 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Recipe: External cache — point the operator at a cache you manage yourself.
+# Recipe: External Redis L3 — point the MP server at Redis you manage.
 #
-# Scenario: you already run an lmcache-server (or share one across clusters)
-# and don't want the controller to provision a new one. External ownership
-# makes the controller skip all provisioning (no Deployment, no Service, no
-# HPA); it mirrors `spec.remoteStorage.endpoint` into `status.endpoint` and
-# marks the CR Ready as soon as admission accepts the spec. The pod webhook
-# then wires
-# engine pods matching `spec.engineSelector` to that endpoint with the same
-# LMCache wire format a managed backend uses — the engine can't tell the
-# difference.
+# Scenario: you already run Redis and do not want the controller to provision
+# it. External ownership skips the remote-provider Deployment/Service/HPA. The
+# pod webhook still injects one PodLocal LMCache MP server per engine Pod, and
+# that server connects to the explicit RESP endpoint.
 #
 # Admission rules for External ownership:
 #   * remoteStorage.endpoint is REQUIRED for External ownership and REJECTED
-#     for Managed ownership. Accepted shapes are bare `host:port` or
-#     `lm://host:port`.
+#     for Managed ownership. Redis accepts bare `host:port`.
 #     A non-empty port is required; IPv6 literals must be bracketed ([::1]:8200).
 #   * If the endpoint resolves to an in-cluster Service in a DIFFERENT namespace
 #     than this CR, set `spec.allowCrossNamespace: true` to acknowledge the
@@ -25,7 +19,7 @@
 #   * The controller does NOT probe the endpoint — it trusts the operator.
 #
 # This recipe ships only the CacheBackend + a matching engine Deployment; the
-# cache server itself is assumed to already exist at the endpoint below.
+# Redis itself is assumed to already exist at the endpoint below.
 #
 # OBSERVABILITY PREREQUISITE: per-replica index entries are reported only when
 # the kvevent-subscriber sidecar is auto-attached, which (as for managed
@@ -51,16 +45,31 @@ spec:
   engineSelector:
     matchLabels:
       app: external-demo
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 2Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 3Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
   observation:
     # Model the engine pods load — keys per-replica index entries when the
     # subscriber sidecar is attached (see the prerequisite note above).
     modelID: Qwen/Qwen2.5-0.5B-Instruct
   remoteStorage:
-    provider: LMCacheServer
+    provider: Redis
     ownership: External
-    # Address of the pre-existing cache server you manage. Swap for your own.
-    # Bare host:port shown; `lm://host:port` is also accepted.
-    endpoint: my-cache.example.com:8200
+    # Address of the pre-existing Redis service you manage. Swap for your own.
+    endpoint: redis.example.internal:6379
 ---
 apiVersion: apps/v1
 kind: Deployment

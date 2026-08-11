@@ -4,6 +4,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# LEGACY IP COMPATIBILITY ONLY. Retained until Phase 7; do not use this script
+# as a production deployment reference. It intentionally exercises
+# LMCacheConnectorV1, LMCACHE_REMOTE_URL, and LMCacheServer.
+#
 # CPU canary for the C6 mutating Pod webhook + cross-pod cache reuse.
 #
 # Proves the engine-wiring webhook injects the LMCache connector env onto
@@ -25,7 +29,7 @@
 # is ~5 GiB per pod, so the Docker VM needs ~12 GiB RAM (see
 # docs/reference-stack/VERSIONS.md for the documented memory floor).
 # Pulls the multi-GB vLLM image. This is NOT a per-PR gate; it runs on a
-# schedule and on manual dispatch.
+# manual dispatch only.
 #
 # Usage:    docs/reference-stack/scripts/canary_c6_engine_wiring.sh
 # Tunables: IMAGE, MODEL, KIND_CLUSTER, NAMESPACE, READY_TIMEOUT,

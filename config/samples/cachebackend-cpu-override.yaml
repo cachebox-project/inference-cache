@@ -2,20 +2,17 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# CacheBackend for a CPU-vLLM dev cluster (no GPU) that uses
-# spec.integration.engineOverrides to tune the engine container the pod
-# webhook injects.
+# Typed vLLM PodLocal LMCache MP example that uses
+# spec.integration.engineOverrides to amend the inference-owner's engine
+# container. The manifest is admission-valid without a GPU; actual engine
+# startup remains the authoritative connector/package compatibility check.
 #
 # The override surface is engine-agnostic K8s vocabulary (args + env), so it
 # also extends to future runtime adapters and remote bindings with no CRD churn.
 #
-# Admission HARD-REJECTS overrides that overlap the adapter's reserved
-# args/env — for the vLLM+LMCache adapter today: `--kv-transfer-config`,
-# `VLLM_USE_V1`, `LMCACHE_REMOTE_URL`, `INFERENCECACHE_FAIL_OPEN`. Suppressing
-# any of those would un-wire the LMCache integration itself; if you don't
-# want LMCache at all, use the per-pod `inferencecache.io/skip-inject`
-# annotation on the engine pod instead of trying to override the canonical
-# wiring out of existence.
+# Admission HARD-REJECTS overrides that overlap the typed MP adapter's reserved
+# args/env: `--kv-transfer-config`, `--disable-hybrid-kv-cache-manager`,
+# `PYTHONHASHSEED`, and `INFERENCECACHE_FAIL_OPEN`.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -40,26 +37,29 @@ spec:
       args:
         - "--max-model-len"
         - "8192"
-      # Override LMCACHE_CHUNK_SIZE — a documented tunable (NOT reserved),
-      # so the merge replaces the adapter's default of "256" with this
-      # value. INFERENCECACHE_FAIL_OPEN / VLLM_USE_V1 / LMCACHE_REMOTE_URL
-      # are reserved and would be rejected at admission if listed here.
       env:
-        - name: LMCACHE_CHUNK_SIZE
-          value: "512"
-        # Free-form engine env the user wants the engine container to see.
-        # The admission rule only fires for reserved Names; FOO is not
-        # reserved, so it's appended verbatim.
+        # Free-form engine env appended after the typed MP wire.
         - name: FOO
           value: bar
   engineSelector:
     matchLabels:
       app.kubernetes.io/name: vllm
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 512
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
   observation:
     # Served model identifier the matched engine pods are loaded with.
     modelID: Qwen/Qwen2.5-0.5B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer:
-      image: lmcache/standalone:v0.4.7

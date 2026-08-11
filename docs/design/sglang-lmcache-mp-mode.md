@@ -2,6 +2,14 @@
 
 Status: **implemented and GPU-validated** for SGLang (Phase 2, increments 1–2); increment 3 (operator surface + the remaining SPOF containment) is open — see [Phased delivery](#phased-delivery). Facts below are live-validated unless marked otherwise. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Built-in adapters: `internal/adapters/builtin/runtime`; public contract: `pkg/adapters/runtime`
 
+> **Implementation history, superseded for the current operator contract.** This
+> document records the SGLang spike that established MP viability. Its flat
+> worker fields, engine-image worker default, and predictions that vLLM MP was
+> future work are historical. Current production behavior is the typed PodLocal
+> API and common standalone-server renderer defined by
+> [`lmcache-multiprocess-migration-roadmap.md`](lmcache-multiprocess-migration-roadmap.md)
+> and [`cachebackend-api.md`](cachebackend-api.md).
+
 **LMCache upstream now recommends multiprocess (MP) mode for *both* vLLM and
 SGLang** (its quickstart: MP is *"recommended"* for vLLM via `LMCacheMPConnector`,
 and *"the SGLang integration now defaults to MP mode"*). MP mode is a **node-local

@@ -2,12 +2,44 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# vLLM + LMCache reference backend (GPU).
+# vLLM + typed PodLocal LMCache MP reference backend (GPU).
 #
-# A minimal, explicit Deployment you can apply directly or use as a template for
-# your own automation. Each flag is annotated below so it is clear what it does
-# and why. The KV-cache event publisher is always enabled so a cache-aware router
-# or controller can subscribe to the engine's cache state.
+# The CacheBackend is the only LMCache enablement switch. The inference-cache
+# webhook injects the MP server native sidecar and vLLM connector JSON into the
+# matching engine Pod; the engine image stays runtime-owned. Kubernetes 1.29+
+# is required.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: vllm-lmcache-llama-8b
+  namespace: cache-substrate
+spec:
+  runtime: VLLM
+  type: LMCache
+  integration:
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: vllm-lmcache-llama-8b
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
+  observation:
+    modelID: meta-llama/Llama-3.1-8B-Instruct
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -40,23 +72,12 @@ spec:
           args:
             - "--port=8000"
             - "--enable-prefix-caching"                 # on by default on v1; explicit for the reference
-            # LMCache connector: vLLM reads/writes KV through LMCache (kv_both).
-            - "--kv-transfer-config"
-            - '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
             # KV-cache event publisher over ZMQ — the stream a cache-aware router
             # or controller subscribes to. Emits BlockStored / BlockRemoved /
             # AllBlocksCleared (msgpack).
             - "--kv-events-config"
             - '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000,"topic":"kv-events"}'
           env:
-            - name: VLLM_USE_V1                # KV events + LMCacheConnectorV1 require the v1 engine
-              value: "1"
-            - name: LMCACHE_CHUNK_SIZE         # LMCache chunk size (tokens)
-              value: "256"
-            - name: LMCACHE_LOCAL_CPU          # Phase-1 reference: CPU offload tier
-              value: "True"
-            - name: LMCACHE_MAX_LOCAL_CPU_SIZE # GiB of CPU offload buffer
-              value: "20"
             - name: HF_TOKEN                   # gated model pull
               valueFrom:
                 secretKeyRef:

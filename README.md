@@ -7,7 +7,7 @@ A **vendor-neutral, Kubernetes-native cache-policy control plane for LLM inferen
 inference-cache makes routing **cache-aware**: it tracks which replica already holds a
 prompt's prefix warm and returns that as a routing *hint*, so a gateway can reuse
 KV/prefill instead of recomputing it — cutting time-to-first-token and cost. It
-**orchestrates** existing KV-cache technology (LMCache, Mooncake); it is **not** a new
+**orchestrates** existing KV-cache technology (LMCache); it is **not** a new
 distributed cache and **not** the data-plane gateway. Guiding principle — **"we decide
 routing; the gateway follows"**: all routing intelligence lives in the server, and the
 gateway simply tokenizes → calls `LookupRoute` → routes to the returned replica →
@@ -27,16 +27,17 @@ The API separates three choices: `spec.runtime` selects the inference runtime,
 provider. Supporting another combination is an adapter addition; the core gRPC
 contract stays stable.
 
-- **vLLM + LMCache** supports host-only caching, a managed or external
-  `LMCacheServer`, and managed or external `Mooncake` storage.
-- **SGLang + LMCache** supports host-only caching or a managed/external Redis
-  remote store.
+- **vLLM + LMCache** supports typed PodLocal MP with host-only caching or an
+  optional managed/external Redis L3.
+- **SGLang + LMCache** supports the same typed PodLocal MP and Redis profiles;
+  the engine launch surface remains SGLang-specific.
 - **SGLang + SGLangHiCache** uses SGLang's native host tier and does not accept
   a remote-storage binding.
 
 See [`config/samples/`](config/samples/) for canonical manifests and
 [`docs/design/cachebackend-api.md`](docs/design/cachebackend-api.md) for the
-compatibility rules retained for older v1alpha1 resources.
+current contract and clearly labeled legacy-compatibility sections retained
+until Phase 7 of the migration.
 
 ## What's Inference Cache?
 

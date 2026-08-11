@@ -1,122 +1,100 @@
-# vLLM (+ SGLang) + LMCache reference stack
+# vLLM and SGLang typed LMCache MP reference stack
 
-A reproducible reference deployment of **vLLM** serving a model with **LMCache**
-as its KV-cache backend, with **KV-cache events published over ZMQ**. Use it to
-verify cache-aware behaviour end to end:
+This directory demonstrates the current inference-cache integration: a typed
+`CacheBackend` selects an inference-engine pod and the operator injects an
+LMCache multiprocess native sidecar plus the engine connector configuration.
+An optional Redis tier provides explicit cross-Pod sharing.
 
-- a **prefix-cache hit** on a repeated long prompt prefix (lower latency, prefill
-  skipped), and
-- a live **KV-cache event stream** (`BlockStored` / `BlockRemoved` /
-  `AllBlocksCleared`) that a cache-aware router or controller can consume.
+The repository does not own or replace the engine image. Use a digest-pinned
+vLLM or SGLang image containing a connector/package compatible with the pinned
+LMCache server. Normal engine startup is the authoritative compatibility check.
 
-The manifests here are intentionally minimal and explicit so they can serve as a
-starting template for your own automation (an operator, a Helm release, or plain
-`kubectl apply`).
-
-> **Two engine references live here.** This page walks the **vLLM** path; the
-> **SGLang** sibling (same LMCache backend + ZMQ event wire) is at
-> [`manifests/sglang-lmcache/`](manifests/sglang-lmcache/) with its own README.
-
-> **You need an NVIDIA GPU** for the full stack — vLLM loads weights on CUDA and
-> LMCache offloads KV from GPU memory. See [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) for
-> how to size GPU memory and pick a card. If you only want to validate the event
-> wiring and prefix-cache behaviour without a GPU, use the
-> [CPU-only path](#cpu-only-local-check).
+> The GPU manifests require Kubernetes 1.29 or later for native sidecars and an
+> NVIDIA GPU. The CPU-only manifest validates engine prefix caching and KV-event
+> decoding, but does not run the LMCache MP data plane.
 
 ## Layout
 
-| Path | What |
+| Path | Purpose |
 |---|---|
-| [`VERSIONS.md`](VERSIONS.md) | Pinned images / models / chart. **Read first.** |
-| [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) | GPU sizing (VRAM math), shape/card table, multi-card tensor-parallelism. |
-| [`kind/cluster.yaml`](kind/cluster.yaml) | Local kind cluster (NodePorts for the API + ZMQ; the ZMQ NodePort is used by the vLLM path — the SGLang manifest deliberately doesn't node-expose ZMQ). |
-| [`manifests/`](manifests/) | GPU reference Deployment + Service. |
-| [`manifests/cpu-local/`](manifests/cpu-local/) | CPU variant (no LMCache): prefix-cache hit + KV events. |
-| [`manifests/sglang-lmcache/`](manifests/sglang-lmcache/) | **SGLang** + LMCache reference (the second engine) — GPU; the hand-built template the `(sglang, LMCache)` adapter mirrors. See its [README](manifests/sglang-lmcache/README.md) for the event-wire scope, validation split, and caveats. |
-| [`helm/values-reference.yaml`](helm/values-reference.yaml) | Upstream vLLM Production-Stack chart path (alternative to the raw manifests). |
-| [`scripts/`](scripts/) | ZMQ event subscriber, prefix-cache-hit test, synthetic publisher, tests. |
-| `captures/` | Where you save your event-stream sample and a cache-hit screenshot. |
+| [`VERSIONS.md`](VERSIONS.md) | Image and validation evidence; read before substituting engine images. |
+| [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) | GPU sizing and operational notes. |
+| [`manifests/deployment.yaml`](manifests/deployment.yaml) | vLLM + typed host-only LMCache MP. |
+| [`manifests/sglang-lmcache/`](manifests/sglang-lmcache/) | SGLang + typed LMCache MP + explicit external Redis. |
+| [`manifests/cpu-local/`](manifests/cpu-local/) | CPU-only engine/event check without LMCache. |
+| [`scripts/`](scripts/) | Event subscriber, prefix-hit test, and compatibility canaries. |
 
-## Prerequisites
+There is no Helm values reference in this phase. The repository has not
+validated an upstream chart API that can faithfully express the operator-owned
+native sidecar contract, so inventing a chart mapping would be unsafe.
+
+## Install the operator
+
+Install `config/default` (or the equivalent published release) before creating
+the reference `CacheBackend`:
 
 ```bash
-brew install kind            # or your platform's installer; kubectl + helm also required
-kind --version               # >= v0.23
+kubectl apply -k config/default
+kubectl -n inference-cache-system wait \
+  --for=condition=Available deployment --all --timeout=180s
 ```
 
-For the GPU path you additionally need an NVIDIA GPU host (or a managed GPU
-cluster), the NVIDIA Container Toolkit / device plugin, and — for gated models —
-a Hugging Face token.
+Use your normal release installation instead in a managed cluster. The
+mutating webhook must be available before the engine Deployment is created;
+otherwise admission fails open and the existing pod remains unwired until it is
+recreated.
 
----
+## vLLM GPU path
 
-## Deploy and test on a GPU
-
-> Size the GPU first with [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md). The 8B reference
-> model fits on a single 24 GB card.
+The manifest contains a deliberately non-pullable engine-image placeholder.
+Replace it with a compatible digest-pinned image; do not change the
+`CacheBackend` server image to disguise an incompatible engine package.
 
 ```bash
-# 1. Cluster + GPU. On the GPU host, install the NVIDIA Container Toolkit and set
-#    the nvidia runtime as Docker's default FIRST, then create the cluster:
 kind create cluster --name inference-cache-substrate --config kind/cluster.yaml
 helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
 helm install nvdp nvdp/nvidia-device-plugin -n kube-system
-kubectl get nodes -o json | jq '.items[].status.allocatable["nvidia.com/gpu"]'   # expect "1"
-#    (Or use any managed GPU cluster that advertises nvidia.com/gpu — the manifests
-#     are identical; only the cluster differs.)
 
-# 2. Pin the image to a real digest (the manifest ships a non-applyable placeholder
-#    on purpose — see VERSIONS.md), then create the HF token secret:
-kubectl create namespace cache-substrate
-kubectl -n cache-substrate create secret generic hf-token --from-literal=token="$HF_TOKEN"
+kubectl apply -f manifests/namespace.yaml
+kubectl -n cache-substrate create secret generic hf-token \
+  --from-literal=token="$HF_TOKEN"
 
-# 3. Deploy.
-kubectl apply -f manifests/namespace.yaml -f manifests/deployment.yaml -f manifests/service.yaml
+# Install the operator, replace the engine placeholder, then create the typed
+# CacheBackend and matching Deployment from the same YAML stream.
+kubectl apply -f manifests/deployment.yaml -f manifests/service.yaml
 kubectl -n cache-substrate rollout status deploy/vllm-lmcache-llama-8b --timeout=20m
-
-# 4. Subscribe to the KV-cache event stream and save a sample.
-pip install -r scripts/requirements.txt
-python scripts/kv_events_subscriber.py --endpoint tcp://localhost:30557 \
-    --topic kv-events --max 200 --json | tee captures/kv-events-sample.jsonl
-
-# 5. Demonstrate the prefix-cache hit (run while the subscriber is watching).
-./scripts/prefix_cache_hit_test.sh           # save the output to captures/
 ```
 
-### What success looks like
+The vLLM reference is host-only: `status.endpoint` is intentionally empty.
+For cross-Pod sharing, explicitly select Redis as shown by the SGLang reference
+or [`config/samples/cachebackend-lmcache.yaml`](../../config/samples/cachebackend-lmcache.yaml).
+Legacy `LMCacheServer` and Mooncake providers are not automatically translated
+because doing so would silently change L3 and sharing semantics.
 
-- **Prefix-cache hit:** request 2 (same long prefix) is faster than request 1, and
-  vLLM's `prefix_cache_hits` counter increases.
-- **Event stream:** the subscriber prints `BlockStored` events (with block hashes)
-  during request 1; the saved sample contains metadata only — hashes and counts,
-  never prompt text or token content.
+## Verify traffic and KV events
 
-### Alternative: upstream Helm chart
+```bash
+pip install -r scripts/requirements.txt
+python scripts/kv_events_subscriber.py \
+  --endpoint tcp://localhost:30557 --topic kv-events --max 200 --json
 
-[`helm/values-reference.yaml`](helm/values-reference.yaml) deploys the same stack
-via the vLLM Production-Stack chart, if you prefer Helm over raw manifests. It
-disables the chart's built-in router (this reference is about cache state and
-events, not routing).
+./scripts/prefix_cache_hit_test.sh
+```
 
----
+A successful run shows a prefix-cache counter increase on the repeated prefix
+and `BlockStored` events. Event captures contain hashes and counts, not prompt
+text. The Service deliberately does not expose MP control/data ports.
 
-## CPU-only local check
+## SGLang GPU path
 
-You can exercise the **whole engine-config path without a GPU** — both a
-prefix-cache hit and the KV-cache event stream. vLLM's v1 engine runs on CPU
-(vLLM >= ~0.21) and the event publisher works there too; it is just slower and
-has no LMCache offload. Uses a tiny model on vLLM's CPU build.
+See [`manifests/sglang-lmcache/README.md`](manifests/sglang-lmcache/README.md).
+That manifest uses the same typed `CacheBackend` contract and makes Redis an
+explicit external L3 choice.
 
-> **Verified** (vLLM 0.21.0 CPU image, arm64): cold request ~31s, warm
-> same-prefix request ~1.4s, `vllm:prefix_cache_hits` incremented, and real
-> `BlockStored` events were captured over ZMQ with token content redacted. It
-> needs enough RAM — see the memory note in
-> [`manifests/cpu-local/deployment.yaml`](manifests/cpu-local/deployment.yaml).
+## CPU-only event check
 
-> **Match the image to your host arch.** `manifests/cpu-local/deployment.yaml`
-> defaults to the **`-arm64`** image tag. On x86_64 hosts, change it to
-> `vllm/vllm-openai-cpu:latest-x86_64` first (the tags are arch-specific):
-> `sed -i 's/latest-arm64/latest-x86_64/' manifests/cpu-local/deployment.yaml`.
+This path has no LMCache offload and needs no GPU. Match the CPU image tag to
+the host architecture before applying it.
 
 ```bash
 kind create cluster --name inference-cache-substrate --config kind/cluster.yaml
@@ -128,118 +106,21 @@ python scripts/kv_events_subscriber.py --endpoint tcp://localhost:30557 --topic 
 MODEL=Qwen/Qwen2.5-0.5B-Instruct ./scripts/prefix_cache_hit_test.sh
 ```
 
-### No image pull / no cluster? Validate the consumer with the synthetic publisher
-
-If you can't pull the image or run a cluster, you can still confirm the
-event-decode + token-redaction path with the synthetic publisher — it emits
-vLLM-shaped frames, no image required:
+Without a cluster or image pull, validate only the consumer and redaction path:
 
 ```bash
-pip install -r scripts/requirements.txt
 python scripts/kv_events_synthetic_publisher.py --bind 'tcp://*:5557' &
 python scripts/kv_events_subscriber.py --endpoint tcp://localhost:5557 --max 4
-python scripts/test_kv_events.py        # asserts token_ids never surfaces; token_count kept
+python scripts/test_kv_events.py
 ```
 
-`test_kv_events.py` is the regression check for the decode + token-redaction
-logic. It is run manually (the repo's CI is Go-only and has no Python step), so
-run it after changing the subscriber.
+## Legacy compatibility canaries
 
----
-
-## CacheBackend reconciler canary (CPU)
-
-[`scripts/canary_c2_reconcile.sh`](scripts/canary_c2_reconcile.sh) is a GPU-free,
-on-demand canary for the **C2 reconciler**: it brings up a kind cluster, runs the
-controller, applies a typed `CacheBackend` with a managed LMCacheServer, and asserts
-the controller stands up a healthy serving backend (Ready condition True, endpoint
-published) and owner-ref garbage collection when the CR is deleted. It exercises
-the reconciler against real pods — the gap the envtest unit tests can't cover.
-An optional traffic block drives prefix traffic through the Service and asserts
-an engine prefix-cache hit, but it is opt-in (`SKIP_TRAFFIC=0`) and requires a
-separately wired engine — see the script for the port-forward target and
-metric source.
-
-```bash
-docs/reference-stack/scripts/canary_c2_reconcile.sh
-```
-
-Like the full-chain canary it is **on-demand**, not a blocking gate: it needs
-Docker + kind and pulls the standalone LMCache server image. The default path
-checks only the managed backend lifecycle, so it does not need an inference
-engine or GPU.
-
-## In-cluster auto-attach (production path)
-
-When the controller is installed in a cluster **and the operator passes
-`--kvevent-subscriber-image=<ref>` on the controller** (the
-`subscriber-image` make target emits the well-known dev tag; pin to a
-digest in production), the pod-mutating webhook auto-attaches the
-`kvevent-subscriber` as a sidecar to every engine pod whose labels match a
-`CacheBackend.spec.engineSelector` and whose backend sets
-`spec.observation.modelID`.
-The subscriber's identity flags (`--replica-id`,
-`--tenant-id`, `--model-id`, `--hash-scheme`) are derived from the CR + pod
-— no operator-supplied flags, no out-of-band `kubectl port-forward` + manual
-binary launch on the demo path.
-
-The default install ships with the flag unset and therefore does not
-auto-attach: a nonexistent image would put the sidecar container into
-`ImagePullBackOff`, which would keep the engine pod from going Ready and
-turn the cache into a serving dependency. Operators opt in by passing the
-image once they have one ready to ship.
-
-The shape decision and rationale are in
-[`docs/design/kvevent-subscriber-wiring.md`](../design/kvevent-subscriber-wiring.md);
-the end-to-end auto-attach behaviour is gated by the webhook envtest
-(`internal/webhook/pod/envtest_integration_test.go`), which boots a real
-apiserver, installs the webhook, applies a `CacheBackend`, creates a labeled
-engine pod, and asserts the persisted pod carries the `kvevent-subscriber`
-container with flags derived from the CR. Run it locally with:
-
-```bash
-KUBEBUILDER_ASSETS=$(make test-env | tail -1) go test ./internal/webhook/pod/...
-```
-
-## Full-chain binary canary
-
-[`scripts/canary_e2e.sh`](scripts/canary_e2e.sh) is a complementary GPU-free
-canary that exercises the **subscriber binary's data path** end-to-end on the
-host (no Kubernetes admission in the loop): CPU vLLM engine → `kvevent-
-subscriber` → policy server → index. It drives prefix traffic and asserts
-both an engine prefix-cache hit and that the server index populated
-(`inferencecache_index_entries > 0`). Builds the binaries, manages the engine
-container, cleans up after itself, exits non-zero on failure.
-
-Because this canary launches the engine in plain Docker (no K8s admission),
-the subscriber is hand-launched on purpose — the binary's wire protocol is
-what the test exercises. The in-cluster auto-attach path is covered by the
-envtest gate above.
-
-The subscriber additionally scrapes the engine's Prometheus `/metrics` and emits
-a per-replica `ReplicaStats` (`cacheMemoryBytes`, `hitRate`, `pressure`) on a
-configurable tick (default `--stats-interval=10s`), so the policy server's
-`/snapshot.replicas[]` (and the `CacheIndex.status.replicas[]` surface the
-controller scrapes from it) populate alongside the prefix stream. Map
-`cacheMemoryBytes` to the engine's KV cache by passing
-`--engine-cache-size-bytes` (it is multiplied by the active `*_cache_usage_perc`
-gauge); leave it `0` to publish `cacheMemoryBytes=0` and let the other fields
-populate normally.
-
-If the engine serves more than one model on the same `/metrics` endpoint, pass
-`--engine-model-name=<served-model>` to filter by vLLM's `model_name` label —
-that label tracks the engine's identifier, which is independent of the cache
-plane's `--model-id` index key. Leave it empty when the engine serves one model
-and you want the scraper to consume every series unfiltered.
-
-```bash
-docs/reference-stack/scripts/canary_e2e.sh
-```
-
-Same on-demand profile as the reconciler canary (Docker, vLLM CPU image, ~10+ GiB
-Docker VM RAM). Run locally or wire into a scheduled/dispatch job.
-
----
+`canary_c2_reconcile.sh` and `canary_c6_engine_wiring.sh` intentionally exercise
+the legacy IP implementation retained until Phase 7. They are manual
+compatibility tests, not current deployment references, and their workflows are
+not scheduled. Current typed MP rendering and admission are covered by Go tests
+and `default_install_smoke.sh`.
 
 ## Teardown
 

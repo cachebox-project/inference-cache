@@ -2,49 +2,33 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# SGLang + LMCache (MP mode) reference deployment — the second-engine sibling of
-# the top-level vLLM + LMCache reference (manifests/deployment.yaml).
+# SGLang + typed LMCache multiprocess reference deployment. The CacheBackend
+# selects the engine pod and the operator injects the native lmcache-mp-server
+# sidecar, MP config, and SGLang connector arguments. Redis is an explicit shared
+# tier choice; no legacy LMCacheServer or Mooncake topology is inferred as Redis.
 #
-# SGLang drives LMCache in MULTIPROCESS (MP) mode, so this stack differs from the
-# vLLM reference on BOTH halves of the data plane:
-#   - the shared tier is a Redis L2 store (below), NOT a standalone lm:// server
-#     (lm:// is not a valid MP --l2-adapter type), and
-#   - the engine attaches to a node-local MP-worker sidecar over 127.0.0.1
-#     (mp_host/mp_port) and reads its config from --lmcache-config-file; the old
-#     lm:// LMCACHE_REMOTE_URL env is gone (MP mode ignores it).
-# This mirrors what the (sglang, LMCache) runtime adapter auto-injects on a matched
-# engine pod (internal/adapters/builtin/runtime/sglang_lmcache.go +
-# internal/adapters/builtin/runtime/sglang_lmcache_wire.go +
-# internal/adapters/builtin/storage/redis.go), which is GPU-validated end to end.
-# The engine image / --model-path /
-# resources / --kv-events-config remain operator-owned scaffolding the adapter
-# assumes is already present, so this is NOT byte-for-byte adapter output.
+# The engine image, model, GPU resources, and KV-event publisher remain inference-
+# system-owned. The engine image must contain a connector/package compatible with
+# the injected LMCache server. Normal engine startup is the authoritative check.
 #
-# VALIDATION STATUS: this hand manifest is derived from the GPU-validated adapter
-# render (store->flush->retrieve reuses KV, via the controller-rendered managed
-# path, #149) and is structurally checked (kubectl apply --dry-run=client). It has NOT been
-# independently re-run end-to-end on a GPU in this exact shape — before treating it
-# as a golden reference, a GPU run should confirm: engine + MP-worker startup, the
-# config-file handoff, CUDA-IPC attachment, and a Redis store/retrieve (README step 4).
-# Pins: docs/reference-stack/VERSIONS.md.
+# VALIDATION STATUS: the typed SGLang renderer was GPU-validated through the
+# controller path. This exact reference manifest has not independently completed a
+# GPU run; see this directory's README and docs/reference-stack/VERSIONS.md.
 #
 # >> You need an NVIDIA GPU. << SGLang loads weights on CUDA and the LMCache MP
-# worker moves KV over CUDA-IPC. There is no first-class CPU fallback here, so this
+# server moves KV over CUDA-IPC. There is no first-class CPU fallback here, so this
 # manifest is GPU-only. SGLang's exact KV-event wire (the 3-tuple EventBatch
 # envelope) is covered off-GPU by `go test ./internal/subscriber/ -run SGLang`; the
 # Python scripts/ tooling exercises the shared decode + token-redaction (it models
 # vLLM's 2-tuple envelope). See this directory's README.
 #
-# KUBERNETES >= 1.29 REQUIRED: the MP worker is a native sidecar (an initContainers
+# KUBERNETES >= 1.29 REQUIRED: the MP server is a native sidecar (an initContainers
 # entry with restartPolicy: Always), which older apiservers do not understand.
 #
-# IMAGE PINNING (see VERSIONS.md): the SGLang engine image ships as a non-applyable
-# placeholder digest (the all-zero @sha256: below won't pull) — the base sglang
-# image does NOT bundle the lmcache client, so you must build a DERIVED image
-# (`pip install lmcache==0.5.1` onto the GPU-validated cu13 base) and substitute its
-# real digest. The MP worker defaults to the SAME image (engine <-> worker must run
-# the same lmcache version — they speak the MP wire). Redis is a normal pullable
-# tag; digest-pin it for production per VERSIONS.md.
+# IMAGE PINNING (see VERSIONS.md): the engine image is a deliberately non-pullable
+# placeholder because this repository does not own inference engine images. Replace
+# it with a digest-pinned compatible image. The CacheBackend pins the independently
+# owned standalone server image. Digest-pin Redis for production as well.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -54,8 +38,9 @@ metadata:
     app: redis-l2
 spec:
   # SINGLETON: the Redis L2 holds no replicated state, so >1 replica would shard KV
-  # across independent keyspaces and silently partition the tier. Keep replicas: 1
-  # (the managed path's admission enforces this for a (sglang, LMCache) backend).
+  # across independent keyspaces and silently partition the tier. Keep replicas: 1.
+  # This manifest owns Redis directly and binds it as External storage, so the
+  # CacheBackend controller does not manage or validate this Deployment.
   replicas: 1
   selector:
     matchLabels:
@@ -79,8 +64,8 @@ spec:
           # (replaces CMD, keeps ENTRYPOINT). --save ""/--appendonly no: ephemeral
           # cache tier, no persistence/PVC (a restart starts cold — soft state).
           # --maxmemory + allkeys-lru bound the dataset so write load can't OOM the
-          # cgroup; the managed path derives ~80% of the memory LIMIT (below: the
-          # byte-exact value for an 8Gi limit, 8589934592 - 8589934592/5 =
+          # cgroup. This mirrors the managed renderer's ~80% derivation (below:
+          # the byte-exact value for an 8Gi limit, 8589934592 - 8589934592/5 =
           # 6871947674 ≈ 6.4Gi). --protected-mode no: the worker dials over the
           # ClusterIP (a non-loopback client).
           args:
@@ -92,7 +77,7 @@ spec:
             - "--protected-mode"
             - "no"
             - "--maxmemory"
-            - "6871947674" # bytes = ~80% of the 8Gi limit below (matches the managed render)
+            - "6871947674" # bytes = ~80% of the 8Gi limit below
             - "--maxmemory-policy"
             - "allkeys-lru"
           ports:
@@ -122,6 +107,42 @@ spec:
   ports:
     - { name: redis, port: 6379, targetPort: redis }
 ---
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: sglang-lmcache-llama-8b
+  namespace: cache-substrate
+spec:
+  runtime: SGLang
+  type: LMCache
+  integration:
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      app: sglang-lmcache-llama-8b
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
+  remoteStorage:
+    provider: Redis
+    ownership: External
+    endpoint: redis-l2:6379
+  observation:
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -143,71 +164,6 @@ spec:
         app: sglang-lmcache-llama-8b
         app.kubernetes.io/name: sglang
     spec:
-      # The MP worker is a NATIVE SIDECAR: an initContainers entry with
-      # restartPolicy: Always, so it starts (and its startupProbe gates the engine)
-      # before the engine container, and keeps running for the pod's life. Requires
-      # Kubernetes >= 1.29.
-      initContainers:
-        - name: lmcache-mp-worker
-          restartPolicy: Always
-          # Defaults to the ENGINE image so the worker and engine run the same
-          # lmcache version (they speak the MP wire). Same non-applyable placeholder
-          # digest as the engine — substitute your derived image (VERSIONS.md).
-          image: example.invalid/sglang-lmcache@sha256:0000000000000000000000000000000000000000000000000000000000000000
-          imagePullPolicy: IfNotPresent
-          # Write the engine's MP config file (mp_host/mp_port), then exec the
-          # LMCache MP server on loopback, offloading to the Redis L2 via `resp`.
-          # This is the shape the adapter renders; keep chunk_size/mp_port/l1-size-gb
-          # in sync with the config the engine reads (below) and the shm sizeLimit.
-          command: ["sh", "-c"]
-          args:
-            - |
-              set -e
-              printf 'chunk_size: 256\nmp_host: "127.0.0.1"\nmp_port: 5555\n' > /etc/lmcache/config.yaml
-              exec python3 -m lmcache.v1.multiprocess.server \
-                --host 127.0.0.1 --port 5555 \
-                --chunk-size 256 --l1-size-gb 4 --eviction-policy LRU \
-                --l2-adapter '{"type":"resp","host":"redis-l2","port":6379}'
-          env:
-            # The GPU-less worker must SEE the engine's GPU to CUDA-IPC its KV. It
-            # holds no nvidia.com/gpu request (consumes none of the node's
-            # allocatable), but the visibility is real — on a shared node it can see
-            # every GPU. GPU-VALIDATED as required: revoking it kills the worker
-            # ("Device UUID ... not found") and the engine never readies. See the
-            # GPU-visibility note in docs/design/cachebackend-api.md.
-            - { name: NVIDIA_VISIBLE_DEVICES, value: "all" }
-          volumeMounts:
-            - { name: lmcache-config, mountPath: /etc/lmcache }
-            - { name: shm, mountPath: /dev/shm } # shared L1 tmpfs with the engine
-          # The MP server binds mp_port on loopback, which a pod-IP probe can't
-          # reach — exec a loopback check so the engine only starts once the worker
-          # is listening. Gating the engine on the worker is deliberate: SGLang has
-          # no cacheless fallback while --enable-lmcache is on (see "Fail-open
-          # semantics" in docs/design/sglang-lmcache-mp-mode.md).
-          startupProbe:
-            exec:
-              command:
-                - python3
-                - -c
-                - "import socket; socket.create_connection(('127.0.0.1',5555),1)"
-            periodSeconds: 3
-            failureThreshold: 40
-          # The L1 lives in the memory-backed /dev/shm tmpfs, charged to this
-          # container's cgroup, so it MUST carry a matching memory request+limit
-          # (l1-size-gb + ~1Gi headroom) or the L1 is invisible to the scheduler.
-          resources:
-            requests: { memory: 5Gi }
-            limits: { memory: 5Gi }
-          # Restricted-compatible: this mutation lands before Pod Security admission,
-          # so the worker must carry the container-only Restricted requirements
-          # itself or it would get the whole engine pod rejected in a restricted
-          # namespace. No added capabilities (KV moves over CUDA-IPC + /dev/shm).
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-            seccompProfile:
-              type: RuntimeDefault
       containers:
         # Container name MUST be `sglang` so the adapter's InjectEngineConfig /
         # engineOverrides target the right container (EngineContainerName()).
@@ -229,18 +185,8 @@ spec:
             - "--model-path=meta-llama/Meta-Llama-3-8B-Instruct"
             - "--host=0.0.0.0"
             - "--port=30000"
-            # Prometheus /metrics on :30000 (store_true flag). SGLang defaults it
-            # OFF (unlike vLLM), so without it the kvevent-subscriber's stats path
-            # has nothing to scrape and load-aware routing goes dark. The managed
-            # path injects this automatically; the reference sets it explicitly.
-            - "--enable-metrics"
-            # SGLang's LMCache connector (store_true flag — no value). Replaces
-            # vLLM's --kv-transfer-config.
-            - "--enable-lmcache"
-            # Points the engine at the MP config file the worker writes (mp_host/
-            # mp_port). MP mode aborts at startup WITHOUT this flag.
-            - "--lmcache-config-file"
-            - "/etc/lmcache/config.yaml"
+            # The CacheBackend webhook injects the SGLang LMCache MP arguments and
+            # config path. Keep only inference-system-owned arguments here.
             # KV-cache event publisher — SGLang's ZmqEventPublisher, same event
             # structs as vLLM (3-tuple batch envelope). Consumer is the Go
             # kvevent-subscriber (managed path). Binds tcp://*:5557 — the operator
@@ -252,15 +198,6 @@ spec:
             - "--kv-events-config"
             - '{"publisher":"zmq","endpoint":"tcp://*:5557","buffer_steps":10000,"topic":"kv-events"}'
           env:
-            # Gates SGLang's experimental LMCache integration — required for
-            # --enable-lmcache to engage the connector.
-            - { name: LMCACHE_USE_EXPERIMENTAL, value: "True" }
-            # Mirror of spec.integration.failOpen (defaults true) — the adapter
-            # injects this as a reserved env so the engine layer can honor the
-            # fail-open contract. (The old lm:// env — LMCACHE_REMOTE_URL / SERDE /
-            # CHUNK_SIZE / LOCAL_CPU — is intentionally absent: MP mode ignores it,
-            # and the MP worker's tunables live in its config file / CLI above.)
-            - { name: INFERENCECACHE_FAIL_OPEN, value: "true" }
             # Gated model — needs a Hugging Face token (see README step 2).
             - name: HF_TOKEN
               valueFrom:
@@ -278,20 +215,16 @@ spec:
               nvidia.com/gpu: "1"
           volumeMounts:
             - { name: cache-home, mountPath: /root/.cache/huggingface }
-            - { name: shm, mountPath: /dev/shm } # shared L1 tmpfs with the MP worker
-            - { name: lmcache-config, mountPath: /etc/lmcache } # reads the worker's config.yaml
+            - { name: shm, mountPath: /dev/shm } # shared with the injected MP server
       volumes:
         - name: cache-home
           emptyDir: {}
-        # The MP L1 tier lives here; shared by the engine and the worker. Sized to
-        # cover the engine's own /dev/shm use PLUS the L1 budget (l1-size-gb=4).
+        # The MP L1 tier lives here; shared by the engine and injected server. Sized
+        # to cover the engine's own /dev/shm use plus the 4Gi typed L1 budget.
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: 8Gi
-        # Carries the MP config file the worker writes and the engine reads.
-        - name: lmcache-config
-          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

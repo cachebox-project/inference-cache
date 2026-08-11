@@ -10,7 +10,7 @@ All CRDs are in the API group **`inferencecache.io`**, version **`v1alpha1`**.
 
 | Kind | Scope | Short name | Reconciled? | Purpose |
 |---|---|---|---|---|
-| `CacheBackend` | Namespaced | `cb` | Yes | Bind engine pods to a KV-cache backend; provision the managed cache server. |
+| `CacheBackend` | Namespaced | `cb` | Yes | Bind engine Pods to typed MP; optionally provision a remote Redis provider. |
 | `CachePolicy` | Namespaced | `cpol` | Declarative (pushed to server) | Per-namespace lookup and eviction tuning. |
 | `CacheTenant` | Namespaced | `ct` | Declarative (pushed to server) | Tenant identity + entry-count quota. |
 | `CacheIndex` | **Cluster** | `ci` | Yes (status-only) | Cluster-wide mirror of the server aggregate. |
@@ -31,17 +31,18 @@ contract follows its own compatibility policy for external consumers.
 |---|---|---|---|
 | `runtime` | `VLLM`, `SGLang` | — | Inference runtime identity. |
 | `type` | `LMCache`, `SGLangHiCache` | `LMCache` | Engine-side cache implementation. |
-| `lmCache` | object | — | Engine-side LMCache configuration. |
-| `remoteStorage` | object | — | Optional provider (`Redis`, `LMCacheServer`, `Mooncake`), ownership (`Managed`, `External`), and external endpoint. |
+| `lmCache` | object | — | Typed LMCache MP topology and server configuration. Current offload uses `topology: PodLocal`. |
+| `lmCache.podLocal.server.resources` | ResourceRequirements | required | Resources for the injected MP server; memory covers L1 plus 1Gi and CPU request is positive. |
+| `remoteStorage` | object | — | Optional Redis L3 with `Managed` or `External` ownership. Legacy providers remain in the alpha schema only until Phase 7. |
 | `observation` | object | — | Model identity and first-event timeout. |
 | `deploymentKind` | `Deployment`, `StatefulSet` | `Deployment` | `StatefulSet` reserved/no-op. |
 | `replicas` | int32 | `1` | Min 0. |
 | `autoscaling` | object | — | `minReplicas`, `maxReplicas` (required), `targetCPUUtilizationPercent` (default 80). |
 | `integration.mode` | `Offload`, `EventsOnly` | `Offload` | Events-only = routing only. |
-| `integration.role` | `ReadOnly`, `WriteOnly`, `ReadWrite` | `ReadWrite` | Maps to LMCache `kv_role`. |
+| `integration.role` | `ReadOnly`, `WriteOnly`, `ReadWrite` | `ReadWrite` | LMCache currently admits only `ReadWrite`; directional semantics are future work. |
 | `integration.failOpen` | bool | `true` | `false` fails closed. |
 | `integration.engineOverrides` | object | — | `args` / `suppressArgs` / `env` / `suppressEnv`. |
-| `integration.engineHostNetwork` | bool | `false` | Opt-in for Mooncake engine pods. |
+| `integration.engineHostNetwork` | bool | `false` | Legacy engine-side Mooncake compatibility field; not used by typed MP. |
 | `engineSelector.matchLabels` | map | — | Equality selector over engine pod labels. |
 | `template` | object | — | Narrow pod-level overrides (no containers). |
 | `remoteStorage.<provider>.resources` | ResourceRequirements | renderer default: `requests.memory 4Gi` / `limits.memory 8Gi` | Resources for the selected managed provider container. |

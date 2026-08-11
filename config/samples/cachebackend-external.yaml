@@ -2,35 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# An External CacheBackend points the controller at a pre-existing remote
-# cache the operator manages themselves. The controller does NOT provision
-# pods for this backend (no Deployment, no Service, no HPA); it only mirrors
-# spec.remoteStorage.endpoint into status.endpoint and marks the CR Ready as
-# soon as admission accepts the spec. The pod-mutating Pod admission webhook then
-# wires engine pods matching spec.engineSelector to that endpoint with the
-# same LMCache engine wire format the managed-LMCache adapter uses (env vars
-# LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/LOCAL_CPU/MAX_LOCAL_CPU_SIZE +
-# VLLM_USE_V1 + the LMCache `--kv-transfer-config` arg), so the engine cannot
-# tell whether the cache it talks to was provisioned by the controller or by
-# the operator out-of-band.
+# Typed vLLM PodLocal LMCache MP with an externally managed Redis L3. The
+# controller provisions no remote provider workload; the injected MP server
+# sidecar connects to spec.remoteStorage.endpoint. The endpoint is RESP on a
+# trusted private network: LMCache 0.5.3 authentication is supported, but TLS is
+# not, and admission rejects a TLS block rather than silently ignoring it.
 #
-# Use cases:
-#   * customers with a pre-existing LMCache deployment they don't want
-#     re-provisioned;
-#   * multi-cluster / cross-cluster cache sharing;
-#   * testing engine-side wiring against a fixture without spinning up a
-#     backend.
-#
-# Admission rules to be aware of:
-#   * remoteStorage.endpoint is REQUIRED for External ownership and rejected
-#     for Managed ownership;
-#   * an endpoint that resolves into an in-cluster Service in a
-#     different namespace than this CacheBackend requires the explicit
-#     opt-in spec.allowCrossNamespace=true (the rule does NOT fire for
-#     external hostnames / IPs);
-#   * the controller does not probe the endpoint for reachability — it
-#     trusts the operator. The CR goes Ready as soon as admission accepts
-#     spec.remoteStorage.endpoint.
+# This sample explicitly chooses Redis. A legacy external LMCacheServer endpoint
+# cannot be converted automatically because replacing lm:// changes sharing and
+# data-plane semantics.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -40,24 +20,28 @@ metadata:
 spec:
   runtime: VLLM
   type: LMCache
-  # Address of the pre-existing cache server. Two accepted shapes:
-  #   - bare `host:port` (canonical; the LMCache adapter adds the
-  #     `lm://` scheme on engine injection)
-  #   - `lm://host:port` (operators who prefer to be explicit)
-  # Whichever shape the operator writes, the reconciler mirrors the
-  # trimmed value into status.endpoint — so status carries the same
-  # form the operator typed (bare or lm://-prefixed), distinct from
-  # managed backends where status.endpoint is always engine-agnostic
-  # bare host:port from the rendered Service. The injection helper is
-  # lenient about an already-prefixed `lm://` value (the prefix is
-  # preserved rather than doubled). Admission requires a non-empty
-  # host AND port; IPv6 must be bracketed (`[::1]:8200`).
   integration:
     role: ReadWrite
   engineSelector:
     matchLabels:
       app.kubernetes.io/name: vllm
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
   remoteStorage:
-    provider: LMCacheServer
+    provider: Redis
     ownership: External
-    endpoint: my-cache.example.com:8200
+    endpoint: redis.example.internal:6379

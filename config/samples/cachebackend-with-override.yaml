@@ -2,12 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Paired CacheBackend + matching engine Deployment that exercises a small
-# `spec.integration.engineOverrides` block. Shows how to tune chunk size
-# and add a debug env WITHOUT losing the rest of the LMCache integration
-# the controller's mutating Pod admission webhook injects.
+# Paired typed-MP CacheBackend + matching engine Deployment that exercises a
+# small `spec.integration.engineOverrides` block. LMCache chunk size is a typed
+# `spec.lmCache.chunkSizeTokens` field; engineOverrides is used only for an
+# extra engine environment value.
 #
-# The override block is intentionally small (two env entries) — the goal
+# The override block is intentionally small — the goal
 # is to demonstrate the cause -> effect of `engineOverrides`, not to
 # exercise all four primitives in one sample. See
 # docs/concepts/cachebackend-engine-overrides.md for the full menu (env
@@ -18,24 +18,10 @@
 #
 #   kubectl apply -f config/samples/cachebackend-with-override.yaml
 #
-# The pod-mutating webhook fail-opens when CacheBackend.status.endpoint is
-# still empty, so a fresh-cluster apply that races the CacheBackend
-# reconciler can create the first engine pod BEFORE the LMCache server
-# endpoint is published, leaving that first pod unwired. If the engine
-# container env is missing the canonical LMCache_* / VLLM_USE_V1 entries
-# after a first apply, wait for `kubectl get cachebackend qwen-demo -o
-# jsonpath='{.status.endpoint}'` to be non-empty and then
-# `kubectl rollout restart deployment/qwen-demo-engine` so the next pod
-# admits with status.endpoint populated.
-#
-# Once admitted with a non-empty status.endpoint,
-# `kubectl describe pod -l app=qwen-demo` should show the engine
-# container carrying:
-#   LMCACHE_CHUNK_SIZE = "64"     (override replaced the canonical "256")
-#   LMCACHE_LOG_LEVEL  = "DEBUG"  (appended; adapter doesn't inject this)
-# plus the rest of the canonical LMCache wiring (LMCACHE_REMOTE_URL,
-# --kv-transfer-config, VLLM_USE_V1, etc.) — see the concept doc's
-# "Baseline" section for the full canonical set.
+# After admission the engine carries `LMCACHE_LOG_LEVEL=DEBUG` in addition to
+# the reserved MP connector JSON, deterministic hash seed, and hybrid-cache
+# manager guard. The MP server sidecar receives chunk size 64 from the typed
+# CacheBackend field.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -50,18 +36,14 @@ spec:
   integration:
     role: ReadWrite
     # Amend the engine container the mutating Pod webhook injects.
-    # Reserved entries (--kv-transfer-config, LMCACHE_REMOTE_URL,
-    # VLLM_USE_V1, INFERENCECACHE_FAIL_OPEN) are HARD-REJECTED at
+    # Reserved entries (--kv-transfer-config,
+    # --disable-hybrid-kv-cache-manager, PYTHONHASHSEED, and
+    # INFERENCECACHE_FAIL_OPEN) are HARD-REJECTED at
     # admission with a field-scoped error; non-reserved entries pass
     # through and merge.
     engineOverrides:
       env:
-        # Upsert: name matches an adapter-injected env, so the canonical
-        # value ("256") is replaced with "64". Drop chunk size for nodes
-        # where the default eats too much per-replica memory.
-        - name: LMCACHE_CHUNK_SIZE
-          value: "64"
-        # Append: name not in the adapter's canonical set, so it's added
+        # Append: name is not in the adapter's canonical set, so it is added
         # to the engine env unchanged. Useful for triaging cache behavior
         # against the LMCache log stream.
         - name: LMCACHE_LOG_LEVEL
@@ -74,17 +56,26 @@ spec:
     # Plumbed to the auto-attached kvevent-subscriber sidecar's --model-id
     # so the index keys per-replica entries by model.
     modelID: Qwen/Qwen2.5-0.5B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer:
-      # Pin to a real digest for non-local runs.
-      image: lmcache/standalone:v0.4.7
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 64
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
 ---
 # Engine Deployment. Apply this alongside the CacheBackend above; the
-# order matters (see the top-of-file comment). Pod injection is
-# CREATE-only, so a pod admitted before the CacheBackend's
-# status.endpoint is published will run unwired until it is recreated.
+# Pod injection is CREATE-only; applying the CacheBackend before the Deployment
+# remains the clearest operational order.
 # The mutating Pod admission webhook intercepts pods matching the
 # CacheBackend's `engineSelector` and injects the LMCache wiring +
 # (above) the engineOverrides amendments onto the `vllm` container at
@@ -92,12 +83,8 @@ spec:
 #
 # The Deployment name is `qwen-demo-engine`, distinct from the CacheBackend
 # name (`qwen-demo`), because the CacheBackend reconciler stands up its own
-# Deployment named after the CacheBackend for the managed lmcache-server.
-# Reusing the same name would either collide on apply or get reconciled
-# back to the lmcache-server shape. Binding to the CacheBackend goes
-# through the `app: qwen-demo` label match in `spec.engineSelector` above,
-# not through the Deployment name, so the engine Deployment can be named
-# anything that does not collide with the managed pod.
+# Binding to the CacheBackend goes through the `app: qwen-demo` label match in
+# `spec.engineSelector`, not through the Deployment name.
 #
 # CPU vLLM image and flags mirror docs/reference-stack/manifests/cpu-local/
 # deployment.yaml (the standalone CPU manifest that has been verified
@@ -166,4 +153,4 @@ spec:
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: 4Gi
+            sizeLimit: 5Gi

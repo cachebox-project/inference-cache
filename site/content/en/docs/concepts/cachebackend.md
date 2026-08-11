@@ -3,27 +3,17 @@ title: "CacheBackend"
 linkTitle: "CacheBackend"
 weight: 2
 description: >
-  The primary resource: bind engine pods to a KV-cache backend and make their KV cache
-  reusable across requests.
+  Bind inference-engine Pods to a typed cache data plane and expose cache-aware routing state.
 ---
 
 ## What is a CacheBackend?
 
-A `CacheBackend` is the primary CRD an operator writes. It describes a shared KV-cache
-backend and the engine-integration policy that uses it. Applying one:
+A namespaced `CacheBackend` selects an inference runtime, its engine-side cache
+integration, and an optional remote L3. The inference system owns the engine
+Deployment and image. CacheBackend injects the selected connector and the cache
+components it owns into matching Pods.
 
-1. **Provisions** a managed cache-server workload (for backend types that need one) and a
-   `ClusterIP` Service.
-2. **Binds** to inference-engine pods by label (`spec.engineSelector`). The mutating Pod
-   webhook injects the KV-connector configuration into matching pods. It also injects the
-   observation sidecar when the controller has `--kvevent-subscriber-image` configured and
-   `spec.observation.modelID` is set.
-3. **Makes the engine's KV cache reusable** — offloaded to the backend (tier 2) and, when
-   subscriber reporting is enabled, surfaced to routing (tier 1) so a warm prefix skips
-   prefill.
-
-`CacheBackend` is namespaced. Group `inferencecache.io`, version `v1alpha1`, short name
-`cb`.
+Current LMCache offload uses typed PodLocal multiprocess mode:
 
 ```yaml
 apiVersion: inferencecache.io/v1alpha1
@@ -35,163 +25,81 @@ spec:
   runtime: VLLM
   type: LMCache
   integration:
-    mode: Offload
     role: ReadWrite
   engineSelector:
     matchLabels:
       app: llama3-vllm
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
   observation:
     modelID: meta-llama/Llama-3.1-8B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer:
-      resources:
-        requests:
-          memory: 4Gi
-        limits:
-          memory: 8Gi
 ```
 
-## Backend types (`spec.type`)
+Omitting `remoteStorage` intentionally selects host-only MP. L1 is per engine
+Pod; add an explicit managed or external Redis L3 when cross-Pod sharing is
+required.
 
-`spec.type` is the engine-side cache implementation. It is a CRD enum and
-defaults to `LMCache`.
-
-| Type | What it is |
-|---|---|
-| **`LMCache`** (default) | LMCache engine integration. `spec.remoteStorage` independently selects an optional remote provider. |
-| **`SGLangHiCache`** | SGLang's native engine-local host cache; it accepts no remote-storage binding. |
-
-The runtime + cache-type **pair** selects the engine adapter. Remote provider
-technology (`Redis`, `LMCacheServer`, or `Mooncake`) and lifecycle ownership
-(`Managed` or `External`) are selected under `spec.remoteStorage`. Admission
-rejects unsupported combinations.
-
-{{% alert title="LMCache durability" color="info" %}}
-The `lm://` LMCache server is **in-memory only.** Durability is a *backend choice*, not a
-generic volume knob — there is no per-`CacheBackend` PVC field. If you need a durable or
-shared store, use `remoteStorage.provider: Mooncake`.
+{{% alert title="Runtime-owned engine image" color="info" %}}
+CacheBackend never rewrites the engine image. Normal engine initialization is
+the authoritative check that the image contains a compatible LMCache client.
+PodLocal native sidecars require Kubernetes 1.29 or newer.
 {{% /alert %}}
 
-### Mooncake needs host networking
+## Cache types and remote storage
 
-Mooncake is a peer-to-peer transfer-engine mesh: its master returns a *directory pointer*
-("block X is on node B, port P"), and the engine then connects directly to that node's real
-IP on a dynamically chosen port to move the KV bytes. A single ClusterIP cannot route that.
+| Type | Current behavior |
+|---|---|
+| `LMCache` | Typed PodLocal MP for vLLM or SGLang; optional Redis L3. |
+| `SGLangHiCache` | SGLang's native engine-local host cache; no remote binding. |
 
-Consequently, a Mooncake backend renders the master with `hostNetwork: true` behind a
-headless Service, and the **engine pods also need host networking** — opt in with
-`spec.integration.engineHostNetwork: true`. The namespace must permit `hostNetwork`, the
-backend becomes a singleton (`replicas > 1` and autoscaling are rejected), and one engine
-per node per port applies. TCP transport is sufficient for correctness; RDMA/RoCE only
-affects bandwidth.
+`remoteStorage` is optional L3 only. Redis may be `Managed` or `External`.
+Legacy topology-less `LMCacheServer` and engine-side Mooncake shapes remain in
+the alpha schema only for compatibility until migration Phase 7; they are not
+current production profiles and are not automatically mapped to Redis.
 
-## Engine integration (`spec.integration`)
-
-| Field | Values | Meaning |
-|---|---|---|
-| `mode` | `Offload` (default), `EventsOnly` | `Offload` = routing + tier-2 offload + a provisioned server. `EventsOnly` = routing only, no server, no KV connector. |
-| `role` | `ReadOnly`, `WriteOnly`, `ReadWrite` (default) | Maps to the LMCache `kv_role` (`kv_consumer` / `kv_producer` / `kv_both`). |
-| `failOpen` | `true` (default) | The engine falls back to local prefill when the cache is unreachable. `false` fails closed (and emits a Warning Event). |
-| `engineOverrides` | — | Fine-grained control over injected args/env (see below). |
-| `engineHostNetwork` | `false` (default) | Opt-in host networking for Mooncake engine pods. |
-
-### Events-only mode
-
-`mode: EventsOnly` provisions **no** cache server — routing tier only. It exists for
-**hybrid-attention models** (for example gated-DeltaNet, Mamba/Jamba, Falcon-H,
-Granite-hybrid families) that cannot take a vLLM KV connector, because vLLM disables its
-hybrid KV-cache manager when any connector loads. The subscriber sidecar is still injected
-so routing hints stay live; evictions are forwarded as `PREFIX_EVICTED`. Events-only
-requires `type: LMCache`, forbids `autoscaling`, and is incompatible with `External`.
-
-### Engine-injection overrides
-
-`spec.integration.engineOverrides` exposes four primitives that merge on top of the
-adapter's canonical injection:
-
-- `args` — extra engine args to add.
-- `suppressArgs` — canonical args to remove.
-- `env` — extra environment variables to add.
-- `suppressEnv` — canonical env vars to remove.
-
-Each adapter declares **reserved** args and env that carry correctness guarantees.
-Overriding a reserved value is **hard-rejected at admission**, not merely warned — a warning
-would be ignored and the engine would crash later with no breadcrumb. See
-[Bind an engine]({{< relref "/docs/tasks/bind-an-engine/" >}}) for the reserved lists per runtime.
-
-## Engine binding (`spec.engineSelector`)
-
-`spec.engineSelector.matchLabels` is an equality selector over engine **pod** labels
-(`matchExpressions` is not available in v1alpha1). Any pod whose labels match, in the
-`CacheBackend`'s namespace, is a target for the mutating Pod webhook. `status.matchedEnginePods`
-reports how many pods currently match.
-
-A pod carrying the annotation `inferencecache.io/skip-inject: "true"` is skipped entirely —
-the all-or-nothing escape hatch.
-
-The subscriber sets `replica_id = <pod-name>`. Treat that ID as opaque: engine Deployment
-names do not need to equal the `CacheBackend` name. The controller attributes pods to a
-backend through `spec.engineSelector` and the webhook's `inferencecache.io/injected-by`
-metadata, not a pod-name prefix.
-
-## Readiness
-
-`CacheBackend.Ready` composes three gates, in order:
-
-1. **Managed-readiness baseline** — the provisioned workload is available (or scaled to
-   zero, or rolling).
-2. **KV-event gate** — Ready stays `False` (`AwaitingFirstKVEvent`) until a *real* engine
-   pod has published at least one KV event for this backend. This proves the publisher
-   works, not just that the pod IP is reachable. After `firstEventTimeout` with no events it
-   reports `NoKVEventsObserved` / `Degraded`. Opt out per-CR with
-   `inferencecache.io/require-kv-events: "false"`.
-3. **Functional-probe gate** — the controller drives a synthetic round-trip through the
-   server's `/probe` endpoint (ingest → routing → tier-2). `FunctionalProbeOK` appears only
-   after this clears. Opt out with `inferencecache.io/skip-functional-probe: "true"`.
-
-`External` backends are exempt from the KV-event and probe gates — only endpoint acceptance
-and Ready are checked.
-
-## Status
-
-Selected `status` fields:
+## Engine integration
 
 | Field | Meaning |
 |---|---|
-| `endpoint` | The resolved backend endpoint. |
-| `matchedEnginePods` | Pointer — `nil` (not yet observed) vs a real count. |
-| `failOpen` | The effective fail-open posture. |
-| `firstKVEventObservedAt` | Write-once latch — the first time any KV event was seen. |
-| `indexParticipation` | `prefixCount`, `lastEventAt`, `hitRate`, `t2HitRate` — this backend's slice of the index. |
-| `conditions` | The authoritative health surface (see below). |
-| `observedGeneration` | Standard reconcile bookkeeping. |
+| `mode` | `Offload` by default; `EventsOnly` observes KV events without injecting a cache connector. |
+| `role` | LMCache currently admits only `ReadWrite`; directional roles are future work. |
+| `failOpen` | Defaults to `true`; remote L3 loss degrades independently from the required PodLocal connector. |
+| `engineOverrides` | Amends non-reserved engine args/env. Use typed `lmCache` fields for MP configuration. |
 
-Printer columns: `Type`, `Ready`, `Matched`, `Endpoint`, `Prefixes`, `LastEvent`, `Age`.
+The webhook binds Pods by `spec.engineSelector.matchLabels` at Pod CREATE. A
+Pod can opt out with `inferencecache.io/skip-inject: "true"`. Recreate Pods
+after changing binding or cache configuration.
 
-### Conditions
+## Readiness and status
 
-Conditions are the authoritative health surface (there is no single `Health` enum). An
-Offload-managed backend can publish up to seven: `Ready`, `Degraded`, `Progressing`,
-`FunctionalProbeOK`, `EngineKernelsHealthy`, `T2Degraded`, `EngineCompatibility`.
-Events-only publishes three (`Ready`/`Degraded`/`Progressing`); `External` publishes
-`Ready` + `Progressing`.
+Typed MP exposes connector and remote-storage health separately:
 
-Two advisory conditions worth calling out:
+- `ConnectorReady` covers selected engines and their required PodLocal MP
+  servers;
+- `RemoteStorageReady` is present only when a Redis L3 is configured; and
+- `Ready` composes the implemented readiness and observation gates.
 
-- **`T2Degraded`** — sourced from `status.indexParticipation.t2HitRate`. `True/T2ZeroHitRate`
-  means the tier-2 offload was queried but served zero reloads — a silently-degraded tier.
-  It never gates `Ready`. (Because it is lifetime-cumulative, a *mid-life* regression is
-  caught by the `LMCacheT2NoHits` alert instead.)
-- **`EngineCompatibility`** — `False/InjectedEngineCrashLooping` flags an engine that is
-  crash-looping after injection (often a hybrid-attention model that cannot take a
-  connector). The remedy is to switch that backend to events-only mode, **not** to
-  `skip-inject`.
+`status.endpoint` is empty for host-only PodLocal MP and contains only a remote
+L3 endpoint. It never publishes the loopback connector address. Other useful
+fields include `matchedEnginePods`, `connector`, `remoteStorage`,
+`indexParticipation`, `conditions`, and `observedGeneration`.
 
 ## Related pages
 
-- [Bind an engine]({{< relref "/docs/tasks/bind-an-engine/" >}}) — the injection contract, reserved
-  args/env, and the skip annotation.
-- [CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}}) — per-namespace lookup and eviction tuning.
-- [CRD API reference]({{< relref "/docs/reference/crd-api/" >}}) — every field.
+- [Bind an engine]({{< relref "/docs/tasks/bind-an-engine/" >}})
+- [CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}})
+- [CRD API reference]({{< relref "/docs/reference/crd-api/" >}})

@@ -360,8 +360,8 @@ the legacy deprecation writer is only implemented if Phase 6 is activated.
 | 2 | Engine-neutral PodLocal MP server renderer | Phase 1 | complete |
 | 3 | Production-credible SGLang PodLocal MP baseline | Phase 2 | complete |
 | 4 | vLLM PodLocal MP | Phase 3 | complete |
-| 5 | Repository consumer migration; migration tooling only if needed | Phase 4 | not started |
-| 6 | Conditional compatibility gate if legacy consumers appear | Phase 5 | not required by Phase 0 finding |
+| 5 | Repository consumer migration; migration tooling only if needed | Phase 4 | complete |
+| 6 | Conditional compatibility gate if legacy consumers appear | Phase 5 | not required by Phase 0 and Phase 5 findings |
 | 7 | Remove IP, `lm://`, and LMCacheServer provider | Phase 5; Phase 6 only when applicable | not started |
 | 8 | NodeLocal shared MP server topology | Phases 3–4; does not block Phase 7 | not started |
 
@@ -675,7 +675,7 @@ probe, so traffic tests waited for the engine health endpoint.
 
 ## Phase 5 — migration tooling and consumer migration
 
-- **Status:** Not started
+- **Status:** Complete (2026-08-11)
 - **Depends on:** Phase 4
 
 ### Objective
@@ -690,13 +690,39 @@ because Phase 0 found no external users or installed legacy objects.
 
 ### Deliverables
 
-- [ ] Convert canonical samples, reference-stack manifests, support tables, CLI
+- [x] Convert canonical samples, reference-stack manifests, support tables, CLI
       output, documentation, screenshots, and non-transition fixtures to MP.
-- [ ] Remove language that presents the legacy LMCache server as a CPU profile
+- [x] Remove language that presents the legacy LMCache server as a CPU profile
       or default backend.
-- [ ] Reconfirm the zero-external-consumer assumption before removal.
-- [ ] If external consumers appear, add inventory/doctor, dry-run conversion,
-      unmappable-field reporting, deprecation Events, and rollback guidance.
+- [x] Reconfirm the zero-external-consumer assumption before removal, within the
+      evidence boundary recorded below.
+- [x] Re-evaluate the conditional tooling trigger. No external consumer or
+      installed legacy-object evidence appeared, so migration tooling,
+      deprecation Events, and a compatibility gate were not activated.
+
+### Phase 5 inventory and disposition
+
+The repository-wide `rg` inventory was classified before editing:
+
+| Class | Findings | Disposition |
+|---|---|---|
+| Production/current consumers | Legacy LMCache samples (`cachebackend-lmcache*`, External, CPU override, paired/override), five recipes, flat SGLang samples, vLLM/SGLang reference manifests, quickstart/concepts/site pages, support tables, and the reference Helm values file. | Converted to typed PodLocal MP with explicit host-only or Redis semantics. The unvalidated Helm mapping, legacy CPU-only LMCache sample, and Mooncake sample were removed rather than translated inaccurately. |
+| Legacy implementation for Phase 7 | Topology-less API fields/provider enums and CRD schema, LMCacheServer/Mooncake renderers, vLLM IP connector/wire helpers, endpoint parser, lifecycle/status code, and the doctor endpoint-scheme parser. | Retained unchanged so legacy alpha objects remain reconcilable until Phase 7. |
+| Historical/migration documentation | This roadmap, the SGLang MP spike, LMCache-server persistence decision, and legacy portions of the API design. | Retained with explicit history/compatibility banners; current sections and links point to typed MP. |
+| Intentional compatibility tests | Go tests for legacy render/admission behavior; C2/C6 scripts/workflows; legacy portions of default-install smoke. | Retained for Phase 7 safety, labelled legacy-only. C2/C6 scheduled triggers were removed; default-install smoke uses inline legacy fixtures instead of current samples. |
+
+No repository-owned screenshot asset contained a legacy deployment. CLI golden
+output contained no legacy backend recommendation, so no output fixture changed;
+the `doctor` `lm://` parsing branch is implementation compatibility for Phase 7.
+
+**External-consumer evidence boundary.** The Phase 5 repository inventory found
+no cross-repository manifest, API client, generated consumer, or migration input,
+and the Phase 0 owner audit remains zero for external consumers and installed
+legacy objects. This phase did not query every OCI cluster or organization-wide
+source repository, so the zero claim is limited to the repository evidence and
+the recorded owner/Phase 0 confirmation. No contrary evidence appeared; adding
+tooling without an input population would therefore create an unused migration
+surface.
 
 Migration rules:
 
@@ -710,17 +736,32 @@ Migration rules:
 
 ### Validation
 
-- [ ] Repository search finds no repository-owned production LMCache workload
+- [x] Repository search finds no repository-owned production LMCache workload
       still using IP, `lm://`, `LMCacheServer`, or flat SGLang MP fields.
-- [ ] Migrated samples and reference manifests pass admission/default-install
-      smoke.
-- [ ] Any newly discovered legacy object has an owner and explicit disposition.
+- [x] `make verify-samples` admits every applicable migrated sample (25 passed,
+      2 pre-existing explicit opt-outs, 0 failed); reference YAML parses, and
+      the typed vLLM/SGLang default-install smoke fixtures remain the current
+      admission path. The live kind default-install workflow was not run locally.
+- [x] Every retained legacy reference is classified as Phase 7 implementation,
+      history/migration documentation, or intentional compatibility coverage.
 
 ### Exit criteria
 
-- [ ] Every repository-owned LMCache workload uses MP.
-- [ ] No migration silently changes cross-Pod sharing behavior.
-- [ ] Conditional tooling, if activated, reports zero unknown legacy shapes.
+- [x] Every repository-owned production/current LMCache workload uses typed MP.
+- [x] No migration silently changes cross-Pod sharing behavior: each converted
+      object explicitly selects host-only or Redis, and ambiguous legacy
+      LMCacheServer/Mooncake examples were not auto-mapped.
+- [x] Conditional tooling was not activated because the re-audit found no input
+      population or unknown legacy shape.
+
+Validation completed on 2026-08-11: `git diff --check`, `go test ./...`,
+`make verify-samples`, shell syntax checks for the modified canaries/smoke,
+reference-manifest YAML parsing, production/current negative searches, and
+`make ci` all passed. `make ci` reported its optional golden-vector check as
+skipped because the local Python environment lacked `xxhash`; the target itself
+completed successfully. No Kubernetes cluster or GPU was required or used for
+this repository-consumer migration, and the live kind default-install workflow
+was not run locally.
 
 ## Phase 6 — reject new IP objects
 
@@ -1075,7 +1116,7 @@ The migration is complete only when all of the following are true:
       `LMCACHE_REMOTE_URL`.
 - [x] Remote-L3 lifecycle events do not automatically roll MP engines.
 - [ ] Every old IP object has been migrated or intentionally deleted.
-- [ ] Canonical samples, reference manifests, CLI output, and design documents
+- [x] Canonical samples, reference manifests, CLI output, and design documents
       describe only the implemented MP behavior.
 - [x] NodeLocal, if enabled, guarantees same-node server selection and accurate
       engine coverage; otherwise it remains rejected rather than partially

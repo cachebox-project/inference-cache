@@ -4,9 +4,10 @@
 
 # Recipe: CPU dev — fastest path to a working cache on a laptop / kind cluster.
 #
-# Scenario: stand up a cache-aware backend with no GPU. This pairs a managed
-# LMCache backend with a tiny vLLM engine running on vLLM's dedicated CPU build.
-# A single `kubectl apply -f` wires the engine to the cache (KV offload/reuse)
+# Scenario: exercise the typed PodLocal binding shape without requiring a GPU
+# for admission. This pairs a host-only LMCache MP CacheBackend with a tiny vLLM
+# CPU Deployment. A single `kubectl apply -f` asks the webhook to wire the engine
+# to the cache
 # and lets the backend produce LookupRoute hints. Acting on those hints to
 # actually route requests is the gateway's job — that integration ships as a
 # separate (deferred) cache-aware-routing recipe, not this one.
@@ -31,26 +32,18 @@
 # the Troubleshooting section of docs/quickstart.md for the per-reason
 # runbook.
 #
-# CPU caveat: LMCache offload is functional on the CPU image (the repo's
-# CPU substrate canary exercises cross-pod KV reuse via the lmcache-server), but
-# representative offload performance wants a GPU — see docs/reference-stack/.
+# Compatibility caveat: the inference owner must supply an engine image that
+# contains the selected LMCache MP client/API. This repository validates the
+# manifest and webhook mutation without a GPU; it does not claim that every
+# vLLM CPU image bundles the connector. Normal engine startup is authoritative.
 #
 # What binds the two objects: the label `app: cpu-dev` appears in BOTH
 # `CacheBackend.spec.engineSelector.matchLabels` AND the engine Deployment's
 # pod-template labels. The mutating Pod webhook intercepts each engine pod at
 # CREATE, finds the matching CacheBackend, and injects the LMCache engine
-# wiring (env + `--kv-transfer-config`). Drift the labels apart and the
+# wiring (native MP sidecar + `--kv-transfer-config`). Drift the labels apart and the
 # webhook silently no-ops — `kubectl get cachebackend` then shows `MATCHED: 0`
 # and the engine runs uncached. See docs/concepts/cachebackend-engine-binding.md.
-#
-# Apply order note: the pod webhook fail-opens (admits the pod unmodified)
-# while `CacheBackend.status.endpoint` is still empty, so a fresh-cluster
-# one-shot apply can race — the first engine pod may come up unwired. If so,
-# wait for the endpoint and recreate the engine pods:
-#
-#   kubectl wait --for=jsonpath='{.status.endpoint}' \
-#     cachebackend/cpu-dev-cache --timeout=60s
-#   kubectl rollout restart deploy/cpu-dev-engine
 #
 # CPU sizing: vLLM's CPU runtime baseline is ~5 GiB before any KV cache. Give
 # the kind node / VM ~10 GiB. Image tags are arch-specific (no shared multi-arch
@@ -69,17 +62,27 @@ spec:
   engineSelector:
     matchLabels:
       app: cpu-dev               # <-- binding label (1 of 2)
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 2Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 3Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
   observation:
     # Served model the engine pods load. Plumbed to the kvevent-subscriber
     # sidecar so the index keys per-replica entries by model. Tiny + ungated
     # so it runs on CPU with no auth token.
     modelID: Qwen/Qwen2.5-0.5B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer:
-      # Managed lmcache-server image. Pin to a digest for non-local runs.
-      image: lmcache/standalone:v0.4.7
 ---
 apiVersion: apps/v1
 kind: Deployment

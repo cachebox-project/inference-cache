@@ -2,6 +2,12 @@
 
 Status: locked · Scope: managed-backend durability (`CacheBackend`)
 
+> **Historical legacy-IP decision record.** This document explains why the old
+> generic PVC surface was removed. Its LMCacheServer/Mooncake recommendation is
+> superseded: current LMCache uses typed PodLocal MP with optional explicit
+> Redis. Do not treat the providers below as current defaults and do not map
+> them automatically to Redis; the operator must choose the desired L3 semantics.
+
 ## Decision
 
 `CacheBackend.spec.storage` — and the nested `storage.pvc.*` plus the
@@ -11,11 +17,11 @@ per-`CacheBackend` volume knob:
 
 - Omitting canonical `spec.remoteStorage` selects an engine-local host tier and
   provisions no provider workload.
-- The managed **in-memory `lm://` LMCache server**
+- Historically, the managed **in-memory `lm://` LMCache server**
   (`spec.remoteStorage.provider: LMCacheServer`) is the simple shared tier. It
   keeps KV in process memory; it is not durable and does not persist across pod
   restarts.
-- The managed **Mooncake provider**
+- Historically, the managed **Mooncake provider**
   (`spec.remoteStorage.provider: Mooncake`) is the durable / shared / scalable
   path: a network-addressable store the engine reaches over the
   `mooncakestore://` remote wire. See
@@ -48,7 +54,7 @@ ClusterIP, engines-anywhere model.
 - `spec.storage{,.pvc}` + `status.capacity` were removed as a category error:
   the Kubernetes-side PVC plumbing could be provisioned, but could never
   honestly back the in-memory server.
-- The recommended durable / shared topology is the **Mooncake backend**. Its
+- The historical durable/shared recommendation was the **Mooncake backend**. Its
   managed workload lifecycle lives in the provider adapter
   (`internal/adapters/builtin/storage/mooncake.go`), while the vLLM runtime adapter
   (`internal/adapters/builtin/runtime/vllm_lmcache.go`) owns engine wiring.

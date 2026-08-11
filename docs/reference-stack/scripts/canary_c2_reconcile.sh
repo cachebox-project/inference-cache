@@ -4,6 +4,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# LEGACY IP COMPATIBILITY ONLY. Retained until Phase 7; do not use this script
+# as a production deployment reference. It intentionally exercises
+# remoteStorage.provider=LMCacheServer and the lm:// data plane.
+#
 # Canary for the C2 CacheBackend reconciler. Proves the controller stands up a
 # healthy, serving backend from a CR on a GPU-free cluster (kind):
 #
@@ -23,7 +27,7 @@
 # can't cover. The managed standalone server uses CPU storage and does not need
 # an inference engine or GPU for this controller lifecycle check.
 #
-# On-demand canary (NOT a per-PR gate): needs Docker + kind + kubectl, pulls the
+# Manual canary (NOT a per-PR gate): needs Docker + kind + kubectl, pulls the
 # standalone LMCache server image. See docs/reference-stack/VERSIONS.md.
 #
 # Usage:  docs/reference-stack/scripts/canary_c2_reconcile.sh

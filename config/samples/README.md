@@ -22,38 +22,40 @@ multi-tenant, Namespaces):
   equivalent typed vLLM PodLocal profiles for
   [host-only](cachebackend-vllm-podlocal-host-only.yaml),
   [managed Redis](cachebackend-vllm-podlocal-managed-redis.yaml), and
-  [external Redis](cachebackend-vllm-podlocal-external-redis.yaml). The
-  `recipe-*.yaml` catalog remains the maintained entry point for legacy
-  in-process LMCache scenarios until the repository-wide Phase-5 migration.
+  [external Redis](cachebackend-vllm-podlocal-external-redis.yaml). All LMCache
+  offload samples use the typed PodLocal MP API; `EventsOnly` intentionally
+  carries no LMCache data plane.
 
 ## Recipe catalog
 
 Each recipe is a single file with a top-of-file comment explaining the scenario
 and the apply steps. Most are self-contained; see "Prerequisites per recipe"
 below for the two that aren't (external cache, multi-tenant), and note
-`recipe-gpu-production` is a shape template whose placeholder images you pin
-before applying. All but `recipe-gpu-production` run without a GPU.
+`recipe-gpu-production` is a shape template whose engine image you pin before
+applying. Admission and sample validation require no GPU; actual LMCache MP
+startup requires a compatible engine connector/package and the selected
+runtime hardware.
 
 | Recipe | Use case |
 | --- | --- |
-| [`recipe-cpu-dev.yaml`](recipe-cpu-dev.yaml) | Fastest path on a laptop / kind — tiny ungated model, no GPU, single replica, no quotas. |
-| [`recipe-gpu-production.yaml`](recipe-gpu-production.yaml) | Typical production — real model on GPU engine pods, managed-backend autoscaling, a CachePolicy with production TTLs. |
-| [`recipe-external-cache.yaml`](recipe-external-cache.yaml) | External `LMCacheServer` ownership — point the operator at a cache server you manage yourself; the controller provisions nothing. |
+| [`recipe-cpu-dev.yaml`](recipe-cpu-dev.yaml) | Small single-replica typed-MP binding shape; engine startup still requires a connector-compatible image. |
+| [`recipe-gpu-production.yaml`](recipe-gpu-production.yaml) | Production shape — GPU engine Pods, per-Pod MP L1, explicit managed Redis L3, and a production CachePolicy. |
+| [`recipe-external-cache.yaml`](recipe-external-cache.yaml) | Typed MP with external Redis L3; the controller provisions no remote provider. |
 | [`recipe-multi-tenant.yaml`](recipe-multi-tenant.yaml) | Two CacheTenants + two CacheBackends across two namespaces — isolated cache identity and entry-count quotas; separate engines for per-tenant memory isolation. |
-| [`recipe-tuning.yaml`](recipe-tuning.yaml) | CPU-dev shape plus a meaningful `engineOverrides` block (tune `LMCACHE_CHUNK_SIZE`, add `LMCACHE_LOG_LEVEL=DEBUG`). |
+| [`recipe-tuning.yaml`](recipe-tuning.yaml) | Small typed-MP shape: typed `chunkSizeTokens` plus an `engineOverrides` log-level addition. |
 
 **Prerequisites per recipe.** Most recipes are self-contained. One has an
-external dependency: `recipe-external-cache.yaml` needs a cache server already
+external dependency: `recipe-external-cache.yaml` needs Redis already
 running at the endpoint you supply (replace the placeholder).
 `recipe-multi-tenant.yaml` has no external dependency but creates and deploys
 into two namespaces of its own.
 
 **Apply + observability.** Each recipe's `kubectl apply` wires matching engine
-pods to the cache. For *managed* backends the wiring becomes available once the
-controller publishes `status.endpoint`, so a pod admitted before then races past
-injection and runs unwired until recreated (see each recipe's header); externally
-owned backends wire straight from `spec.remoteStorage.endpoint` and have no such
-race. KV reuse then works, but a *managed* backend only reaches `Ready=True`
+pods to the cache. Host-only PodLocal wiring needs no provider endpoint. A
+managed Redis L3 is controller-resolved, so apply the CacheBackend before
+creating engine Pods; externally owned Redis uses the declared endpoint. KV
+reuse then works when the runtime-owned image is compatible, but a managed
+backend only reaches `Ready=True`
 and reports index entries once the `kvevent-subscriber` sidecar is auto-attached,
 which requires the controller to run with `--kvevent-subscriber-image` set
 (empty by default); otherwise it holds at `AwaitingFirstKVEvent` and then
