@@ -72,13 +72,19 @@ func validateLMCacheTopology(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 				"required when topology=NodeLocal"))
 		} else {
 			errs = append(errs, validateNodeLocalServer(lm.NodeLocal.Server, lmPath.Child("nodeLocal", "server"))...)
+			if lm.NodeLocal.IdleRetentionSeconds < 0 || lm.NodeLocal.IdleRetentionSeconds > 86400 {
+				errs = append(errs, field.Invalid(lmPath.Child("nodeLocal", "idleRetentionSeconds"), lm.NodeLocal.IdleRetentionSeconds,
+					"must be between 0 and 86400 seconds"))
+			}
 		}
 		if lm.PodLocal != nil {
 			errs = append(errs, field.Forbidden(lmPath.Child("podLocal"),
 				"must be omitted when topology=NodeLocal"))
 		}
-		errs = append(errs, field.Forbidden(lmPath.Child("topology"),
-			"NodeLocal is reserved for Phase 8 and is not implemented; use PodLocal"))
+		if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
+			errs = append(errs, field.Required(field.NewPath("spec", "engineSelector", "matchLabels"),
+				"NodeLocal requires a non-empty engine selector to define its trust domain"))
+		}
 	default:
 		errs = append(errs, field.NotSupported(lmPath.Child("topology"), lm.Topology,
 			[]string{string(cachev1alpha1.LMCacheTopologyPodLocal), string(cachev1alpha1.LMCacheTopologyNodeLocal)}))
@@ -97,6 +103,10 @@ func validatePodLocalServer(server *cachev1alpha1.LMCachePodLocalServerSpec, pat
 		&server.L1Capacity,
 		server.Resources,
 		path,
+		map[int32]string{
+			lmcacheKVEventPort: "engine KV-event publisher",
+			lmcacheMPHTTPPort:  "LMCache MP HTTP health/control",
+		},
 	)
 	if server.MaxWorkers < 1 {
 		errs = append(errs, field.Invalid(path.Child("maxWorkers"), server.MaxWorkers, "must be at least 1"))
@@ -114,12 +124,41 @@ func validateNodeLocalServer(server *cachev1alpha1.LMCacheNodeLocalServerSpec, p
 		&server.L1Capacity,
 		server.Resources,
 		path,
+		nil,
 	)
 	if server.MaxGPUWorkers < 1 {
 		errs = append(errs, field.Invalid(path.Child("maxGPUWorkers"), server.MaxGPUWorkers, "must be at least 1"))
 	}
 	if server.MaxCPUWorkers < 1 {
 		errs = append(errs, field.Invalid(path.Child("maxCPUWorkers"), server.MaxCPUWorkers, "must be at least 1"))
+	}
+	ports := []struct {
+		name string
+		port int32
+	}{
+		{name: "port", port: server.Port},
+		{name: "httpPort", port: server.HTTPPort},
+	}
+	seen := map[int32]string{}
+	for _, item := range ports {
+		if item.port < 1 || item.port > 65535 {
+			errs = append(errs, field.Invalid(path.Child(item.name), item.port, "must be between 1 and 65535"))
+			continue
+		}
+		if prior, ok := seen[item.port]; ok {
+			errs = append(errs, field.Invalid(path.Child(item.name), item.port,
+				fmt.Sprintf("must be distinct from %s because both listeners bind the node network namespace", prior)))
+			continue
+		}
+		seen[item.port] = item.name
+	}
+	if _, requested := server.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")]; requested {
+		errs = append(errs, field.Forbidden(path.Child("resources", "requests").Key("nvidia.com/gpu"),
+			"NodeLocal MP servers use NVIDIA_VISIBLE_DEVICES=all for CUDA IPC and must not reserve engine allocatable GPUs"))
+	}
+	if _, limited := server.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]; limited {
+		errs = append(errs, field.Forbidden(path.Child("resources", "limits").Key("nvidia.com/gpu"),
+			"NodeLocal MP servers use NVIDIA_VISIBLE_DEVICES=all for CUDA IPC and must not reserve engine allocatable GPUs"))
 	}
 	return errs
 }
@@ -130,6 +169,7 @@ func validateMPServer(
 	l1Capacity *resource.Quantity,
 	resources corev1.ResourceRequirements,
 	path *field.Path,
+	reservedPorts map[int32]string,
 ) field.ErrorList {
 	var errs field.ErrorList
 	trimmedImage := strings.TrimSpace(image)
@@ -143,12 +183,9 @@ func validateMPServer(
 
 	if port < 1 || port > 65535 {
 		errs = append(errs, field.Invalid(path.Child("port"), port, "must be between 1 and 65535"))
-	} else if port == lmcacheKVEventPort {
+	} else if owner, reserved := reservedPorts[port]; reserved {
 		errs = append(errs, field.Invalid(path.Child("port"), port,
-			fmt.Sprintf("collides with the engine KV-event publisher port %d", lmcacheKVEventPort)))
-	} else if port == lmcacheMPHTTPPort {
-		errs = append(errs, field.Invalid(path.Child("port"), port,
-			fmt.Sprintf("collides with the LMCache MP HTTP health/control port %d", lmcacheMPHTTPPort)))
+			fmt.Sprintf("collides with the %s port %d", owner, port)))
 	}
 
 	if l1Capacity == nil || l1Capacity.Sign() <= 0 {
@@ -261,7 +298,7 @@ func validateMPServerResourceRequirements(resources corev1.ResourceRequirements,
 }
 
 // rejectUnimplementedRedisBindingFeatures permits authentication for typed
-// PodLocal LMCache MP adapters while keeping every unsupported LMCache 0.5.3
+// LMCache MP adapters while keeping every unsupported LMCache 0.5.3
 // RESP feature explicit. The common MP server renderer supports
 // username/password for both SGLang and vLLM, but not TLS or logical database
 // selection. Managed Redis currently provisions the default user, so its
@@ -275,14 +312,15 @@ func rejectUnimplementedRedisBindingFeatures(cb *cachev1alpha1.CacheBackend) fie
 	var errs field.ErrorList
 	if redis.Authentication != nil {
 		authPath := path.Child("authentication")
-		isTypedPodLocalMP := cb.Spec.LMCache != nil &&
+		isTypedMP := cb.Spec.LMCache != nil &&
 			cb.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache &&
-			cb.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal &&
+			(cb.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal ||
+				cb.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyNodeLocal) &&
 			(cb.Spec.Runtime == cachev1alpha1.CacheBackendRuntimeSGLang ||
 				cb.Spec.Runtime == cachev1alpha1.CacheBackendRuntimeVLLM)
-		if !isTypedPodLocalMP {
+		if !isTypedMP {
 			errs = append(errs, field.Forbidden(authPath,
-				"Redis authentication is currently rendered only by a typed PodLocal LMCache MP adapter"))
+				"Redis authentication is currently rendered only by a typed LMCache MP adapter"))
 		} else {
 			if redis.Authentication.Username != nil {
 				errs = append(errs, validateRedisSecretKeySelector(*redis.Authentication.Username, authPath.Child("username"))...)

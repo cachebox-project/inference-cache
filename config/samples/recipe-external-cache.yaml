@@ -44,7 +44,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: external-demo
+      inferencecache.io/cache-domain: external-demo
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256
@@ -86,6 +86,7 @@ spec:
     metadata:
       labels:
         app: external-demo
+        inferencecache.io/cache-domain: external-demo
     spec:
       nodeSelector:
         kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`

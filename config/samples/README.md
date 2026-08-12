@@ -23,8 +23,12 @@ multi-tenant, Namespaces):
   [host-only](cachebackend-vllm-podlocal-host-only.yaml),
   [managed Redis](cachebackend-vllm-podlocal-managed-redis.yaml), and
   [external Redis](cachebackend-vllm-podlocal-external-redis.yaml). All LMCache
-  offload samples use the typed PodLocal MP API; `EventsOnly` intentionally
-  carries no LMCache data plane.
+  offload samples use the typed MP API. NodeLocal host-only profiles are
+  available for [vLLM](cachebackend-vllm-nodelocal-host-only.yaml) and
+  [SGLang](cachebackend-sglang-nodelocal-host-only.yaml); the inference system
+  owns their placement and they opt into server host networking plus shared
+  host `/dev/shm`.
+  `EventsOnly` intentionally carries no LMCache data plane.
 
 ## Recipe catalog
 
@@ -62,6 +66,20 @@ which requires the controller to run with `--kvevent-subscriber-image` set
 degrades to `NoKVEventsObserved`. Externally owned backends are exempt from that gate —
 they go `Ready` as soon as admission accepts the endpoint. See the
 [quickstart](../../docs/quickstart.md).
+
+NodeLocal focused samples are not five-minute recipes. Before applying one,
+reserve its MP and HTTP host ports on every node where the inference system may
+place a selected engine, and ensure all selected engine Pods belong to one
+mutually trusted tenant domain. CacheBackend does not select nodes or rewrite
+engine placement. The declared `l1Capacity` is a shared budget on every active
+engine node; `maxGPUWorkers` must cover the maximum selected engine instances on
+one node. `idleRetentionSeconds` keeps the per-node server and its L1 warm after
+the final engine leaves (300 seconds in the focused samples; zero deletes it
+immediately). The server requests no allocatable GPU, so set the optional
+`nodeLocal.scheduling.runtimeClassName` when the engine's inherited runtime does
+not provide the required NVIDIA visibility.
+Host-network listeners bypass Kubernetes NetworkPolicy, so restrict them with
+node firewall controls. Do not add a load-balanced Service for the MP port.
 
 `SGLangHiCache` is endpoint-free and has no endpoint publication race. Its
 first implementation intentionally publishes no `Ready` condition; the

@@ -54,10 +54,10 @@ const (
 // sglangLMCacheAdapter wires SGLang engine pods to LMCache for the (SGLang, LMCache)
 // pair. SGLang drives LMCache in MULTIPROCESS (MP) mode:
 //
-//   - Typed PodLocal objects use the shared CacheBackend-configured MP-server native
-//     sidecar + a config file (mp_host/mp_port) the engine reads via
-//     --lmcache-config-file. A nil binding is L1-only; an optional RESP binding
-//     offloads to independently selected Redis storage.
+//   - Typed PodLocal objects use the shared CacheBackend-configured MP-server
+//     native sidecar. Typed NodeLocal objects use an on-demand same-node server
+//     Pod and an ownership-verifying startup gate. Both render the config file
+//     (mp_host/mp_port) read through --lmcache-config-file.
 //   - It turns LMCache on with
 //     --enable-lmcache + LMCACHE_USE_EXPERIMENTAL (not vLLM's --kv-transfer-config)
 //     and does not inject any IP-connector environment.
@@ -88,7 +88,9 @@ func (sglangLMCacheAdapter) Supports(runtime runtimeadapter.RuntimeID, cache *ca
 		return false
 	}
 	return cache.Spec.IsEventsOnly() ||
-		(cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal)
+		(cache.Spec.LMCache != nil &&
+			(cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal ||
+				cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyNodeLocal))
 }
 
 // SupportedPairs lets the registry surface this adapter's canonical pair in the
@@ -108,7 +110,7 @@ func (sglangLMCacheAdapter) SupportsBinding(binding *backendadapter.Binding) boo
 // InjectEngineConfig renders SGLang's LMCache MP-mode launch surface from a
 // host-only nil binding or a RESP binding for Redis L2 storage.
 func (a sglangLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
-	if err := injectSGLangLMCachePodLocal(pod, binding, cache); err != nil {
+	if err := injectSGLangLMCacheMP(pod, binding, cache); err != nil {
 		return err
 	}
 	return ensureSGLangMetricsForSubscriber(pod, cache, a.subscriber)
@@ -139,12 +141,17 @@ func (sglangLMCacheAdapter) ValidateMPEnginePod(pod *corev1.Pod, cache *cachev1a
 	if cache == nil || cache.Spec.LMCache == nil {
 		return fmt.Errorf("SGLang LMCache MP CacheBackend configuration is missing")
 	}
-	if cache.Spec.LMCache.Topology != cachev1alpha1.LMCacheTopologyPodLocal {
-		return fmt.Errorf("SGLang LMCache MP topology %q is not implemented; want %q",
-			cache.Spec.LMCache.Topology, cachev1alpha1.LMCacheTopologyPodLocal)
-	}
-	if cache.Spec.LMCache.PodLocal == nil || cache.Spec.LMCache.PodLocal.Server == nil {
-		return fmt.Errorf("SGLang LMCache PodLocal server configuration is missing")
+	switch cache.Spec.LMCache.Topology {
+	case cachev1alpha1.LMCacheTopologyPodLocal:
+		if cache.Spec.LMCache.PodLocal == nil || cache.Spec.LMCache.PodLocal.Server == nil {
+			return fmt.Errorf("SGLang LMCache PodLocal server configuration is missing")
+		}
+	case cachev1alpha1.LMCacheTopologyNodeLocal:
+		if cache.Spec.LMCache.NodeLocal == nil || cache.Spec.LMCache.NodeLocal.Server == nil {
+			return fmt.Errorf("SGLang LMCache NodeLocal server configuration is missing")
+		}
+	default:
+		return fmt.Errorf("SGLang LMCache MP topology %q is not implemented", cache.Spec.LMCache.Topology)
 	}
 	engineIndex, err := EngineContainerIndexNamed(&pod.Spec, SGLangEngineContainerName)
 	if err != nil {
@@ -195,31 +202,46 @@ func effectiveLMCacheChunkSize(spec *cachev1alpha1.LMCacheEngineSpec) int32 {
 	return 256
 }
 
-func injectSGLangLMCachePodLocal(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+func injectSGLangLMCacheMP(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	if err := validateInjectPodCacheInputs(pod, cache, "engine"); err != nil {
 		return err
 	}
 	lm := cache.Spec.LMCache
-	if lm == nil || lm.Topology != cachev1alpha1.LMCacheTopologyPodLocal || lm.PodLocal == nil || lm.PodLocal.Server == nil {
-		return fmt.Errorf("inject SGLang LMCache MP: typed PodLocal server configuration is required")
+	if lm == nil {
+		return fmt.Errorf("inject SGLang LMCache MP: typed server configuration is required")
 	}
-	server := lm.PodLocal.Server
 	chunkSize := effectiveLMCacheChunkSize(lm)
 
 	// Compose the common server and SGLang launch surface on one copy. Although
 	// the post-render SGLang upserts cannot fail, keeping one commit point makes
 	// the adapter's atomicity contract explicit and future-proof.
 	work := pod.DeepCopy()
-	configPath, err := renderLMCachePodLocalServer(work, SGLangEngineContainerName, lmCacheMPServerConfig{
-		Image:             server.Image,
-		Port:              server.Port,
-		ChunkSizeTokens:   chunkSize,
-		L1Capacity:        server.L1Capacity,
-		MaxWorkers:        server.MaxWorkers,
-		Resources:         server.Resources,
-		Binding:           binding,
-		WriteClientConfig: true,
-	})
+	var configPath string
+	var err error
+	switch lm.Topology {
+	case cachev1alpha1.LMCacheTopologyPodLocal:
+		if lm.PodLocal == nil || lm.PodLocal.Server == nil {
+			return fmt.Errorf("inject SGLang LMCache MP: typed PodLocal server configuration is required")
+		}
+		server := lm.PodLocal.Server
+		configPath, err = renderLMCachePodLocalServer(work, SGLangEngineContainerName, lmCacheMPServerConfig{
+			Image:             server.Image,
+			Port:              server.Port,
+			ChunkSizeTokens:   chunkSize,
+			L1Capacity:        server.L1Capacity,
+			MaxWorkers:        server.MaxWorkers,
+			Resources:         server.Resources,
+			Binding:           binding,
+			WriteClientConfig: true,
+		})
+	case cachev1alpha1.LMCacheTopologyNodeLocal:
+		if lm.NodeLocal == nil || lm.NodeLocal.Server == nil {
+			return fmt.Errorf("inject SGLang LMCache MP: typed NodeLocal server configuration is required")
+		}
+		configPath, err = renderLMCacheNodeLocalEngine(work, SGLangEngineContainerName, cache, true)
+	default:
+		return fmt.Errorf("inject SGLang LMCache MP: topology %q is not implemented", lm.Topology)
+	}
 	if err != nil {
 		return err
 	}

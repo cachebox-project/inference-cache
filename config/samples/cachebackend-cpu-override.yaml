@@ -41,7 +41,7 @@ spec:
           value: bar
   engineSelector:
     matchLabels:
-      app.kubernetes.io/name: vllm
+      inferencecache.io/cache-domain: vllm-cpu-override
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 512

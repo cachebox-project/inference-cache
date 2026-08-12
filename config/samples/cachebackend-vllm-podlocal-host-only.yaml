@@ -17,7 +17,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      inferencecache.io/runtime: vllm-mp
+      inferencecache.io/cache-domain: vllm-mp
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256

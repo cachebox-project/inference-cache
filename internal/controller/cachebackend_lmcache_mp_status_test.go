@@ -15,11 +15,26 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
+
+func setNodeLocalShmIdentity(t *testing.T, backend *cachev1alpha1.CacheBackend, pod *corev1.Pod) {
+	t.Helper()
+	name, err := builtinruntime.NodeLocalServerShmName(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[enginebinding.AnnotationNodeLocalShmName] = name
+	pod.Spec.Containers = []corev1.Container{{Name: lmCacheMPServerStatusContainerName, Args: []string{"server", "--shm-name", name}}}
+}
 
 func typedMPStatusBackend() *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
@@ -89,6 +104,10 @@ func TestRefreshLMCacheMPConnectorStatusTransitions(t *testing.T) {
 		status.ReadyEnginePods != 1 || status.CoveredEnginePods != 1 || status.UncoveredEnginePods != 1 {
 		t.Fatalf("connector status = %+v", status)
 	}
+	if len(status.EnginePodCoverage) != 2 || status.EnginePodCoverage[0].Name != "ready" || !status.EnginePodCoverage[0].Covered ||
+		status.EnginePodCoverage[1].Name != "uncovered" || status.EnginePodCoverage[1].Covered {
+		t.Fatalf("engine pod coverage = %+v", status.EnginePodCoverage)
+	}
 	cond := meta.FindStatusCondition(got.Status.Conditions, conditionTypeConnectorReady)
 	if cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != reasonConnectorUnverified {
 		t.Fatalf("ConnectorReady = %+v", cond)
@@ -150,6 +169,245 @@ func TestRefreshLMCacheMPConnectorStatusTransitions(t *testing.T) {
 	cond = meta.FindStatusCondition(got.Status.Conditions, conditionTypeConnectorReady)
 	if cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != reasonConnectorUnverified {
 		t.Fatalf("ConnectorReady after spec generation change = %+v", cond)
+	}
+}
+
+func TestRefreshLMCacheNodeLocalConnectorStatusSameNodeCoverage(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	backend := nodeLocalBackend("cache", "ns1")
+	backend.Generation = 3
+	backend.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "sglang"}}
+	controller := true
+	serverPod := func(name, node string, ready bool) *corev1.Pod {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: "ns1",
+				Labels: map[string]string{
+					enginebinding.LabelLMCacheNodeLocalServer: "true",
+					enginebinding.LabelCacheBackendUID:        string(backend.UID),
+				},
+				Annotations: map[string]string{
+					enginebinding.AnnotationNodeLocalOwner:      "ns1/cache",
+					enginebinding.AnnotationNodeLocalOwnerUID:   string(backend.UID),
+					enginebinding.AnnotationNodeLocalGeneration: "3",
+					enginebinding.AnnotationNodeLocalTargetNode: node,
+				},
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: cachev1alpha1.GroupVersion.String(), Kind: "CacheBackend", Name: backend.Name, UID: backend.UID, Controller: &controller}},
+			},
+			Spec: corev1.PodSpec{NodeName: node},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name: lmCacheMPServerStatusContainerName, Ready: ready, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				}},
+			},
+		}
+		if ready {
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		}
+		setNodeLocalShmIdentity(t, backend, pod)
+		return pod
+	}
+	enginePod := func(name, node string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: "ns1", Labels: map[string]string{"app": "sglang"},
+				Annotations: map[string]string{
+					enginebinding.AnnotationInjectedBy:         "ns1/cache",
+					enginebinding.AnnotationInjectedByUID:      string(backend.UID),
+					enginebinding.AnnotationInjectedGeneration: "3",
+				},
+			},
+			Spec:   corev1.PodSpec{NodeName: node},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+		}
+	}
+	objects := []client.Object{
+		backend,
+		serverPod("server-a", "node-a", true), serverPod("server-b", "node-b", true),
+		enginePod("engine-a1", "node-a"), enginePod("engine-a2", "node-a"), enginePod("engine-b1", "node-b"),
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &corev1.Pod{}).
+		WithObjects(objects...).Build()
+	r := &CacheBackendReconciler{Client: c, APIReader: c}
+	r.refreshLMCacheMPConnectorStatus(ctx, backend)
+
+	var got cachev1alpha1.CacheBackend
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns1", Name: "cache"}, &got); err != nil {
+		t.Fatalf("get backend: %v", err)
+	}
+	if got.Status.Connector == nil || got.Status.Connector.DesiredServers != 2 || got.Status.Connector.ReadyServers != 2 ||
+		got.Status.Connector.MatchedEnginePods != 3 || got.Status.Connector.CoveredEnginePods != 3 || got.Status.Connector.ReadyEnginePods != 3 {
+		t.Fatalf("NodeLocal connector status = %+v", got.Status.Connector)
+	}
+	if len(got.Status.Connector.EnginePodCoverage) != 3 || got.Status.Connector.EnginePodCoverage[0].Name != "engine-a1" ||
+		!got.Status.Connector.EnginePodCoverage[0].Covered || got.Status.Connector.EnginePodCoverage[2].NodeName != "node-b" {
+		t.Fatalf("NodeLocal engine pod coverage = %+v", got.Status.Connector.EnginePodCoverage)
+	}
+	condition := meta.FindStatusCondition(got.Status.Conditions, conditionTypeConnectorReady)
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("ConnectorReady = %+v", condition)
+	}
+
+	// Losing only node-a's server uncovers both node-a engines while the
+	// node-b engine remains covered; coverage never falls back to another node.
+	var serverA corev1.Pod
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns1", Name: "server-a"}, &serverA); err != nil {
+		t.Fatalf("get server-a: %v", err)
+	}
+	serverA.Status.ContainerStatuses[0].Ready = false
+	serverA.Status.Conditions = nil
+	if err := c.Status().Update(ctx, &serverA); err != nil {
+		t.Fatalf("mark server-a unready: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns1", Name: "cache"}, backend); err != nil {
+		t.Fatalf("refresh backend: %v", err)
+	}
+	r.refreshLMCacheMPConnectorStatus(ctx, backend)
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns1", Name: "cache"}, &got); err != nil {
+		t.Fatalf("get degraded backend: %v", err)
+	}
+	if got.Status.Connector.CoveredEnginePods != 1 || got.Status.Connector.UncoveredEnginePods != 2 || got.Status.Connector.ReadyServers != 1 {
+		t.Fatalf("same-node degraded coverage = %+v", got.Status.Connector)
+	}
+}
+
+func TestNodeLocalHostPortConflictReason(t *testing.T) {
+	pod := &corev1.Pod{Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+		Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable,
+		Message: "0/2 nodes are available: 2 node(s) didn't have free ports for the requested pod ports",
+	}}}}
+	if !nodeLocalHostPortConflict(pod) {
+		t.Fatal("scheduler host-port conflict was not classified")
+	}
+}
+
+func TestRefreshLMCacheNodeLocalConnectorStatusFailureModes(t *testing.T) {
+	tests := []struct {
+		name             string
+		mutate           func(*cachev1alpha1.CacheBackend, *[]*corev1.Pod, *corev1.Pod)
+		wantCondition    string
+		wantCoverage     string
+		wantReadyServers int32
+		noEngine         bool
+	}{
+		{
+			name: "no selected engines", mutate: func(_ *cachev1alpha1.CacheBackend, _ *[]*corev1.Pod, _ *corev1.Pod) {},
+			wantCondition: reasonNoEnginePods, wantReadyServers: 0, noEngine: true,
+		},
+		{
+			name: "engine has not been admitted with current identity",
+			mutate: func(_ *cachev1alpha1.CacheBackend, _ *[]*corev1.Pod, engine *corev1.Pod) {
+				engine.Annotations[enginebinding.AnnotationInjectedGeneration] = "2"
+			},
+			wantCondition: reasonConnectorUnverified, wantCoverage: reasonConnectorUnverified, wantReadyServers: 1,
+		},
+		{
+			name: "engine is not scheduled",
+			mutate: func(_ *cachev1alpha1.CacheBackend, _ *[]*corev1.Pod, engine *corev1.Pod) {
+				engine.Spec.NodeName = ""
+			},
+			wantCondition: reasonNodeLocalPoolPending, wantCoverage: "EngineSchedulingPending", wantReadyServers: 0,
+		},
+		{
+			name: "worker capacity exceeded",
+			mutate: func(backend *cachev1alpha1.CacheBackend, _ *[]*corev1.Pod, _ *corev1.Pod) {
+				backend.Spec.LMCache.NodeLocal.Server.MaxGPUWorkers = 0
+			},
+			wantCondition: reasonNodeLocalWorkerCapacity, wantCoverage: reasonNodeLocalWorkerCapacity, wantReadyServers: 1,
+		},
+		{
+			name: "server is missing UID-scoped shared-memory identity",
+			mutate: func(_ *cachev1alpha1.CacheBackend, servers *[]*corev1.Pod, _ *corev1.Pod) {
+				delete((*servers)[0].Annotations, enginebinding.AnnotationNodeLocalShmName)
+			},
+			wantCondition: reasonNodeLocalPoolPending, wantCoverage: reasonMPServersNotReady, wantReadyServers: 0,
+		},
+		{
+			name: "ambiguous ready servers on one node",
+			mutate: func(_ *cachev1alpha1.CacheBackend, servers *[]*corev1.Pod, _ *corev1.Pod) {
+				duplicate := (*servers)[0].DeepCopy()
+				duplicate.Name = "server-duplicate"
+				*servers = append(*servers, duplicate)
+			},
+			wantCondition: reasonNodeLocalAmbiguousServers, wantCoverage: reasonNodeLocalAmbiguousServers, wantReadyServers: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			backend := nodeLocalBackend("cache", "ns1")
+			backend.Generation = 3
+			backend.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "engine"}}
+			controller := true
+			server := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "server", Namespace: "ns1",
+					Labels: map[string]string{enginebinding.LabelLMCacheNodeLocalServer: "true", enginebinding.LabelCacheBackendUID: string(backend.UID)},
+					Annotations: map[string]string{
+						enginebinding.AnnotationNodeLocalOwner: "ns1/cache", enginebinding.AnnotationNodeLocalOwnerUID: string(backend.UID),
+						enginebinding.AnnotationNodeLocalGeneration: "3", enginebinding.AnnotationNodeLocalTargetNode: "node-a",
+					},
+					OwnerReferences: []metav1.OwnerReference{{APIVersion: cachev1alpha1.GroupVersion.String(), Kind: "CacheBackend", Name: backend.Name, UID: backend.UID, Controller: &controller}},
+				},
+				Spec: corev1.PodSpec{NodeName: "node-a"},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning,
+					Conditions:        []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+					ContainerStatuses: []corev1.ContainerStatus{{Name: lmCacheMPServerStatusContainerName, Ready: true, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}},
+				},
+			}
+			setNodeLocalShmIdentity(t, backend, server)
+			servers := []*corev1.Pod{server}
+			engine := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: "ns1", Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{
+					enginebinding.AnnotationInjectedBy: "ns1/cache", enginebinding.AnnotationInjectedByUID: string(backend.UID), enginebinding.AnnotationInjectedGeneration: "3",
+				}},
+				Spec:   corev1.PodSpec{NodeName: "node-a"},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+			}
+			tt.mutate(backend, &servers, engine)
+			objects := []client.Object{backend}
+			if !tt.noEngine {
+				objects = append(objects, engine)
+			}
+			for _, server := range servers {
+				objects = append(objects, server)
+			}
+			c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &corev1.Pod{}).WithObjects(objects...).Build()
+			r := &CacheBackendReconciler{Client: c, APIReader: c}
+			r.refreshLMCacheNodeLocalConnectorStatus(ctx, backend)
+
+			var got cachev1alpha1.CacheBackend
+			if err := c.Get(ctx, types.NamespacedName{Namespace: "ns1", Name: "cache"}, &got); err != nil {
+				t.Fatalf("get backend: %v", err)
+			}
+			condition := meta.FindStatusCondition(got.Status.Conditions, conditionTypeConnectorReady)
+			if condition == nil || condition.Reason != tt.wantCondition {
+				t.Fatalf("ConnectorReady = %+v, want reason %s", condition, tt.wantCondition)
+			}
+			if got.Status.Connector == nil || got.Status.Connector.ReadyServers != tt.wantReadyServers {
+				t.Fatalf("connector status = %+v, want coverage reason %s and %d ready servers", got.Status.Connector, tt.wantCoverage, tt.wantReadyServers)
+			}
+			if tt.noEngine {
+				if len(got.Status.Connector.EnginePodCoverage) != 0 {
+					t.Fatalf("unexpected engine coverage = %+v", got.Status.Connector.EnginePodCoverage)
+				}
+			} else if len(got.Status.Connector.EnginePodCoverage) != 1 || got.Status.Connector.EnginePodCoverage[0].Reason != tt.wantCoverage {
+				t.Fatalf("engine coverage = %+v, want reason %s", got.Status.Connector.EnginePodCoverage, tt.wantCoverage)
+			}
+		})
+	}
+}
+
+func TestRefreshLMCacheNodeLocalConnectorStatusIncompleteObjectIsFailSoft(t *testing.T) {
+	backend := nodeLocalBackend("cache", "ns1")
+	backend.Spec.LMCache.NodeLocal.Server = nil
+	r := &CacheBackendReconciler{}
+	r.refreshLMCacheNodeLocalConnectorStatus(context.Background(), backend)
+	if backend.Status.Connector != nil {
+		t.Fatalf("incomplete admission-bypassed object unexpectedly received connector status: %+v", backend.Status.Connector)
 	}
 }
 

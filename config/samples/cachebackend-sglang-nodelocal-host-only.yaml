@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Typed SGLang NodeLocal LMCache MP. SGLang engine Pods must explicitly declare
+# --page-size as a divisor of chunkSizeTokens and use TP=1 for the currently
+# validated profile. The controller follows selected engines onto their scheduled
+# nodes and never rewrites engine placement. The 5556/8081 host-port pair is
+# intentionally disjoint from the sibling vLLM sample if both backends have
+# engines on the same node. Set scheduling.runtimeClassName when the engine's
+# runtime does not provide the server's required NVIDIA visibility.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: sglang-nodelocal-host-only
+spec:
+  runtime: SGLang
+  type: LMCache
+  integration:
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      inferencecache.io/cache-domain: sglang-node-mp
+  lmCache:
+    topology: NodeLocal
+    chunkSizeTokens: 256
+    nodeLocal:
+      idleRetentionSeconds: 300
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5556
+        httpPort: 8081
+        l1Capacity: 32Gi
+        maxGPUWorkers: 4
+        maxCPUWorkers: 4
+        resources:
+          requests:
+            cpu: "2"
+            memory: 33Gi
+          limits:
+            cpu: "4"
+            memory: 34Gi
+  observation:
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct

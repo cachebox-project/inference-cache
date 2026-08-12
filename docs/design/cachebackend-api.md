@@ -3,8 +3,9 @@
 Status: implemented · Tracks: InferenceCache tech spec §4.1 · API group: `inferencecache.io/v1alpha1`
 
 > **Current production contract:** LMCache uses typed
-> `spec.lmCache.topology: PodLocal` multiprocess wiring for both vLLM and
-> SGLang, with optional Redis selected explicitly. References to topology-less
+> `spec.lmCache.topology: PodLocal|NodeLocal` multiprocess wiring for both vLLM
+> and SGLang, with optional Redis selected explicitly. NodeLocal control-plane
+> support and its required SJC GPU matrix were completed in Phase 8. References to topology-less
 > LMCacheServer, the former IP-wired Mooncake provider, `lm://`, and the IP
 > connector are explicitly marked history for behavior physically removed in
 > Phase 7. Mooncake remains a planned typed MP L2 provider; it is not available
@@ -133,7 +134,7 @@ and [`config/samples/cachebackend-external.yaml`](../../config/samples/cacheback
 |---|---|---|
 | `runtime` | enum | Required inference runtime: `VLLM` or `SGLang`. Values are case-sensitive. |
 | `type` | enum | Engine-side cache implementation: `LMCache` or `SGLangHiCache`. Defaults to `LMCache`. |
-| `lmCache` | object | Typed LMCache MP configuration: topology, chunk size, and PodLocal server image/port/L1/resources. |
+| `lmCache` | object | Typed LMCache MP configuration: topology, chunk size, and PodLocal or NodeLocal server contract. |
 | `remoteStorage` | object | Optional remote tier. Omitting it means host-only and provisions no provider workload. |
 | `remoteStorage.provider` | enum | Current MP provider: `Redis`. |
 | `remoteStorage.ownership` | enum | `Managed` or `External`. |
@@ -143,9 +144,9 @@ and [`config/samples/cachebackend-external.yaml`](../../config/samples/cacheback
 | `observation` | object | Observation-owned `modelID` and `firstEventTimeout`. |
 | `integration.mode` | enum | Which cache tiers the engine is wired for: `Offload` (default) or `EventsOnly`. `Offload` is full participation — cache-aware routing (tier-1) plus the KV-offload connector (tier-2). It may remain host-only, connect to externally owned remote storage, or provision a provider workload when `remoteStorage.ownership` is `Managed`. `EventsOnly` wires routing only: the kvevent-subscriber sidecar is injected when the controller runs with `--kvevent-subscriber-image` set and `observation.modelID` is present; otherwise the append is skipped fail-open. No KV connector or backend server is created. See [Events-only mode](#events-only-mode-specintegrationmode--eventsonly). |
 | `integration.role` | enum | Engine participation mode: `ReadOnly`, `WriteOnly`, or `ReadWrite`. Defaults to `ReadWrite`. LMCache currently admits only `ReadWrite`; directional roles remain reserved for a connector that demonstrably enforces them. |
-| `integration.failOpen` | boolean | Default `true`. Remote L3 failure is soft by default and the PodLocal MP server can continue L1-only. The co-scheduled `lmcache-mp-server` is part of the required connector path for both vLLM and SGLang, so `failOpen` does not turn a missing or broken PodLocal server into a cacheless engine launch. Setting `false` makes remote storage a serving dependency and is surfaced as a Warning Event. |
+| `integration.failOpen` | boolean | Default `true`. Remote L3 failure is soft by default and the MP server can continue L1-only. The PodLocal native sidecar or NodeLocal same-node server Pod is part of the required connector path, so `failOpen` does not turn a missing server into a cacheless injected engine launch. Setting `false` makes remote storage a serving dependency and is surfaced as a Warning Event. |
 | `integration.engineOverrides` | object | Optional engine-injection overrides applied to the args/env the pod-mutating webhook would otherwise inject into the engine container. See [Engine-injection overrides](#engine-injection-overrides-specintegrationengineoverrides). |
-| `engineSelector.matchLabels` | map | Equality-based label selector matched against engine **pod** labels (the pod template's `metadata.labels`, not Deployment, DaemonSet, or any other workload-level labels). Every key/value here must appear on the pod for it to match. `matchExpressions` is intentionally not exposed in v1alpha1 — the surface is `matchLabels` only. |
+| `engineSelector.matchLabels` | map | Canonical engine ownership selector matched against **pod-template** labels. A non-empty map must contain exactly one entry, `inferencecache.io/cache-domain: <domain>`, and that value must be unique among CacheBackends in the namespace. Engine Pods may carry other labels, but those labels do not participate in CacheBackend ownership. CREATE and UPDATE both enforce this shape. `matchExpressions` is not exposed. |
 | `hiCache` | object | Typed SGLang native HiCache configuration. Required only for `type: SGLangHiCache`; see [SGLang native HiCache](#sglang-native-hicache). |
 | `allowCrossNamespace` | boolean | Opt-in flag that allows `spec.remoteStorage.endpoint` to resolve to a Kubernetes Service in a different namespace from the CacheBackend itself. Without it, admission rejects cross-namespace Service-DNS endpoints. External hostnames and IPs are unaffected. Defaults to `false`. |
 
@@ -158,7 +159,8 @@ and [`config/samples/cachebackend-external.yaml`](../../config/samples/cacheback
 ### Resources
 
 Current resources live with the workload owner:
-`lmCache.podLocal.server.resources` for the MP native sidecar and
+`lmCache.podLocal.server.resources` for the MP native sidecar,
+`lmCache.nodeLocal.server.resources` for every active-node server Pod, and
 `remoteStorage.redis.resources` for managed Redis. The Redis renderer
 deep-copies the selected block onto its managed container.
 
@@ -198,16 +200,17 @@ Limits-only shapes admit unchanged for any resource — K8s auto-populates `requ
 
 **Resource names must match K8s container-resource rules.** `ResourceList` keys are opaque map keys at the CRD-schema layer; an invalid name like `"foo"` or `""` persists in etcd and only fails when the apiserver later rejects the child pod. The validating webhook (`rejectInvalidResourceNames`) applies the same rules the apiserver applies to a `Container.Resources` map: standard names (`cpu`, `memory`, `ephemeral-storage`) admit unconditionally; a `hugepages-<size>` name admits only when the size suffix parses as a strictly-positive `resource.Quantity` (e.g. `"hugepages-2Mi"`, `"hugepages-1Gi"` — a bare `"hugepages-"` or non-numeric `"hugepages-nope"` is rejected because the apiserver requires the size token); any other name must be **third-party vendor-prefixed** (e.g. `"nvidia.com/gpu"`) and pass `IsQualifiedName`. A bare unqualified `"foo"` is rejected even though `IsQualifiedName` alone admits it, because the apiserver's container-resource layer requires extended resources to carry a vendor identity. Names under the **K8s-reserved prefixes `kubernetes.io/` and `requests.kubernetes.io/`** are also rejected — those prefixes are reserved for native resources, so extended resources may not use them. The rejection names the offending key so multi-key errors surface together.
 
-**Inert without a controller-managed workload.** Host-only, externally owned,
-and `SGLangHiCache` configurations provision no provider Deployment or Service.
-Typed PodLocal LMCache still injects its server into each matching engine Pod as
-a native sidecar. HiCache host memory belongs to the user-owned engine container
-and must be sized on that workload instead.
+**Provider lifecycle is independent.** Host-only and externally owned LMCache
+configurations provision no provider Deployment or Service. PodLocal injects a
+server into each matching engine Pod; NodeLocal follows scheduled selected
+engines and reconciles one direct server Pod per active node, but never creates
+a load-balanced MP Service. SGLangHiCache provisions neither. HiCache host
+memory belongs to the user-owned engine container.
 
-### vLLM typed PodLocal LMCache MP support
+### vLLM typed LMCache MP support
 
 The typed shape `spec.runtime: VLLM`, `spec.type: LMCache`, and
-`spec.lmCache.topology: PodLocal` selects a dedicated MP adapter; it does not
+`spec.lmCache.topology: PodLocal|NodeLocal` selects a dedicated MP adapter; it does not
 reuse the legacy `LMCacheConnectorV1` / `lm://` path. The engine image remains
 owned by the inference runtime. No connector-profile annotation or image
 allowlist is required: this CacheBackend shape is the only enablement switch.
@@ -216,12 +219,16 @@ wire. The engine's normal initialization loads the connector and fails before
 serving if its image does not contain a compatible LMCache client/API;
 admission does not pull, execute, or otherwise introspect the engine image.
 
-The webhook injects a digest-pinned `lmcache-mp-server` native sidecar and adds
-the following vLLM launch contract:
+For PodLocal the webhook injects a digest-pinned `lmcache-mp-server` native
+sidecar. For NodeLocal it preserves engine placement, mounts host `/dev/shm`,
+and adds a blocking identity/health gate while the controller follows the
+scheduled engine with a same-node server Pod. Both add the following vLLM
+launch contract:
 
 - `--kv-transfer-config` selects `LMCacheMPConnector` through
   `lmcache.integration.vllm.lmcache_mp_connector`, points it at
-  `tcp://127.0.0.1:<podLocal.server.port>`, and sets `kv_role: kv_both` for the
+  `tcp://127.0.0.1:<podLocal.server.port>` or the Downward-API-derived
+  `tcp://<status.hostIP>:<nodeLocal.server.port>`, and sets `kv_role: kv_both` for the
   only currently admitted LMCache role, `ReadWrite`;
 - `--disable-hybrid-kv-cache-manager` is required by the initial validated
   integration;
@@ -236,8 +243,8 @@ because that RESP adapter cannot consume them. The initial adapter admits TP
 but rejects PP/DP greater than one and external multi-process DP flags. These
 checks and persisted webhook injection are covered without GPU; the pinned
 vLLM image/version, KV reuse, TP determinism, and failure recovery remain Phase
-4 runtime gates. Canonical examples are the three
-`config/samples/cachebackend-vllm-podlocal-*.yaml` files.
+4 runtime gates. Canonical examples are the three PodLocal profiles plus
+`config/samples/cachebackend-vllm-nodelocal-host-only.yaml`.
 
 For both typed vLLM and SGLang PodLocal adapters, `l1Capacity` is the usable L1
 target, not the complete container budget. The common renderer creates a
@@ -248,6 +255,46 @@ memory-backed `emptyDir` with a `sizeLimit` at least as large as that budget.
 This keeps scheduling/cgroup accounting aligned with the tmpfs and leaves room
 for LMCache metadata and shared-memory allocator overhead.
 
+For NodeLocal, `l1Capacity` is instead one shared per-node budget. CacheBackend
+creation alone creates no server and never changes engine placement. After an
+injected engine has been scheduled, the controller owns one host-networked
+server Pod for each distinct active engine node, declares the MP and FastAPI
+listeners as host ports, and mounts the node's `/dev/shm` into both the server
+and selected engine Pods. Exact node-name affinity sends the server through the
+normal scheduler on the engine's node; `status.hostIP` prevents ClusterIP or
+cross-node CUDA IPC. `maxGPUWorkers` must cover all selected engine instances on
+one node. Every server receives the controller-derived
+`lmcache_l1_pool_inferencecache_<cacheBackendUID>` through `--shm-name`; the
+engine gate verifies both the declared MP value and the effective L1
+memory-manager value before startup. Different CacheBackend UIDs therefore do
+not accidentally unlink or rebind the same POSIX SHM object. The server sets
+`NVIDIA_VISIBLE_DEVICES=all` but requests no
+allocatable GPU. It inherits the source engine's runtime class, tolerations,
+image-pull secrets, priority class, and scheduler unless optional
+`nodeLocal.scheduling` server overrides are supplied. The FastAPI/MP listeners
+are unauthenticated and host networking bypasses NetworkPolicy, so this topology
+requires one trusted tenant domain per pool plus node firewall controls.
+CacheBackend name/UID/generation verification detects wrong ownership but is
+not cryptographic authentication, and unique names do not isolate hostile
+processes that already have compatible access to host `/dev/shm`. Co-located
+pools therefore remain limited to one trusted node domain. After the last
+selected engine leaves a
+node, `nodeLocal.idleRetentionSeconds` keeps the server and shared L1 warm for
+the configured window (300 seconds by default); new demand on that node reuses
+the same Pod. Set it to zero for immediate deletion. A retained Pod continues
+to reserve its declared host ports, so another NodeLocal backend using the same
+pair remains in the normal Kubernetes host-port conflict path until expiry.
+
+NodeLocal ports are explicit rather than dynamically allocated. Engine Pods
+are immutable and receive their endpoint during admission, before the
+on-demand server exists; Kubernetes dynamically allocates Service node ports,
+not direct Pod host ports, and a Service is not a valid CUDA MP endpoint. A
+CacheBackend also declares one runtime, so vLLM and SGLang never share one
+server pool. The selector must describe one runtime/model/cache-layout and
+trust domain; different prompts within that domain are separated by LMCache KV
+keys, while a different model, runtime, package baseline, or tenant needs a
+separate backend with disjoint ports on shared nodes.
+
 ### SGLang engine support
 
 SGLang supports two peer cache integrations:
@@ -256,6 +303,7 @@ SGLang supports two peer cache integrations:
 |---|---|---|
 | `(SGLang, LMCache)` without `remoteStorage` | PodLocal LMCache MP server, host-only | Native sidecar in each selected engine Pod |
 | `(SGLang, LMCache)` with Managed Redis | PodLocal LMCache MP server with a shared Redis remote tier | Native sidecar plus Redis Deployment and Service |
+| `(SGLang, LMCache)` with `topology: NodeLocal` | Same-node shared LMCache MP server | One CacheBackend-owned server Pod per active engine node; optional Redis remains independent |
 | `(sglang, SGLangHiCache)` | Native engine-local host cache | None |
 
 #### SGLang LMCache MP mode
@@ -317,12 +365,17 @@ The old lm:// `LMCACHE_REMOTE_URL` / serde / chunk-size / local-CPU env is
 | Field | Default | Bounds | Purpose |
 |---|---|---|---|
 | `lmCache.chunkSizeTokens` | `256` | `>=1` | Server chunk size and client config. |
-| `lmCache.topology` | required | `PodLocal` | `NodeLocal` is a future shape and is rejected. |
+| `lmCache.topology` | required | `PodLocal`, `NodeLocal` | Chooses native-sidecar or engine-demanded per-node server placement. |
 | `lmCache.podLocal.server.image` | required | digest-pinned reference | Independently owned LMCache server image; never copied from or into the engine image. |
 | `lmCache.podLocal.server.port` | required | `1`–`65535` | Loopback MP port. |
 | `lmCache.podLocal.server.l1Capacity` | required | positive quantity | Usable L1; `/dev/shm` and memory resources must cover this plus 1Gi. |
 | `lmCache.podLocal.server.maxWorkers` | required | `>=1` | Server worker bound. |
 | `lmCache.podLocal.server.resources` | required | validated K8s resources | Positive CPU request and sufficient memory request/limit. |
+| `lmCache.nodeLocal.server.{image,port,httpPort}` | required | digest plus distinct ports | One server image/config and real node-bound listeners for the pool. |
+| `lmCache.nodeLocal.server.l1Capacity` | required | positive quantity | Shared L1 budget per active engine node; memory request/limit cover it plus 1Gi. |
+| `lmCache.nodeLocal.server.{maxGPUWorkers,maxCPUWorkers}` | required | `>=1` | Shared per-server worker bounds. |
+| `lmCache.nodeLocal.idleRetentionSeconds` | `300` | `0`–`86400` | Warm retention after the last selected engine leaves a node; `0` deletes immediately. |
+| `lmCache.nodeLocal.scheduling` | optional | server operational overrides | May override tolerations, image-pull secrets, ServiceAccount, Pod security context, priority/scheduler, runtime class, and termination grace on server Pods. It does not expose node selection or mutate engine placement. |
 
 Deliberately **not** injected for SGLang (a real engine difference, not an omission): `VLLM_USE_V1` (a vLLM-internal codepath with no SGLang analogue) and `PYTHONHASHSEED` (vLLM pins it to stabilise its builtin-`hash()`-seeded block-hash chain across TP workers; SGLang derives its prefix hash with `hashlib.sha256` over the token-id bytes, independent of `PYTHONHASHSEED`).
 
@@ -357,7 +410,7 @@ spec:
   type: SGLangHiCache
   engineSelector:
     matchLabels:
-      app: sglang
+      inferencecache.io/cache-domain: sglang-hicache
   hiCache:
     # Exactly one:
     ratio: "2.0"
@@ -625,9 +678,9 @@ The poller attributes each `/snapshot.replicas[]` entry to a single owning `Cach
 
 1. Looks up the engine pod by `(tenant, replicaID)`.
 2. If the pod carries the webhook's `inferencecache.io/injected-by` annotation (stamped as `<namespace>/<name>`), resolves the owning CacheBackend directly. This is the authoritative wiring signal — the engine container was wired to exactly that backend's endpoint.
-3. Otherwise, iterates that namespace's CacheBackends sorted by `metadata.name` and picks the first whose `spec.engineSelector.matchLabels` is non-empty and is a subset of the pod's labels. This mirrors the pod webhook's first-match rule for pods that bypassed the webhook (manual sidecar attachment, opt-out).
+3. Otherwise, iterates that namespace's CacheBackends sorted by `metadata.name` and picks the first whose `spec.engineSelector.matchLabels` is non-empty and is a subset of the pod's labels. This fallback exists only for manually attached subscriber Pods that bypassed normal webhook injection. CacheBackend admission rejects duplicate ownership, and the Pod webhook rejects a fresh Pod with multiple matches rather than using this attribution fallback to choose its connector owner.
 
-Only ONE CacheBackend ever claims a given replica — overlapping selectors must agree on which backend owns the pod, otherwise status would disagree with what the engine was actually wired to. A CacheBackend without an EngineSelector (or with empty `MatchLabels`) is excluded from the selector fallback — otherwise a misconfigured backend would silently claim every replica in its namespace by vacuous truth — but a pod can still be attributed to it via the `injected-by` annotation. A replica whose pod can no longer be found (drained between events and now) is skipped; its data still appears in the cluster-wide `CacheIndex`. A failing scrape preserves existing state (soft-state); a successful scrape that finds no matching replicas resets `prefixCount` to `0` so stale positive values do not survive a drain.
+Every newly admitted engine has exactly one CacheBackend owner. Every non-empty selector contains only the namespace-unique `inferencecache.io/cache-domain` label. The Pod webhook denies runtime ambiguity caused by concurrent CREATE races. A CacheBackend without an EngineSelector (or with empty `MatchLabels`) is excluded from the selector fallback — otherwise a misconfigured backend would silently claim every replica in its namespace by vacuous truth — but a pod can still be attributed to it via the `injected-by` annotation. A replica whose pod can no longer be found (drained between events and now) is skipped; its data still appears in the cluster-wide `CacheIndex`. A failing scrape preserves existing state (soft-state); a successful scrape that finds no matching replicas resets `prefixCount` to `0` so stale positive values do not survive a drain.
 
 ## Contract Notes
 
@@ -662,8 +715,8 @@ autoscaling, provider images, or an engine image.
 Validation aggregates field-scoped violations into one Kubernetes `Invalid`
 response. The current rules enforce:
 
-- a typed LMCache `PodLocal` topology (NodeLocal is published but rejected
-  until Phase 8), a digest-pinned MP-server image, non-colliding ports, and
+- a typed LMCache `PodLocal` or `NodeLocal` topology, a digest-pinned MP-server
+  image, non-colliding ports, explicit NodeLocal placement, and
   sufficient CPU/memory resources;
 - Redis as the only remote provider, with explicit Managed/External ownership,
   a valid External endpoint, provider/config agreement, and only RESP features
@@ -715,8 +768,8 @@ rejects any override or suppression that overlaps those lists:
 
 | Adapter | Reserved args | Reserved env |
 |---|---|---|
-| vLLM typed PodLocal MP | `--kv-transfer-config`, `--disable-hybrid-kv-cache-manager` | `PYTHONHASHSEED`, `INFERENCECACHE_FAIL_OPEN` |
-| SGLang typed PodLocal MP | `--enable-lmcache`, `--lmcache-config-file`, `--enable-metrics` | `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN` |
+| vLLM typed MP | `--kv-transfer-config`, `--disable-hybrid-kv-cache-manager` | `PYTHONHASHSEED`, `INFERENCECACHE_FAIL_OPEN` |
+| SGLang typed MP | `--enable-lmcache`, `--lmcache-config-file`, `--enable-metrics` | `LMCACHE_USE_EXPERIMENTAL`, `INFERENCECACHE_FAIL_OPEN` |
 | SGLangHiCache | its injected HiCache flags | none unless introduced by the adapter |
 
 The removed IP connector environment is neither injected nor part of the
@@ -748,10 +801,10 @@ A separate mutating admission webhook on `corev1/v1.Pod` (`name: mpod.inferencec
 
 | Aspect | Behavior |
 |---|---|
-| Selection | Lists `CacheBackend`s in the pod's namespace via the manager's **APIReader** (uncached live client; an informer-cache miss on a freshly-Ready backend would leave the pod permanently unwired since pod CREATE is a one-shot), then matches `pod.Labels` against each `Spec.EngineSelector.MatchLabels`. The first matching `CacheBackend` wins; one with a nil or empty `EngineSelector` is skipped (a "match-everything" selector would silently claim every pod in the namespace). |
+| Selection | Lists `CacheBackend`s in the pod's namespace via the manager's **APIReader** (uncached live client; an informer-cache miss on a freshly-Ready backend would leave the pod permanently unwired since pod CREATE is a one-shot), then matches `pod.Labels` against each `Spec.EngineSelector.MatchLabels`. Exactly one match is required. Zero matches pass through unmodified; multiple matches deny Pod admission and name every conflicting backend. CacheBackend admission normally prevents this shape; the Pod check closes the concurrent-CREATE race. A nil or empty `EngineSelector` is skipped. |
 | Injection | Resolves the runtime adapter via `runtime.Registry.Select(runtimeID, cache)`, resolves `spec.remoteStorage` independently, and constructs a structured provider `Binding{Protocol, Endpoint}`. Managed ownership uses `status.remoteStorage.endpoint` from the live Service; External ownership uses the trimmed, provider-validated `spec.remoteStorage.endpoint` with no fallback to stale status; omitted `remoteStorage` produces a nil host-only binding. `SupportsBinding` is part of the required runtime adapter interface, and the webhook passes the binding directly to `adapter.InjectEngineConfig`, so the adapter selects host-only MP or the RESP wire from the binding protocol instead of inferring storage from `spec.type`. A non-nil binding with a missing endpoint fails open. Events-only skips engine injection because it wires no KV connector and appends only the kvevent-subscriber sidecar. Adapters preserve existing user args/env and make repeat injection idempotent. |
 | Annotations | Stamps TWO annotations on every successfully mutated pod: `inferencecache.io/injected-by: <namespace>/<name>` (operator-readable identity, shows in `kubectl describe pod`) AND `inferencecache.io/injected-by-uid: <cache.UID>` (the matched CR's metadata.uid). Successful injection also clears any stale `inferencecache.io/inject-skipped` marker. Reads `inferencecache.io/skip-inject: <truthy>` as an opt-out: the webhook returns Allowed, skips engine wiring, clears any stale injected-by/injected-by-uid pair, and stamps `inferencecache.io/inject-skipped: skip-inject-annotation` so explicit operator opt-out is distinguishable from selector drift. On all other fail-open returns after the pod is decoded (list/no match/missing endpoint/adapter errors), the webhook strips stale injected-by/injected-by-uid and inject-skipped annotations so a user cannot trick the events controller by pre-stamping a pod template. Decode failures fail open before a Pod exists to patch, so stale annotations cannot be cleared on that path. |
 | Events | The webhook itself does NOT record events (the apiserver assigns `metadata.uid` after mutating admission, so a webhook-recorded event would carry `involvedObject.uid=""` and be invisible to `kubectl describe pod`). Instead, the pod-watching `engine-pod-events` controller reads the persisted decision annotations after CREATE. For injected pods, it validates `inferencecache.io/injected-by-uid` against the live CR's `metadata.uid` and records a `Normal InjectedByCacheBackend` event on the now-persisted pod. For explicitly skipped pods carrying both a truthy `inferencecache.io/skip-inject` and `inferencecache.io/inject-skipped: skip-inject-annotation`, it records a `Normal SkippedByOperator` event on that pod. The skip marker is not authenticated, and `skipInjection` treats a pre-existing correct marker as already converged; `SkippedByOperator` therefore means the persisted pod carries the explicit opt-out plus skipped marker, not proof that the webhook authored the marker. The UID match REDUCES — but does NOT eliminate — the failurePolicy=Ignore forgery surface for injected pods: a casual copy-paste of an injected pod's annotations into a fresh template won't match the live CR's UID, but `metadata.uid` is not secret, so a pod creator with `get` RBAC on CacheBackends can read it and stamp the pair correctly. The injected Event signals "the webhook claims this pod was injected and the claim is consistent with the live CR," not "the webhook was cryptographically authenticated." The controller skips the injected event when the CR is missing, the UID annotation is absent, or the UID does not match — see the controller godoc for the full skip table. controller-runtime's EventBroadcaster aggregates duplicates on the apiserver side, so a re-enqueue across controller restarts upserts the existing event rather than spamming. |
 | Idempotency | The handler calls the adapter unconditionally on every admission and trusts the adapter to converge the full injected contract. For LMCache this is env plus the engine-specific required surface — `--kv-transfer-config` for vLLM; for SGLang `--enable-lmcache` + `--lmcache-config-file` **plus** the MP-worker native sidecar and the shared config / `/dev/shm` volumes + mounts. Its merge primitives (`upsertEnv` / `upsertArgPair` / `upsertFlag`, and for SGLang `adoptContainer` / `adoptVolume` / `upsertMountByName`) converge on the desired value rather than appending a duplicate. The SGLang `adopt*` pair additionally distinguishes the adapter's own prior injection (converge) from an operator's object squatting a reserved name (reject → fail-open admit) — see [Names the MP wire reserves](#sglang-engine-support). Native HiCache validates all reserved arguments against the original pod before mutation, preserves one matching or well-formed operator-supplied value, appends each missing canonical argument once, and rejects conflicts, malformed values, or duplicates without partially changing the pod. Re-admission of a fully-injected pod therefore produces an empty JSON-patch set. Trusting the adapter rather than a handler-side env-presence shortcut avoids the trap where a partially-injected pod is admitted permanently missing the rest of the contract. |
-| Fail-open | Every error path (decode failure, list error, no matching backend, missing managed `status.remoteStorage.endpoint`, no registered adapter, adapter rejection, re-encode failure) returns `admission.Allowed(...)` with a reason — webhook errors MUST NOT block engine admission. `MutatingWebhookConfiguration.failurePolicy` is also pinned to `Ignore` as a belt-and-suspenders second layer. |
+| Fail-open | Operational paths (decode/list errors, no matching backend, missing managed `status.remoteStorage.endpoint`, no registered adapter, adapter rejection, re-encode failure) return `admission.Allowed(...)` with a reason. Selector ambiguity is the intentional exception: a live webhook denies the Pod rather than choosing an unintended cache trust domain. `MutatingWebhookConfiguration.failurePolicy=Ignore` still protects engine availability during webhook transport outages; the CacheBackend validating webhook has `failurePolicy=Fail` and rejects overlapping selectors in the normal path. |
 | Verbs | `CREATE` only. UPDATE re-admissions to a running pod don't re-inject (and the engine container can't pick up env changes without a restart anyway); UPDATEs to engine pods are rare in this fleet. |

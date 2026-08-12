@@ -790,6 +790,36 @@ func TestEnginePodInjectionAudit(t *testing.T) {
 		t.Errorf("expected exactly 5 findings (one per matching pod), got %v", codesOf(fs))
 	}
 
+	t.Run("overlapping selectors report ambiguity without choosing a winner", func(t *testing.T) {
+		broad := backend.DeepCopy()
+		broad.Name = "alpha"
+		broad.UID = "alpha-uid"
+		narrow := backend.DeepCopy()
+		narrow.Name = "beta"
+		narrow.UID = "beta-uid"
+		narrow.Spec.EngineSelector.MatchLabels = map[string]string{"app": "engine", "model": "qwen"}
+		ambiguous := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name:      "ambiguous",
+			Namespace: "ns1",
+			UID:       "ambiguous-uid",
+			Labels:    map[string]string{"app": "engine", "model": "qwen"},
+			Annotations: map[string]string{
+				annotationInjectedBy:    "ns1/alpha",
+				annotationInjectedByUID: "alpha-uid",
+			},
+		}}
+		fs := EnginePodInjectionAudit(ctx, fakeClient(t, broad, narrow, ambiguous), "")
+		if len(fs) != 1 {
+			t.Fatalf("want one ambiguity finding, got %+v", fs)
+		}
+		if fs[0].Code != doctor.CodeEngineSelectorAmbiguous || fs[0].Status != doctor.StatusWarn {
+			t.Fatalf("want EP003 WARN, got %+v", fs[0])
+		}
+		if !strings.Contains(fs[0].Message, "alpha") || !strings.Contains(fs[0].Message, "beta") {
+			t.Fatalf("ambiguity message must name both backends: %q", fs[0].Message)
+		}
+	})
+
 	t.Run("backend list error", func(t *testing.T) {
 		c := listErrClient{Client: fakeClient(t), failOn: func(l client.ObjectList) bool {
 			_, ok := l.(*cachev1alpha1.CacheBackendList)

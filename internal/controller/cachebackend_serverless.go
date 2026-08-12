@@ -111,7 +111,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		}
 		remoteStatus := readyStatus
 		setRemoteStorageStatus(backend, endpoint, remoteStatus, remoteReason, remoteMessage, backend.Generation)
-		if isTypedLMCachePodLocal(backend) {
+		if isTypedLMCacheMP(backend) {
 			readyStatus, readyReason, readyMsg = lmCacheMPReadyBase(backend, remoteStatus, remoteReason, remoteMessage)
 		}
 		progressingStatus, progressingReason, progressingMessage := progressingFromReady(readyStatus, readyReason, readyMsg)
@@ -263,7 +263,7 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 		// available merely because it has no separately managed workload: wait
 		// for the connector observation, otherwise a Pod that appears after the
 		// timeout window would be declared NoKVEventsObserved immediately.
-		canAnchorAvailability := eventsOnly || !isTypedLMCachePodLocal(backend) || baseStatus == metav1.ConditionTrue
+		canAnchorAvailability := eventsOnly || !isTypedLMCacheMP(backend) || baseStatus == metav1.ConditionTrue
 		if transitionedFromServerMode && !canAnchorAvailability {
 			backend.Status.FirstAvailableAt = nil
 		} else if canAnchorAvailability && (backend.Status.FirstAvailableAt == nil || transitionedFromServerMode) {

@@ -40,11 +40,12 @@ PVC**:
    volume mounted on the server pod. Provisioning a PVC for that server would
    mount storage nothing writes KV to.
 2. **LMCache's only on-server local-disk path is node-local.** Its MP-mode (the
-   L2 NIXL POSIX backend writing to a `file_path`) is documented to deploy as a
-   DaemonSet with `hostNetwork` and a shared host `/dev/shm`, where the control
-   socket is ZMQ-only and KV bytes move over CUDA-IPC or POSIX shared memory. A
-   server reachable only through a ClusterIP Service therefore has **no data
-   plane** in that mode, and the mode is **per-node, not per-`CacheBackend`**.
+   L2 NIXL POSIX backend writing to a `file_path`) requires `hostNetwork` and a
+   shared host `/dev/shm`, where the control socket is ZMQ-only and KV bytes move
+   over CUDA-IPC or POSIX shared memory. A server reachable only through a
+   ClusterIP Service therefore has **no data plane** in that mode. The current
+   implementation creates one directly scheduled server Pod per active engine
+   node and CacheBackend; multiple pools on one node require disjoint host ports.
 
 MP-mode is thus incompatible with this project's per-backend Deployment +
 ClusterIP, engines-anywhere model.

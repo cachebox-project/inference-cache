@@ -12,7 +12,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
@@ -83,6 +85,136 @@ func TestSetupCacheBackendWebhookRequiresRegistry(t *testing.T) {
 	}
 }
 
+func TestValidatorRejectsOverlappingEngineSelectorsInNamespace(t *testing.T) {
+	existing := newBackend()
+	existing.Name = "broad"
+	existing.Namespace = "team-a"
+	existing.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+
+	tests := []struct {
+		name     string
+		selector map[string]string
+		wantErr  bool
+	}{
+		{name: "same domain", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}, wantErr: true},
+		{name: "different domain is disjoint", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "sglang"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := newBackend()
+			candidate.Name = "candidate"
+			candidate.Namespace = "team-a"
+			candidate.Spec.EngineSelector.MatchLabels = tc.selector
+			_, err := selectorValidator(t, existing).ValidateCreate(context.Background(), candidate)
+			if tc.wantErr {
+				if err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "already owned") {
+					t.Fatalf("ValidateCreate error = %v, want overlapping-selector Invalid", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ValidateCreate rejected disjoint selector: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidatorEngineSelectorOverlapIsNamespaceScoped(t *testing.T) {
+	existing := newBackend()
+	existing.Name = "other-namespace"
+	existing.Namespace = "team-b"
+	existing.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	candidate := newBackend()
+	candidate.Name = "candidate"
+	candidate.Namespace = "team-a"
+	candidate.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	if _, err := selectorValidator(t, existing).ValidateCreate(context.Background(), candidate); err != nil {
+		t.Fatalf("same selector in another namespace rejected: %v", err)
+	}
+}
+
+func TestValidatorRejectsUpdateThatIntroducesSelectorOverlap(t *testing.T) {
+	existing := newBackend()
+	existing.Name = "existing"
+	existing.Namespace = "team-a"
+	existing.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	oldCB := newBackend()
+	oldCB.Name = "candidate"
+	oldCB.Namespace = "team-a"
+	oldCB.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "sglang"}
+	newCB := oldCB.DeepCopy()
+	newCB.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+
+	_, err := selectorValidator(t, existing).ValidateUpdate(context.Background(), oldCB, newCB)
+	if err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("ValidateUpdate error = %v, want newly-overlapping selector Invalid", err)
+	}
+}
+
+func TestValidatorRejectsUnrelatedUpdateWhileSelectorOverlapExists(t *testing.T) {
+	existing := newBackend()
+	existing.Name = "existing"
+	existing.Namespace = "team-a"
+	existing.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	oldCB := newBackend()
+	oldCB.Name = "candidate"
+	oldCB.Namespace = "team-a"
+	oldCB.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	newCB := oldCB.DeepCopy()
+	newCB.Labels = map[string]string{"maintenance": "requested"}
+
+	_, err := selectorValidator(t, existing).ValidateUpdate(context.Background(), oldCB, newCB)
+	if err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("unrelated update error = %v, want existing overlap to remain blocked", err)
+	}
+}
+
+func TestValidatorRequiresSoleCacheDomainSelector(t *testing.T) {
+	tests := []struct {
+		name     string
+		selector map[string]string
+		want     string
+	}{
+		{name: "app selector is not an ownership domain", selector: map[string]string{"app": "vllm"}, want: cachev1alpha1.CacheBackendDomainLabel},
+		{name: "extra ownership key", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm", "app": "vllm"}, want: "must contain only"},
+		{name: "invalid domain value", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "Qwen/Qwen"}, want: "Invalid value"},
+		{name: "canonical domain", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := newBackend()
+			cb.Spec.EngineSelector.MatchLabels = tc.selector
+			_, err := shippingValidator().ValidateCreate(context.Background(), cb)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("canonical selector rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateCreate error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidatorRejectsNonCanonicalSelectorOnEveryUpdate(t *testing.T) {
+	oldCB := newBackend()
+	oldCB.Spec.EngineSelector.MatchLabels = map[string]string{"app": "legacy"}
+
+	unrelated := oldCB.DeepCopy()
+	unrelated.Labels = map[string]string{"maintenance": "requested"}
+	if _, err := shippingValidator().ValidateUpdate(context.Background(), oldCB, unrelated); err == nil || !strings.Contains(err.Error(), cachev1alpha1.CacheBackendDomainLabel) {
+		t.Fatalf("non-canonical selector update error = %v, want strict domain requirement", err)
+	}
+
+	canonical := oldCB.DeepCopy()
+	canonical.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "canonical"}
+	if _, err := shippingValidator().ValidateUpdate(context.Background(), oldCB, canonical); err != nil {
+		t.Fatalf("canonical selector update rejected: %v", err)
+	}
+}
+
 func TestValidator_VLLMRoleReadOnlyRejected(t *testing.T) {
 	// vLLM renders ReadOnly as kv_consumer, but LMCache 0.5.3 does not enforce
 	// that directionality. Admission must reject the unsupported API promise.
@@ -104,6 +236,18 @@ func defaultShippingRegistry() *adapterruntime.Registry {
 
 func shippingValidator() *CacheBackendValidator {
 	return &CacheBackendValidator{Registry: defaultShippingRegistry()}
+}
+
+func selectorValidator(t *testing.T, existing ...*cachev1alpha1.CacheBackend) *CacheBackendValidator {
+	t.Helper()
+	objects := make([]runtime.Object, len(existing))
+	for i := range existing {
+		objects[i] = existing[i]
+	}
+	return &CacheBackendValidator{
+		Registry: defaultShippingRegistry(),
+		Reader:   fake.NewClientBuilder().WithScheme(newCacheScheme(t)).WithRuntimeObjects(objects...).Build(),
+	}
 }
 
 type rejectingBindingAdapter struct {
@@ -134,7 +278,7 @@ func newHiCacheBackend() *cachev1alpha1.CacheBackend {
 				Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
 				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "sglang"}},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "sglang"}},
 		},
 	}
 }

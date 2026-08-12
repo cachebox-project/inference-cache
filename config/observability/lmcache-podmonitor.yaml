@@ -2,10 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# PodMonitor for successfully injected PodLocal LMCache multiprocess native
-# sidecars. The mutating webhook stamps the selector label only after the typed
-# MP renderer has completed atomically, so matching Pods have the named
-# `lmcache-http` port and the real FastAPI `/metrics` route.
+# PodMonitor for PodLocal native sidecars and controller-owned NodeLocal server
+# Pods. Both expose the real FastAPI `/metrics` route on the named
+# `lmcache-http` port. NodeLocal targets use hostNetwork, so NetworkPolicy does
+# not isolate this unauthenticated listener; restrict its host port with node
+# firewall controls inside the backend's trust domain.
 #
 # Engine Pods can live in any workload namespace while this PodMonitor remains
 # in the inference-cache system/monitoring namespace. `namespaceSelector.any`

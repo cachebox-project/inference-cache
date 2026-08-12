@@ -172,7 +172,7 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	} else {
 		remoteReason = reasonRemoteStorageUnavailable
 	}
-	if isTypedLMCachePodLocal(backend) {
+	if isTypedLMCacheMP(backend) {
 		readyStatus, reason, message = lmCacheMPReadyBase(backend, remoteStatus, remoteReason, remoteMessage)
 	}
 	// Resolve the stable timeout anchor: the latched FirstAvailableAt, or — the

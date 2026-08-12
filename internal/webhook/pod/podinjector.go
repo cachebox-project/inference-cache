@@ -7,6 +7,7 @@ package pod
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -98,11 +99,13 @@ const InjectSkippedReasonSkipAnnotation = enginebinding.InjectSkippedReasonSkipA
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch
 
 // EngineInjector is the admission.Handler that injects LMCache engine
-// configuration into user-provided engine pods. failurePolicy=ignore on the
-// MutatingWebhookConfiguration AND a fail-open posture in the handler give a
-// belt-and-suspenders guarantee: even if the controller is unreachable or
-// the handler returns an error response, pod admission is never blocked.
-// The cache is always an optimization, never a serving dependency.
+// configuration into user-provided engine pods. Operational lookup/adapter
+// failures remain fail-open because the cache is an optimization. A selector
+// ambiguity is different: choosing one of several trust domains would be an
+// unsafe mutation, so a live webhook explicitly denies that Pod. The
+// MutatingWebhookConfiguration still uses failurePolicy=Ignore for webhook
+// transport outages; CacheBackend admission prevents overlaps in the normal
+// path and this denial is the defense for historical/concurrent conflicts.
 type EngineInjector struct {
 	// Reader lists CacheBackends in the pod's namespace. Production wiring
 	// passes the manager's APIReader (an uncached live client) — pod
@@ -124,11 +127,10 @@ type EngineInjector struct {
 	Log logr.Logger
 }
 
-// Handle implements [admission.Handler]. Any rejection at this layer
-// translates to admission.Allowed: a webhook error MUST NOT block pod
-// admission (the cache is an optimization). The reason string carries
-// enough context that an operator running `kubectl get events` can tell
-// why a pod was admitted without injection.
+// Handle implements [admission.Handler]. Operational failures translate to
+// admission.Allowed because the cache is an optimization. Selector ambiguity
+// is the deliberate exception: choosing a cache trust domain is unsafe, so a
+// live webhook denies the Pod. The reason string explains either outcome.
 func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admission.Response {
 	log := h.logger(ctx).WithValues(
 		"namespace", req.Namespace, "name", req.Name, "uid", string(req.UID),
@@ -161,6 +163,11 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 
 	cache, err := h.selectCacheBackend(ctx, &pod)
 	if err != nil {
+		var ambiguity *ambiguousCacheBackendMatchError
+		if errors.As(err, &ambiguity) {
+			log.Info("rejecting Pod: more than one CacheBackend engineSelector matches", "cachebackends", ambiguity.names)
+			return admission.Denied(err.Error())
+		}
 		log.V(1).Info("fail-open: backend lookup failed", "error", err.Error())
 		return failOpen(req, &pod, fmt.Sprintf("backend lookup failed (fail-open): %v", err))
 	}
@@ -459,25 +466,12 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	return resp
 }
 
-// selectCacheBackend returns the first CacheBackend in pod.Namespace whose
+// selectCacheBackend returns the only CacheBackend in pod.Namespace whose
 // Spec.EngineSelector.MatchLabels match pod.Labels, or nil when no backend
-// claims the pod. Selecting "the first match" is deliberately simple for
-// Phase 1: a future revision can grow a tie-break policy (e.g. an explicit
-// `inferencecache.io/cachebackend: <name>` annotation), but the current rule
-// matches the reconciler's "each CacheBackend owns its EngineSelector"
-// contract — an operator running two backends in the same namespace whose
-// selectors overlap is misconfigured, and the handler logs the chosen one
-// so the ambiguity is observable.
-//
-// Iteration order is metadata.name ascending so the "first match" is
-// deterministic across apiserver List cache states and is shared with the
-// CacheIndex poller's annotation-fallback path (see
-// internal/controller/cacheindex_controller.go's attributePod). The two
-// surfaces MUST agree on which backend owns a given engine pod — the
-// webhook stamps `inferencecache.io/injected-by` and the poller relies
-// on it as the authoritative signal, but on overlapping-selector
-// fallback both sides need to pick the same backend or status will
-// disagree with what the engine was wired to.
+// claims the pod. More than one match is rejected: silently choosing one would
+// route an engine into an unintended cache trust domain. CacheBackend admission
+// rejects overlapping selectors in the normal path; this runtime check covers
+// objects admitted before that rule and concurrent CREATE races.
 //
 // A CacheBackend with no EngineSelector or with an empty MatchLabels map is
 // skipped: a "match everything" selector at admission time would silently
@@ -497,6 +491,7 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 		return list.Items[idxs[a]].Name < list.Items[idxs[b]].Name
 	})
 	podLabels := labels.Set(pod.Labels)
+	matches := make([]*cachev1alpha1.CacheBackend, 0, 1)
 	for _, i := range idxs {
 		cb := &list.Items[i]
 		if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
@@ -504,10 +499,30 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 		}
 		sel := labels.SelectorFromSet(cb.Spec.EngineSelector.MatchLabels)
 		if sel.Matches(podLabels) {
-			return cb, nil
+			matches = append(matches, cb)
 		}
 	}
-	return nil, nil
+	if len(matches) == 0 {
+		return nil, nil
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	names := make([]string, len(matches))
+	for i := range matches {
+		names[i] = matches[i].Name
+	}
+	return nil, &ambiguousCacheBackendMatchError{namespace: pod.Namespace, names: names}
+}
+
+type ambiguousCacheBackendMatchError struct {
+	namespace string
+	names     []string
+}
+
+func (e *ambiguousCacheBackendMatchError) Error() string {
+	return fmt.Sprintf("Pod labels match multiple CacheBackends in namespace %q (%s); engine admission requires exactly one CacheBackend owner",
+		e.namespace, strings.Join(e.names, ", "))
 }
 
 // SkipAnnotationOptsOut returns true when the value of [AnnotationSkip]

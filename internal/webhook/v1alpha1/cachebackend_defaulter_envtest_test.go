@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -127,6 +129,7 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	mvCR := validPodLocalMPBackend()
 	mvCR.Name = "minimum"
 	mvCR.Namespace = "team-a"
+	mvCR.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "minimum"}
 	mvCR.Spec.Type = ""
 	mvCR.Spec.Integration = nil
 	mvCR.Spec.Observation = nil
@@ -178,6 +181,7 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	canonicalCR := validPodLocalMPBackend()
 	canonicalCR.Name = "canonical-host-only"
 	canonicalCR.Namespace = "team-a"
+	canonicalCR.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "canonical"}
 	canonicalCR.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	canonicalCR.Spec.RemoteStorage = nil
 	if err := k8s.Create(ctx, canonicalCR); err != nil {
@@ -209,7 +213,7 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
 			HiCache: &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app.kubernetes.io/name": "sglang"},
+				MatchLabels: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "explicit"},
 			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
 				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
@@ -230,12 +234,12 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 
 	// --- Current MP API CREATE/UPDATE compatibility ---
 	//
-	// The real apiserver must accept the new PodLocal shape, preserve it on an
-	// unrelated update, and reject an update that selects the reserved NodeLocal
-	// topology before it is implemented.
+	// The real apiserver must accept both typed MP topologies and enforce the
+	// NodeLocal host/scheduling contract on CREATE and UPDATE.
 	mpCR := validPodLocalMPBackend()
 	mpCR.Name = "podlocal-mp"
 	mpCR.Namespace = "team-a"
+	mpCR.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "podlocal"}
 	if err := k8s.Create(ctx, mpCR); err != nil {
 		t.Fatalf("PodLocal MP CacheBackend should be admitted: %v", err)
 	}
@@ -254,10 +258,63 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	if err := k8s.Update(ctx, &persistedMP); err != nil {
 		t.Fatalf("unrelated update on PodLocal MP object should be admitted: %v", err)
 	}
-	persistedMP.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
-	persistedMP.Spec.LMCache.PodLocal = nil
-	persistedMP.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{}
-	if err := k8s.Update(ctx, &persistedMP); err == nil {
-		t.Fatal("update selecting unimplemented NodeLocal topology should be rejected")
+	toNodeLocal := func(cb *cachev1alpha1.CacheBackend) {
+		cb.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
+		cb.Spec.LMCache.PodLocal = nil
+		cb.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{
+			Server: &cachev1alpha1.LMCacheNodeLocalServerSpec{
+				Image: "registry.example/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				Port:  6555, HTTPPort: 18080, L1Capacity: resource.MustParse("4Gi"), MaxGPUWorkers: 4, MaxCPUWorkers: 4,
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+					Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("5Gi")},
+				},
+			},
+			Scheduling: &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{},
+		}
+	}
+	toNodeLocal(&persistedMP)
+	if err := k8s.Update(ctx, &persistedMP); err != nil {
+		t.Fatalf("valid PodLocal-to-NodeLocal update should be admitted: %v", err)
+	}
+
+	nodeLocalCreate := validPodLocalMPBackend()
+	nodeLocalCreate.Name = "nodelocal-create"
+	nodeLocalCreate.Namespace = "team-a"
+	nodeLocalCreate.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "nodelocal"}
+	toNodeLocal(nodeLocalCreate)
+	if err := k8s.Create(ctx, nodeLocalCreate); err != nil {
+		t.Fatalf("valid NodeLocal CREATE should be admitted: %v", err)
+	}
+	var persistedNodeLocal cachev1alpha1.CacheBackend
+	if err := live.Get(ctx, client.ObjectKeyFromObject(nodeLocalCreate), &persistedNodeLocal); err != nil {
+		t.Fatalf("get back NodeLocal CR: %v", err)
+	}
+	persistedNodeLocal.Spec.LMCache.NodeLocal.Server.HTTPPort = persistedNodeLocal.Spec.LMCache.NodeLocal.Server.Port
+	if err := k8s.Update(ctx, &persistedNodeLocal); err == nil {
+		t.Fatal("NodeLocal UPDATE with colliding host ports should be rejected")
+	}
+
+	// A second CacheBackend cannot own the same namespace-scoped cache domain.
+	overlap := validPodLocalMPBackend()
+	overlap.Name = "overlapping-selector"
+	overlap.Namespace = "team-a"
+	overlap.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "nodelocal"}
+	if err := k8s.Create(ctx, overlap); err == nil {
+		t.Fatal("CacheBackend CREATE with overlapping engineSelector should be rejected")
+	}
+
+	// Ownership is intentionally independent of ordinary Pod labels: the
+	// canonical selector contains only cache-domain, even when those Pods carry
+	// app/model/environment labels for other Kubernetes consumers.
+	extraSelector := validPodLocalMPBackend()
+	extraSelector.Name = "extra-selector-label"
+	extraSelector.Namespace = "team-a"
+	extraSelector.Spec.EngineSelector.MatchLabels = map[string]string{
+		cachev1alpha1.CacheBackendDomainLabel: "extra-selector-label",
+		"app":                                 "vllm",
+	}
+	if err := k8s.Create(ctx, extraSelector); err == nil {
+		t.Fatal("CacheBackend CREATE with a second ownership selector label should be rejected")
 	}
 }

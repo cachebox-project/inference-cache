@@ -36,7 +36,7 @@ func validPodLocalMPBackend() *cachev1alpha1.CacheBackend {
 				}},
 			},
 			Integration:    &cachev1alpha1.CacheBackendIntegrationSpec{Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "engine"}},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "engine"}},
 		},
 	}
 }
@@ -160,7 +160,7 @@ func TestValidateRedisAuthenticationForTypedPodLocal(t *testing.T) {
 		cb.Spec.LMCache.Topology = ""
 		cb.Spec.LMCache.PodLocal = nil
 		errs := rejectUnimplementedRedisBindingFeatures(cb)
-		if len(errs) != 1 || !strings.Contains(errs[0].Error(), "typed PodLocal LMCache MP") {
+		if len(errs) != 1 || !strings.Contains(errs[0].Error(), "typed LMCache MP") {
 			t.Fatalf("errors = %v, want topology-scoped rejection", errs)
 		}
 	})
@@ -169,7 +169,7 @@ func TestValidateRedisAuthenticationForTypedPodLocal(t *testing.T) {
 		cb := newAuthBackend(cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal)
 		cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
 		errs := rejectUnimplementedRedisBindingFeatures(cb)
-		if len(errs) != 1 || !strings.Contains(errs[0].Error(), "typed PodLocal LMCache MP") {
+		if len(errs) != 1 || !strings.Contains(errs[0].Error(), "typed LMCache MP") {
 			t.Fatalf("errors = %v, want cache-type-scoped rejection", errs)
 		}
 	})
@@ -187,13 +187,70 @@ func TestValidateLMCacheTopologyRequiresTypedPodLocal(t *testing.T) {
 	}
 }
 
-func TestValidateLMCacheTopologyRejectsNodeLocalUntilImplemented(t *testing.T) {
+func TestValidateLMCacheTopologyAcceptsCompleteNodeLocal(t *testing.T) {
 	cb := validPodLocalMPBackend()
 	cb.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
 	cb.Spec.LMCache.PodLocal = nil
-	cb.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{}
-	if errs := validateLMCacheTopology(cb); len(errs) == 0 {
-		t.Fatal("NodeLocal was accepted before Phase 8")
+	cb.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{
+		Server: &cachev1alpha1.LMCacheNodeLocalServerSpec{
+			Image: "registry.example/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Port:  6555, HTTPPort: 18080,
+			L1Capacity: resource.MustParse("4Gi"), MaxGPUWorkers: 4, MaxCPUWorkers: 4,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("5Gi")},
+			},
+		},
+		Scheduling: &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{},
+	}
+	if errs := validateLMCacheTopology(cb); len(errs) != 0 {
+		t.Fatalf("complete NodeLocal errors: %v", errs)
+	}
+}
+
+func TestValidateLMCacheNodeLocalSafetyContract(t *testing.T) {
+	base := func() *cachev1alpha1.CacheBackend {
+		cb := validPodLocalMPBackend()
+		cb.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
+		cb.Spec.LMCache.PodLocal = nil
+		cb.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{
+			Server: &cachev1alpha1.LMCacheNodeLocalServerSpec{
+				Image: "registry.example/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				Port:  6555, HTTPPort: 18080,
+				L1Capacity: resource.MustParse("4Gi"), MaxGPUWorkers: 4, MaxCPUWorkers: 4,
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+					Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("5Gi")},
+				},
+			},
+			Scheduling: &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{},
+		}
+		return cb
+	}
+	tests := []struct {
+		name      string
+		mutate    func(*cachev1alpha1.CacheBackend)
+		wantField string
+	}{
+		{name: "distinct HTTP host port", mutate: func(cb *cachev1alpha1.CacheBackend) { cb.Spec.LMCache.NodeLocal.Server.HTTPPort = 6555 }, wantField: "httpPort"},
+		{name: "no GPU reservation", mutate: func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.LMCache.NodeLocal.Server.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")] = resource.MustParse("1")
+			cb.Spec.LMCache.NodeLocal.Server.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")] = resource.MustParse("1")
+		}, wantField: "nvidia.com/gpu"},
+		{name: "required trust-domain selector", mutate: func(cb *cachev1alpha1.CacheBackend) { cb.Spec.EngineSelector = nil }, wantField: "engineSelector"},
+		{name: "bounded idle retention", mutate: func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.LMCache.NodeLocal.IdleRetentionSeconds = 86401
+		}, wantField: "idleRetentionSeconds"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := base()
+			tc.mutate(cb)
+			errs := validateLMCacheTopology(cb)
+			if len(errs) == 0 || !strings.Contains(errs.ToAggregate().Error(), tc.wantField) {
+				t.Fatalf("errors = %v, want field %q", errs, tc.wantField)
+			}
+		})
 	}
 }
 
@@ -230,11 +287,11 @@ func TestValidateLMCacheTopologyCurrentMatrix(t *testing.T) {
 		{name: "mixed NodeLocal block", mutate: func(cb *cachev1alpha1.CacheBackend) {
 			cb.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{}
 		}, wantField: "spec.lmCache.nodeLocal"},
-		{name: "NodeLocal reserved", mutate: func(cb *cachev1alpha1.CacheBackend) {
+		{name: "NodeLocal missing server", mutate: func(cb *cachev1alpha1.CacheBackend) {
 			cb.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
 			cb.Spec.LMCache.PodLocal = nil
 			cb.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{}
-		}, wantField: "spec.lmCache.topology"},
+		}, wantField: "spec.lmCache.nodeLocal.server"},
 		{name: "digest without repository", mutate: func(cb *cachev1alpha1.CacheBackend) {
 			cb.Spec.LMCache.PodLocal.Server.Image = "@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		}, wantField: "spec.lmCache.podLocal.server.image"},

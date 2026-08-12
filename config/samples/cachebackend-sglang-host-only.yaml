@@ -15,7 +15,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app.kubernetes.io/name: sglang
+      inferencecache.io/cache-domain: sglang-host-only
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256

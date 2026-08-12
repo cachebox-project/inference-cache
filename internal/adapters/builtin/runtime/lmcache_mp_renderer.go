@@ -58,7 +58,7 @@ type lmCacheMPServerConfig struct {
 
 	// WriteClientConfig asks the native sidecar to create the generic LMCache
 	// MP client YAML shared with the engine. SGLang consumes this file. vLLM's
-	// connector consumes JSON and will set this false in Phase 4.
+	// connector consumes JSON and sets this false.
 	WriteClientConfig bool
 }
 

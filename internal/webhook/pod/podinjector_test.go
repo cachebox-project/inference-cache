@@ -323,6 +323,26 @@ func typedVLLMPodLocalBackend(name, namespace string, selector map[string]string
 	return cb
 }
 
+func typedVLLMNodeLocalBackend(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
+	cb := typedVLLMPodLocalBackend(name, namespace, selector)
+	cb.Generation = 3
+	cb.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
+	cb.Spec.LMCache.PodLocal = nil
+	cb.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{
+		Server: &cachev1alpha1.LMCacheNodeLocalServerSpec{
+			Image: "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Port:  6555, HTTPPort: 18080,
+			L1Capacity: resource.MustParse("8Gi"), MaxGPUWorkers: 4, MaxCPUWorkers: 4,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("9Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("9Gi")},
+			},
+		},
+		Scheduling: &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{},
+	}
+	return cb
+}
+
 func TestHandle_TypedVLLMWithoutCapabilityAnnotationsUsesDedicatedMPAdapter(t *testing.T) {
 	const ns = "engines"
 	cb := typedVLLMPodLocalBackend("primary", ns, map[string]string{"app": "vllm"})
@@ -334,6 +354,47 @@ func TestHandle_TypedVLLMWithoutCapabilityAnnotationsUsesDedicatedMPAdapter(t *t
 	if !resp.Allowed || len(resp.Patches) == 0 {
 		t.Fatalf("typed MP pod should be injected without capability annotations: allowed=%v patches=%d result=%+v",
 			resp.Allowed, len(resp.Patches), resp.Result)
+	}
+}
+
+func TestHandle_TypedNodeLocalVLLMGatesOnOwnershipVerifiedSameNodeServer(t *testing.T) {
+	const ns = "engines"
+	cb := typedVLLMNodeLocalBackend("node-cache", ns, map[string]string{"app": "vllm-node"})
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-node", map[string]string{"app": "vllm-node"})
+	pod.Spec.NodeSelector = map[string]string{"inference-system.io/pool": "owned"}
+	pod.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{Weight: 1}}}}
+	wantNodeSelector := map[string]string{"inference-system.io/pool": "owned"}
+	wantAffinity := pod.Spec.Affinity.DeepCopy()
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("NodeLocal injection: Allowed=%v patches=%d result=%+v", resp.Allowed, len(resp.Patches), resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-server") != nil {
+		t.Fatalf("NodeLocal engine received PodLocal server: %+v", mutated.Spec.InitContainers)
+	}
+	gate := findInitContainerByName(mutated.Spec.InitContainers, "lmcache-node-local-gate")
+	if gate == nil || !strings.Contains(strings.Join(gate.Args, " "), "/healthcheck") || !strings.Contains(strings.Join(gate.Args, " "), "/config") {
+		t.Fatalf("ownership-verifying NodeLocal gate = %+v", gate)
+	}
+	config := testArgValue(mutated.Spec.Containers[0].Args, "--kv-transfer-config")
+	if !strings.Contains(config, `tcp://$(INFERENCECACHE_NODE_IP)`) {
+		t.Fatalf("node-derived vLLM config = %q", config)
+	}
+	if mutated.Spec.HostNetwork || mutated.Spec.HostIPC {
+		t.Fatalf("engine entered host namespace: hostNetwork=%v hostIPC=%v", mutated.Spec.HostNetwork, mutated.Spec.HostIPC)
+	}
+	if !reflect.DeepEqual(mutated.Spec.NodeSelector, wantNodeSelector) || !reflect.DeepEqual(mutated.Spec.Affinity, wantAffinity) {
+		t.Fatalf("NodeLocal mutated inference-owned placement: selector=%v affinity=%+v", mutated.Spec.NodeSelector, mutated.Spec.Affinity)
+	}
+	if got := mutated.Annotations[AnnotationInjectedByUID]; got != string(cb.UID) {
+		t.Fatalf("injected backend UID = %q", got)
+	}
+	if got := mutated.Labels[LabelLMCacheMPMetrics]; got != "" {
+		t.Fatalf("NodeLocal engine must not advertise a PodLocal metrics sidecar: %s=%q", LabelLMCacheMPMetrics, got)
 	}
 }
 
@@ -1422,61 +1483,22 @@ func TestHandle_EmptyEngineSelector_Skipped(t *testing.T) {
 	}
 }
 
-// TestHandle_OverlappingSelectors_FirstNameWins exercises the shared
-// attribution rule between the pod webhook and the CacheIndex poller:
-// when two CacheBackends in the same namespace have overlapping
-// EngineSelectors that both match the engine pod, BOTH surfaces must
-// pick the same backend — the one sorted first by metadata.name —
-// otherwise the engine is wired to one backend's endpoint while
-// status.indexParticipation reports the other as the owner.
-//
-// The matching poller-side assertion lives in
-// TestRefreshOverlappingSelectorsFirstNameWins
-// (internal/controller/cacheindex_controller_test.go).
-func TestHandle_OverlappingSelectors_FirstNameWins(t *testing.T) {
+func TestHandle_OverlappingSelectors_Rejected(t *testing.T) {
 	const ns = "engines"
-	// Create the backends in non-alphabetical order so a name-sort is
-	// observably different from raw List order.
 	cbZebra := readyCacheBackend("zebra", ns, map[string]string{"app": "vllm"})
-	cbAlpha := readyCacheBackend("alpha", ns, map[string]string{"app": "vllm"})
+	cbAlpha := readyCacheBackend("alpha", ns, map[string]string{"app": "vllm", "model": "qwen"})
 	h := newHandler(t, cbZebra, cbAlpha)
-	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm", "model": "qwen"})
 	req := newRequest(t, pod, ns)
 
 	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	if resp.Allowed {
+		t.Fatalf("expected overlapping selectors to deny Pod admission, got Allowed with patches %+v", resp.Patches)
 	}
-	if len(resp.Patches) == 0 {
-		t.Fatal("expected injection patches when at least one backend matches")
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "multiple CacheBackends") ||
+		!strings.Contains(resp.Result.Message, "alpha, zebra") {
+		t.Fatalf("denial message = %+v, want deterministic conflicting backend names", resp.Result)
 	}
-	// The `inferencecache.io/injected-by` annotation records who claimed
-	// the pod. Sorted-by-name "alpha" must win over "zebra".
-	want := ns + "/alpha"
-	var got string
-	for _, p := range resp.Patches {
-		if p.Path == "/metadata/annotations" || p.Path == "/metadata/annotations/"+jsonPatchEscape(AnnotationInjectedBy) {
-			if anno, ok := p.Value.(map[string]any); ok {
-				if v, ok := anno[AnnotationInjectedBy].(string); ok {
-					got = v
-				}
-			} else if s, ok := p.Value.(string); ok {
-				got = s
-			}
-		}
-	}
-	if got != want {
-		t.Fatalf("injected-by annotation = %q, want %q (deterministic name-sort: alpha < zebra)", got, want)
-	}
-}
-
-// jsonPatchEscape is the JSON-Pointer escaping for "/" and "~" in JSON
-// Patch paths (RFC 6901). Used here only to match the annotation path
-// regardless of how the controller-runtime patch emitter renders it.
-func jsonPatchEscape(s string) string {
-	s = strings.ReplaceAll(s, "~", "~0")
-	s = strings.ReplaceAll(s, "/", "~1")
-	return s
 }
 
 func TestHandle_ListError_FailOpen(t *testing.T) {

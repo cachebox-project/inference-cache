@@ -335,6 +335,7 @@ func reconcileManagedContainer(live *corev1.PodSpec, desired *corev1.PodSpec) {
 				live.Containers[j].ReadinessProbe = want.ReadinessProbe
 				live.Containers[j].LivenessProbe = want.LivenessProbe
 				live.Containers[j].StartupProbe = want.StartupProbe
+				live.Containers[j].SecurityContext = want.SecurityContext
 				matched = true
 				break
 			}

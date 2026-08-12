@@ -5,8 +5,8 @@
 # Typed SGLang PodLocal LMCache MP with a controller-managed Redis L3. The
 # webhook injects the common lmcache-mp-server native sidecar plus SGLang's
 # --enable-lmcache/--lmcache-config-file launch surface. Kubernetes 1.29 or
-# newer is required for native sidecars. SGLang TP>1 is outside the validated
-# migration baseline.
+# newer is required for native sidecars. SGLang TP>1 is outside the currently
+# validated profile.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -20,7 +20,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app.kubernetes.io/name: sglang
+      inferencecache.io/cache-domain: sglang-lmcache
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256

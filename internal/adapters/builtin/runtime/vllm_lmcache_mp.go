@@ -33,7 +33,7 @@ type vllmLMCacheMPAdapter struct {
 	subscriber SubscriberConfig
 }
 
-// NewVLLMLMCacheMPAdapter returns the typed PodLocal vLLM adapter.
+// NewVLLMLMCacheMPAdapter returns the typed PodLocal/NodeLocal vLLM adapter.
 func NewVLLMLMCacheMPAdapter(subscriber SubscriberConfig) runtimeadapter.KVCacheRuntimeAdapter {
 	return vllmLMCacheMPAdapter{subscriber: subscriber}
 }
@@ -48,7 +48,9 @@ func (vllmLMCacheMPAdapter) Supports(runtime runtimeadapter.RuntimeID, cache *ca
 		return false
 	}
 	return cache.Spec.IsEventsOnly() ||
-		(cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal)
+		(cache.Spec.LMCache != nil &&
+			(cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal ||
+				cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyNodeLocal))
 }
 
 func (vllmLMCacheMPAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
@@ -68,12 +70,17 @@ func (vllmLMCacheMPAdapter) ValidateMPEnginePod(pod *corev1.Pod, cache *cachev1a
 		return fmt.Errorf("vLLM LMCache MP CacheBackend configuration is missing")
 	}
 	lm := cache.Spec.LMCache
-	if lm.Topology != cachev1alpha1.LMCacheTopologyPodLocal {
-		return fmt.Errorf("vLLM LMCache MP topology %q is not implemented; want %q",
-			lm.Topology, cachev1alpha1.LMCacheTopologyPodLocal)
-	}
-	if lm.PodLocal == nil || lm.PodLocal.Server == nil {
-		return fmt.Errorf("vLLM LMCache PodLocal server configuration is missing")
+	switch lm.Topology {
+	case cachev1alpha1.LMCacheTopologyPodLocal:
+		if lm.PodLocal == nil || lm.PodLocal.Server == nil {
+			return fmt.Errorf("vLLM LMCache PodLocal server configuration is missing")
+		}
+	case cachev1alpha1.LMCacheTopologyNodeLocal:
+		if lm.NodeLocal == nil || lm.NodeLocal.Server == nil {
+			return fmt.Errorf("vLLM LMCache NodeLocal server configuration is missing")
+		}
+	default:
+		return fmt.Errorf("vLLM LMCache MP topology %q is not implemented", lm.Topology)
 	}
 	engineIndex, err := EngineContainerIndexNamed(&pod.Spec, EngineContainerName)
 	if err != nil {
@@ -190,6 +197,10 @@ type vllmMPConnectorExtraConfig struct {
 }
 
 func vllmMPKVTransferConfigJSON(role cachev1alpha1.CacheBackendIntegrationRole, port int32) (string, error) {
+	return vllmMPKVTransferConfigJSONForHost(role, "tcp://127.0.0.1", port)
+}
+
+func vllmMPKVTransferConfigJSONForHost(role cachev1alpha1.CacheBackendIntegrationRole, host string, port int32) (string, error) {
 	kvRole := ""
 	switch role {
 	case cachev1alpha1.CacheBackendIntegrationRoleReadOnly:
@@ -206,7 +217,7 @@ func vllmMPKVTransferConfigJSON(role cachev1alpha1.CacheBackendIntegrationRole, 
 		ConnectorModule: vllmLMCacheMPConnectorModulePath,
 		Role:            kvRole,
 		ExtraConfig: vllmMPConnectorExtraConfig{
-			Host: "tcp://127.0.0.1",
+			Host: host,
 			Port: strconv.FormatInt(int64(port), 10),
 		},
 	})
@@ -221,29 +232,48 @@ func (vllmLMCacheMPAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *bac
 		return err
 	}
 	lm := cache.Spec.LMCache
-	if lm == nil || lm.Topology != cachev1alpha1.LMCacheTopologyPodLocal || lm.PodLocal == nil || lm.PodLocal.Server == nil {
-		return fmt.Errorf("inject vLLM LMCache MP: typed PodLocal server configuration is required")
+	if lm == nil {
+		return fmt.Errorf("inject vLLM LMCache MP: typed server configuration is required")
 	}
 	if !(vllmLMCacheMPAdapter{}).SupportsBinding(binding) {
 		return fmt.Errorf("vLLM LMCache MP adapter does not support remote binding protocol %q", binding.Protocol)
 	}
-	server := lm.PodLocal.Server
-	configJSON, err := vllmMPKVTransferConfigJSON(IntegrationRole(cache), server.Port)
-	if err != nil {
-		return err
-	}
-
 	work := pod.DeepCopy()
-	if _, err := renderLMCachePodLocalServer(work, EngineContainerName, lmCacheMPServerConfig{
-		Image:             server.Image,
-		Port:              server.Port,
-		ChunkSizeTokens:   effectiveLMCacheChunkSize(lm),
-		L1Capacity:        server.L1Capacity,
-		MaxWorkers:        server.MaxWorkers,
-		Resources:         server.Resources,
-		Binding:           binding,
-		WriteClientConfig: false,
-	}); err != nil {
+	var configJSON string
+	var err error
+	switch lm.Topology {
+	case cachev1alpha1.LMCacheTopologyPodLocal:
+		if lm.PodLocal == nil || lm.PodLocal.Server == nil {
+			return fmt.Errorf("inject vLLM LMCache MP: typed PodLocal server configuration is required")
+		}
+		server := lm.PodLocal.Server
+		configJSON, err = vllmMPKVTransferConfigJSON(IntegrationRole(cache), server.Port)
+		if err == nil {
+			_, err = renderLMCachePodLocalServer(work, EngineContainerName, lmCacheMPServerConfig{
+				Image:             server.Image,
+				Port:              server.Port,
+				ChunkSizeTokens:   effectiveLMCacheChunkSize(lm),
+				L1Capacity:        server.L1Capacity,
+				MaxWorkers:        server.MaxWorkers,
+				Resources:         server.Resources,
+				Binding:           binding,
+				WriteClientConfig: false,
+			})
+		}
+	case cachev1alpha1.LMCacheTopologyNodeLocal:
+		if lm.NodeLocal == nil || lm.NodeLocal.Server == nil {
+			return fmt.Errorf("inject vLLM LMCache MP: typed NodeLocal server configuration is required")
+		}
+		server := lm.NodeLocal.Server
+		configJSON, err = vllmMPKVTransferConfigJSONForHost(
+			IntegrationRole(cache), "tcp://$("+lmCacheNodeIPEnv+")", server.Port)
+		if err == nil {
+			_, err = renderLMCacheNodeLocalEngine(work, EngineContainerName, cache, false)
+		}
+	default:
+		return fmt.Errorf("inject vLLM LMCache MP: topology %q is not implemented", lm.Topology)
+	}
+	if err != nil {
 		return err
 	}
 	engineIndex, err := EngineContainerIndexNamed(work, EngineContainerName)

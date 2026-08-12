@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Paired typed-MP sample: one CacheBackend and one matching vLLM Deployment.
-# The label `app: qwen-demo` is the binding; at Pod CREATE the webhook injects
+# The `inferencecache.io/cache-domain: qwen-demo` label is the binding; at Pod
+# CREATE the webhook injects
 # an LMCache MP native sidecar and the vLLM LMCacheMPConnector JSON. This example
 # intentionally omits remoteStorage, so L1 is per Pod and no cross-Pod sharing
 # is claimed. The engine image remains inference-owner supplied: normal engine
@@ -20,7 +21,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: qwen-demo                # <-- binding key/value (1 of 2)
+      inferencecache.io/cache-domain: qwen-demo # <-- ownership domain (1 of 2)
   observation:
     # Served model the engine pods are loaded with. Plumbed to the
     # auto-attached kvevent-subscriber sidecar so the index keys
@@ -57,7 +58,8 @@ spec:
   template:
     metadata:
       labels:
-        app: qwen-demo              # <-- binding key/value (2 of 2)
+        app: qwen-demo
+        inferencecache.io/cache-domain: qwen-demo # <-- ownership domain (2 of 2)
     spec:
       containers:
         - name: vllm

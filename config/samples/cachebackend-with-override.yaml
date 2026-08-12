@@ -48,7 +48,7 @@ spec:
           value: DEBUG
   engineSelector:
     matchLabels:
-      app: qwen-demo
+      inferencecache.io/cache-domain: qwen-demo
   observation:
     # Served model identifier the matched engine pods are loaded with.
     # Plumbed to the auto-attached kvevent-subscriber sidecar's --model-id
@@ -81,7 +81,8 @@ spec:
 #
 # The Deployment name is `qwen-demo-engine`, distinct from the CacheBackend
 # name (`qwen-demo`), because the CacheBackend reconciler stands up its own
-# Binding to the CacheBackend goes through the `app: qwen-demo` label match in
+# Binding to the CacheBackend goes through the
+# `inferencecache.io/cache-domain: qwen-demo` label match in
 # `spec.engineSelector`, not through the Deployment name.
 #
 # CPU vLLM image and flags mirror docs/reference-stack/manifests/cpu-local/
@@ -104,6 +105,7 @@ spec:
     metadata:
       labels:
         app: qwen-demo
+        inferencecache.io/cache-domain: qwen-demo
     spec:
       # The image below is arm64-only; pin scheduling to an arm64 node so
       # an unmodified apply on a mixed-arch cluster does not schedule the

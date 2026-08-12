@@ -20,7 +20,8 @@
 #   * A CachePolicy tunes eviction for the namespace (see the CachePolicy doc
 #     pointer in config/samples/README.md).
 #
-# Binding works exactly as in recipe-cpu-dev.yaml: the `app: prod-llm` label on
+# Binding works exactly as in recipe-cpu-dev.yaml: the
+# `inferencecache.io/cache-domain: prod-llm` label on
 # the engine pod template matches `spec.engineSelector.matchLabels`. Same
 # binding remains CREATE-time; apply the CacheBackend before the engine
 # Deployment. See docs/concepts/cachebackend-engine-binding.md.
@@ -60,7 +61,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: prod-llm
+      inferencecache.io/cache-domain: prod-llm
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256
@@ -144,6 +145,7 @@ spec:
     metadata:
       labels:
         app: prod-llm
+        inferencecache.io/cache-domain: prod-llm
     spec:
       containers:
         - name: vllm

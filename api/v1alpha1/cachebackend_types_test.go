@@ -86,9 +86,37 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireMinimum(t, mustProperty(t, podLocalServerSchema, "maxWorkers"), 1)
 	nodeLocalSchema := mustProperty(t, lmCacheSchema, "nodeLocal")
 	requireRequired(t, nodeLocalSchema, "server")
+	requireRequired(t, nodeLocalSchema, "idleRetentionSeconds")
+	idleRetentionSchema := mustProperty(t, nodeLocalSchema, "idleRetentionSeconds")
+	requireMinimum(t, idleRetentionSchema, 0)
+	requireMaximum(t, idleRetentionSchema, 86400)
+	if got := idleRetentionSchema["default"]; got != float64(300) {
+		t.Fatalf("nodeLocal.idleRetentionSeconds default = %v, want 300", got)
+	}
 	nodeLocalServerSchema := mustProperty(t, nodeLocalSchema, "server")
+	for _, field := range []string{"image", "port", "httpPort", "l1Capacity", "maxGPUWorkers", "maxCPUWorkers", "resources"} {
+		requireRequired(t, nodeLocalServerSchema, field)
+	}
+	for _, field := range []string{"port", "httpPort"} {
+		requireMinimum(t, mustProperty(t, nodeLocalServerSchema, field), 1)
+		requireMaximum(t, mustProperty(t, nodeLocalServerSchema, field), 65535)
+	}
 	requireMinimum(t, mustProperty(t, nodeLocalServerSchema, "maxGPUWorkers"), 1)
 	requireMinimum(t, mustProperty(t, nodeLocalServerSchema, "maxCPUWorkers"), 1)
+	nodeLocalSchedulingSchema := mustProperty(t, nodeLocalSchema, "scheduling")
+	for _, field := range []string{
+		"tolerations", "imagePullSecrets", "serviceAccountName",
+		"securityContext", "priorityClassName", "schedulerName", "runtimeClassName",
+		"terminationGracePeriodSeconds",
+	} {
+		if !hasProperty(nodeLocalSchedulingSchema, field) {
+			t.Fatalf("spec.lmCache.nodeLocal.scheduling.%s is missing from CRD schema", field)
+		}
+	}
+	for _, field := range []string{"nodeSelector", "affinity"} {
+		requireNoProperty(t, nodeLocalSchedulingSchema, field)
+	}
+	requireMinimum(t, mustProperty(t, nodeLocalSchedulingSchema, "terminationGracePeriodSeconds"), 0)
 	requireMinimum(t, mustProperty(t, lmCacheSchema, "chunkSizeTokens"), 1)
 	remoteStorageSchema := mustProperty(t, specSchema, "remoteStorage")
 	requireRequired(t, remoteStorageSchema, "provider")
@@ -236,8 +264,7 @@ func TestCacheBackendMPRoundTripAndDeepCopy(t *testing.T) {
 					},
 				}},
 				NodeLocal: &LMCacheNodeLocalSpec{Scheduling: &LMCacheNodeLocalSchedulingSpec{
-					NodeSelector: map[string]string{"pool": "cache"},
-					Tolerations:  []corev1.Toleration{{Key: "cache"}},
+					Tolerations: []corev1.Toleration{{Key: "cache"}},
 				}},
 			},
 			RemoteStorage: &CacheBackendRemoteStorageSpec{
@@ -263,6 +290,7 @@ func TestCacheBackendMPRoundTripAndDeepCopy(t *testing.T) {
 				ReadyEnginePods:   1,
 				DesiredServers:    2,
 				ReadyServers:      1,
+				EnginePodCoverage: []CacheBackendEnginePodCoverageStatus{{Name: "engine-0", NodeName: "node-a", Ready: true, Covered: true, Reason: "ConnectorReady"}},
 			},
 			RemoteStorage: &CacheBackendRemoteStorageStatus{
 				Provider: CacheBackendRemoteStorageProviderRedis,
@@ -286,7 +314,6 @@ func TestCacheBackendMPRoundTripAndDeepCopy(t *testing.T) {
 
 	copied := backend.DeepCopy()
 	backend.Spec.LMCache.PodLocal.Server.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("64Gi")
-	backend.Spec.LMCache.NodeLocal.Scheduling.NodeSelector["pool"] = "general"
 	backend.Spec.LMCache.NodeLocal.Scheduling.Tolerations[0].Key = "general"
 	*backend.Spec.RemoteStorage.Redis.Database = 9
 	backend.Spec.RemoteStorage.Redis.Authentication.Password.Name = "changed"
@@ -296,7 +323,7 @@ func TestCacheBackendMPRoundTripAndDeepCopy(t *testing.T) {
 	if got := copied.Spec.LMCache.PodLocal.Server.Resources.Requests[corev1.ResourceMemory]; got.Cmp(resource.MustParse("33Gi")) != 0 {
 		t.Fatalf("podLocal server resources alias original: %s", got.String())
 	}
-	if copied.Spec.LMCache.NodeLocal.Scheduling.NodeSelector["pool"] != "cache" || copied.Spec.LMCache.NodeLocal.Scheduling.Tolerations[0].Key != "cache" {
+	if copied.Spec.LMCache.NodeLocal.Scheduling.Tolerations[0].Key != "cache" {
 		t.Fatalf("nodeLocal scheduling was not deep-copied")
 	}
 	if *copied.Spec.RemoteStorage.Redis.Database != 2 || copied.Spec.RemoteStorage.Redis.Authentication.Password.Name != "redis-auth" {

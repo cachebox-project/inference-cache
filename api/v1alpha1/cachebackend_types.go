@@ -20,6 +20,12 @@ type CacheBackendRuntime string
 const (
 	CacheBackendRuntimeVLLM   CacheBackendRuntime = "VLLM"
 	CacheBackendRuntimeSGLang CacheBackendRuntime = "SGLang"
+
+	// CacheBackendDomainLabel is the sole supported engineSelector key. Its
+	// namespace-scoped value identifies one runtime/model/KV-layout/trust
+	// compatibility domain. Engine Pods may carry other labels, but cache
+	// ownership is intentionally independent of them.
+	CacheBackendDomainLabel = "inferencecache.io/cache-domain"
 )
 
 // +kubebuilder:validation:Enum=LMCache;SGLangHiCache
@@ -208,20 +214,32 @@ type LMCachePodLocalSpec struct {
 	Server *LMCachePodLocalServerSpec `json:"server"`
 }
 
-// LMCacheNodeLocalServerSpec describes the future one-server-per-node MP
-// topology. The shape is published now so the API does not need another
-// topology redesign, but admission rejects NodeLocal until Phase 8.
+// LMCacheNodeLocalServerSpec configures the controller-owned LMCache MP server
+// shared by selected engine Pods on one node chosen by the inference system.
 type LMCacheNodeLocalServerSpec struct {
+	// Image is the digest-pinned LMCache server image. The same image is used
+	// by the lightweight engine startup gate; CacheBackend never changes the
+	// inference-engine image.
 	Image string `json:"image"`
 
+	// Port is the node-bound LMCache MP data port.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	Port int32 `json:"port"`
 
+	// HTTPPort is the node-bound FastAPI health/control port used by probes and
+	// by the engine startup gate to verify the same-node server identity.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	HTTPPort int32 `json:"httpPort"`
+
+	// L1Capacity is one shared host-memory budget per active engine node, not per
+	// selected engine Pod.
 	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0'))",message="l1Capacity must be greater than zero"
 	L1Capacity resource.Quantity `json:"l1Capacity"`
 
-	// MaxGPUWorkers bounds workers serving GPU-backed engine clients.
+	// MaxGPUWorkers bounds workers serving GPU-backed engine clients and must
+	// cover the maximum number of engine instances expected on one node.
 	// +kubebuilder:validation:Minimum=1
 	MaxGPUWorkers int32 `json:"maxGPUWorkers"`
 
@@ -229,27 +247,65 @@ type LMCacheNodeLocalServerSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	MaxCPUWorkers int32 `json:"maxCPUWorkers"`
 
+	// Resources are applied to every per-node server Pod. Admission requires
+	// memory request and limit headroom above the shared L1 budget.
 	Resources corev1.ResourceRequirements `json:"resources"`
 }
 
-// LMCacheNodeLocalSchedulingSpec configures placement of the future per-node
-// MP server workload.
+// LMCacheNodeLocalSchedulingSpec configures server-Pod scheduling details that
+// are independent of node placement. The controller derives the exact node
+// from already-scheduled selected engine Pods; these fields never constrain or
+// rewrite inference-engine placement.
 type LMCacheNodeLocalSchedulingSpec struct {
-	// +optional
-	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
-
+	// Tolerations are merged with the tolerations of an engine already running
+	// on the target node. They allow the server Pod to pass that node's taints
+	// without selecting a different node.
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
 	// +optional
-	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+
+	// +optional
+	SecurityContext *corev1.PodSecurityContext `json:"securityContext,omitempty"`
+
+	// +optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
+
+	// +optional
+	SchedulerName string `json:"schedulerName,omitempty"`
+
+	// RuntimeClassName overrides the runtime inherited from the engine Pod used
+	// to place this server. Clusters that do not make the NVIDIA runtime the
+	// default can use this field to provide GPU visibility without reserving
+	// allocatable GPUs.
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
 }
 
-// LMCacheNodeLocalSpec configures the future one-server-per-eligible-node
-// topology. It is rejected at admission until its controller exists.
+// LMCacheNodeLocalSpec configures one shared MP server per node that currently
+// hosts at least one selected engine Pod.
 type LMCacheNodeLocalSpec struct {
 	Server *LMCacheNodeLocalServerSpec `json:"server"`
 
+	// IdleRetentionSeconds keeps an otherwise healthy per-node server alive
+	// after the final selected engine leaves that node. A new matching engine
+	// scheduled there during the window reuses the same server Pod and shared
+	// L1. Zero requests immediate deletion.
+	// +kubebuilder:default=300
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=86400
+	IdleRetentionSeconds int32 `json:"idleRetentionSeconds"`
+
+	// Scheduling optionally overrides server-Pod runtime and operational fields.
+	// It cannot select nodes; inference-engine scheduling remains authoritative.
 	// +optional
 	Scheduling *LMCacheNodeLocalSchedulingSpec `json:"scheduling,omitempty"`
 }
@@ -258,16 +314,15 @@ type LMCacheNodeLocalSpec struct {
 // fields apply to the connector or node-local MP worker, not to a remote
 // storage provider.
 type LMCacheEngineSpec struct {
-	// Topology selects the canonical LMCache MP server placement. PodLocal is
-	// implemented first; NodeLocal is reserved and rejected until Phase 8.
+	// Topology selects the canonical LMCache MP server placement.
 	Topology LMCacheTopology `json:"topology"`
 
 	// PodLocal configures one MP server in each selected engine Pod.
 	// +optional
 	PodLocal *LMCachePodLocalSpec `json:"podLocal,omitempty"`
 
-	// NodeLocal configures a future per-node MP server. Admission currently
-	// rejects this block so it can never be accepted as inert configuration.
+	// NodeLocal configures a controller-owned, engine-demand-driven per-node MP
+	// server pool.
 	// +optional
 	NodeLocal *LMCacheNodeLocalSpec `json:"nodeLocal,omitempty"`
 
@@ -451,11 +506,16 @@ type CacheBackendSpec struct {
 	// +optional
 	Integration *CacheBackendIntegrationSpec `json:"integration,omitempty"`
 
-	// EngineSelector selects which engine pods this CacheBackend claims via
-	// equality-based label matching over the pod's labels: every key/value
-	// in MatchLabels must be present on the pod. The full
-	// metav1.LabelSelector surface (matchExpressions, operator-based
-	// selection) is NOT exposed today — only MatchLabels.
+	// EngineSelector selects which engine pods this CacheBackend claims. A
+	// non-empty selector must contain exactly one MatchLabels entry whose key is
+	// inferencecache.io/cache-domain. The value is an operator-chosen,
+	// namespace-scoped compatibility-domain ID; the selected Pods must carry the
+	// same label. Pods may carry other labels, but they do not participate in
+	// CacheBackend ownership. The full metav1.LabelSelector surface
+	// (matchExpressions, operator-based selection) is NOT exposed today.
+	// Admission requires the domain value to be unique among CacheBackends in
+	// the same namespace. Every engine Pod must have exactly one CacheBackend
+	// owner.
 	// Pods that match get runtime-adapter engine wiring injected by the
 	// mutating Pod admission webhook at pod CREATE time. LMCache MP adapters
 	// inject the local connector immediately; when an optional managed Redis
@@ -728,7 +788,7 @@ type CacheBackendConnectorStatus struct {
 	ReadyEnginePods int32 `json:"readyEnginePods,omitempty"`
 
 	// DesiredServers is one per selected engine Pod for PodLocal and one per
-	// eligible node for NodeLocal.
+	// distinct active scheduled engine node for NodeLocal.
 	// +kubebuilder:validation:Minimum=0
 	DesiredServers int32 `json:"desiredServers,omitempty"`
 
@@ -745,6 +805,33 @@ type CacheBackendConnectorStatus struct {
 	// reachable MP server.
 	// +kubebuilder:validation:Minimum=0
 	UncoveredEnginePods int32 `json:"uncoveredEnginePods,omitempty"`
+
+	// EnginePodCoverage reports the connector verdict for every active selected
+	// engine Pod. The list is keyed by Pod name and sorted by name by the
+	// controller so operators can identify the exact uncovered instance.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	EnginePodCoverage []CacheBackendEnginePodCoverageStatus `json:"enginePodCoverage,omitempty"`
+}
+
+// CacheBackendEnginePodCoverageStatus is the per-engine connector verdict.
+// Ready means the engine Pod itself is Ready; Covered means the current
+// CacheBackend generation has exactly one healthy reachable MP server for it.
+type CacheBackendEnginePodCoverageStatus struct {
+	// Name is the selected engine Pod name in the CacheBackend namespace.
+	Name string `json:"name"`
+
+	// NodeName is the scheduled node. It is empty while the Pod is pending.
+	// +optional
+	NodeName string `json:"nodeName,omitempty"`
+
+	Ready bool `json:"ready"`
+
+	Covered bool `json:"covered"`
+
+	// Reason is a stable machine-readable explanation of the coverage verdict.
+	Reason string `json:"reason"`
 }
 
 // CacheBackendRemoteStorageStatus reports the optional shared L3 independently
@@ -881,10 +968,11 @@ type CacheBackendStatus struct {
 // resolves each replica to its engine pod by (tenant, replica_id) and then
 // attributes it to the owning CacheBackend — either via the engine pod's
 // `inferencecache.io/injected-by` annotation (the authoritative wiring
-// signal stamped by the pod webhook) or, for pods that bypassed the
-// webhook, via a deterministic first-match on `spec.engineSelector.
-// matchLabels`. The poller writes write-only-on-change and never clears
-// it on a single failed scrape (soft state).
+// signal stamped by the pod webhook) or, for manually attached subscriber Pods
+// that bypassed the webhook, via a deterministic metadata.name-ordered selector
+// fallback. Admission rejects ambiguous ownership; the poller
+// writes write-only-on-change and never clears it on a single failed scrape
+// (soft state).
 type CacheBackendIndexParticipation struct {
 	// PrefixCount is the sum of distinct prefix entries currently attributed
 	// to this backend's replicas. Zero is a valid observed value — it means

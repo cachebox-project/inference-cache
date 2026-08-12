@@ -15,7 +15,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      inferencecache.io/runtime: sglang-mp-managed-redis
+      inferencecache.io/cache-domain: sglang-mp-managed-redis
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256

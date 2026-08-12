@@ -20,7 +20,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: vllm-lmcache-llama-8b
+      inferencecache.io/cache-domain: vllm-lmcache-llama-8b
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256
@@ -45,9 +45,10 @@ kind: Deployment
 metadata:
   name: vllm-lmcache-llama-8b
   namespace: cache-substrate
-  labels:
-    app: vllm-lmcache-llama-8b
-    inferencecache.io/backend-type: lmcache
+	      labels:
+	        app: vllm-lmcache-llama-8b
+	        inferencecache.io/cache-domain: vllm-lmcache-llama-8b
+	        inferencecache.io/backend-type: lmcache
     inferencecache.io/engine: vllm
 spec:
   replicas: 1
@@ -58,6 +59,7 @@ spec:
     metadata:
       labels:
         app: vllm-lmcache-llama-8b
+        inferencecache.io/cache-domain: vllm-lmcache-llama-8b
         inferencecache.io/backend-type: lmcache
         inferencecache.io/engine: vllm
     spec:

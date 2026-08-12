@@ -45,7 +45,7 @@ spec:
           value: DEBUG
   engineSelector:
     matchLabels:
-      app: tuning-demo
+      inferencecache.io/cache-domain: tuning-demo
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 128
@@ -80,6 +80,7 @@ spec:
     metadata:
       labels:
         app: tuning-demo
+        inferencecache.io/cache-domain: tuning-demo
     spec:
       nodeSelector:
         kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`

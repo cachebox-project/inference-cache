@@ -27,6 +27,11 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	registry := r.Registry
 	runtimeID := adapterruntime.ResolveRuntimeID(backend)
 	storage := backend.Spec.EffectiveRemoteStorage()
+	if !isTypedLMCacheNodeLocal(backend) {
+		if err := r.cleanupLMCacheNodeLocalServerPods(ctx, backend); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// Events-only (tier-1 routing) provisions no backend server: the engine is
 	// wired for cache-aware routing via the kvevent-subscriber alone, with no KV
@@ -102,6 +107,9 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 			return ctrl.Result{}, err
 		}
+		if err := r.reconcileLMCacheNodeLocalServerPods(ctx, backend, binding); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
 	}
 
@@ -120,6 +128,9 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 		if backend.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeSGLangHiCache {
 			return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 		}
+		if err := r.reconcileLMCacheNodeLocalServerPods(ctx, backend, nil); err != nil {
+			return ctrl.Result{}, err
+		}
 		return r.reconcileHostOnly(ctx, backend)
 	}
 
@@ -134,12 +145,16 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render remote storage for %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
-	binding := &backendadapter.Binding{Protocol: rendered.Protocol}
+	desiredService := r.buildService(backend, rendered.Service)
+	binding := backendadapter.BindingFor(storage, rendered.Protocol, serviceEndpoint(desiredService))
 	if !adapter.SupportsBinding(binding) {
 		logger.V(1).Info("runtime adapter does not accept remote-storage binding; treating as unmanaged",
 			"runtime", runtimeID, "type", backend.Spec.EffectiveCacheType(), "protocol", rendered.Protocol,
 			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
+	}
+	if err := r.reconcileLMCacheNodeLocalServerPods(ctx, backend, binding); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	return r.reconcileManaged(ctx, logger, backend, rendered)

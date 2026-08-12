@@ -23,7 +23,7 @@ spec:
   type: LMCache
   engineSelector:
     matchLabels:
-      inferencecache.io/cache-enabled: "true"
+      inferencecache.io/cache-domain: cachebackend-sample
   lmCache:
     topology: PodLocal
     podLocal:

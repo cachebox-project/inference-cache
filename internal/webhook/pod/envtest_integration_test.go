@@ -444,6 +444,61 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if !envtestHasContainerEnvValue(&gotVLLMMP, "PYTHONHASHSEED", "0") {
 		t.Fatalf("typed vLLM Pod is missing PYTHONHASHSEED=0: %+v", gotVLLMMP.Spec.Containers[0].Env)
 	}
+
+	// Typed vLLM NodeLocal smoke: the real apiserver must preserve hostPath
+	// /dev/shm, preserved inference-owned placement, the Downward API node address, and
+	// the blocking ownership gate. No PodLocal native sidecar may be present.
+	nodeLocalCB := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "vllm-node-mp", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{
+				"app": "vllm-node-mp-test",
+			}},
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyNodeLocal,
+				NodeLocal: &cachev1alpha1.LMCacheNodeLocalSpec{
+					Server: &cachev1alpha1.LMCacheNodeLocalServerSpec{
+						Image: "registry.example.com/lmcache@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+						Port:  16555, HTTPPort: 18080, L1Capacity: resource.MustParse("1Gi"), MaxGPUWorkers: 2, MaxCPUWorkers: 2,
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+							Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+						},
+					},
+					Scheduling: &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{},
+				},
+			},
+		},
+	}
+	if err := mgr.GetClient().Create(ctx, nodeLocalCB); err != nil {
+		t.Fatalf("create typed vLLM NodeLocal CacheBackend: %v", err)
+	}
+	nodeLocalPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "vllm-node-mp-engine", Namespace: ns, Labels: map[string]string{"app": "vllm-node-mp-test"}},
+		Spec: corev1.PodSpec{NodeSelector: map[string]string{"gpu-pool": "inference-owned"}, Containers: []corev1.Container{{
+			Name: "vllm", Image: "vllm:connector-ready", Args: []string{"--model", "model-a", "--tensor-parallel-size=1"},
+		}}},
+	}
+	if err := mgr.GetClient().Create(ctx, nodeLocalPod); err != nil {
+		t.Fatalf("create typed vLLM NodeLocal Pod: %v", err)
+	}
+	var gotNodeLocal corev1.Pod
+	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: nodeLocalPod.Name}, &gotNodeLocal); err != nil {
+		t.Fatalf("get typed vLLM NodeLocal Pod: %v", err)
+	}
+	if envtestFindInitContainer(&gotNodeLocal, "lmcache-mp-server") != nil || envtestFindInitContainer(&gotNodeLocal, "lmcache-node-local-gate") == nil {
+		t.Fatalf("NodeLocal init containers = %+v", gotNodeLocal.Spec.InitContainers)
+	}
+	if len(gotNodeLocal.Spec.NodeSelector) != 1 || gotNodeLocal.Spec.NodeSelector["gpu-pool"] != "inference-owned" || gotNodeLocal.Spec.Affinity != nil {
+		t.Fatalf("NodeLocal mutated inference-owned placement: selector:%v affinity:%+v", gotNodeLocal.Spec.NodeSelector, gotNodeLocal.Spec.Affinity)
+	}
+	nodeConfig := envtestArgValue(gotNodeLocal.Spec.Containers[0].Args, "--kv-transfer-config")
+	if !strings.Contains(nodeConfig, `"lmcache.mp.host":"tcp://$(INFERENCECACHE_NODE_IP)"`) ||
+		!envtestContainerHasFieldRef(&gotNodeLocal, "INFERENCECACHE_NODE_IP", "status.hostIP") {
+		t.Fatalf("NodeLocal node-derived engine wire = config:%q env:%+v", nodeConfig, gotNodeLocal.Spec.Containers[0].Env)
+	}
 }
 
 func envtestArgValue(args []string, flag string) string {
@@ -464,6 +519,18 @@ func envtestHasContainerEnvValue(pod *corev1.Pod, name, value string) bool {
 	}
 	for _, entry := range pod.Spec.Containers[0].Env {
 		if entry.Name == name && entry.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func envtestContainerHasFieldRef(pod *corev1.Pod, name, path string) bool {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return false
+	}
+	for _, entry := range pod.Spec.Containers[0].Env {
+		if entry.Name == name && entry.ValueFrom != nil && entry.ValueFrom.FieldRef != nil && entry.ValueFrom.FieldRef.FieldPath == path {
 			return true
 		}
 	}

@@ -70,6 +70,7 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 | `CB007` | WARN | `FunctionalProbeOK` condition present but not `True` — the controller's functional self-test is failing for this backend (explains a Ready downgrade) |
 | `EP001` | WARN | matched engine pod missing an injection marker (no `inferencecache.io/injected-by` annotation and no Event) |
 | `EP002` | OK | matched engine pod is injected (annotation or Event) |
+| `EP003` | WARN | engine pod matches multiple same-namespace CacheBackends; no implicit owner is selected |
 | `OP001` | WARN | orphaned engine pod (NoMatchingCacheBackend; forward-looking — see note below) |
 | `CT001` | WARN | CacheTenant over quota (`QuotaExceeded=True`) |
 | `CT002` | OK | CacheTenant within quota |

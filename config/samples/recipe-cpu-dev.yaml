@@ -37,7 +37,8 @@
 # manifest and webhook mutation without a GPU; it does not claim that every
 # vLLM CPU image bundles the connector. Normal engine startup is authoritative.
 #
-# What binds the two objects: the label `app: cpu-dev` appears in BOTH
+# What binds the two objects: the `inferencecache.io/cache-domain: cpu-dev`
+# label appears in BOTH
 # `CacheBackend.spec.engineSelector.matchLabels` AND the engine Deployment's
 # pod-template labels. The mutating Pod webhook intercepts each engine pod at
 # CREATE, finds the matching CacheBackend, and injects the LMCache engine
@@ -60,7 +61,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: cpu-dev               # <-- binding label (1 of 2)
+      inferencecache.io/cache-domain: cpu-dev # <-- ownership domain (1 of 2)
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256
@@ -97,7 +98,8 @@ spec:
   template:
     metadata:
       labels:
-        app: cpu-dev             # <-- binding label (2 of 2)
+        app: cpu-dev
+        inferencecache.io/cache-domain: cpu-dev # <-- ownership domain (2 of 2)
     spec:
       nodeSelector:
         kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`

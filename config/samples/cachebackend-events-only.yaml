@@ -54,7 +54,7 @@ spec:
     mode: EventsOnly
   engineSelector:
     matchLabels:
-      app.kubernetes.io/name: vllm
+      inferencecache.io/cache-domain: vllm-events-only
   observation:
     # Served model identifier the matched engine pods are loaded with. Plumbed
     # to the auto-attached kvevent-subscriber sidecar's --model-id so the index

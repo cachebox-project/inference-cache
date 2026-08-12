@@ -8,6 +8,7 @@ import (
 	"context"
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	builtinadapters "github.com/cachebox-project/inference-cache/internal/adapters/builtin"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/go-logr/logr"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -70,6 +72,46 @@ func configureTestRegistries(r *CacheBackendReconciler) {
 	}
 	if r.BackendRegistry == nil {
 		r.BackendRegistry = registries.Storage
+	}
+}
+
+func TestCacheBackendRequestForPod(t *testing.T) {
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want types.NamespacedName
+	}{
+		{
+			name: "controller-owned server",
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: cachev1alpha1.GroupVersion.String(), Kind: "CacheBackend", Name: "cache", Controller: ptr.To(true),
+			}}}},
+			want: types.NamespacedName{Namespace: "team-a", Name: "cache"},
+		},
+		{
+			name: "injected engine",
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Annotations: map[string]string{
+				enginebinding.AnnotationInjectedBy: "team-a/cache", enginebinding.AnnotationInjectedByUID: "uid",
+			}}},
+			want: types.NamespacedName{Namespace: "team-a", Name: "cache"},
+		},
+		{name: "unverified engine", pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Annotations: map[string]string{
+			enginebinding.AnnotationInjectedBy: "team-a/cache",
+		}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cacheBackendRequestForPod(context.Background(), tt.pod)
+			if tt.want.Name == "" {
+				if len(got) != 0 {
+					t.Fatalf("requests = %+v, want none", got)
+				}
+				return
+			}
+			if len(got) != 1 || got[0].NamespacedName != tt.want {
+				t.Fatalf("requests = %+v, want %s", got, tt.want)
+			}
+		})
 	}
 }
 

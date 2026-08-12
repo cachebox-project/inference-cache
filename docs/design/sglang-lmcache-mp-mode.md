@@ -10,15 +10,16 @@ MP migration. The current contract is in
 > MP viability. Its flat worker fields, engine-image worker default, vLLM IP
 > coexistence, and predictions that vLLM MP was future work are historical and
 > were physically removed in migration Phase 7. Current production behavior is
-> the typed PodLocal API and common MP-server sidecar renderer defined by
+> the typed PodLocal/NodeLocal API and common MP renderer defined by
 > [`lmcache-multiprocess-migration-roadmap.md`](lmcache-multiprocess-migration-roadmap.md)
 > and [`cachebackend-api.md`](cachebackend-api.md).
 
 ## Current-state summary
 
-- vLLM and SGLang support only typed PodLocal LMCache MP in the current API.
-- Admission injects a CacheBackend-configured `lmcache-mp-server` native sidecar;
-  it does not own or replace the engine image.
+- vLLM and SGLang support typed PodLocal and NodeLocal LMCache MP in the current
+  API. PodLocal injects a native sidecar; NodeLocal follows scheduled engines
+  with one on-demand same-node server Pod.
+- Admission does not own or replace the engine image.
 - Omitting `remoteStorage` selects host-only MP. Explicit Redis selects the only
   currently supported remote L3. Removed LMCacheServer and legacy IP-wired
   Mooncake objects are never translated to Redis; a new typed MP Mooncake L2

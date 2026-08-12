@@ -20,7 +20,7 @@ spec:
   type: LMCache                # engine-local cache integration
   engineSelector:
     matchLabels:
-      app: my-engine            # must match your engine pods' labels
+      inferencecache.io/cache-domain: my-engine-cache
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256
@@ -41,16 +41,34 @@ spec:
     modelID: Qwen/Qwen2.5-0.5B-Instruct
 ```
 
-That is the whole CacheBackend. The runtime/cache pair, matching labels, model
+That is the whole CacheBackend. The runtime/cache pair, ownership domain, model
 identity, and MP server contract are explicit; `integration.role` defaults to
 `ReadWrite`, the readiness gate's `firstEventTimeout` defaults to `5m`, and
 `integration.failOpen` defaults to `true`. Omitting `remoteStorage` selects
 host-only MP: L1 is per engine Pod and there is no cross-Pod sharing. Add an
 explicit Redis L3 when sharing is required.
 
-> **One label does the binding.** The value under
-> `engineSelector.matchLabels` must also appear on your engine pods'
-> template labels. That label match is what lets the mutating Pod webhook
+To share one MP L1 across several engine Pods on each GPU node, use the
+focused NodeLocal samples for
+[vLLM](../config/samples/cachebackend-vllm-nodelocal-host-only.yaml) or
+[SGLang](../config/samples/cachebackend-sglang-nodelocal-host-only.yaml).
+NodeLocal is an advanced host-bound topology. The inference system schedules
+each engine without CacheBackend changing its placement; the controller then
+creates one shared server Pod on every node that actually has an active
+selected engine. The server mounts host `/dev/shm` and declares MP and HTTP host
+ports. Engines are held in an init gate until their own node's server reports
+the exact CacheBackend name/UID/generation and healthy config. Co-schedule only
+mutually trusted engines and enforce host-port access with node firewalls;
+hostNetwork bypasses Kubernetes NetworkPolicy. L1 capacity is per node, and
+`maxGPUWorkers` must cover the maximum engine instances on that node. The
+focused samples retain an idle per-node server and its L1 for 300 seconds so an
+engine restart can reuse them; set `idleRetentionSeconds: 0` for immediate
+cleanup.
+
+> **One label does the binding.** Every non-empty selector contains only
+> `inferencecache.io/cache-domain`; its namespace-scoped value must also appear
+> on your engine pods' template labels. Other Pod labels do not participate in
+> CacheBackend ownership. That domain match lets the mutating Pod webhook
 > inject the cache wiring at pod CREATE. Drift them apart and the engine runs
 > uncached — `kubectl get cachebackend` then shows `MATCHED: 0`.
 
@@ -143,8 +161,8 @@ Once the backend is Ready and engine pods are bound, three things are live:
   annotation. Any active gate that reports a per-stage failure can
   hold the backend at `Ready=False` with a stage-specific reason on
   `.status.conditions[]` — see [Troubleshooting](#troubleshooting).
-  `ENDPOINT` is empty for host-only PodLocal MP and contains only a configured
-  remote L3 endpoint, never the loopback MP connector address. `MATCHED` is the
+  `ENDPOINT` is empty for host-only PodLocal or NodeLocal MP and contains only a
+  configured remote L3 endpoint, never a local MP connector address. `MATCHED` is the
   engine-pod count the selector binds, and
   `PREFIXES` / `LASTEVENT` show the cache actually receiving state.
 

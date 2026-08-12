@@ -1,6 +1,6 @@
 # Design Roadmap: LMCache Multiprocess Migration
 
-Status: **Phases 0–5 and 7 complete; Phase 6 was not required (2026-08-11)** · Scope:
+Status: **Phases 0–5, 7, and 8 complete; Phase 6 was not required (2026-08-12)** · Scope:
 deprecate and remove this project's LMCache in-process data plane, converge vLLM
 and SGLang on LMCache multiprocess (MP) mode, and model
 Pod-local and node-local MP server placement without conflating either with
@@ -73,8 +73,9 @@ type. In particular:
   connector. Existing code and documents sometimes call it an MP worker.
 - **PodLocal** means one MP server native sidecar per engine Pod, reached over
   loopback and sharing that Pod's `/dev/shm`.
-- **NodeLocal** means one MP server Pod per node, normally a DaemonSet member,
-  shared by engine Pods on that node.
+- **NodeLocal** means one on-demand MP server Pod per node that currently hosts
+  selected engine Pods. The inference system schedules engines first; the
+  cache controller follows that observed placement.
 - **Remote storage** means only the optional L3 behind the IP connector or MP
   server. An MP server is never declared as `remoteStorage`.
 - **Legacy LMCacheServer** means the legacy IP centralized-sharing service
@@ -95,7 +96,7 @@ code lands.
 | D2 | `remoteStorage` is optional L3 only. | Local CPU capacity and MP server placement are engine-integration concerns, not remote-provider selection. |
 | D3 | `LMCacheServer` is removed from the canonical `remoteStorage.provider` set. | `lm://` is a legacy IP remote connector and is absent from the MP L3 adapter catalog. |
 | D4 | PodLocal is the first production candidate and migration target. | It has the smallest scheduling and ownership surface and builds on the existing SGLang proof. |
-| D5 | NodeLocal means a per-`CacheBackend` DaemonSet in its first implementation. | Multiple engine Pods of one backend may share it; cross-`CacheBackend` sharing introduces unresolved config, tenancy, port, and deletion ownership. |
+| D5 | NodeLocal means one controller-owned server Pod per active engine node per `CacheBackend`; the inference system remains the placement authority. This replaces the earlier DaemonSet/server-first decision on 2026-08-12. | A DaemonSet requires a node set before engines are scheduled and therefore inverted ownership by forcing engines onto cache-selected nodes. Engine-demanded Pods preserve arbitrary inference-system scheduling while still allowing same-node sharing. |
 | D6 | A generic Deployment behind a load-balanced Service is not a valid CUDA MP topology. | CUDA IPC and shared memory require the engine to reach the MP server on its own node. |
 | D7 | Connector endpoints are not published in the generic `status.endpoint`. | PodLocal uses loopback; NodeLocal is node-dependent. Only remote L3 has a globally meaningful provider endpoint. |
 | D8 | Unsupported combinations are rejected at admission. | An accepted but inert cache field commonly produces silent zero-hit behavior. |
@@ -103,6 +104,7 @@ code lands.
 | D10 | Component lifecycle ownership is capability-specific. | The Pod-local MP process is kubelet-owned while remote L3 is independently managed; connector re-registration after an MP-process restart is a post-migration enhancement, not an MVP contract. |
 | D11 | Each supported vLLM integration explicitly identifies its MP connector implementation; the initial reference baseline uses the LMCache-shipped connector. | With vLLM 0.20 or newer, `LMCacheMPConnector` without a module path selects vLLM's built-in implementation. The initial adapter uses `kv_connector_module_path: lmcache.integration.vllm.lmcache_mp_connector` so the tested client tracks the pinned LMCache server protocol; a future adapter revision may validate a different implementation explicitly. |
 | D12 | CacheBackend never owns or rewrites the inference engine image. Engine images in validation matrices are reproducible fixtures only; CacheBackend digest-pins only cache components it injects or manages. | The inference system owns its runtime lifecycle. The selected adapter renders its engine-specific connector contract, while normal engine initialization is the authoritative compatibility check; tested images are neither an admission allowlist nor a mutation default. |
+| D13 | Selecting `NodeLocal` explicitly opts the backend into one host-networked MP server per active engine node and host `/dev/shm` mounts in both server and selected engine Pods; engine Pods themselves remain off host networking and host IPC. | LMCache 0.5.3 requires node-visible networking and shared host memory for cross-Pod CUDA IPC. Keeping engine placement and networking under the inference system reduces coupling, while the topology choice and documented trust domain make the remaining host access explicit. |
 
 ## Migration baseline (before Phase 1)
 
@@ -187,7 +189,7 @@ GPU node
             +-----------+-----------+
                         v
               +--------------------+
-              | LMCache MP server  |   one DaemonSet Pod per node
+              | LMCache MP server  |   one on-demand Pod per active node
               | shared CPU L2      |
               +---------+----------+
                         |
@@ -197,13 +199,15 @@ GPU node
 
 Properties:
 
-- one MP server per eligible node per `CacheBackend`;
+- one MP server per node currently hosting selected engines for a
+  `CacheBackend`;
 - multiple selected engine Pods on that node share CPU cache capacity;
 - engines derive the endpoint from their node identity, not a load-balanced
   Service endpoint;
 - L2 capacity is per node;
-- server scheduling, host port, host shared-memory arrangement, GPU visibility,
-  and node coverage become controller-owned concerns;
+- engine scheduling remains inference-system-owned; server exact-node binding,
+  host port, host shared-memory arrangement, GPU visibility, and node coverage
+  become controller-owned concerns;
 - cross-`CacheBackend` and cross-tenant sharing are out of scope for the first
   implementation.
 
@@ -244,7 +248,7 @@ spec:
     failOpen: true
   engineSelector:
     matchLabels:
-      app.kubernetes.io/name: vllm
+      inferencecache.io/cache-domain: vllm-lmcache
 ```
 
 Omit `remoteStorage` for host-only MP operation.
@@ -265,6 +269,7 @@ spec:
       server:
         image: registry.example/lmcache-standalone@sha256:...
         port: 6555
+        httpPort: 8080
         l1Capacity: 128Gi
         maxGPUWorkers: 8
         maxCPUWorkers: 8
@@ -275,16 +280,14 @@ spec:
           limits:
             memory: 132Gi
       scheduling:
-        nodeSelector:
-          inferencecache.io/lmcache-mp: "true"
-        tolerations: []
+        runtimeClassName: nvidia # optional server override; never selects nodes
   remoteStorage:
     provider: Redis
     ownership: External
     endpoint: redis.example:6379
   engineSelector:
     matchLabels:
-      app.kubernetes.io/name: vllm
+      inferencecache.io/cache-domain: vllm-lmcache
 ```
 
 ### Final provider matrix
@@ -293,8 +296,8 @@ spec:
 |---|---|---:|---:|---:|---:|
 | SGLang | PodLocal | required MVP | required MVP | future | rejected |
 | vLLM | PodLocal | required MVP | required MVP | future | rejected |
-| SGLang | NodeLocal | planned | planned | future | rejected |
-| vLLM | NodeLocal | planned | planned | future | rejected |
+| SGLang | NodeLocal | implemented; GPU pending | functional GPU passed; metrics pending | future | rejected |
+| vLLM | NodeLocal | implemented; functional GPU passed | functional GPU passed; metrics pending | future | rejected |
 
 “Required MVP” means the combination must be implemented and validated, not that
 the remote L3 field itself is required.
@@ -316,6 +319,12 @@ status:
     readyServers: 4
     coveredEnginePods: 8
     uncoveredEnginePods: 0
+    enginePodCoverage:
+      - name: engine-0
+        nodeName: gpu-node-a
+        ready: true
+        covered: true
+        reason: ConnectorReady
   remoteStorage:
     provider: Redis
     endpoint: redis.example:6379
@@ -332,9 +341,9 @@ status:
 Required semantics:
 
 - PodLocal `desiredServers` equals the selected engine Pod count.
-- NodeLocal `desiredServers` equals the number of distinct nodes hosting selected
-  engine Pods, or the explicitly managed eligible-node count when the DaemonSet
-  is intentionally prewarmed.
+- NodeLocal `desiredServers` equals the number of distinct `spec.nodeName`
+  values among active engine Pods carrying this CacheBackend's valid name+UID
+  injection record. Unscheduled engines demand no speculative server yet.
 - `coveredEnginePods` counts selected engine Pods whose required MP server is
   healthy and reachable.
 - PodLocal loopback and NodeLocal node-derived connector addresses are not
@@ -366,8 +375,8 @@ the legacy deprecation writer is only implemented if Phase 6 is activated.
 | 4 | vLLM PodLocal MP | Phase 3 | complete |
 | 5 | Repository consumer migration; migration tooling only if needed | Phase 4 | complete |
 | 6 | Conditional compatibility gate if legacy consumers appear | Phase 5 | not required by Phase 0 and Phase 5 findings |
-| 7 | Remove IP, `lm://`, and LMCacheServer provider | Phase 5; Phase 6 only when applicable | in progress |
-| 8 | NodeLocal shared MP server topology | Phases 3–4; does not block Phase 7 | not started |
+| 7 | Remove IP, `lm://`, and LMCacheServer provider | Phase 5; Phase 6 only when applicable | complete |
+| 8 | NodeLocal shared MP server topology | Phases 3–4; does not block Phase 7 | complete |
 
 ## Phase 0 — design freeze and compatibility baseline
 
@@ -869,7 +878,8 @@ skipped because `xxhash` was unavailable; `make ci` still passed.
 
 ## Phase 8 — NodeLocal shared MP servers
 
-- **Status:** Not started
+- **Status:** Complete (2026-08-12), including focused live-node and GPU
+  validation of the UID-scoped POSIX SHM remediation.
 - **Depends on:** Phases 3–4; does not block Phase 7
 
 ### Objective
@@ -879,71 +889,351 @@ node without weakening placement, isolation, or status correctness.
 
 ### Scope
 
-Includes same-node discovery, DaemonSet lifecycle, shared capacity, and
-multi-node coverage. Cross-`CacheBackend` sharing remains out of scope.
+Includes engine-first same-node discovery, on-demand per-node server lifecycle,
+shared capacity, multi-node coverage, host-port conflict handling, and status.
+PodLocal remains supported. SGLang TP>1, multi-node TP, distributed executors,
+MLA, directional PD roles, typed MP Mooncake L2, managed Redis clustering,
+generic MP-server restart/re-registration, and cross-`CacheBackend` server
+sharing remain out of scope.
+
+The final contract is:
+
+- **API:** `nodeLocal.server` explicitly requires a digest-pinned image,
+  distinct MP and FastAPI host ports, per-node L1 capacity, GPU/CPU worker
+  limits, and resources covering `l1Capacity + 1Gi`. The FastAPI listener also
+  serves `/metrics`; no third metrics port is created. `nodeLocal.scheduling`
+  exposes only server operational overrides and cannot select nodes.
+  `nodeLocal.idleRetentionSeconds` defaults to 300, accepts 0–86400, and owns
+  warm server/L1 retention independently from engine-Pod lifetime. Host-bound
+  and security-relevant values have no implicit defaults.
+- **Lifecycle and placement:** CacheBackend creation alone creates no MP server.
+  The inference system schedules engines first; the controller then owns one
+  direct server Pod per distinct active engine node. Required node affinity to
+  `engine.spec.nodeName` preserves engine placement while keeping normal
+  host-port, taint, resource, and scheduler checks active. After the last
+  selected engine leaves a node, typed `idleRetentionSeconds` retains that
+  server and L1 for reuse; expiry removes it, while zero requests immediate
+  deletion. No Deployment, ReplicaSet, or DaemonSet owns these Pods.
+- **Host boundary:** Server Pods use `hostNetwork`, `ClusterFirstWithHostNet`,
+  host `/dev/shm`, the selected NVIDIA runtime without reserving allocatable
+  GPUs, and a restrictive container security context. Engine Pods remain off
+  host networking and host IPC.
+- **Endpoint and gate:** Engines derive the same-node address from Downward API
+  `status.hostIP`. A blocking init gate requires healthy `/healthcheck` plus an
+  exact `/config` match for namespace/name/UID/generation, ports, and chunk size
+  before the engine starts. It also verifies both the declared MP `shm_name`
+  and the effective L1 memory-manager `shm_name`, so an unsafe pool or LMCache
+  shared-memory fallback cannot silently admit the engine. SGLang writes its
+  engine-specific client YAML; vLLM retains its connector JSON. No Service or
+  ClusterIP participates in CUDA MP traffic.
+- **Ownership and isolation:** One CacheBackend name/UID/runtime and its sole
+  namespace-unique `inferencecache.io/cache-domain` value own one server pool.
+  CREATE and UPDATE reject non-canonical or duplicate ownership; Pod admission
+  denies concurrent ambiguity. Every server receives the full UID-derived
+  `lmcache_l1_pool_inferencecache_<uid>` name through `--shm-name`; the name is
+  stable across same-UID generation/server replacement and distinct after
+  CacheBackend delete/recreate. Disjoint port pairs prevent network bind
+  conflicts, while UID-scoped names prevent accidental POSIX SHM unlink/rebind
+  between co-located pools. Idle-retained servers continue reserving their
+  ports and SHM budget until expiry. UID matching and a unique SHM name are
+  routing/ownership identities, not authentication: co-located pools must
+  remain inside one mutually trusted node domain, host firewall controls are
+  required, and NetworkPolicy does not isolate host-network listeners.
+- **Runtime consistency:** A pool cannot mix vLLM and SGLang. CacheBackend
+  supplies one server image, chunk size, port tuple, generation, and runtime for
+  the pool. The inference-system owner remains responsible for engine
+  image/package/model compatibility; normal engine initialization is
+  authoritative. Different prompts within one compatibility domain may share
+  content-addressed KV entries, while another runtime/model/layout/tenant
+  domain requires a separate CacheBackend.
+- **Status:** `desiredServers` is the distinct active scheduled-engine node
+  count. `readyServers` counts current-generation, name/UID-verified Ready
+  servers carrying the expected UID-scoped SHM annotation and exact
+  `--shm-name` argument on those nodes. An engine is covered only by exactly one
+  healthy current server on its own node; unscheduled, stale-generation,
+  SHM-mismatched, ambiguous, or serverless engines are uncovered. Connector
+  readiness requires all desired servers and all matched engines to be Ready
+  and covered.
+- **Capacity:** `l1Capacity` is one shared budget per active node, not per engine
+  Pod. `maxGPUWorkers` must cover the maximum engine instances expected on one
+  node.
 
 ### Deliverables
 
-- [ ] Reconcile one DaemonSet per NodeLocal `CacheBackend`.
-- [ ] Restrict it to intended GPU/engine nodes through typed scheduling fields.
-- [ ] Configure host networking and host shared memory according to the pinned
-      upstream deployment contract.
-- [ ] Declare host ports so Kubernetes scheduling exposes conflicts.
-- [ ] Authenticate ownership by CacheBackend name and UID.
-- [ ] Compute desired/ready servers and engine-node coverage.
-- [ ] Handle engine scheduling before the node-local server is ready without
-      starting an engine against a missing required MP endpoint.
-- [ ] Derive the node-local address from the engine Pod's node/host IP through a
-      Downward API field or another deterministic node-scoped mechanism.
-- [ ] Do not use a load-balanced ClusterIP as the CUDA MP endpoint.
-- [ ] Keep SGLang and vLLM launch surfaces engine-specific.
-- [ ] Validate the server's global chunk size and version against every selected
-      engine Pod.
-- [ ] Define port-conflict behavior for multiple NodeLocal CacheBackends on one
-      node.
-- [ ] Restrict the first implementation to one trust/tenant domain per
-      CacheBackend server pool.
-- [ ] Document that L1 capacity is per node and shared by selected engine Pods.
-- [ ] Size `maxGPUWorkers` for the number of engine instances sharing a server.
-- [ ] Add NetworkPolicy/firewall guidance where host networking permits it.
-- [ ] Assess the security impact of host networking/shared memory and GPU
-      visibility.
+- [x] Reconcile one controller-owned server Pod per distinct active scheduled
+      engine node, retain it for the typed idle window after final demand, and
+      delete it on expiry.
+- [x] Preserve inference-system engine placement and bind the server through
+      exact-node affinity so Kubernetes still checks ports and resources.
+- [x] Configure the required host-network, host-shared-memory, GPU-visibility,
+      probe, resource, and restrictive security surfaces.
+- [x] Declare both host ports and surface same-node conflicts without accepting
+      another backend's listener.
+- [x] Require one namespace-unique `inferencecache.io/cache-domain` selector on
+      CREATE and UPDATE; deny ambiguous Pod injection and cross-backend sharing.
+- [x] Gate engine startup on the healthy same-node server's exact
+      name/UID/generation/port/chunk-size identity.
+- [x] Derive one full UID-scoped POSIX SHM name per CacheBackend, pass it
+      explicitly to every NodeLocal server, verify declared and effective live
+      configuration, and replace or un-cover servers missing that identity.
+- [x] Derive the endpoint from Downward API node data and render no MP Service
+      or load-balanced ClusterIP.
+- [x] Keep vLLM and SGLang launch/configuration surfaces separate while sharing
+      the common server renderer.
+- [x] Compute desired/ready servers and per-engine same-node coverage.
+- [x] Enforce one trust/tenant/runtime/model/layout domain per server pool and
+      leave engine package compatibility to normal engine initialization.
+- [x] Define L1 as a per-node shared budget and require `maxGPUWorkers` sizing
+      for all engines expected on that node.
+- [x] Document the host-network, shared-memory, GPU, firewall, isolation, and
+      failure-domain boundaries.
 
 ### Validation
 
-- [ ] One engine Pod on one node.
-- [ ] Multiple engine Pods sharing one node-local server.
-- [ ] Engines spread across multiple nodes, each using only its local server.
-- [ ] Node drain and engine rescheduling.
-- [ ] Host-port conflict negative test.
-- [ ] Redis outage/recovery with multiple node-local servers.
-- [ ] No cross-node attempt to use CUDA IPC.
+An initial DaemonSet/server-first prototype was tested and then rejected during
+architecture review on 2026-08-12 because it made CacheBackend placement
+authoritative over the inference system. None of that prototype's results count
+toward Phase 8. The evidence below is for the replacement engine-first,
+on-demand server-Pod implementation only.
+
+Local and repository validation completed on 2026-08-12 PDT:
+
+| Check | Result |
+|---|---|
+| Generated API artifacts | `make generate manifests` passed after the final engine-first/idle-retention API change; deepcopy, served CRD, Pod create/patch/delete RBAC, and webhook manifests are synchronized. No DaemonSet RBAC remains. |
+| Unit/envtest | `git diff --check` and `go test ./...` passed. Tests cover zero-server-without-engine, one server per distinct scheduled node, multiple same-node engines, idle marking/reuse/expiry and zero-retention cleanup, generation replacement, foreign-name collision, cross-CacheBackend ownership rejection, exact-node affinity, Pod watch mapping, same-node status coverage, optional scheduling overrides, strict canonical one-label cache-domain validation on CREATE and UPDATE, duplicate-domain rejection, ambiguous-Pod denial, doctor ambiguity reporting, and vLLM/SGLang placement-preserving injection. The real Kubernetes 1.31 admission envtest also passed an API-server CREATE rejection for a duplicate cache domain. |
+| Samples | `make verify-samples` passed: 27 admitted, one pre-existing explicit skip, zero failures. Both engine-first NodeLocal samples passed real admission. |
+| Coverage | `make cover-check` passed. |
+| CI | The baseline was amended as `628194e` with a matching `Signed-off-by`; `make verify-dco` and the complete `make ci` target passed. The optional Python golden-vector regeneration explicitly skipped because `xxhash` is unavailable. |
+| Fresh install | Dedicated Kubernetes 1.32 kind clusters passed the engine-first CRD/controller/webhook installation, real duplicate cache-domain rejection, zero speculative server Pods, placement-preserving NodeLocal engine admission, scheduler-selected engine node followed by one exact-node-affinity direct server Pod, host boundary/host ports, no MP Service, PodLocal admission, current samples, doctor, idempotent re-apply, served idle-retention default/bounds, Pod patch RBAC, idle marking, and same-UID reuse. VPN-safe temporary self-signed webhook TLS replaced only the cert-manager download; both clusters were deleted. The later UID-scoped `--shm-name` delta updated this smoke with exact annotation/argument checks but was not rerun end-to-end because no kind node image/cluster was cached and the standard cert-manager URL remained unavailable through the VPN. That delta instead passed real envtest admission plus the SJC current-controller live tests recorded below. |
+| Legacy production search | Production Go/manifests contain no `LMCacheConnectorV1`, `LMCACHE_REMOTE_URL`, `LMCACHE_REMOTE_SERDE`, `ProtocolLMCache`, `lm://`, or LMCacheServer provider path. Remaining LMCacheServer matches are sample comments explicitly describing its removal. |
+| Confirmed SHM collision root cause | A focused SJC dev test placed two independent LMCache 0.5.3 standalone Pods on node `10.0.103.182`, with disjoint ports and instance IDs but no `--shm-name`. Both ran as PID 1: A created `/dev/shm/lmcache_l1_pool_1` at inode `14092`; B unlinked that name and recreated inode `14097`; A retained a mapping to deleted inode `14092`. The dedicated namespace was deleted and no control-plane object changed. |
+| UID-scoped SHM implementation | `git diff --check`, gate-script Python syntax parsing, `go test ./...`, `make verify-samples` (27 passed, one explicit skip), `make cover-check`, and complete `make ci` passed. Tests cover deterministic full-UID naming, distinct UIDs, unsafe/oversized UID rejection, exact server args/annotation, declared and effective startup-gate checks, status exclusion, automatic replacement of an existing server missing the managed SHM identity, and PodLocal regression. Fresh-install could not run locally because no kind node image/cluster is cached and the standard cert-manager bootstrap requires the known-unavailable GitHub path; real envtest API-server admission did run. |
+| Focused live SHM remediation | On SJC Kubernetes 1.31.1, two raw LMCache 0.5.3 servers with distinct explicit UID-style names ran together on CPU node `10.0.103.182`: A remained at inode `14166`, while B used inode `14176` and then `14181` after replacement. A's mapping remained named and unchanged throughout. The current controller then created two independent NodeLocal pools on the same node with real CacheBackend UIDs `61a98028-653a-4cfb-83ef-2dc3a9321b50` and `47205c02-6d7d-45aa-bf40-0e1882346309`: their effective names and inodes were respectively `14196` and `14200`; replacing only B moved it to `14207` while A stayed `14196`; deleting and recreating B's engine demand inside idle retention reused B's same server Pod UID and inode `14207`. Both pools reported server/engine coverage `1/1/1/1`. All CPU test resources were deleted. |
+
+SJC engine-first GPU validation ran on 2026-08-12 PDT:
+
+The dedicated `inference-cache-gpu-test` namespace ran Kubernetes 1.31.1 on
+two BM.GPU.A100-v2.8 nodes with A100-SXM4-80GB GPUs, NVIDIA driver 550.163.01,
+and CUDA 12.9 client artifacts. The server image was
+`docker.io/lmcache/standalone@sha256:0df30fc70a7d689e1f12823789208a0ee8ef31537316eba6a4c2fa83b0abe61b`.
+The vLLM 0.25.1 engine image was
+`sha256:f72dd35b1efd50fd7646ebce708f173a4040fddf3f2363759c67ad732d912d0a`;
+the SGLang 0.5.13.post1 engine image was
+`sha256:920df39109c60429b0a23eaacfd2786fcf1595c12f3ca4fc6e153b2abe34865f`.
+Both engine manifests used the LMCache 0.5.3 CUDA 12.9 wheel with SHA-256
+`3587d26a23e942b774589c88ea4cfb019af53474aba84dc772dae5900f9ad2cb`
+as test-only runtime-owner scaffolding. It is not a production installation
+mechanism and was not supplied by CacheBackend.
+
+| Check | Evidence/result |
+|---|---|
+| Engine-first lifecycle and gating | Each CacheBackend initially created only its managed Redis Deployment/Service and zero MP servers. After the inference-system-owned engine Pod was scheduled, the controller created the same-node direct server Pod. All gates first observed connection refusal, then admitted the engine only after `/config` and `/healthcheck` matched the exact CacheBackend namespace/name/UID/generation and typed port/worker/chunk configuration. The test Pods had no application readiness probe, so data-plane testing additionally waited for the engine's `Application startup complete`; Kubernetes Pod Ready alone was not treated as service readiness. |
+| Effective vLLM configuration | TP=1, Qwen2.5-0.5B-Instruct, MP/HTTP host ports 15555/39080, chunk size 256, shared 8 GiB L1, three GPU/CPU worker slots, and managed Redis L2. Two engines on `10.0.121.10` shared one server and a third engine on `10.0.75.171` used a second server. Status converged to `desiredServers=readyServers=2` and matched/ready/covered engines `3/3/3`. |
+| vLLM store/reset/retrieve | Engine A's 750-token request caused its local server to log `Stored 512`. After `/reset_prefix_cache`, fresh engine B's first matching request caused the same `.121` server to log `Retrieved 512`; that server registered two distinct GPU IDs and affinity keys. Engine C's first matching request caused only its `.75` server to retrieve 512 through Redis L2 before local GPU transfer. |
+| Effective SGLang configuration | TP=1, TinyLlama-1.1B-Chat-v1.0, MP/HTTP host ports 15556/39081, chunk size 256, shared 8 GiB L1, two GPU/CPU worker slots, and managed Redis L2. Two engines on `.121` shared one server and a third engine on `.75` used a second server. Status converged to servers `2/2` and engines `3/3/3` ready/covered. |
+| SGLang store/flush/retrieve | Engine A's 831-token request caused `Stored 768`; after `/flush_cache`, its response reported `cached_tokens=768` and `host=768` while the server logged `Retrieved 768`. Fresh engine B's first request retrieved the same 768-token entry through the shared `.121` server. Engine C's first matching request retrieved 768 through only its local `.75` server. |
+| Same-node and no cross-node CUDA IPC | Every engine endpoint came from its own Downward API `status.hostIP`; each direct server used exact node affinity for that engine node, and no MP Service existed. The `.121` servers registered/transferred only for `.121` engines, while the `.75` servers registered/transferred only for `.75` engines. Cross-node reuse occurred through Redis L2, then terminated in the engine's same-node server; no CUDA IPC endpoint crossed nodes. |
+| Host-port conflict | A second backend demanded the same 15555/39080 host ports on `.121`. Its exact-node server remained Pending with scheduler `didn't have free ports`; status reported `NodeLocalHostPortConflict`, desired one server, zero ready servers, and the selected engine uncovered/gated. It did not accept the first backend's listener. |
+| Redis outage/recovery | SGLang and vLLM were fault-tested separately with two engine-demanded node-local servers. Deleting each managed Redis Pod changed `RemoteStorageReady` to `False/RemoteStorageUnavailable` while `ConnectorReady` and both local servers remained healthy. The replacement Redis restored the condition to True; all engine/server UIDs and restart counts remained unchanged/zero, and post-recovery reset/flush requests retrieved 512 vLLM or 768 SGLang tokens from shared L1. |
+| Engine lifecycle | The initial GPU run proved node-scoped deletion/recreation and gating. Architecture review then selected warm idle retention instead of immediate final-engine deletion. The final controller unit/envtest contract marks the server idle, reuses the same Pod when demand returns within the typed window, deletes it after expiry, and supports explicit zero-retention cleanup. The focused metrics GPU run left the server unchanged across normal engine traffic; it did not repeat the full engine-deletion matrix. |
+| Canonical selector follow-up | The latest amd64 controller `sha256:9d15ece6a854655d77c558b30005345190fd9cd5966fc4bedb1385b72cb95a70` rejected a non-canonical `app:` selector and separately rejected a second CacheBackend claiming the existing namespace-local `inferencecache.io/cache-domain`. A canonical vLLM engine matched successfully. The backend had zero server Pods before engine scheduling, then created one exact-node server on `10.0.121.10`; status converged to desired/ready servers `1/1` and matched/ready/covered engines `1/1/1`. |
+| Representative common-MP metrics | A focused vLLM TP=1 follow-up used the same pinned vLLM and standalone-server images and checksummed LMCache 0.5.3 wheel. Before traffic, `/metrics` reported L1 usage `0`. A 1,521-token request logged `Stored 1280 tokens`, raised `lmcache_mp_l1_write_chunks_total` to `5`, and raised L1 usage to `15,728,640` bytes. After successful `/reset_prefix_cache`, the identical request logged `Retrieved 1280 tokens in 0.002 seconds`; requested/hit counters became `2560/1280`, and vLLM reported a 42.1% external prefix-cache hit rate. vLLM and SGLang data-plane correctness had already passed separately above; the FastAPI `/metrics` endpoint and counters belong to their common standalone MP server, so this focused follow-up did not repeat the full runtime/node/Redis matrix. |
+| Post-rebase engine-metrics merge | A focused current-controller test used controller `sha256:a318ea5e96bbcd0ea10f33394beb8fdaa74ce8a93424f6a38f8df75edb4e6889` and subscriber `sha256:ed8a2ad680d248be3e737adf4ba09cd289f6b99909cec580d1cf240d877b3d88`. Live vLLM admission rendered `--hash-scheme=vllm` and the default `http://127.0.0.1:8000/metrics`. A real SGLang 0.5.13.post1 TP=1 Pod instead used its explicitly configured port 8000 and rendered `--hash-scheme=sglang`, `--engine-metrics-url=http://127.0.0.1:8000/metrics`, and `--enable-metrics`. Its endpoint exposed the expected `sglang:token_usage`, `sglang:cache_hit_rate`, `sglang:num_running_reqs`, and `sglang:num_queue_reqs` families; an active request produced `num_running_reqs=1`. Before engine startup the subscriber reported connection failures and `load_signal_stale`; after the endpoint came up it logged `load_signal_recovered`. The authenticated server snapshot then reported `statsReported=true`, `pressure=0.00390625`, one prefix, and a current update timestamp for the SGLang replica. This validates the rebased per-engine profile selection and custom-port plumbing without repeating the already-completed runtime/node/Redis matrix. |
+| UID-scoped two-pool GPU isolation | A final vLLM TP=1 run placed two CacheBackends and two engines on A100 node `10.0.75.171`, using disjoint ports `15655/39180` and `15656/39181`, 8 GiB L1, chunk size 256, and one GPU/CPU worker per pool. The tested controller was `sha256:0320ba07bae7bf5158ca1120e96c8e31275bf0b2e879a89cde46a48d0f8edc9b`; the server was the pinned standalone digest above; the vLLM digest was `sha256:f72dd35b1efd50fd7646ebce708f173a4040fddf3f2363759c67ad732d912d0a`; and the checksummed wheel carrier was `sha256:81b6767d1435f41832d3494eee47f93d08998cba99f50e9b019d6a7ba7ea1e33`. Both gate checks verified the exact full-UID name in declared and effective `/config`. A stored 1,536 tokens; B's first request for the identical prompt still missed and independently stored 1,536, proving it did not retrieve A's object. After each engine's `/reset_prefix_cache`, each server independently retrieved 1,536 tokens. Metrics for each pool were write/read chunks `6/6`, lookup requested/hit tokens `3072/1536`, L1 usage `18,874,368` bytes, and zero L2 adapters. The servers registered different GPUs (`GPU-4d9375ae-f17c-3721-2417-3af8a961c530` and `GPU-eba663df-3529-f1ea-0da8-6fbe522719d9`) and neither registered the other's worker. Recreating B changed its engine/worker identity but preserved B's server Pod UID and L1; its first request retrieved 1,536 from retained B L1 while A remained unchanged. LMCache did not retain a visible UID-named file in `/dev/shm` during this GPU-worker run, so named-inode lifetime is established by the focused CPU tests above; the GPU test establishes effective-config, endpoint, worker-registration, and behavioral data isolation. |
+| Cleanup/control-plane restore | All test objects were removed. The original validation restored from `/private/tmp/inference-cache-phase8-engine-first-sjc-backup-20260812`; the focused metrics run restored from `/private/tmp/inference-cache-phase8-metrics-backup-20260812`; the UID-scoped run restored from `/private/tmp/inference-cache-phase8-shm-backup-20260812`; and the post-rebase metrics run restored from `/private/tmp/inference-cache-phase8-rebase-metrics-backup-20260812`. Semantic comparisons of the CRD spec, ClusterRole rules, ClusterRoleBinding role/subjects, controller and server Deployment specs, and both webhook lists returned no differences after the final run. The original controller digest `sha256:6dcab2344027ef8ac3db2ab22352cdaa77d80202ec11df49dddeeefe08095b18` returned `1/1` Ready, and the test namespace had no remaining workload or CacheBackend. |
+
+- [x] Zero servers before an engine is scheduled; one healthy same-node server
+      after the first vLLM or SGLang TP=1 engine is placed.
+- [x] Multiple same-node engines share one server for both runtimes.
+- [x] Engines distributed across two nodes use only their respective same-node
+      servers; cross-node reuse terminates through Redis L2 without cross-node
+      CUDA IPC.
+- [x] vLLM store → local reset → retrieve and SGLang store → flush → retrieve.
+- [x] Desired/ready server counts and per-engine same-node coverage converge.
+- [x] Host-port conflict leaves the second server Pending and its engine gated.
+- [x] Redis outage/recovery with multiple node-local servers does not restart
+      engines or healthy local servers.
+- [x] Engine lifecycle is node-scoped; typed idle retention reuses the server
+      before expiry and removes it only after expiry (or immediately at zero).
+- [x] Before/after MP `/metrics` snapshots on the representative common server
+      data path, in addition to the separate vLLM and SGLang functional runs.
+- [x] Two CacheBackends with disjoint ports retain distinct UID-scoped SHM
+      names and inodes on one live node through server startup/replacement and
+      idle-retention reuse.
+- [x] Two GPU engines independently pass store → engine GPU/local KV clear → L1
+      retrieve and worker restart/reconnect; exact effective SHM identities,
+      disjoint worker registrations, and an identical-prompt cold miss prove
+      that neither pool retrieved or registered the other pool's object/worker.
 
 ### Exit criteria
 
-- [ ] Every selected engine Pod is covered by exactly one healthy same-node MP
-      server.
-- [ ] No load-balanced Service can route an engine to another node's server.
-- [ ] Shared L1 accounting and failure blast radius are measured.
-- [ ] Cross-`CacheBackend` sharing remains rejected.
+- [x] Repository, envtest, samples, coverage, and fresh-install validation pass.
+- [x] Every selected engine Pod is covered by exactly one healthy same-node MP
+      server under the engine-first lifecycle.
+- [x] No load-balanced Service can route an engine to another node's server.
+- [x] Shared L1 accounting and Redis failure blast radius are revalidated with
+      engine-demanded servers.
+- [x] Cross-`CacheBackend` sharing remains rejected by the name+UID demand filter.
+- [x] Required vLLM and SGLang functional matrix evidence is supplemented by
+      before/after metrics from their common standalone MP-server data path.
+- [x] UID-scoped NodeLocal SHM isolation passes focused live-node and GPU
+      validation; missing or mismatched SHM identity never counts as Ready or
+      covered and never admits an engine.
 
-## Post-migration improvements and additional features
+## Required GPU validation matrix
 
-These items are separate capability profiles. They are not Phase 3 or Phase 4
-exit criteria and do not block migration away from the legacy IP data plane:
+The matrix grows by phase. A cell is complete only when it proves a cache hit
+after clearing or replacing the engine GPU cache; successful process startup is
+not sufficient.
 
-- [ ] Design and validate multi-node TP and vLLM distributed-executor profiles,
-      including connector/server cardinality, endpoint discovery, failure
-      domains, scheduling, and an explicit admission contract.
-- [ ] Design and validate MLA and other model-specific connector profiles using
-      model architecture metadata rather than image or model-name heuristics.
+| Runtime | Topology | Remote L3 | Parallelism | Required by |
+|---|---|---|---|---|
+| SGLang | PodLocal | none | TP=1 | Phase 3 |
+| vLLM | PodLocal | none | TP=1 | Phase 4 |
+| vLLM | PodLocal | none | TP=2 | Phase 4 |
+| SGLang | NodeLocal | Redis | multiple engine Pods | Phase 8 |
+| vLLM | NodeLocal | Redis | multiple engine Pods | Phase 8 |
+
+Every required data test records:
+
+- exact image digests and LMCache version;
+- Kubernetes, driver, CUDA, and GPU model;
+- engine args and effective MP server config;
+- first-request store evidence;
+- GPU-cache clear or fresh-engine proof;
+- second-request retrieve/hit evidence;
+- MP metrics before and after, plus L3 metrics only when an optional L3 binding
+  is part of that particular test.
+
+## Overall definition of done
+
+The migration is complete only when all of the following are true:
+
+- [x] `spec.type: LMCache` selects only MP implementations.
+- [x] Both SGLang and vLLM pass the required PodLocal GPU matrix.
+- [x] Host-only MP is supported for both engines; optional L3 implementations
+      are validated and versioned independently from the engine connector gate.
+- [x] Current MP server health is observable and steady-state cache behavior is
+      tested.
+- [x] `remoteStorage` is optional L3 and no longer contains LMCacheServer.
+- [x] No production code injects `LMCacheConnectorV1`, `lm://`, or
+      `LMCACHE_REMOTE_URL`.
+- [x] Remote-L3 lifecycle events do not automatically roll MP engines.
+- [x] Every old IP object has been migrated or intentionally deleted.
+- [x] Canonical samples, reference manifests, CLI output, and design documents
+      describe only the implemented MP behavior.
+- [x] NodeLocal, if enabled, guarantees same-node server selection and accurate
+      engine coverage; otherwise it remains rejected rather than partially
+      accepted.
+
+Phase 8 is complete, including focused UID-scoped SHM validation, and is the
+final phase of this migration. The future capability profiles below are
+independent backlog items rather than additional migration phases.
+
+## Known limitations and future work
+
+These are independent known limitations and future capability profiles, not
+additional migration phases. They do not restore the legacy IP data plane and
+must not introduce `LMCacheConnectorV1`, `lm://`, or an LMCacheServer provider.
+A profile enters the supported matrix only after its API contract, GPU
+correctness, failure-recovery, security, and operability gates pass against
+immutable artifacts. The numbered items below are the future-work backlog.
+
+### 1. NodeLocal hostile-process isolation and aggregate SHM capacity
+
+Phase 8 owns the accidental-collision fix and its correctness validation: every
+NodeLocal pool now uses a deterministic full-UID `--shm-name`, and startup/status
+verify that exact identity. This future item covers the stronger security and
+capacity guarantees that unique names cannot provide.
+
+- [ ] Define the hostile-process boundary. A unique name does not stop a
+      same-node process with host `/dev/shm` access and compatible Unix
+      credentials from deliberately opening or unlinking another pool. Decide
+      whether production support requires distinct Unix identities, isolated
+      SHM backing, admission-enforced node separation, or a combination.
+- [ ] Account for aggregate host `/dev/shm` capacity across co-located pools and
+      expose actionable admission/Pending/status behavior before publishing a
+      supported multi-pool capacity envelope.
+- [ ] Validate the selected tenant boundary with unauthorized open/unlink tests;
+      until then, multiple pools on one node are supported only inside one
+      mutually trusted node domain.
+
+### 2. MP client/server compatibility signaling
+
 - [ ] Add client/server compatibility signaling or health detection before
-      supporting multiple LMCache version baselines; do not generalize from an
-      arbitrary mismatched-version test pair.
-- [ ] Add each profile to the supported validation matrix only after its own
-      GPU correctness, failure-recovery, and operability gates pass.
+      supporting multiple LMCache version baselines.
+- [ ] Define the admitted version/digest relationship and surface actionable
+      mismatch status rather than inferring compatibility from process health.
+- [ ] Do not generalize support from an arbitrary mismatched-version test pair;
+      qualify each selected combination with GPU store/clear/retrieve and
+      recovery evidence.
 
-### Typed MP Mooncake L2 adapter
+### 3. SGLang TP>1 control-plane convergence
+
+SGLang TP>1 is outside the migration baseline. Inference-cache neither patches
+the engine-owned connector nor adds a TP=1 admission guard.
+
+| Finding | Evidence/impact |
+|---|---|
+| vLLM has one scheduler-side owner for LOOKUP/status/session state. | Per-rank workers only retrieve their GPU shard. |
+| SGLang 0.5.3 runs the control flow in every TP rank. | In TP=2, one rank consumed the exactly-once prefetch result; the other got `Prefetch job ... not found`, so the cross-rank minimum became zero. |
+| A diagnostic rank-0-owner overlay retrieved 1,280 tokens on both ranks. | It proves a coordination direction, not a safe production patch; collective failure/cancellation remains undesigned. |
+
+- [ ] Determine why the vLLM and SGLang integrations deliberately use different
+      scheduler/worker ownership models and whether SGLang exposes a stable
+      scheduler-to-worker metadata path suitable for LMCache.
+- [ ] Define one owner for LOOKUP, prefetch status, sessions, and global lock
+      cleanup while preserving per-rank registration and GPU RETRIEVE.
+- [ ] Define bounded cross-rank error and cancellation propagation so a failed
+      owner cannot hang peers in a collective.
+- [ ] Add upstream TP=2 tests covering miss/store, GPU flush, host-only hit,
+      Redis-backed hit, partial hit, timeout, cancellation, and lock/session
+      cleanup.
+- [ ] Adopt only an immutable released connector artifact, then add SGLang
+      TP>1 to the production validation matrix after the tests pass.
+
+### 4. Multi-node TP and distributed executors
+
+- [ ] Define connector and MP-server cardinality for vLLM distributed executors
+      and multi-node TP without allowing cross-node CUDA IPC.
+- [ ] Specify deterministic endpoint discovery, engine/server placement,
+      scheduling ownership, failure domains, and admission behavior.
+- [ ] Validate node loss, rank loss, partial registration, replacement, and
+      store/clear/retrieve across all supported ranks before adding a profile to
+      the matrix.
+
+### 5. MLA and architecture-specific connectors
+
+- [ ] Define an explicit typed capability contract for MLA and other
+      model-specific connector behavior.
+- [ ] Use authoritative model architecture metadata; never infer support from
+      image names, model-name strings, or runtime labels.
+- [ ] Add architecture-specific correctness and incompatibility tests before
+      admission accepts the profile.
+
+### 6. Directional LMCache roles for PD separation
+
+`ReadOnly` / `WriteOnly` remain generic CacheBackend API concepts, but all
+LMCache backends currently admit only `ReadWrite`. This is an intentional safety
+restriction, not a claim that producer/consumer roles are unnecessary.
+
+| Finding | Evidence/impact |
+|---|---|
+| SGLang's LMCache integration has no directional role surface. | `--enable-lmcache` always participates in both store and retrieve. |
+| vLLM accepts `kv_consumer`, `kv_producer`, and `kv_both`. | These are connector configuration values, not LMCache server roles. |
+| LMCache 0.5.3's vLLM MP connector did not enforce the configured direction in live GPU tests. | `kv_consumer` still stored and `kv_producer` still retrieved, so exposing ReadOnly/WriteOnly would create a false API guarantee. |
+
+- [ ] Define PD producer, consumer, and optional decode write-back semantics,
+      including whether generated-token KV may be persisted after a request.
+- [ ] Adopt a pinned connector that prevents store in consumer mode and retrieve
+      in producer mode rather than relying only on configuration naming.
+- [ ] Add GPU negative tests that fail on any prohibited request, plus normal
+      prefill-to-decode transfer and multi-turn write-back tests where selected.
+- [ ] Lift LMCache admission restrictions only for an adapter/version profile
+      that passes those tests; do not infer support from engine CLI acceptance.
+
+### 7. Typed MP Mooncake L2 adapter
 
 Mooncake remains a supported provider direction, but its removed implementation
 was coupled to the legacy IP connector and is not safe to restore. Future work
@@ -961,12 +1251,16 @@ must add a new typed MP binding using LMCache's `mooncake_store` L2 adapter:
 - [ ] Never translate a legacy Mooncake object to Redis or infer typed adapter
       settings from its old URL; migration requires an explicit operator choice.
 
-### Managed backend clusters
+### 8. Managed backend topology and security
 
 The current managed Redis renderer intentionally creates one standalone Redis
 Pod. Multiple replicas behind its Service would be independent keyspaces, not a
 cluster. A future managed backend-cluster capability must therefore be
-provider-specific:
+provider-specific. Its current security boundary is also limited: password
+authentication is optional, no backend NetworkPolicy is controller-owned, and
+the pinned LMCache 0.5.3 RESP adapter does not support TLS. The existing managed
+Redis profile is therefore suitable only for an explicitly trusted development
+or private network, not as a secure multi-tenant production profile.
 
 - [ ] Define Redis topology explicitly (for example standalone versus cluster),
       including shard count, replicas per shard, stable identity, discovery,
@@ -978,58 +1272,17 @@ provider-specific:
       the advertised cluster behavior before exposing it in the support matrix.
 - [ ] Keep generic `remoteStorage.workload` limited to Pod scheduling/security;
       do not add replicas or autoscaling that silently changes provider semantics.
+- [ ] Define whether authentication is mandatory for a production profile and
+      keep all credentials in namespace-local Secret references.
+- [ ] Define NetworkPolicy ownership and ingress/egress selectors for managed
+      Redis; do not assume that a ClusterIP is a tenancy boundary.
+- [ ] Require a pinned TLS-capable LMCache RESP client, a verified TLS proxy, or
+      an equivalently explicit encrypted transport before advertising Redis
+      across an untrusted network. Continue rejecting inert TLS configuration.
+- [ ] Validate unauthorized access denial, credential rotation, network-policy
+      isolation, and selected encrypted-transport failure/recovery behavior.
 
-### Directional LMCache roles for PD separation
-
-`ReadOnly` / `WriteOnly` remain generic CacheBackend API concepts, but all
-LMCache backends currently admit only `ReadWrite`. This is an intentional safety
-restriction, not a claim that producer/consumer roles are unnecessary.
-
-| Finding | Evidence/impact |
-|---|---|
-| SGLang's LMCache integration has no directional role surface. | `--enable-lmcache` always participates in both store and retrieve. |
-| vLLM accepts `kv_consumer`, `kv_producer`, and `kv_both`. | These are connector configuration values, not LMCache server roles. |
-| LMCache 0.5.3's vLLM MP connector did not enforce the configured direction in live GPU tests. | `kv_consumer` still stored and `kv_producer` still retrieved, so exposing ReadOnly/WriteOnly would create a false API guarantee. |
-
-Future work must treat directional access as a separately validated connector
-capability:
-
-- [ ] Define PD producer, consumer, and optional decode write-back semantics,
-      including whether generated-token KV may be persisted after a request.
-- [ ] Adopt a pinned connector that prevents store in consumer mode and retrieve
-      in producer mode rather than relying only on configuration naming.
-- [ ] Add GPU negative tests that fail on any prohibited request, plus normal
-      prefill-to-decode transfer and multi-turn write-back tests where selected.
-- [ ] Lift LMCache admission restrictions only for an adapter/version profile
-      that passes those tests; do not infer support from engine CLI acceptance.
-
-### LMCache connector control-plane convergence and SGLang TP>1
-
-SGLang TP>1 is outside the migration baseline. Inference-cache neither patches
-the engine-owned connector nor adds a TP=1 admission guard.
-
-| Finding | Evidence/impact |
-|---|---|
-| vLLM has one scheduler-side owner for LOOKUP/status/session state. | Per-rank workers only retrieve their GPU shard. |
-| SGLang 0.5.3 runs the control flow in every TP rank. | In TP=2, one rank consumed the exactly-once prefetch result; the other got `Prefetch job ... not found`, so the cross-rank minimum became zero. |
-| A diagnostic rank-0-owner overlay retrieved 1,280 tokens on both ranks. | It proves a coordination direction, not a safe production patch; collective failure/cancellation remains undesigned. |
-
-Future work must answer the architectural question before selecting a fix:
-
-- [ ] Determine why the vLLM and SGLang integrations deliberately use different
-      scheduler/worker ownership models and whether SGLang exposes a stable
-      scheduler-to-worker metadata path suitable for LMCache.
-- [ ] Define one owner for LOOKUP, prefetch status, sessions, and global lock
-      cleanup while preserving per-rank registration and GPU RETRIEVE.
-- [ ] Define bounded cross-rank error and cancellation propagation so a failed
-      owner cannot hang peers in a collective.
-- [ ] Add upstream TP=2 tests covering miss/store, GPU flush, host-only hit,
-      Redis-backed hit, partial hit, timeout, cancellation, and lock/session
-      cleanup.
-- [ ] Adopt only an immutable released connector artifact, then add SGLang
-      TP>1 back to the production validation matrix after the tests pass.
-
-### LMCache MP server restart and connector re-registration
+### 9. LMCache MP server restart and connector re-registration
 
 The migration guarantees steady-state MP operation and sidecar process-health
 observation. It does not guarantee that a running engine continues caching after
@@ -1057,122 +1310,65 @@ If this capability is selected later, its independent scope is:
 - [ ] Validate crash, hang, fast restart, repeated restart, callback failure,
       TP=1/TP=2, and post-recovery store/flush/retrieve for each selected engine
       profile.
-- [ ] For NodeLocal, validate DaemonSet rollout and single-node server restart
-      separately from the basic same-node topology.
+- [ ] For NodeLocal, validate per-node server-Pod replacement and single-node
+      server restart separately from the basic same-node topology.
 
-## Required GPU validation matrix
+### 10. LMCache fail-open and fail-closed semantics
 
-The matrix grows by phase. A cell is complete only when it proves a cache hit
-after clearing or replacing the engine GPU cache; successful process startup is
-not sufficient.
+`spec.integration.failOpen` currently drives status, Events, and the injected
+`INFERENCECACHE_FAIL_OPEN` environment variable. The pinned vLLM and SGLang
+LMCache MP connectors have not been shown to consume that project-specific
+variable or enforce request behavior. The SJC Redis outage tests validated the
+default fail-open status path while L1 remained available; they did not validate
+an L1+L2 outage or a fail-closed request failure. Consequently, accepting
+`failOpen: false` is not yet proof of a data-plane fail-closed guarantee.
 
-| Runtime | Topology | Remote L3 | Parallelism | Required by |
-|---|---|---|---|---|
-| SGLang | PodLocal | none | TP=1 | Phase 3 |
-| vLLM | PodLocal | none | TP=1 | Phase 4 |
-| vLLM | PodLocal | none | TP=2 | Phase 4 |
-| SGLang | NodeLocal | Redis | multiple engine Pods | Phase 8 |
-| vLLM | NodeLocal | Redis | multiple engine Pods | Phase 8 |
+- [ ] Decide whether LMCache admission must temporarily accept only
+      `failOpen: true` until a connector-native fail-closed surface exists.
+- [ ] Map the API to a pinned connector feature that actually controls request
+      behavior; do not treat a project-specific environment mirror as
+      enforcement.
+- [ ] Validate vLLM and SGLang with L1 available/L2 unavailable, L1
+      unavailable/L2 available, and complete L1+L2 loss.
+- [ ] Prove that fail-open recomputes locally without failing the request and
+      that fail-closed fails within a bounded timeout with accurate status and
+      Events.
+- [ ] Test recovery without engine restart and remove the restriction only for
+      runtime/version profiles that pass the same fault matrix.
 
-Every required data test records:
+### 11. MP worker-pool saturation and sizing
 
-- exact image digests and LMCache version;
-- Kubernetes, driver, CUDA, and GPU model;
-- engine args and effective MP server config;
-- first-request store evidence;
-- GPU-cache clear or fresh-engine proof;
-- second-request retrieve/hit evidence;
-- MP metrics before and after, plus L3 metrics only when an optional L3 binding
-  is part of that particular test.
+Phase 8 proved that multiple TP=1 engine Pods can share one NodeLocal server and
+requires `maxGPUWorkers` to cover their count. It did not establish saturation,
+queueing, backpressure, or latency behavior at and beyond the configured worker
+limits, nor how a future TP profile contributes workers.
 
-## Test pyramid
+- [ ] Define whether each engine instance, process, or TP rank consumes a GPU
+      worker and document the corresponding `maxGPUWorkers` formula.
+- [ ] Define the purpose and sizing rule for `maxCPUWorkers`, including its
+      interaction with GPU workers and L2 operations.
+- [ ] Load-test below, at, and above both worker limits and record queueing,
+      rejection, timeout, throughput, and tail-latency behavior.
+- [ ] Surface an actionable signal when registered demand reaches or exceeds a
+      worker limit; silent request hangs are not an acceptable capacity policy.
+- [ ] Qualify each future TP/distributed profile independently rather than
+      extrapolating from TP=1 engine counts.
 
-| Layer | Required evidence |
-|---|---|
-| API/unit | schema, defaulting, validation, provider matrix, deep copy, status transitions |
-| Renderer/unit | exact args/env/config, resources, probes, security, volumes, idempotence, collision rejection |
-| Envtest | real CREATE/UPDATE admission and status persistence; legacy grandfathering only if Phase 6 activates |
-| Kubernetes smoke | live webhook injection into matching engine Pods, native-sidecar schema support, controller-owned workload shape |
-| GPU functional | store/flush/retrieve and cross-Pod L3 reuse |
-| GPU fault | Redis loss/recovery, engine rollout, node drain for NodeLocal |
-| Upgrade/migration | Repository manifest conversion by default; old-object inventory, dry-run conversion, grandfather rules, and rollback only if Phase 6 activates |
+### 12. Remote L3 concurrency and connection limits
 
-## Security, reliability, scalability, and cost gates
+The current Redis/RESP profile has no typed or validated bound for connections
+and concurrent store/retrieve work as the number of engine Pods, NodeLocal
+servers, and nodes grows. This is independent of whether Redis remains a
+singleton or later becomes a managed cluster.
 
-### Security
-
-- [ ] No production managed Redis profile is exposed without an explicit network
-      isolation and credential/TLS posture.
-- [x] Secrets are referenced, not embedded in CR status, Pod args visible to all
-      readers, logs, or Events.
-- [ ] PodLocal and NodeLocal GPU visibility is documented and reviewed for the
-      target tenancy model.
-- [ ] NodeLocal host networking/IPC is an explicit operator choice.
-- [ ] Cross-namespace remote endpoints retain explicit opt-in validation.
-
-### Reliability
-
-- [x] MP server health affects connector status.
-- [ ] Remote L3 loss follows tested fail-open/fail-closed behavior.
-
-### Scalability and latency
-
-- [x] PodLocal memory cost is reported per engine Pod.
-- [ ] NodeLocal memory cost is reported per node.
-- [ ] Worker pool sizing is tested under the expected engine count and TP shape.
-- [ ] Remote L3 concurrency and connection limits are bounded.
-- [x] Routing/index signals can be correlated with actual LMCache hit metrics.
-
-### Operability
-
-- [x] Status distinguishes connector, MP server, engine, and remote L3 health.
-- [ ] Metrics expose server availability, L1/L3 store/retrieve/hit, capacity,
-      and eviction.
-- [ ] Events contain an actionable remediation or migration instruction.
-- [ ] Samples never depend on an implicit runtime-selected connector mode.
-
-## Risk register
-
-| Risk | Impact | Mitigation / gate |
-|---|---|---|
-| A legacy consumer appears after Phase 0 | Breaking removal | Reconfirm before removal; activate Phase 6 and a grandfather period when non-zero. |
-| MP client/server version skew | Permanent unhealthy or protocol failure | Pin a validated client/server baseline and record exact artifacts; automatic version negotiation/detection is a future improvement. |
-| Redis restart rolls all engines | Availability blast radius | Lifecycle-specific restart policy in Phase 2. |
-| `failOpen` is only a custom env | Contract not enforced | Render native runtime policy and fault-test it. |
-| Sidecar sees all node GPUs | Isolation exposure | Document/review tenant model; prefer dedicated nodes where required. |
-| PodLocal duplicates CPU L2 | Memory cost per replica | Explicit per-Pod capacity; NodeLocal follow-up. |
-| NodeLocal port collision | DaemonSet Pods fail or bind incorrectly | Declared host port, typed port, controller condition, negative tests. |
-| NodeLocal engine reaches remote node | CUDA IPC failure | Node-derived endpoint; reject load-balanced service topology. |
-| Existing engine-side Mooncake config is treated as MP-equivalent | Admission succeeds but adapter cannot start | No automatic migration; separate MP + Mooncake Store implementation. |
-| Index says warm while MP/L3 evicted data | Routing quality degrades silently | Correlate cache events with LMCache metrics/health; define stale-entry behavior. |
-
-## Roadmap maintenance
-
-Each implementation PR updates the delivery table and the affected phase's
-checkboxes. A phase becomes complete only when every exit criterion is checked;
-validation details stay summarized in the phase evidence table rather than in
-dated closure sections or separate phase documents.
-
-## Overall definition of done
-
-The migration is complete only when all of the following are true:
-
-- [x] `spec.type: LMCache` selects only MP implementations.
-- [x] Both SGLang and vLLM pass the required PodLocal GPU matrix.
-- [x] Host-only MP is supported for both engines; optional L3 implementations
-      are validated and versioned independently from the engine connector gate.
-- [x] Current MP server health is observable and steady-state cache behavior is
-      tested.
-- [x] `remoteStorage` is optional L3 and no longer contains LMCacheServer.
-- [x] No production code injects `LMCacheConnectorV1`, `lm://`, or
-      `LMCACHE_REMOTE_URL`.
-- [x] Remote-L3 lifecycle events do not automatically roll MP engines.
-- [x] Every old IP object has been migrated or intentionally deleted.
-- [x] Canonical samples, reference manifests, CLI output, and design documents
-      describe only the implemented MP behavior.
-- [x] NodeLocal, if enabled, guarantees same-node server selection and accurate
-      engine coverage; otherwise it remains rejected rather than partially
-      accepted.
+- [ ] Measure and document Redis connections per MP server and per registered
+      engine under idle, store, retrieve, and reconnect behavior.
+- [ ] Define client-side connection, concurrency, queue, and timeout limits and
+      their relationship to Redis `maxclients` and server resources.
+- [ ] Validate connection exhaustion, slow Redis, concurrent store/retrieve,
+      reconnect storms, and recovery without engine rollout.
+- [ ] Add capacity guidance and actionable status/metrics for connection or
+      concurrency exhaustion before advertising a production scale envelope.
 
 ## Upstream references
 

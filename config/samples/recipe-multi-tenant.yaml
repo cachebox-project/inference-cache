@@ -93,7 +93,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: tenant-engine
+      inferencecache.io/cache-domain: tenant-a-engine
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256
@@ -125,7 +125,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: tenant-engine
+      inferencecache.io/cache-domain: tenant-b-engine
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256
@@ -161,6 +161,7 @@ spec:
     metadata:
       labels:
         app: tenant-engine
+        inferencecache.io/cache-domain: tenant-a-engine
     spec:
       nodeSelector:
         kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`
@@ -224,6 +225,7 @@ spec:
     metadata:
       labels:
         app: tenant-engine
+        inferencecache.io/cache-domain: tenant-b-engine
     spec:
       nodeSelector:
         kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`

@@ -120,7 +120,7 @@ spec:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: sglang-lmcache-llama-8b
+      inferencecache.io/cache-domain: sglang-lmcache-llama-8b
   lmCache:
     topology: PodLocal
     chunkSizeTokens: 256
@@ -164,6 +164,7 @@ spec:
       labels:
         app: sglang-lmcache-llama-8b
         app.kubernetes.io/name: sglang
+        inferencecache.io/cache-domain: sglang-lmcache-llama-8b
     spec:
       containers:
         # Container name MUST be `sglang` so the adapter's InjectEngineConfig /
