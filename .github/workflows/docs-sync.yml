@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Docs Sync
+
+# Keep the public API documentation gate responsive to the no-docs-needed
+# waiver without restarting the full CI suite for every label change.
+on:
+  pull_request:
+    branches:
+    - main
+    types:
+    - opened
+    - synchronize
+    - reopened
+    - labeled
+    - unlabeled
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-sync:
+    name: Docs Sync
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Fetch pull request base
+      env:
+        PR_BASE_REF: ${{ github.base_ref }}
+      run: git fetch --no-tags origin "+refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+
+    - name: Verify docs updated for public-surface changes
+      if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-docs-needed') }}
+      env:
+        PR_BASE_REF: ${{ github.base_ref }}
+      run: make verify-docs-sync DOCS_SYNC_BASE="origin/${PR_BASE_REF}"
+
+    - name: Record docs-sync waiver
+      if: ${{ contains(github.event.pull_request.labels.*.name, 'no-docs-needed') }}
+      run: echo "Docs-sync waived by the no-docs-needed label."

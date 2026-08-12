@@ -251,4 +251,4 @@ The public surfaces have user-facing documentation, and it must not drift behind
 make verify-docs-sync    # checks the current branch's diff vs origin/main; also runs in CI on every PR
 ```
 
-CI runs this check on each pull request (as part of the **Lint, Generated Code, Proto** job). If a public-surface change genuinely needs no doc update, add the **`no-docs-needed`** label to the PR to waive it.
+CI runs this check on each pull request as the lightweight **Docs Sync** job. Label changes rerun only that job, so adding or removing the **`no-docs-needed`** waiver does not restart the full CI suite.

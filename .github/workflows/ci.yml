@@ -8,16 +8,10 @@ on:
   pull_request:
     branches:
     - main
-    # Include label events so the docs-sync 'no-docs-needed' escape hatch takes
-    # effect immediately — the default pull_request activity types omit
-    # 'labeled'/'unlabeled', so a label added after a failing run would otherwise
-    # never re-trigger CI.
     types:
     - opened
     - synchronize
     - reopened
-    - labeled
-    - unlabeled
   push:
     branches:
     - main
@@ -146,17 +140,6 @@ jobs:
         PR_BASE_REF: ${{ github.base_ref }}
       run: buf breaking --against ".git#ref=origin/${PR_BASE_REF}"
 
-    # Documentation stays in sync with the public surface: a change to the CRD
-    # API types (api/v1alpha1/*_types.go) or the gRPC contract (proto/) must
-    # also update the docs (site/ or docs/) in the same PR. Reuses the base ref
-    # fetched above. Waived when the PR carries the 'no-docs-needed' label.
-    # See CONTRIBUTING.md "Documentation stays in sync".
-    - name: Verify docs updated for public-surface changes
-      if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'no-docs-needed')
-      env:
-        PR_BASE_REF: ${{ github.base_ref }}
-      run: make verify-docs-sync DOCS_SYNC_BASE="origin/${PR_BASE_REF}"
-
     - name: Lint
       run: |
         make lint
@@ -198,12 +181,11 @@ jobs:
         python3 -m pip install --quiet -r pkg/fingerprint/testdata/requirements.txt
         make verify-golden-vectors
 
-  test:
-    name: Test
+  race-test:
+    name: Race Tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
     steps:
     - name: Checkout
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -215,10 +197,8 @@ jobs:
         cache: true
 
     # Fetch envtest binaries (apiserver + etcd + kubectl) so the controller
-    # integration tests (internal/controller/integration_test.go) run against
-    # a real apiserver instead of skipping AND so the "Verify samples" step
-    # below has the envtest apiserver + the kubectl that `make verify-samples`
-    # shells out to. The test skip guard checks $KUBEBUILDER_ASSETS, so
+    # integration tests run against a real apiserver instead of skipping. The
+    # test skip guard checks $KUBEBUILDER_ASSETS, so
     # exporting it via $GITHUB_ENV is enough to flip them on.
     # The script fails fast if the path is empty or missing, so a `make test-env`
     # failure can't silently skip the integration suite and let CI go green.
@@ -234,6 +214,34 @@ jobs:
 
     - name: Test (race detector)
       run: make test-race
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+    - name: Setup Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    # Coverage includes the envtest integration suites, and sample admission
+    # below reuses the same apiserver binaries.
+    - name: Install envtest binaries
+      run: |
+        set -euo pipefail
+        path="$(make test-env | tail -1)"
+        if [ -z "$path" ] || [ ! -d "$path" ]; then
+          echo "make test-env did not produce a valid envtest path: '$path'" >&2
+          exit 1
+        fi
+        echo "KUBEBUILDER_ASSETS=$path" >> "$GITHUB_ENV"
 
     - name: Coverage gate
       run: make cover-check
@@ -389,17 +397,19 @@ jobs:
       run: make tokenize-cgo-test
 
   lint-test-proto:
-    name: Lint, Test, Proto
+    name: CI Gate
     runs-on: ubuntu-latest
     needs:
     - dco
     - lint-generated-proto
-    - test
+    - race-test
+    - coverage
     - fingerprint-e2e
     - vulnerability-scan
     - build
     - sbom-smoke
     - tokenize-cgo
+    - image-build
     if: always()
     permissions:
       contents: read
@@ -408,23 +418,27 @@ jobs:
       env:
         LINT_GENERATED_PROTO_RESULT: ${{ needs.lint-generated-proto.result }}
         DCO_RESULT: ${{ needs.dco.result }}
-        TEST_RESULT: ${{ needs.test.result }}
+        RACE_TEST_RESULT: ${{ needs.race-test.result }}
+        COVERAGE_RESULT: ${{ needs.coverage.result }}
         FINGERPRINT_E2E_RESULT: ${{ needs.fingerprint-e2e.result }}
         VULNERABILITY_SCAN_RESULT: ${{ needs.vulnerability-scan.result }}
         BUILD_RESULT: ${{ needs.build.result }}
         SBOM_SMOKE_RESULT: ${{ needs.sbom-smoke.result }}
         TOKENIZE_CGO_RESULT: ${{ needs.tokenize-cgo.result }}
+        IMAGE_BUILD_RESULT: ${{ needs.image-build.result }}
       run: |
         failed=0
         for item in \
           "dco:$DCO_RESULT" \
           "lint-generated-proto:$LINT_GENERATED_PROTO_RESULT" \
-          "test:$TEST_RESULT" \
+          "race-test:$RACE_TEST_RESULT" \
+          "coverage:$COVERAGE_RESULT" \
           "fingerprint-e2e:$FINGERPRINT_E2E_RESULT" \
           "vulnerability-scan:$VULNERABILITY_SCAN_RESULT" \
           "build:$BUILD_RESULT" \
           "sbom-smoke:$SBOM_SMOKE_RESULT" \
-          "tokenize-cgo:$TOKENIZE_CGO_RESULT"; do
+          "tokenize-cgo:$TOKENIZE_CGO_RESULT" \
+          "image-build:$IMAGE_BUILD_RESULT"; do
           name="${item%%:*}"
           result="${item#*:}"
           if [ "$result" != "success" ]; then
@@ -439,12 +453,6 @@ jobs:
   image-build:
     name: Image Build
     runs-on: ubuntu-latest
-    needs:
-    - lint-generated-proto
-    - test
-    - fingerprint-e2e
-    - vulnerability-scan
-    - build
     permissions:
       contents: read
       # Required for Trivy SARIF upload to the Security tab.
