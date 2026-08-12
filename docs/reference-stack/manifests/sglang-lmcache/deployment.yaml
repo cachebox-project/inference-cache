@@ -5,7 +5,8 @@
 # SGLang + typed LMCache multiprocess reference deployment. The CacheBackend
 # selects the engine pod and the operator injects the native lmcache-mp-server
 # sidecar, MP config, and SGLang connector arguments. Redis is an explicit shared
-# tier choice; no legacy LMCacheServer or Mooncake topology is inferred as Redis.
+# tier choice; no removed LMCacheServer or legacy IP-wired Mooncake topology is
+# inferred as Redis. Mooncake requires a future typed MP L2 adapter.
 #
 # The engine image, model, GPU resources, and KV-event publisher remain inference-
 # system-owned. The engine image must contain a connector/package compatible with
@@ -28,7 +29,7 @@
 # IMAGE PINNING (see VERSIONS.md): the engine image is a deliberately non-pullable
 # placeholder because this repository does not own inference engine images. Replace
 # it with a digest-pinned compatible image. The CacheBackend pins the independently
-# owned standalone server image. Digest-pin Redis for production as well.
+# owned MP-server sidecar image. Digest-pin Redis for production as well.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

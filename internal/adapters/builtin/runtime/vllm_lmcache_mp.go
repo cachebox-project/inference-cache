@@ -21,29 +21,34 @@ const (
 	vllmLMCacheMPConnectorName       = "LMCacheMPConnector"
 	vllmLMCacheMPConnectorModulePath = "lmcache.integration.vllm.lmcache_mp_connector"
 	vllmDisableHybridKVCacheArg      = "--disable-hybrid-kv-cache-manager"
+	vllmDefaultMetricsPortStr        = "8000"
+	vllmDefaultEngineZMQPortStr      = "5557"
+	vllmSubscriberHashScheme         = "vllm"
+	kvRoleConsumer                   = "kv_consumer"
+	kvRoleProducer                   = "kv_producer"
+	kvRoleBoth                       = "kv_both"
 )
 
-// vllmLMCacheMPAdapter is the typed PodLocal vLLM adapter. It embeds the
-// legacy adapter only to reuse engine-neutral observation and kernel-check
-// providers; selection and engine injection are implemented independently so
-// the legacy LMCacheConnectorV1/IP wire cannot leak into the MP path.
 type vllmLMCacheMPAdapter struct {
-	vllmLMCacheAdapter
+	subscriber SubscriberConfig
 }
 
-// NewVLLMLMCacheMPAdapter returns the explicit typed PodLocal adapter. Register
-// it before NewVLLMLMCacheAdapter because both advertise the canonical
-// vllm/LMCache pair and the registry selects the first matching adapter.
+// NewVLLMLMCacheMPAdapter returns the typed PodLocal vLLM adapter.
 func NewVLLMLMCacheMPAdapter(subscriber SubscriberConfig) runtimeadapter.KVCacheRuntimeAdapter {
-	return vllmLMCacheMPAdapter{vllmLMCacheAdapter: vllmLMCacheAdapter{subscriber: subscriber}}
+	return vllmLMCacheMPAdapter{subscriber: subscriber}
+}
+
+func (vllmLMCacheMPAdapter) SupportedPairs() []runtimeadapter.SupportedPair {
+	return []runtimeadapter.SupportedPair{{Runtime: runtimeadapter.RuntimeVLLM, Backend: cachev1alpha1.CacheBackendTypeLMCache}}
 }
 
 func (vllmLMCacheMPAdapter) Supports(runtime runtimeadapter.RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
-	return cache != nil &&
-		runtime == runtimeadapter.RuntimeVLLM &&
-		cache.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache &&
-		cache.Spec.LMCache != nil &&
-		cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal
+	if cache == nil || runtime != runtimeadapter.RuntimeVLLM ||
+		cache.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache {
+		return false
+	}
+	return cache.Spec.IsEventsOnly() ||
+		(cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal)
 }
 
 func (vllmLMCacheMPAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
@@ -248,15 +253,6 @@ func (vllmLMCacheMPAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *bac
 	engine := &work.Containers[engineIndex]
 	engine.Args = UpsertArgPair(engine.Args, defaultEngineKVTransferConfigArg, configJSON)
 	engine.Args = UpsertFlag(engine.Args, vllmDisableHybridKVCacheArg)
-	for _, name := range []string{
-		EnvLMCacheRemoteURL,
-		EnvLMCacheRemoteSerde,
-		EnvLMCacheChunkSize,
-		EnvLMCacheLocalCPU,
-		EnvLMCacheMaxLocalCPU,
-	} {
-		engine.Env = removeEnv(engine.Env, name)
-	}
 	engine.Env = removeEnv(engine.Env, EnvPythonHashSeed)
 	engine.Env = append(engine.Env, corev1.EnvVar{Name: EnvPythonHashSeed, Value: defaultPythonHashSeed})
 	engine.Env = removeEnv(engine.Env, EnvInferenceCacheFailOpen)
@@ -272,6 +268,24 @@ func (vllmLMCacheMPAdapter) ReservedArgs() []string {
 
 func (vllmLMCacheMPAdapter) ReservedEnv() []string {
 	return []string{EnvPythonHashSeed, EnvInferenceCacheFailOpen}
+}
+
+func (vllmLMCacheMPAdapter) EngineContainerName() string { return EngineContainerName }
+
+func (vllmLMCacheMPAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
+	return nil
+}
+
+func (a vllmLMCacheMPAdapter) ObservationSidecar(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
+	return renderSubscriberSidecar(subscriberSidecarParams{
+		Config:               a.subscriber,
+		Cache:                cache,
+		Pod:                  pod,
+		HashScheme:           vllmSubscriberHashScheme,
+		EngineMetricsPortStr: vllmDefaultMetricsPortStr,
+		EngineContainerName:  a.EngineContainerName(),
+		EngineZMQPortStr:     vllmDefaultEngineZMQPortStr,
+	})
 }
 
 var _ runtimeadapter.KVCacheRuntimeAdapter = vllmLMCacheMPAdapter{}

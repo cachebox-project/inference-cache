@@ -254,9 +254,6 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 		{"fail closed", func(cache *cachev1alpha1.CacheBackend) {
 			cache.Spec.Integration.FailOpen = &falseValue
 		}},
-		{"autoscaling", func(cache *cachev1alpha1.CacheBackend) {
-			cache.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 2}
-		}},
 		{"missing selector", func(cache *cachev1alpha1.CacheBackend) {
 			cache.Spec.EngineSelector = nil
 		}},

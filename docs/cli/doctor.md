@@ -33,7 +33,7 @@ CacheBackend / engine-pod data path, then tenant and policy configuration:
 | 2 | `/snapshot` reachability | HTTP GET returns 200 with a JSON-parseable body (bearer token if available; flags the unauthenticated path) |
 | 3 | `/policy` reachability | the route is wired (non-mutating HEAD; 2xx/401/403/405 = wired, 404 = not mounted, 5xx = WARN) |
 | 4 | `/probe` reachability | the controller-driven functional self-test route (same `:8081` listener + auth profile) is wired (non-mutating HEAD; same status classification as `/policy`) |
-| 5 | Per-CacheBackend health | `Ready=True`; managed backends have ever observed a KV event (durable `firstKVEventObservedAt` latch) and, if `lastEventAt` is present, it is fresh (drained backends with a cleared `lastEventAt` are not flagged); `FunctionalProbeOK` is not failing (when the condition is present, a non-`True` value surfaces *why* Ready is downgraded); `status.endpoint` populated and reachable |
+| 5 | Per-CacheBackend health | `Ready=True`; managed backends have ever observed a KV event (durable `firstKVEventObservedAt` latch) and, if `lastEventAt` is present, it is fresh (drained backends with a cleared `lastEventAt` are not flagged); `FunctionalProbeOK` is not failing; an optional `status.remoteStorage.endpoint` is reachable |
 | 6 | Engine-pod injection audit | every pod matching a CacheBackend `engineSelector` carries the `inferencecache.io/injected-by` annotation (or the injection Event) |
 | 7 | Orphan-pod check | pods with a `NoMatchingCacheBackend` Event in the last 24h (forward-looking — no producer yet, see Notes) |
 | 8 | CacheTenant health | `QuotaExceeded` condition is not `True` |
@@ -65,7 +65,7 @@ Every finding carries a stable, greppable code. Codes are permanent identifiers
 | `CB002` | WARN | managed backend with a selector matches 0 engine pods (LikelySelectorMismatch) |
 | `CB003` | WARN | no KV event ever observed for the backend (EngineNotReportingState) |
 | `CB004` | WARN | last KV event is stale (EngineStale) |
-| `CB005` | WARN | `status.endpoint` empty or unreachable |
+| `CB005` | WARN | Configured remote-storage endpoint is empty or unreachable |
 | `CB006` | OK | CacheBackend healthy on every applicable axis |
 | `CB007` | WARN | `FunctionalProbeOK` condition present but not `True` — the controller's functional self-test is failing for this backend (explains a Ready downgrade) |
 | `EP001` | WARN | matched engine pod missing an injection marker (no `inferencecache.io/injected-by` annotation and no Event) |
@@ -173,11 +173,11 @@ The declarative Kubernetes-config checks (per-CacheBackend health, injection
 audit, orphan-pod, CacheTenant, CachePolicy — minus the per-CacheBackend TCP
 dial) work from anywhere your kubeconfig can reach the apiserver. The live
 endpoint probes (server gRPC health, `/snapshot`, `/policy`, `/probe`) and the
-per-CacheBackend `status.endpoint` TCP dial need network reachability to the
+per-CacheBackend remote-storage endpoint TCP dial needs network reachability to the
 cache-plane server's gRPC `:9090` / snapshot-policy-probe `:8081` ports and to
 each backend's endpoint — which from a workstation are usually in-cluster
 Service DNS / ClusterIPs that do not resolve. `--config-only` skips the endpoint
-probes and the per-CacheBackend TCP dial (it still validates `status.endpoint`
+probes and the per-CacheBackend TCP dial (it still validates the remote endpoint
 is published), so it is the right mode from a workstation without a port-forward:
 
 - **In-cluster**: the server is discovered by Service DNS. Note the two

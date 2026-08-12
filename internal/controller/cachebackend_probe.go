@@ -118,9 +118,7 @@ func init() {
 // to zero for every label combination. Package-private so tests in this
 // package can assert on per-test counts without leaking state across
 // runs; intentionally not exported because production callers have no
-// reason to zero an operator-visible metric. Mirrors the helper next to
-// backendServerRestartCascadesTotal in cachebackend_server_restart.go
-// (the package convention for controller-runtime-registered counters).
+// reason to zero an operator-visible metric.
 func resetProbeResultMetricForTest() {
 	probeResultMetric.Reset()
 }

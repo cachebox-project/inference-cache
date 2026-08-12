@@ -12,16 +12,16 @@
 #   - cacheindex/cluster-default.status.observedServer is populated (proves the
 #     controller's CacheIndex poller is talking to the server's /snapshot)
 #   - gRPC LookupRoute returns reason_code=NO_HINT (fail-open default)
-#   - typed PodLocal MP injection for vLLM and SGLang, including native sidecar,
-#     connector arguments, shared memory, and optional Redis L3 rendering
-#   - explicitly labelled legacy-IP compatibility checks for the implementation
-#     retained until Phase 7; these inline fixtures are not deployment examples
+#   - server /readyz and /metrics are reachable through the installed Service
+#   - current samples pass live server-side admission, and the generic
+#     CachePolicy/CacheTenant/PromptTemplate/PDTopology APIs remain usable
+#   - the served CacheBackend CRD contains only the MP schema
+#   - typed PodLocal MP admission injects the vLLM connector and native sidecar
+#   - managed Redis renders independently and publishes remote-storage status
+#   - an idempotent bundle re-apply preserves typed CacheBackend objects
 #
-# Lightweight (two distroless ~30 MB images + cert-manager + a busybox
-# stand-in for the engine container + a pause-image pod, no real engine
-# pull), so it runs on every PR. Sister-canaries
-# (legacy-ip-c2-reconciler-canary, legacy-ip-c6-engine-wiring-canary) remain
-# manual compatibility checks until Phase 7.
+# Lightweight: no real inference engine, LMCache server, GPU, or model is
+# started, so it runs on every PR.
 name: default-install-smoke
 
 on:
@@ -41,11 +41,9 @@ concurrency:
 jobs:
   install-smoke:
     runs-on: ubuntu-latest
-    # Script targets ~6 min end-to-end (incl. the Calico CNI install the smoke
-    # needs to enforce NetworkPolicy). The timeout is a circuit breaker for a
-    # wedged kind cluster / image pull, not the expected runtime; it sits above
-    # the worst-case Calico readiness budget (~510s) plus the smoke so a wedged
-    # CNI still leaves room for the exit trap to collect diagnostics.
+    # The timeout is a circuit breaker for a wedged kind cluster, image build,
+    # cert-manager rollout, or admission check; the exit trap still has time to
+    # collect diagnostics.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4

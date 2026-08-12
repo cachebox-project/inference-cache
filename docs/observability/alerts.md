@@ -32,8 +32,7 @@ There are two distribution shapes, same rule set, drift-gated by
      Required for the controller-side alerts (`ServerProbeFail` reads
      `inferencecache_backend_probe_result_total`, which the
      CacheBackend reconciler emits; the existing
-     `inferencecache_backend_server_restart_cascades_total` is also
-     controller-emitted). Without this, those rules load but never
+     `inferencecache_backend_probe_result_total` is controller-emitted). Without this, those rules load but never
      have a series to evaluate.
   3. A second [`PodMonitor`](../../config/observability/lmcache-podmonitor.yaml)
      that discovers successfully injected PodLocal LMCache native sidecars
@@ -81,8 +80,8 @@ There are two distribution shapes, same rule set, drift-gated by
   need `scrape_configs:` entries for all applicable targets — the
   `inference-cache-server` pod (server-side series: index, lookup, auth)
   AND the `inference-cache-controller-manager` pod (controller-side
-  series: per-stage probe-result counter, cache-server restart-cascade
-  counter) and each injected PodLocal LMCache sidecar (`:8080/metrics`).
+  per-stage probe-result counter) and each injected PodLocal LMCache sidecar
+  (`:8080/metrics`).
   Server-only scrape leaves the controller-side alerts
   (`ServerProbeFail` today) loaded but inert — they read
   `inferencecache_backend_probe_result_total` which is controller-emitted.

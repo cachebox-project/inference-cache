@@ -114,7 +114,7 @@ func TestIntegrationT2DegradedCondition(t *testing.T) {
 		}
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
 		cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
-		cb.Spec.RemoteStorage = externalLMCacheStorage("shared.svc.cluster.local:9000")
+		cb.Spec.RemoteStorage = externalRedisStorage("shared.svc.cluster.local:6379")
 		if err := k8s.Update(ctx, &cb); err != nil {
 			t.Fatalf("flip to External: %v", err)
 		}

@@ -25,10 +25,8 @@ import (
 
 // TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted is the
 // end-to-end pin for the defaulter-sweep operator-UX win: applying a
-// CacheBackend with the required runtime plus an engine selector and model ID
-// must produce a
-// fully-defaulted CR with every Phase-1 default stamped — Type=LMCache,
-// DeploymentKind=Deployment, Replicas=1,
+// typed CacheBackend with type and optional parents omitted must produce a
+// fully-defaulted CR with the current defaults stamped — Type=LMCache,
 // Integration.Role=ReadWrite, Integration.Mode=Offload,
 // Integration.FailOpen=true, and Observation.FirstEventTimeout=5m. The apiserver in the loop applies
 // `+kubebuilder:default=` markers; the webhook materialises
@@ -120,22 +118,18 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	live := mgr.GetAPIReader()
 	mkNamespace(t, ctx, k8s, "team-a")
 
-	// --- Minimum-viable CR: runtime + engineSelector + observation.modelID ---
+	// --- Minimum typed MP CR with optional/defaulted fields omitted ---
 	//
-	// An apply with no Type, no DeploymentKind, no Replicas, no Integration
-	// block, no Storage, no Autoscaling. Every other field must be stamped
+	// An apply with no Type, Integration, Observation, or remoteStorage. The
+	// required typed PodLocal shape remains explicit; optional defaults are stamped
 	// by the apiserver (kubebuilder-marker defaults) + the defaulter webhook
 	// (cluster-context defaults).
-	mvCR := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "minimum", Namespace: "team-a"},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app.kubernetes.io/name": "vllm"},
-			},
-			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "meta-llama/Meta-Llama-3-8B-Instruct"},
-		},
-	}
+	mvCR := validPodLocalMPBackend()
+	mvCR.Name = "minimum"
+	mvCR.Namespace = "team-a"
+	mvCR.Spec.Type = ""
+	mvCR.Spec.Integration = nil
+	mvCR.Spec.Observation = nil
 	if err := k8s.Create(ctx, mvCR); err != nil {
 		t.Fatalf("minimum-viable CacheBackend should be admitted: %v", err)
 	}
@@ -147,7 +141,7 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 		t.Fatalf("get back persisted CR: %v", err)
 	}
 
-	// --- Phase-1 default surface assertions ---
+	// --- Current default surface assertions ---
 	//
 	// Each assertion below pins one item from the default sweep. If a future
 	// change drops a default marker or rewrites the defaulter, the
@@ -156,12 +150,6 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 
 	if want := cachev1alpha1.CacheBackendTypeLMCache; got.Spec.Type != want {
 		t.Errorf("spec.type = %q, want %q (kubebuilder default)", got.Spec.Type, want)
-	}
-	if want := cachev1alpha1.CacheBackendDeploymentKindDeployment; got.Spec.DeploymentKind != want {
-		t.Errorf("spec.deploymentKind = %q, want %q (kubebuilder default)", got.Spec.DeploymentKind, want)
-	}
-	if got.Spec.Replicas == nil || *got.Spec.Replicas != 1 {
-		t.Errorf("spec.replicas = %v, want 1 (kubebuilder default)", got.Spec.Replicas)
 	}
 	if got.Spec.Integration == nil {
 		t.Fatalf("spec.integration was not materialised by the defaulter; got nil")
@@ -187,13 +175,11 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	// engine-local. The apiserver and webhook must preserve the absence of
 	// deprecated top-level resources rather than claiming a provider workload
 	// this resource did not request.
-	canonicalCR := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "canonical-host-only", Namespace: "team-a"},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
-			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-		},
-	}
+	canonicalCR := validPodLocalMPBackend()
+	canonicalCR.Name = "canonical-host-only"
+	canonicalCR.Namespace = "team-a"
+	canonicalCR.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	canonicalCR.Spec.RemoteStorage = nil
 	if err := k8s.Create(ctx, canonicalCR); err != nil {
 		t.Fatalf("canonical host-only CacheBackend should be admitted: %v", err)
 	}
@@ -211,18 +197,17 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 
 	// --- Non-clobber pin: an explicit CR overrides every default ---
 	//
-	// Same minimum-viable shape but with an operator-set replicas and a
-	// pinned Type. Both values must survive every default layer — proving
+	// Same shape but with an operator-pinned Type. It must survive every
+	// default layer, proving
 	// the "defaulter never clobbers" contract holds for the new markers
 	// just as it did for the webhook-stamped defaults before the marker
 	// sweep landed.
 	explicitCR := &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "explicit", Namespace: "team-a"},
 		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime:  cachev1alpha1.CacheBackendRuntimeSGLang,
-			Type:     cachev1alpha1.CacheBackendTypeSGLangHiCache,
-			HiCache:  &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
-			Replicas: i32p(5),
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			HiCache: &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
 				MatchLabels: map[string]string{"app.kubernetes.io/name": "sglang"},
 			},
@@ -242,15 +227,12 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	if explicit.Spec.Type != cachev1alpha1.CacheBackendTypeSGLangHiCache {
 		t.Errorf("operator type clobbered: got %q, want SGLangHiCache", explicit.Spec.Type)
 	}
-	if explicit.Spec.Replicas == nil || *explicit.Spec.Replicas != 5 {
-		t.Errorf("operator replicas clobbered: got %v, want 5", explicit.Spec.Replicas)
-	}
 
-	// --- Final MP API CREATE/UPDATE compatibility ---
+	// --- Current MP API CREATE/UPDATE compatibility ---
 	//
 	// The real apiserver must accept the new PodLocal shape, preserve it on an
-	// unrelated update, and reject an update that mixes a legacy flat field into
-	// the canonical MP contract.
+	// unrelated update, and reject an update that selects the reserved NodeLocal
+	// topology before it is implemented.
 	mpCR := validPodLocalMPBackend()
 	mpCR.Name = "podlocal-mp"
 	mpCR.Namespace = "team-a"
@@ -272,202 +254,10 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	if err := k8s.Update(ctx, &persistedMP); err != nil {
 		t.Fatalf("unrelated update on PodLocal MP object should be admitted: %v", err)
 	}
-	persistedMP.Spec.LMCache.WorkerImage = "legacy-worker:test"
+	persistedMP.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
+	persistedMP.Spec.LMCache.PodLocal = nil
+	persistedMP.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{}
 	if err := k8s.Update(ctx, &persistedMP); err == nil {
-		t.Fatal("update mixing legacy workerImage into PodLocal MP should be rejected")
-	}
-
-	// --- Autoscaling defaulter-computed minReplicas ---
-	//
-	// Pins the one non-literal default: when an operator opts into
-	// autoscaling without pinning the floor, the defaulter computes
-	// minReplicas from spec.replicas (post-marker-default, so =1 here)
-	// rather than a hard-coded constant. This is the only field on the
-	// default that needs cluster context — every other default rides on
-	// a marker.
-	hpaCR := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "hpa", Namespace: "team-a"},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app.kubernetes.io/name": "vllm"},
-			},
-			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "meta-llama/Meta-Llama-3-8B-Instruct"},
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
-			},
-			Autoscaling: &cachev1alpha1.CacheBackendAutoscalingSpec{
-				MaxReplicas: 10,
-			},
-		},
-	}
-	if err := k8s.Create(ctx, hpaCR); err != nil {
-		t.Fatalf("HPA-opted-in CacheBackend should be admitted: %v", err)
-	}
-	var hpa cachev1alpha1.CacheBackend
-	if err := live.Get(ctx, client.ObjectKey{Name: "hpa", Namespace: "team-a"}, &hpa); err != nil {
-		t.Fatalf("get back hpa CR: %v", err)
-	}
-	if hpa.Spec.Autoscaling == nil || hpa.Spec.Autoscaling.MinReplicas == nil ||
-		*hpa.Spec.Autoscaling.MinReplicas != 1 {
-		t.Errorf("autoscaling.minReplicas = %v, want 1 (= post-default spec.replicas)",
-			hpa.Spec.Autoscaling.MinReplicas)
-	}
-}
-
-// TestDefaulter_AutoscalingMinReplicasNotRecomputedOnReplicasUpdate pins the
-// FIRST-APPLY-ONLY semantics of the autoscaling.minReplicas default: the
-// admission defaulter computes minReplicas from spec.replicas exactly once
-// (at the create that opted into autoscaling), and a subsequent update that
-// bumps spec.replicas does NOT recompute the floor. This matches the
-// standard Kubernetes HPA convention — once an HPA owns the workload, the
-// operator-set HPA fields are the source of truth for the autoscaling
-// band; spec.replicas edits flow through the HPA controller, not back into
-// minReplicas via the admission defaulter.
-//
-// Without this guarantee an operator who applied at replicas=3 (floor=3 by
-// default), then bumped to replicas=5 to manually pre-warm the workload,
-// would silently see the autoscaling floor jump to 5 too — turning a
-// transient pre-warm into a permanent over-provision. The non-clobber
-// contract in the defaulter (refuses to overwrite a non-nil MinReplicas)
-// plus the apiserver field manager pinning the previously-stamped value
-// together produce the desired "first apply only" behavior; this envtest
-// pins it against future regression.
-//
-// Skips when KUBEBUILDER_ASSETS is unset so default CI stays green; run
-// with the same incantation as the test above.
-func TestDefaulter_AutoscalingMinReplicasNotRecomputedOnReplicasUpdate(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping envtest in short mode")
-	}
-	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		t.Skip("KUBEBUILDER_ASSETS unset; skipping CacheBackend defaulter envtest")
-	}
-
-	webhookManifest := filepath.Join("..", "..", "..", "config", "webhook", "manifests.yaml")
-
-	env := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
-		WebhookInstallOptions: envtest.WebhookInstallOptions{
-			Paths: []string{webhookManifest},
-		},
-	}
-	cfg, err := env.Start()
-	if err != nil {
-		t.Fatalf("envtest.Start: %v", err)
-	}
-	t.Cleanup(func() { _ = env.Stop() })
-
-	scheme := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		t.Fatalf("clientgoscheme.AddToScheme: %v", err)
-	}
-	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatalf("cachev1alpha1.AddToScheme: %v", err)
-	}
-
-	wopts := env.WebhookInstallOptions
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme,
-		WebhookServer: webhook.NewServer(webhook.Options{
-			Host:    wopts.LocalServingHost,
-			Port:    wopts.LocalServingPort,
-			CertDir: wopts.LocalServingCertDir,
-		}),
-		Metrics: metricsserver.Options{BindAddress: "0"},
-	})
-	if err != nil {
-		t.Fatalf("ctrl.NewManager: %v", err)
-	}
-	if err := SetupCacheBackendWebhookWithManager(mgr, defaultShippingRegistry()); err != nil {
-		t.Fatalf("SetupCacheBackendWebhookWithManager: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	mgrErr := make(chan error, 1)
-	go func() { mgrErr <- mgr.Start(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-mgrErr:
-			if err != nil && !isContextCanceledErr(err) {
-				t.Logf("manager exited with error: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Logf("manager did not exit within 5s")
-		}
-	})
-
-	if !mgr.GetCache().WaitForCacheSync(ctx) {
-		t.Fatalf("manager cache did not sync")
-	}
-	waitForWebhookPort(t, wopts.LocalServingHost, wopts.LocalServingPort)
-
-	k8s := mgr.GetClient()
-	live := mgr.GetAPIReader()
-	mkNamespace(t, ctx, k8s, "team-a")
-
-	// --- Step 1: apply CR with spec.replicas=3, autoscaling.maxReplicas=10,
-	// no minReplicas. The defaulter computes minReplicas=3 from spec.replicas.
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "minfloor", Namespace: "team-a"},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime:  cachev1alpha1.CacheBackendRuntimeVLLM,
-			Replicas: i32p(3),
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app.kubernetes.io/name": "vllm"},
-			},
-			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "meta-llama/Meta-Llama-3-8B-Instruct"},
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
-			},
-			Autoscaling: &cachev1alpha1.CacheBackendAutoscalingSpec{
-				MaxReplicas: 10,
-			},
-		},
-	}
-	if err := k8s.Create(ctx, cb); err != nil {
-		t.Fatalf("first-apply CacheBackend should be admitted: %v", err)
-	}
-
-	// --- Step 2: assert post-apply minReplicas == 3 (first-apply default).
-	var afterCreate cachev1alpha1.CacheBackend
-	if err := live.Get(ctx, client.ObjectKey{Name: "minfloor", Namespace: "team-a"}, &afterCreate); err != nil {
-		t.Fatalf("get back created CR: %v", err)
-	}
-	if afterCreate.Spec.Autoscaling == nil || afterCreate.Spec.Autoscaling.MinReplicas == nil ||
-		*afterCreate.Spec.Autoscaling.MinReplicas != 3 {
-		t.Fatalf("post-apply autoscaling.minReplicas = %v, want 3 (= spec.replicas first-apply default)",
-			afterCreate.Spec.Autoscaling.MinReplicas)
-	}
-
-	// --- Step 3: update spec.replicas=5 (operator scales workload manually).
-	afterCreate.Spec.Replicas = i32p(5)
-	if err := k8s.Update(ctx, &afterCreate); err != nil {
-		t.Fatalf("update spec.replicas=5 should be admitted: %v", err)
-	}
-
-	// --- Step 4: assert post-update minReplicas == 3 (NOT recomputed).
-	// The non-clobber semantics in the defaulter plus the apiserver field-
-	// manager ownership of the previously-stamped minReplicas together
-	// keep the floor anchored at the first-apply value. A regression
-	// would show minReplicas=5 here (defaulter re-running on every admit
-	// and re-deriving from spec.replicas).
-	var afterUpdate cachev1alpha1.CacheBackend
-	if err := live.Get(ctx, client.ObjectKey{Name: "minfloor", Namespace: "team-a"}, &afterUpdate); err != nil {
-		t.Fatalf("get back updated CR: %v", err)
-	}
-	if afterUpdate.Spec.Replicas == nil || *afterUpdate.Spec.Replicas != 5 {
-		t.Errorf("spec.replicas update lost: got %v, want 5", afterUpdate.Spec.Replicas)
-	}
-	if afterUpdate.Spec.Autoscaling == nil || afterUpdate.Spec.Autoscaling.MinReplicas == nil ||
-		*afterUpdate.Spec.Autoscaling.MinReplicas != 3 {
-		t.Fatalf("post-update autoscaling.minReplicas = %v, want 3 (operator-owned after first apply; spec.replicas edits must NOT recompute the floor)",
-			afterUpdate.Spec.Autoscaling.MinReplicas)
+		t.Fatal("update selecting unimplemented NodeLocal topology should be rejected")
 	}
 }

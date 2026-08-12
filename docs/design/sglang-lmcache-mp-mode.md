@@ -1,68 +1,30 @@
-# Design: LMCache MP mode — the converged worker model (SGLang now, vLLM migration)
+# Historical design: the SGLang LMCache MP spike
 
-Status: **implemented and GPU-validated** for SGLang (Phase 2, increments 1–2); increment 3 (operator surface + the remaining SPOF containment) is open — see [Phased delivery](#phased-delivery). Facts below are live-validated unless marked otherwise. · Supersedes the "mirror the vLLM+LMCache adapter" model in [cachebackend-api.md](cachebackend-api.md) SGLang section · Built-in adapters: `internal/adapters/builtin/runtime`; public contract: `pkg/adapters/runtime`
+Status: **historical implementation record**. Its spike evidence remains useful,
+but its API shape and rollout predictions are superseded by the completed typed
+MP migration. The current contract is in
+[`cachebackend-api.md`](cachebackend-api.md).
 
-> **Implementation history, superseded for the current operator contract.** This
-> document records the SGLang spike that established MP viability. Its flat
-> worker fields, engine-image worker default, and predictions that vLLM MP was
-> future work are historical. Current production behavior is the typed PodLocal
-> API and common standalone-server renderer defined by
+> **Everything below the current-state summary is implementation history, not
+> an operator guide.** This document records the SGLang spike that established
+> MP viability. Its flat worker fields, engine-image worker default, vLLM IP
+> coexistence, and predictions that vLLM MP was future work are historical and
+> were physically removed in migration Phase 7. Current production behavior is
+> the typed PodLocal API and common MP-server sidecar renderer defined by
 > [`lmcache-multiprocess-migration-roadmap.md`](lmcache-multiprocess-migration-roadmap.md)
 > and [`cachebackend-api.md`](cachebackend-api.md).
 
-**LMCache upstream now recommends multiprocess (MP) mode for *both* vLLM and
-SGLang** (its quickstart: MP is *"recommended"* for vLLM via `LMCacheMPConnector`,
-and *"the SGLang integration now defaults to MP mode"*). MP mode is a **node-local
-`lmcache` worker** the engine attaches to over ZMQ + shared memory — not the
-`lm://` standalone-remote-server model. This doc adopts MP as the **converged
-worker model for both engines** and specifies the shared infrastructure (a
-node-local worker + config-file wire + a shared L2 store) that carries it.
+## Current-state summary
 
-The shipped `(sglang, LMCache)` adapter was built by analogy to the vLLM `lm://`
-model, and **live GPU validation showed that is wrong for SGLang** — SGLang has no
-`lm://` path at all, only MP. So SGLang is the first concrete implementation of the
-converged model and the driver for this design; the vLLM migration reuses the same
-infrastructure and is future work (see [Support matrix](#converged-foundation-mp-for-both-engines)).
-
-**Status: implemented and GPU-validated (Phase 2, increments 1–2).** The wire
-described here is what the adapter renders today. The advisory admission warning
-that used to flag the SGLang pair as non-functional (`sglangLMCacheDataPlaneWarning`)
-is **retired** — it existed only because the shipped `lm://` wiring cached nothing,
-which this design replaced. What remains open is tracked in
-[Phased delivery](#phased-delivery).
-
-> **API ownership update.** The MP worker is still the validated engine-side
-> wire, but Redis is no longer selected by that runtime adapter. Canonical
-> resources use `spec.runtime: SGLang`, `spec.type: LMCache`, and optionally
-> `spec.remoteStorage{provider: Redis, ownership: Managed}`. Without
-> `remoteStorage`, the same worker starts without `--l2-adapter` and provides a
-> host-only LMCache tier. The storage-provider registry owns Redis rendering and
-> gives the engine adapter an optional RESP binding. Historical descriptions of
-> `ResolveCacheServer` below document the pre-separation implementation.
-
-## TL;DR
-
-- Both engines can drive LMCache in **multiprocess (MP) mode** (upstream-
-  recommended): the engine attaches to a **node-local `lmcache` worker** over ZMQ
-  (`mp_host`/`mp_port`) + a shared-memory data path. SGLang configures it via a
-  **`--lmcache-config-file`** (the injected remote-connection/tuning `LMCACHE_*`
-  env is ignored; `LMCACHE_USE_EXPERIMENTAL` gates the connector); vLLM via
-  `LMCacheMPConnector` + `kv_connector_extra_config`. **SGLang is MP-only** (no
-  `lm://` path exists); vLLM keeps its `lm://` path too — see the support matrix
-  below.
-- Cross-node KV sharing is a **networked L2 store behind the MP worker**
-  (`--l2-adapter` = `resp`/Redis, `s3`, `mooncake_store`, or `p2p`) — **not** the
-  `lm://` server, which is not even a valid MP `--l2-adapter` type.
-- Runtime and provider capabilities resolve independently: the Managed Redis
-  provider renders the shared L2 and produces a RESP binding; the SGLang
-  runtime adapter accepts that binding or nil for host-only operation.
-  Engine injection adds a **node-local MP-worker native sidecar (which writes
-  the config file it then serves) + the engine wire** to the engine pod.
-  `mp_host=127.0.0.1` (worker co-located in
-  the pod), so — unlike Mooncake — the engine needs **no `hostNetwork`**. The
-  packaging question (a **GPU-less sidecar** vs. a single container) is **resolved
-  in favour of the GPU-less native sidecar** — spiked, then GPU-validated end to end;
-  see [Resolved: GPU-less sidecar](#resolved-gpu-less-sidecar-vs-same-container).
+- vLLM and SGLang support only typed PodLocal LMCache MP in the current API.
+- Admission injects a CacheBackend-configured `lmcache-mp-server` native sidecar;
+  it does not own or replace the engine image.
+- Omitting `remoteStorage` selects host-only MP. Explicit Redis selects the only
+  currently supported remote L3. Removed LMCacheServer and legacy IP-wired
+  Mooncake objects are never translated to Redis; a new typed MP Mooncake L2
+  adapter remains future work.
+- Current limits remain TP=1 for SGLang and exclude multi-node TP, distributed
+  executors, MLA, and MP-server restart/re-registration.
 
 ## Converged foundation: MP for both engines
 
@@ -72,25 +34,24 @@ and each engine attaches through its own launch surface.
 | Engine | LMCache modes | Recommended (operator docs) | This design implements |
 |---|---|---|---|
 | **SGLang** | **MP only** — `LMCacheMPConnector` via `--lmcache-config-file`; no `lm://` client exists | MP (the only option) | **Yes — Phases 1–3** |
-| **vLLM** | `lm://` (shipped: `LMCacheConnectorV1` + `LMCACHE_REMOTE_URL`) **and** MP (`LMCacheMPConnector` + `mp.host`/`mp.port`) | **MP** | vLLM MP is a **future migration** reusing this infra; the `lm://` adapter stays supported |
+| **vLLM** | **MP only** — `LMCacheMPConnector` via `--kv-transfer-config` | MP | **Yes — typed PodLocal** |
 
 Policy this locks in:
 
 - **SGLang: MP-only.** No `lm://` client exists for SGLang, so the adapter supports
   MP exclusively (this design).
-- **vLLM: both, MP recommended.** The existing `lm://` vLLM+LMCache adapter stays
-  supported (validated and shipped — operators on it are not broken). A future vLLM
-  MP adapter reuses the *same* worker + config/extra-config wire + shared-L2 store
-  this design builds; operator-facing docs **recommend MP** for vLLM once it lands,
-  matching upstream.
+- **vLLM: MP-only.** The former IP adapter was removed in migration Phase 7.
 - **Shared, engine-agnostic infrastructure.** The node-local worker, the
   config-file / `kv_connector_extra_config` wire, the shared L2
   (Redis / `--l2-adapter`), and the `/dev/shm` + fail-open handling are not
   SGLang-specific — SGLang is just the first consumer. Keeping them engine-neutral
   is what makes the vLLM migration a wiring change, not a rebuild.
 
-Everything below specifies the SGLang implementation concretely; the engine-agnostic
-pieces are flagged so the vLLM migration inherits them.
+## Historical spike record
+
+Everything below describes the SGLang implementation as it existed during the
+spike. It is retained as evidence and rationale, not as the current API or
+support contract.
 
 ## Background: how SGLang+LMCache actually works
 
@@ -492,8 +453,9 @@ data plane), different resolution because the data planes differ:
   silently falls back to slow pickle serialization. The shared `emptyDir` must be
   `medium: Memory` and sized ≥ the L1.
 - **L2 durability/HA** — a single managed Redis is a simple default, not an HA
-  store. A future typed remote-storage option will let operators
-  who need durability select an `s3` or `mooncake_store` `--l2-adapter` instead,
-  mirroring the LMCache-vs-Mooncake durability-is-a-backend-choice decision.
+  store. Future provider-specific work may add a real managed Redis Cluster;
+  separately, a typed `mooncake_store` L2 adapter can provide Mooncake without
+  restoring the deleted IP wire. Neither capability is represented by scaling
+  the standalone Redis Deployment.
 - **Bleeding edge** — SGLang's LMCache integration is new (early 2026); the working
   image/version tuple is pinned by the reference stack, not assumed stable.

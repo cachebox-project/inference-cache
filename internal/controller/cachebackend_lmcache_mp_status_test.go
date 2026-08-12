@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -256,49 +255,6 @@ func TestLMCacheMPReadyBase(t *testing.T) {
 				t.Fatalf("ready base = (%s, %q), want (%s, %q)", gotStatus, gotReason, tc.wantStatus, tc.wantReason)
 			}
 		})
-	}
-}
-
-func TestTypedMPManagedRedisRestartDoesNotCascadeEngineDeployment(t *testing.T) {
-	backend := typedMPStatusBackend()
-	backend.Status.ObservedServerInstance = "legacy-remote-instance-latch"
-	backend.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
-		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{Image: "redis:7.4-alpine"},
-	}
-	controller := true
-	engineDep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: "sglang-engine", Namespace: "ns1", UID: "engine-dep-uid"},
-		Spec:       appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "sglang"}}}},
-	}
-	engineRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
-		Name: "sglang-engine-rs", Namespace: "ns1", UID: "engine-rs-uid",
-		OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: "apps/v1", Kind: "Deployment", Name: engineDep.Name, UID: engineDep.UID, Controller: &controller,
-		}},
-	}}
-	enginePod := typedMPStatusPod("sglang-engine-pod", true, true, true)
-	enginePod.OwnerReferences = []metav1.OwnerReference{{
-		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: engineRS.Name, UID: engineRS.UID, Controller: &controller,
-	}}
-
-	r := newReconciler(newScheme(t), backend, engineDep, engineRS, enginePod)
-	reconcile(t, r, backend.Name, backend.Namespace)
-
-	var gotDep appsv1.Deployment
-	if err := r.Get(context.Background(), types.NamespacedName{Namespace: "ns1", Name: engineDep.Name}, &gotDep); err != nil {
-		t.Fatalf("get engine Deployment: %v", err)
-	}
-	if got := gotDep.Spec.Template.Annotations[AnnotationCacheServerRestartTrigger]; got != "" {
-		t.Fatalf("Redis lifecycle cascaded engine Deployment with trigger %q", got)
-	}
-	var gotBackend cachev1alpha1.CacheBackend
-	if err := r.Get(context.Background(), types.NamespacedName{Namespace: "ns1", Name: backend.Name}, &gotBackend); err != nil {
-		t.Fatalf("get CacheBackend: %v", err)
-	}
-	if gotBackend.Status.ObservedServerInstance != "" {
-		t.Fatalf("typed MP retained legacy remote instance latch %q", gotBackend.Status.ObservedServerInstance)
 	}
 }
 

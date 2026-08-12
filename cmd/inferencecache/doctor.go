@@ -279,8 +279,8 @@ func readToken(path string) string {
 	return strings.TrimSpace(string(b))
 }
 
-// dialTCP reports whether a TCP connection to addr succeeds. addr may carry an
-// lm:// scheme (LMCache endpoints) which is stripped before dialing.
+// dialTCP reports whether a TCP connection to addr succeeds. HTTP URL schemes
+// are stripped before dialing.
 func dialTCP(ctx context.Context, addr string) error {
 	addr = stripScheme(addr)
 	var d net.Dialer
@@ -292,7 +292,7 @@ func dialTCP(ctx context.Context, addr string) error {
 }
 
 func stripScheme(addr string) string {
-	for _, scheme := range []string{"lm://", "http://", "https://"} {
+	for _, scheme := range []string{"http://", "https://"} {
 		if strings.HasPrefix(addr, scheme) {
 			return strings.TrimPrefix(addr, scheme)
 		}

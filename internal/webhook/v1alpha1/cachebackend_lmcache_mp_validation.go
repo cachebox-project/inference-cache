@@ -24,67 +24,26 @@ const (
 
 var sha256ImagePattern = regexp.MustCompile(`^[^[:space:]@]+@sha256:[a-f0-9]{64}$`)
 
-// validateLMCacheTopology enforces the canonical MP-only LMCache shape while
-// leaving a topology-less legacy object untouched during repository migration.
-// The presence of topology/podLocal/nodeLocal is the explicit boundary between
-// the old flat inputs and the new API; the two shapes can never be mixed.
+// validateLMCacheTopology enforces the canonical MP-only LMCache shape.
 func validateLMCacheTopology(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb == nil || cb.Spec.LMCache == nil {
+	if cb == nil || cb.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache {
 		return nil
+	}
+	lmPath := field.NewPath("spec", "lmCache")
+	if cb.Spec.IsEventsOnly() {
+		if cb.Spec.LMCache != nil {
+			return field.ErrorList{field.Forbidden(lmPath,
+				"LMCache topology is invalid with integration.mode=EventsOnly because that mode injects no KV connector or MP server")}
+		}
+		return nil
+	}
+	if cb.Spec.LMCache == nil {
+		return field.ErrorList{field.Required(lmPath, "required for the LMCache multiprocess data plane")}
 	}
 
 	lm := cb.Spec.LMCache
-	lmPath := field.NewPath("spec", "lmCache")
-	hasMPShape := lm.Topology != "" || lm.PodLocal != nil || lm.NodeLocal != nil
-	if !hasMPShape {
-		return nil // grandfathered flat-field/IP shape
-	}
 
 	var errs field.ErrorList
-	if cb.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache {
-		// validateCacheHierarchy owns the clearer type error.
-		return nil
-	}
-	if cb.Spec.IsEventsOnly() {
-		errs = append(errs, field.Forbidden(lmPath,
-			"LMCache topology is invalid with integration.mode=EventsOnly because that mode injects no KV connector or MP server"))
-	}
-
-	// Flat fields are compatibility inputs, not alternate spellings for MP.
-	if lm.HostMemory != nil {
-		errs = append(errs, field.Forbidden(lmPath.Child("hostMemory"),
-			"legacy flat field cannot be mixed with the MP topology; use podLocal.server.l1Capacity"))
-	}
-	if strings.TrimSpace(lm.WorkerImage) != "" {
-		errs = append(errs, field.Forbidden(lmPath.Child("workerImage"),
-			"legacy flat field cannot be mixed with the MP topology; use podLocal.server.image"))
-	}
-	if lm.WorkerPort != nil {
-		errs = append(errs, field.Forbidden(lmPath.Child("workerPort"),
-			"legacy flat field cannot be mixed with the MP topology; use podLocal.server.port"))
-	}
-	if strings.TrimSpace(lm.RemoteSerde) != "" {
-		errs = append(errs, field.Forbidden(lmPath.Child("remoteSerde"),
-			"remoteSerde belongs to the legacy in-process connector and is not supported by LMCache MP"))
-	}
-
-	storage := cb.Spec.EffectiveRemoteStorage()
-	if storage != nil {
-		switch storage.Provider {
-		case cachev1alpha1.CacheBackendRemoteStorageProviderRedis:
-			// Redis/RESP is the initial shared L3 for both engines.
-		case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
-			errs = append(errs, field.NotSupported(
-				field.NewPath("spec", "remoteStorage", "provider"), storage.Provider,
-				[]string{string(cachev1alpha1.CacheBackendRemoteStorageProviderRedis)},
-			))
-		case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
-			errs = append(errs, field.NotSupported(
-				field.NewPath("spec", "remoteStorage", "provider"), storage.Provider,
-				[]string{string(cachev1alpha1.CacheBackendRemoteStorageProviderRedis)},
-			))
-		}
-	}
 
 	switch lm.Topology {
 	case "":

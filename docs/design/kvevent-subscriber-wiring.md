@@ -43,18 +43,17 @@ to turn it on.**
 Concretely:
 
 * `KVCacheRuntimeAdapter` gains `ObservationSidecar(cb, pod) (*corev1.Container, error)`.
-  The vLLM/LMCache, vLLM/Mooncake, SGLang/LMCache, and SGLang/HiCache adapters return the `kvevent-subscriber`
+  The vLLM/LMCache, SGLang/LMCache, and SGLang/HiCache adapters return the `kvevent-subscriber`
   container spec (via their shared internal subscriber renderer — the KV-event stream is the
   engine's own ZMQ publisher, independent of the L2 store; each adapter pins its engine's
   `--hash-scheme` tag + ZMQ port); the reference adapter returns `(nil, nil)`.
   External Redis ownership stays on the runtime/cache adapter and can attach
-  observation. Legacy IP/Mooncake adapters retain observation behavior only
-  until Phase 7.
+  observation. The former IP adapters were removed in Phase 7.
 * The Pod webhook (`internal/webhook/pod/podinjector.go`) calls `ObservationSidecar` right
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
   fail open, matching the rest of the webhook.
-* **The vLLM/LMCache, vLLM/Mooncake, SGLang/LMCache, and SGLang/HiCache adapters return nil unless the
+* **The vLLM/LMCache, SGLang/LMCache, and SGLang/HiCache adapters return nil unless the
   controller's `--kvevent-subscriber-image` flag is set** (all go through the same shared
   internal renderer, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
   container into `ImagePullBackOff`, which keeps the engine pod from going Ready — the
@@ -96,9 +95,7 @@ Concretely:
   The SGLang adapter reuses the same shared subscriber, only its `--hash-scheme` tag
   differs (SGLang adopted vLLM's ZMQ KV-event wire); the seam is what would let a genuinely
   different future engine return a different sidecar (e.g. a different ZMQ port or a
-  completely different observation mechanism). A Mooncake remote binding uses the same
-  vLLM kvevent-subscriber because the engine is still vLLM and its KV events still come
-  from vLLM's ZMQ publisher (scheme-tagged `vllm`); only the backend store differs. A
+  completely different observation mechanism). A
   future backend that fronts a non-vLLM engine, or exposes observation data some other way,
   could still return `nil` or a different container here. **DaemonSet remains an option for
   any future adapter** that wants it — it just isn't this PR.

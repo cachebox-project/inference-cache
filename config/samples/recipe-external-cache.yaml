@@ -5,7 +5,7 @@
 # Recipe: External Redis L3 — point the MP server at Redis you manage.
 #
 # Scenario: you already run Redis and do not want the controller to provision
-# it. External ownership skips the remote-provider Deployment/Service/HPA. The
+# it. External ownership skips the remote-provider Deployment and Service. The
 # pod webhook still injects one PodLocal LMCache MP server per engine Pod, and
 # that server connects to the explicit RESP endpoint.
 #

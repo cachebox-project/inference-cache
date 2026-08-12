@@ -32,17 +32,13 @@ const (
 	CacheBackendTypeSGLangHiCache CacheBackendType = "SGLangHiCache"
 )
 
-// +kubebuilder:validation:Enum=Redis;LMCacheServer;Mooncake
+// +kubebuilder:validation:Enum=Redis
 
 // CacheBackendRemoteStorageProvider identifies the technology used for the
 // optional shared/remote cache tier.
 type CacheBackendRemoteStorageProvider string
 
-const (
-	CacheBackendRemoteStorageProviderRedis         CacheBackendRemoteStorageProvider = "Redis"
-	CacheBackendRemoteStorageProviderLMCacheServer CacheBackendRemoteStorageProvider = "LMCacheServer"
-	CacheBackendRemoteStorageProviderMooncake      CacheBackendRemoteStorageProvider = "Mooncake"
-)
+const CacheBackendRemoteStorageProviderRedis CacheBackendRemoteStorageProvider = "Redis"
 
 // +kubebuilder:validation:Enum=Managed;External
 
@@ -75,16 +71,6 @@ type LMCacheConnectorMode string
 
 const (
 	LMCacheConnectorModeMultiprocess LMCacheConnectorMode = "Multiprocess"
-)
-
-// +kubebuilder:validation:Enum=Deployment;StatefulSet
-
-// CacheBackendDeploymentKind identifies the Kubernetes workload kind used for managed backends.
-type CacheBackendDeploymentKind string
-
-const (
-	CacheBackendDeploymentKindDeployment  CacheBackendDeploymentKind = "Deployment"
-	CacheBackendDeploymentKindStatefulSet CacheBackendDeploymentKind = "StatefulSet"
 )
 
 // +kubebuilder:validation:Enum=ReadOnly;WriteOnly;ReadWrite
@@ -188,15 +174,6 @@ type SGLangHiCacheSpec struct {
 	MemoryLayout SGLangHiCacheMemoryLayout `json:"memoryLayout,omitempty"`
 }
 
-// CacheBackendHostMemorySpec configures engine-side host memory. Capacity is
-// owned by the engine cache implementation and never sizes a remote provider.
-type CacheBackendHostMemorySpec struct {
-	// Capacity is the memory budget for the engine-side host cache.
-	// +optional
-	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0'))",message="capacity must be greater than zero"
-	Capacity *resource.Quantity `json:"capacity,omitempty"`
-}
-
 // LMCachePodLocalServerSpec configures the CacheBackend-owned LMCache MP
 // server injected into each selected engine Pod.
 type LMCachePodLocalServerSpec struct {
@@ -283,10 +260,7 @@ type LMCacheNodeLocalSpec struct {
 type LMCacheEngineSpec struct {
 	// Topology selects the canonical LMCache MP server placement. PodLocal is
 	// implemented first; NodeLocal is reserved and rejected until Phase 8.
-	// Omit this field only for a legacy in-process/flat-field object during the
-	// repository migration window.
-	// +optional
-	Topology LMCacheTopology `json:"topology,omitempty"`
+	Topology LMCacheTopology `json:"topology"`
 
 	// PodLocal configures one MP server in each selected engine Pod.
 	// +optional
@@ -301,27 +275,6 @@ type LMCacheEngineSpec struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	ChunkSizeTokens *int32 `json:"chunkSizeTokens,omitempty"`
-
-	// HostMemory is a legacy flat-field input retained only while repository
-	// consumers migrate to podLocal.server.l1Capacity.
-	// +optional
-	HostMemory *CacheBackendHostMemorySpec `json:"hostMemory,omitempty"`
-
-	// WorkerImage is a legacy flat-field input retained only while repository
-	// consumers migrate to podLocal.server.image.
-	// +optional
-	WorkerImage string `json:"workerImage,omitempty"`
-
-	// WorkerPort is a legacy flat-field input retained only while repository
-	// consumers migrate to podLocal.server.port.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=65535
-	WorkerPort *int32 `json:"workerPort,omitempty"`
-
-	// RemoteSerde is a legacy in-process input and is forbidden with MP.
-	// +optional
-	RemoteSerde string `json:"remoteSerde,omitempty"`
 }
 
 // RemoteStorageTLSSpec configures server-authenticated TLS for a remote L3.
@@ -373,39 +326,56 @@ type RedisRemoteStorageSpec struct {
 	Database *int32 `json:"database,omitempty"`
 }
 
-// LMCacheServerRemoteStorageSpec configures a standalone lmcache-server
-// remote-storage provider.
-type LMCacheServerRemoteStorageSpec struct {
-	// Image is used only when ownership is Managed.
+// CacheBackendManagedWorkloadSpec configures Pod scheduling and security for a
+// controller-managed remote-storage workload. Provider topology and scaling do
+// not belong here: each provider must expose those semantics through its own
+// typed configuration rather than treating replicas as interchangeable.
+type CacheBackendManagedWorkloadSpec struct {
+	// NodeSelector constrains provider Pods to nodes with matching labels.
 	// +optional
-	Image string `json:"image,omitempty"`
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 
-	// Command overrides the managed server command and arguments.
+	// Affinity configures provider Pod scheduling affinity.
 	// +optional
-	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:items:MinLength=1
-	Command []string `json:"command,omitempty"`
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
 
-	// Resources are applied to the managed lmcache-server container.
+	// Tolerations allow provider Pods to schedule onto tainted nodes.
 	// +optional
-	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
-}
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
-// MooncakeRemoteStorageSpec configures a Mooncake remote-storage provider.
-type MooncakeRemoteStorageSpec struct {
-	// Image is used only when ownership is Managed.
+	// TopologySpreadConstraints configures provider Pod spreading across
+	// topology domains.
 	// +optional
-	Image string `json:"image,omitempty"`
+	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 
-	// Command overrides the managed Mooncake master command and arguments.
+	// ImagePullSecrets references Secrets used to pull provider images.
 	// +optional
-	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:items:MinLength=1
-	Command []string `json:"command,omitempty"`
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 
-	// Resources are applied to the managed Mooncake master container.
+	// ServiceAccountName is the ServiceAccount used by provider Pods.
 	// +optional
-	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+
+	// SecurityContext configures Pod-level security settings for provider Pods.
+	// +optional
+	SecurityContext *corev1.PodSecurityContext `json:"securityContext,omitempty"`
+
+	// PriorityClassName is the priority class assigned to provider Pods.
+	// +optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
+
+	// SchedulerName selects the scheduler used for provider Pods.
+	// +optional
+	SchedulerName string `json:"schedulerName,omitempty"`
+
+	// RuntimeClassName selects the runtime class used for provider Pods.
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+
+	// TerminationGracePeriodSeconds configures graceful provider shutdown.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
 }
 
 // CacheBackendRemoteStorageSpec configures the optional shared/remote tier.
@@ -424,17 +394,14 @@ type CacheBackendRemoteStorageSpec struct {
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 
+	// Workload configures Pod scheduling and security for controller-managed
+	// provider workloads. It is rejected when ownership is External.
+	// +optional
+	Workload *CacheBackendManagedWorkloadSpec `json:"workload,omitempty"`
+
 	// Redis contains Redis-owned configuration.
 	// +optional
 	Redis *RedisRemoteStorageSpec `json:"redis,omitempty"`
-
-	// LMCacheServer contains standalone lmcache-server-owned configuration.
-	// +optional
-	LMCacheServer *LMCacheServerRemoteStorageSpec `json:"lmCacheServer,omitempty"`
-
-	// Mooncake contains Mooncake-owned configuration.
-	// +optional
-	Mooncake *MooncakeRemoteStorageSpec `json:"mooncake,omitempty"`
 }
 
 // CacheBackendObservationSpec configures KV-event observation independently
@@ -451,9 +418,6 @@ type CacheBackendObservationSpec struct {
 }
 
 // CacheBackendSpec defines the desired state of a cache backend.
-//
-// The autoscaling spec (spec.autoscaling) is reconciled into a
-// HorizontalPodAutoscaler for managed backends.
 type CacheBackendSpec struct {
 	// Runtime identifies the inference runtime. Values are case-sensitive: use
 	// VLLM or SGLang.
@@ -483,39 +447,6 @@ type CacheBackendSpec struct {
 	// +optional
 	Observation *CacheBackendObservationSpec `json:"observation,omitempty"`
 
-	// DeploymentKind identifies whether a managed backend is reconciled as a
-	// Deployment or StatefulSet. Defaults to Deployment — the only kind the
-	// Phase-1 reconciler templates; StatefulSet is reserved for future
-	// per-replica-PVC topologies and is a no-op today.
-	// +optional
-	// +kubebuilder:default=Deployment
-	DeploymentKind CacheBackendDeploymentKind `json:"deploymentKind,omitempty"`
-
-	// Replicas is the desired number of backend workload replicas. Defaults
-	// to 1 — a conservative single-replica deployment; operators opt into
-	// horizontal scale via spec.autoscaling.
-	//
-	// When spec.autoscaling is set, the HPA owns the live replica count and
-	// the autoscaling floor (spec.autoscaling.minReplicas) is auto-defaulted
-	// to spec.replicas on FIRST APPLY ONLY by the admission defaulter.
-	// Subsequent edits to spec.replicas do NOT move the autoscaling floor —
-	// minReplicas is operator-owned (and operator-pinned via the apiserver
-	// field manager) after first apply, matching the standard Kubernetes HPA
-	// convention that scaling intent flows through HPA fields once an HPA
-	// owns the workload. To widen or narrow the autoscaling band post-apply,
-	// edit spec.autoscaling.minReplicas directly.
-	// +optional
-	// +kubebuilder:default=1
-	// +kubebuilder:validation:Minimum=0
-	Replicas *int32 `json:"replicas,omitempty"`
-
-	// Autoscaling configures horizontal autoscaling for the managed backend
-	// workload. When set, the controller reconciles a HorizontalPodAutoscaler
-	// owned by this CacheBackend; the HPA then drives the underlying workload's
-	// replica count, overriding spec.replicas.
-	// +optional
-	Autoscaling *CacheBackendAutoscalingSpec `json:"autoscaling,omitempty"`
-
 	// Integration describes how inference engines should use the cache backend.
 	// +optional
 	Integration *CacheBackendIntegrationSpec `json:"integration,omitempty"`
@@ -526,18 +457,17 @@ type CacheBackendSpec struct {
 	// metav1.LabelSelector surface (matchExpressions, operator-based
 	// selection) is NOT exposed today — only MatchLabels.
 	// Pods that match get runtime-adapter engine wiring injected by the
-	// mutating Pod admission webhook at pod CREATE time. Server-backed
-	// adapters require status.endpoint to be published first; the webhook
-	// fail-opens when it is empty. Engine-local adapters such as native
-	// SGLang HiCache, and the LMCache host-only path, explicitly require no
-	// endpoint and inject immediately.
+	// mutating Pod admission webhook at pod CREATE time. LMCache MP adapters
+	// inject the local connector immediately; when an optional managed Redis
+	// tier is configured, its address is read from status.remoteStorage.endpoint.
+	// Engine-local adapters such as native SGLang HiCache require no endpoint.
 	// Admission is CREATE-only; recovery or a configuration update requires
 	// recreating the pod (e.g. `kubectl rollout restart`), not editing its
 	// live labels.
 	//
 	// This describes the default spec.integration.mode=Offload path. For
 	// spec.integration.mode=EventsOnly no KV connector wiring (env vars +
-	// CLI args) is injected and status.endpoint is neither required nor
+	// CLI args) is injected and no connector or remote-storage endpoint is
 	// published — the kvevent-subscriber observation sidecar alone is
 	// injected (see below), so matched pods report cache state for routing
 	// without offloading KV to a backend server.
@@ -572,10 +502,6 @@ type CacheBackendSpec struct {
 	// +optional
 	HiCache *SGLangHiCacheSpec `json:"hiCache,omitempty"`
 
-	// Template provides pod-level overrides for managed backend workloads.
-	// +optional
-	Template *CacheBackendPodSpecOverride `json:"template,omitempty"`
-
 	// AllowCrossNamespace opts the CacheBackend into referencing an Endpoint
 	// that resolves into a Kubernetes Service in a different namespace from
 	// this object. Without this opt-in admission rejects such Endpoints,
@@ -584,42 +510,6 @@ type CacheBackendSpec struct {
 	// not in-cluster Service DNS (external hostnames, IPs) are unaffected.
 	// +optional
 	AllowCrossNamespace bool `json:"allowCrossNamespace,omitempty"`
-}
-
-// CacheBackendAutoscalingSpec configures horizontal autoscaling of the managed
-// backend workload via a HorizontalPodAutoscaler. Cache-aware (custom-metric)
-// autoscaling is deferred to a later module; Phase 1 supports a CPU-utilization
-// target, which is sufficient to demonstrate scale-up under load.
-//
-// +kubebuilder:validation:XValidation:rule="!has(self.minReplicas) || self.minReplicas <= self.maxReplicas",message="minReplicas must not exceed maxReplicas"
-type CacheBackendAutoscalingSpec struct {
-	// MinReplicas is the lower bound for the HPA replica count. The
-	// admission defaulter computes the default at write time from
-	// spec.replicas (which itself defaults to 1) so the HPA's floor matches
-	// the operator-declared baseline rather than a hard-coded constant. This
-	// is a FIRST-APPLY-ONLY default: the defaulter never overwrites an
-	// operator-set value, AND once stamped the field is owned by the
-	// apiserver field manager — subsequent edits to spec.replicas do NOT
-	// recompute or move minReplicas, matching the standard Kubernetes HPA
-	// convention that scaling intent flows through HPA fields once an HPA
-	// owns the workload. To widen or narrow the autoscaling band post-apply,
-	// edit spec.autoscaling.minReplicas directly. Operators who want a
-	// non-default floor on first apply set the field explicitly.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MinReplicas *int32 `json:"minReplicas,omitempty"`
-
-	// MaxReplicas is the upper bound for the HPA replica count.
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Minimum=1
-	MaxReplicas int32 `json:"maxReplicas"`
-
-	// TargetCPUUtilizationPercent is the average per-pod CPU utilization the
-	// HPA targets. Defaults to 80 when unset.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=100
-	TargetCPUUtilizationPercent *int32 `json:"targetCPUUtilizationPercent,omitempty"`
 }
 
 // CacheBackendIntegrationSpec describes engine integration behavior.
@@ -640,8 +530,8 @@ type CacheBackendIntegrationSpec struct {
 	// EventsOnly is the supported integration for hybrid-attention models that
 	// cannot take a vLLM KV connector (and a lighter routing-only deployment for
 	// anyone who does not want an offload tier). Because EventsOnly provisions
-	// no server, status.endpoint stays empty and the autoscaling spec is
-	// rejected at admission; Ready is still gated on the first observed KV event.
+	// no server, connector and remote-storage status stay empty; Ready is still
+	// gated on the first observed KV event.
 	// SGLangHiCache supports Offload only and is rejected with EventsOnly.
 	// See the CacheBackendIntegrationMode godoc.
 	// +optional
@@ -702,30 +592,6 @@ type CacheBackendIntegrationSpec struct {
 	// crashed engine. See the package doc for the rationale.
 	// +optional
 	EngineOverrides *EngineInjectionOverrides `json:"engineOverrides,omitempty"`
-
-	// EngineHostNetwork opts engine pods bound to this backend into host
-	// networking. It exists for exactly one backend today: Mooncake, whose
-	// transfer engine is a peer-to-peer mesh — the engine dials a real node IP
-	// on a dynamically negotiated port, which a CNI overlay pod IP cannot do.
-	// Without this the backend reconciles Ready and transfers zero KV, and
-	// admission warns as much on every apply.
-	//
-	// This is opt-in, and deliberately not a default, because it rewrites the
-	// networking of a pod the operator owns:
-	//   - hostNetwork is a privilege. A Pod Security "restricted" namespace
-	//     rejects such a pod, and because mutating webhooks run BEFORE Pod
-	//     Security validation, silently injecting it would turn a working engine
-	//     pod into a rejected one — with an error that names Pod Security, not
-	//     this controller.
-	//   - The pod's ports move onto the node's interfaces, outside the pod
-	//     network. NetworkPolicy selects pods by pod IP and therefore stops
-	//     constraining them (see docs/design/cachebackend-api.md).
-	//
-	// Admission rejects this on any backend type that does not need it, so it
-	// can never sit inert on a CacheBackend.
-	//
-	// +optional
-	EngineHostNetwork bool `json:"engineHostNetwork,omitempty"`
 }
 
 // EngineInjectionOverrides is the in-between knob between "take the
@@ -842,54 +708,6 @@ type CacheBackendEngineSelector struct {
 	MatchLabels map[string]string `json:"matchLabels,omitempty"`
 }
 
-// CacheBackendPodSpecOverride defines optional pod-level overrides applied to managed backend pods.
-type CacheBackendPodSpecOverride struct {
-	// NodeSelector constrains backend pods to nodes with matching labels.
-	// +optional
-	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
-
-	// Affinity configures backend pod scheduling affinity.
-	// +optional
-	Affinity *corev1.Affinity `json:"affinity,omitempty"`
-
-	// Tolerations allow backend pods to schedule onto tainted nodes.
-	// +optional
-	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
-
-	// TopologySpreadConstraints configures backend pod spreading across topology domains.
-	// +optional
-	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
-
-	// ImagePullSecrets references secrets used to pull backend pod images.
-	// +optional
-	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
-
-	// ServiceAccountName is the service account used by backend pods.
-	// +optional
-	ServiceAccountName string `json:"serviceAccountName,omitempty"`
-
-	// SecurityContext configures pod-level security settings for backend pods.
-	// +optional
-	SecurityContext *corev1.PodSecurityContext `json:"securityContext,omitempty"`
-
-	// PriorityClassName is the priority class assigned to backend pods.
-	// +optional
-	PriorityClassName string `json:"priorityClassName,omitempty"`
-
-	// SchedulerName selects the scheduler used for backend pods.
-	// +optional
-	SchedulerName string `json:"schedulerName,omitempty"`
-
-	// RuntimeClassName selects the runtime class used for backend pods.
-	// +optional
-	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
-
-	// TerminationGracePeriodSeconds configures graceful shutdown for backend pods.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
-}
-
 // CacheBackendConnectorStatus reports the engine-to-cache connector separately
 // from the optional remote L3 provider. PodLocal loopback and NodeLocal
 // node-derived addresses deliberately do not appear as a generic endpoint.
@@ -955,12 +773,6 @@ type CacheBackendStatus struct {
 	// +optional
 	RemoteStorage *CacheBackendRemoteStorageStatus `json:"remoteStorage,omitempty"`
 
-	// Endpoint is the legacy remote-provider endpoint projection. New MP-aware
-	// clients read status.remoteStorage.endpoint; retained until repository
-	// consumers migrate.
-	// +optional
-	Endpoint string `json:"endpoint,omitempty"`
-
 	// MatchedEnginePods is the number of pods in this CacheBackend's namespace
 	// whose labels match spec.engineSelector at the last reconcile. The field
 	// is a pointer so nil ("not yet computed") is distinguishable from 0
@@ -1023,8 +835,8 @@ type CacheBackendStatus struct {
 
 	// FirstAvailableAt is the stable anchor for the firstEventTimeout clock.
 	// It latches one of two events depending on the integration mode:
-	//   - Offload (managed): the first time the managed cache-backend
-	//     workload was observed Available — there is a workload to wait on.
+	//   - Offload: the first time the effective engine-side connector and any
+	//     fail-closed remote-storage dependency were observed Ready.
 	//   - EventsOnly: the first reconcile. A server-less backend has no
 	//     workload to become Available, so it is "up" the moment it exists
 	//     and the firstEventTimeout clock starts immediately.
@@ -1036,10 +848,10 @@ type CacheBackendStatus struct {
 	// Degraded, stays Degraded until an event arrives" contract. Anchoring on
 	// this latched value keeps the elapsed window monotonic WITHIN a serving
 	// mode, so Degraded is sticky. It survives availability flaps and a
-	// recreated managed Deployment (the gate re-evaluates from the prior
-	// anchor, safe because a cache-server restart does not change the engine
-	// event source). It is NOT immortal across a mode change, though: a
-	// server-bearing→EventsOnly flip re-anchors it to the flip moment (and also
+	// recreated managed Redis Deployment (the gate re-evaluates from the prior
+	// anchor, safe because a Redis restart does not change the engine event
+	// source). It is NOT immortal across a mode change, though: an
+	// Offload→EventsOnly flip re-anchors it to the flip moment (and also
 	// bypasses the sticky NoKVEventsObserved reason) so the flip gets a fresh
 	// first-event window instead of inheriting the old mode's availability time
 	// or timed-out verdict; and an unmanaged transition clears it so a later
@@ -1048,31 +860,6 @@ type CacheBackendStatus struct {
 	// set on the first reconcile.)
 	// +optional
 	FirstAvailableAt *metav1.Time `json:"firstAvailableAt,omitempty"`
-
-	// ObservedServerInstance is the controller's cascade-decision
-	// baseline — a stable identifier for the Ready cache-server pod
-	// set the controller last anchored against. NOT a live current-
-	// pod-set view: the controller intentionally pins this through
-	// transient rolling-update midpoints and through no-Ready
-	// windows so the cascade does not fire on rollbacks or transient
-	// outages. For the live pod inventory, operators should consult
-	// status.matchedEnginePods (engine side) and `kubectl get pod`
-	// (cache-server side).
-	//
-	// Shape: `<pod-uid>:<restart-sum>` per Ready pod, comma-joined
-	// and lex-sorted by pod name. restart-sum is the per-pod
-	// containerStatuses[].RestartCount summed across cache-server
-	// containers (the names from the owned Deployment's pod
-	// template; foreign sidecars are excluded). Inert and cleared
-	// for External backends and unsupported-runtime backends.
-	//
-	// Operator-side recovery for the upstream LMCache
-	// LMServerConnector EPIPE-on-restart bug. See
-	// docs/design/cachebackend-api.md for the cascade contract,
-	// transition rules (which changes do / do not cascade), and
-	// rate-limit / no-Ready / rollback / scale-up rationale.
-	// +optional
-	ObservedServerInstance string `json:"observedServerInstance,omitempty"`
 
 	// IndexParticipation summarizes this CacheBackend's contribution to the
 	// cluster-wide cache index — populated by the CacheIndex poller (it groups
@@ -1145,7 +932,7 @@ type CacheBackendIndexParticipation struct {
 // +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Matched",type=integer,JSONPath=`.status.matchedEnginePods`
-// +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
+// +kubebuilder:printcolumn:name="Remote",type=string,JSONPath=`.status.remoteStorage.endpoint`
 // +kubebuilder:printcolumn:name="Prefixes",type=integer,JSONPath=`.status.indexParticipation.prefixCount`
 // +kubebuilder:printcolumn:name="LastEvent",type=date,JSONPath=`.status.indexParticipation.lastEventAt`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

@@ -15,22 +15,6 @@ import (
 	"strings"
 )
 
-func rejectNonPositiveHostMemoryCapacity(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.LMCache == nil || cb.Spec.LMCache.HostMemory == nil ||
-		cb.Spec.LMCache.HostMemory.Capacity == nil ||
-		cb.Spec.LMCache.HostMemory.Capacity.Sign() > 0 {
-		return nil
-	}
-
-	return field.ErrorList{
-		field.Invalid(
-			field.NewPath("spec", "lmCache", "hostMemory", "capacity"),
-			cb.Spec.LMCache.HostMemory.Capacity.String(),
-			"must be greater than zero",
-		),
-	}
-}
-
 func selectedProviderResources(cb *cachev1alpha1.CacheBackend) (*corev1.ResourceRequirements, *field.Path) {
 	if cb == nil || cb.Spec.RemoteStorage == nil {
 		return nil, nil
@@ -42,14 +26,6 @@ func selectedProviderResources(cb *cachev1alpha1.CacheBackend) (*corev1.Resource
 		if storage.Redis != nil {
 			return storage.Redis.Resources, storagePath.Child("redis", "resources")
 		}
-	case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
-		if storage.LMCacheServer != nil {
-			return storage.LMCacheServer.Resources, storagePath.Child("lmCacheServer", "resources")
-		}
-	case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
-		if storage.Mooncake != nil {
-			return storage.Mooncake.Resources, storagePath.Child("mooncake", "resources")
-		}
 	}
 	return nil, nil
 }
@@ -57,13 +33,6 @@ func selectedProviderResources(cb *cachev1alpha1.CacheBackend) (*corev1.Resource
 func validateCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	var errs field.ErrorList
 	specPath := field.NewPath("spec")
-
-	if cb.Spec.RemoteStorage == nil && cb.Spec.Autoscaling != nil {
-		errs = append(errs, field.Forbidden(
-			specPath.Child("autoscaling"),
-			"host-only backends omit spec.remoteStorage and provision no provider workload, so there is nothing to autoscale",
-		))
-	}
 
 	if cb.Spec.LMCache != nil && cb.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache {
 		errs = append(errs, field.Forbidden(
@@ -87,7 +56,7 @@ func validateCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	case cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged:
 		if strings.TrimSpace(storage.Endpoint) != "" {
 			errs = append(errs, field.Forbidden(storagePath.Child("endpoint"),
-				"managed providers publish their observed endpoint in status.endpoint"))
+				"managed providers publish their observed endpoint in status.remoteStorage.endpoint"))
 		}
 	case cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal:
 		if strings.TrimSpace(storage.Endpoint) == "" {
@@ -96,6 +65,10 @@ func validateCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 		} else if err := backendadapter.ValidateExternalEndpoint(storage.Provider, storage.Endpoint); err != nil {
 			errs = append(errs, field.Invalid(storagePath.Child("endpoint"), storage.Endpoint, err.Error()))
 		}
+		if storage.Workload != nil {
+			errs = append(errs, field.Forbidden(storagePath.Child("workload"),
+				"valid only with Managed ownership"))
+		}
 	}
 
 	type providerConfig struct {
@@ -103,72 +76,22 @@ func validateCacheHierarchy(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 		set      bool
 		path     *field.Path
 	}
-	configs := []providerConfig{
-		{cachev1alpha1.CacheBackendRemoteStorageProviderRedis, storage.Redis != nil, storagePath.Child("redis")},
-		{cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, storage.LMCacheServer != nil, storagePath.Child("lmCacheServer")},
-		{cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, storage.Mooncake != nil, storagePath.Child("mooncake")},
-	}
+	configs := []providerConfig{{cachev1alpha1.CacheBackendRemoteStorageProviderRedis, storage.Redis != nil, storagePath.Child("redis")}}
 	for _, config := range configs {
 		if config.set && storage.Provider != config.provider {
 			errs = append(errs, field.Forbidden(config.path,
 				fmt.Sprintf("configuration belongs to provider %s, but remoteStorage.provider=%s", config.provider, storage.Provider)))
 		}
 		if config.set && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
-			if config.provider == cachev1alpha1.CacheBackendRemoteStorageProviderRedis {
-				// Redis combines connection settings (authentication/TLS/database),
-				// which apply to either ownership mode, with managed-workload
-				// settings. External bindings may retain the former but cannot ask
-				// this controller to choose an image or container resources.
-				if strings.TrimSpace(storage.Redis.Image) != "" {
-					errs = append(errs, field.Forbidden(config.path.Child("image"),
-						"valid only with Managed ownership"))
-				}
-				if storage.Redis.Resources != nil {
-					errs = append(errs, field.Forbidden(config.path.Child("resources"),
-						"valid only with Managed ownership"))
-				}
-				continue
+			if strings.TrimSpace(storage.Redis.Image) != "" {
+				errs = append(errs, field.Forbidden(config.path.Child("image"), "valid only with Managed ownership"))
 			}
-			errs = append(errs, field.Forbidden(config.path,
-				"provider workload configuration is valid only with Managed ownership"))
-		}
-	}
-	if storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
-		switch storage.Provider {
-		case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
-			if storage.LMCacheServer != nil {
-				errs = append(errs, validateManagedProviderCommand(
-					storagePath.Child("lmCacheServer", "command"),
-					storage.LMCacheServer.Command,
-				)...)
-			}
-		case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
-			if storage.Mooncake != nil {
-				errs = append(errs, validateManagedProviderCommand(
-					storagePath.Child("mooncake", "command"),
-					storage.Mooncake.Command,
-				)...)
+			if storage.Redis.Resources != nil {
+				errs = append(errs, field.Forbidden(config.path.Child("resources"), "valid only with Managed ownership"))
 			}
 		}
 	}
 
-	return errs
-}
-
-func validateManagedProviderCommand(path *field.Path, command []string) field.ErrorList {
-	if command == nil {
-		return nil
-	}
-	if len(command) == 0 {
-		return field.ErrorList{field.Invalid(path, command, "must contain an executable")}
-	}
-
-	var errs field.ErrorList
-	for i, part := range command {
-		if strings.TrimSpace(part) == "" {
-			errs = append(errs, field.Invalid(path.Index(i), part, "must not be empty"))
-		}
-	}
 	return errs
 }
 

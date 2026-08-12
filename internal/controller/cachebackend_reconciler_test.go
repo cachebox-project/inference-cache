@@ -13,6 +13,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -54,11 +55,6 @@ func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendR
 		Client: c,
 		Scheme: scheme,
 		Log:    logr.Discard(),
-		// Seed a real serverInstanceCascade so lifecycle tests that
-		// assert on the in-process shadow / lastAt / counted maps
-		// actually exercise the clear path rather than skipping
-		// the check on a nil pointer.
-		serverInstanceCascade: newServerInstanceCascade(),
 	}
 	configureTestRegistries(r)
 	return r
@@ -68,9 +64,7 @@ func configureTestRegistries(r *CacheBackendReconciler) {
 	if r.Registry != nil && r.BackendRegistry != nil {
 		return
 	}
-	registries := builtinadapters.New(builtinadapters.Options{
-		LMCacheServerImage: "lmcache/standalone:test",
-	})
+	registries := builtinadapters.New(builtinadapters.Options{})
 	if r.Registry == nil {
 		r.Registry = registries.Runtime
 	}
@@ -84,11 +78,12 @@ func setupTestCacheBackendReconciler(mgr ctrl.Manager, r *CacheBackendReconciler
 	return r.SetupWithManager(mgr)
 }
 
-func externalLMCacheStorage(endpoint string) *cachev1alpha1.CacheBackendRemoteStorageSpec {
+func externalRedisStorage(endpoint string) *cachev1alpha1.CacheBackendRemoteStorageSpec {
 	return &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
 		Endpoint:  endpoint,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 	}
 }
 
@@ -104,7 +99,7 @@ func reconcile(t *testing.T, r *CacheBackendReconciler, name, namespace string) 
 
 func ptrInt32(v int32) *int32 { return &v }
 
-// lmcacheBackend is the shared managed-backend fixture. It opts OUT of the
+// lmcacheBackend is the shared typed MP fixture with managed Redis. It opts OUT of the
 // KV-event readiness gate via the inferencecache.io/require-kv-events:
 // "false" annotation so the many tests that assert rollout-driven Ready /
 // Degraded conditions, HPA behavior, apply-error status, and transition
@@ -122,11 +117,27 @@ func lmcacheBackend(name, namespace string) *cachev1alpha1.CacheBackend {
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+				PodLocal: &cachev1alpha1.LMCachePodLocalSpec{
+					Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+						Image:      "registry.example/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+						Port:       6500,
+						L1Capacity: resource.MustParse("4Gi"),
+						MaxWorkers: 4,
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+							Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("5Gi")},
+						},
+					},
+				},
 			},
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+			},
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite},
 		},
 	}
 }
@@ -154,28 +165,6 @@ func getBackend(t *testing.T, r *CacheBackendReconciler, name, namespace string)
 		t.Fatalf("get CacheBackend %s/%s: %v", namespace, name, err)
 	}
 	return &cb
-}
-
-// mooncakeBackend is the managed-Mooncake fixture, mirroring lmcacheBackend:
-// it opts OUT of the KV-event readiness gate so the rollout-driven Ready
-// assertion is orthogonal to the gate.
-func mooncakeBackend(name, namespace string) *cachev1alpha1.CacheBackend {
-	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   namespace,
-			Generation:  1,
-			Annotations: map[string]string{"inferencecache.io/require-kv-events": "false"},
-		},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-			},
-		},
-	}
 }
 
 func volumeNames(vs []corev1.Volume) []string {
@@ -212,10 +201,9 @@ func newReconcilerWithInterceptor(scheme *runtime.Scheme, funcs interceptor.Func
 		WithInterceptorFuncs(funcs).
 		Build()
 	r := &CacheBackendReconciler{
-		Client:                c,
-		Scheme:                scheme,
-		Log:                   logr.Discard(),
-		serverInstanceCascade: newServerInstanceCascade(),
+		Client: c,
+		Scheme: scheme,
+		Log:    logr.Discard(),
 	}
 	configureTestRegistries(r)
 	return r

@@ -67,9 +67,14 @@ PodLocal native sidecars require Kubernetes 1.29 or newer.
 | `SGLangHiCache` | SGLang's native engine-local host cache; no remote binding. |
 
 `remoteStorage` is optional L3 only. Redis may be `Managed` or `External`.
-Legacy topology-less `LMCacheServer` and engine-side Mooncake shapes remain in
-the alpha schema only for compatibility until migration Phase 7; they are not
-current production profiles and are not automatically mapped to Redis.
+The removed topology-less IP providers are not accepted or automatically
+mapped to Redis because that would change sharing semantics.
+
+For `Managed` Redis, `remoteStorage.workload` controls provider Pod scheduling
+and security. The built-in managed Redis is a standalone singleton; a future
+managed Redis Cluster requires provider-specific shard and replica semantics,
+not a generic Deployment replica count. Mooncake is likewise planned as a new
+typed MP L2 adapter rather than a restoration of its former IP wire.
 
 ## Engine integration
 
@@ -93,9 +98,9 @@ Typed MP exposes connector and remote-storage health separately:
 - `RemoteStorageReady` is present only when a Redis L3 is configured; and
 - `Ready` composes the implemented readiness and observation gates.
 
-`status.endpoint` is empty for host-only PodLocal MP and contains only a remote
-L3 endpoint. It never publishes the loopback connector address. Other useful
-fields include `matchedEnginePods`, `connector`, `remoteStorage`,
+`status.remoteStorage.endpoint` exists only when a remote L3 is configured. It
+never publishes the loopback connector address. Other useful fields include
+`matchedEnginePods`, `connector`, `remoteStorage`,
 `indexParticipation`, `conditions`, and `observedGeneration`.
 
 ## Related pages

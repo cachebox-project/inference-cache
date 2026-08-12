@@ -15,8 +15,7 @@ import (
 // Phase-1 defaults applied by the mutating webhook. Centralised here so the
 // tests pin the same constants the handler uses.
 //
-// Literal-value defaults (spec.type=LMCache, spec.deploymentKind=Deployment,
-// spec.replicas=1, spec.integration.mode=Offload,
+// Literal-value defaults (spec.type=LMCache, spec.integration.mode=Offload,
 // spec.integration.role=ReadWrite, spec.integration.failOpen=true) are
 // expressed via `+kubebuilder:default=` markers on the API types and stamped
 // by the apiserver before this webhook runs. The webhook handles
@@ -27,9 +26,6 @@ import (
 //     operator omits observation entirely the webhook materialises it here so
 //     the persisted CR carries the readiness-gate deadline rather than relying
 //     on the controller's runtime fallback.
-//   - spec.autoscaling.minReplicas: cluster-context default computed from
-//     spec.replicas at admission so the HPA's floor matches the operator's
-//     baseline declaration rather than a hard-coded constant.
 //
 // Per-field rationale lives in the godoc on each spec field; this comment
 // is the index for the webhook-stamped defaults specifically.
@@ -42,8 +38,8 @@ const (
 
 // CacheBackendDefaulter applies the Phase-1 defaults that CRD-schema
 // `+kubebuilder:default=` markers cannot express at admission time. Literal
-// defaults (spec.type, deploymentKind, replicas,
-// integration.mode, integration.role, integration.failOpen) ride on schema
+// defaults (spec.type, integration.mode, integration.role,
+// integration.failOpen) ride on schema
 // markers and are stamped by the apiserver before this handler runs;
 // the webhook handles context-sensitive and schema-inexpressible defaults:
 //
@@ -51,10 +47,6 @@ const (
 //   - Materialises spec.observation to persist
 //     spec.observation.firstEventTimeout when the operator omits the parent
 //     block entirely.
-//   - Computes spec.autoscaling.minReplicas from spec.replicas when
-//     autoscaling is opted into and minReplicas is left unset — the HPA
-//     floor needs to follow the workload's baseline declaration, which is
-//     cluster-context the schema cannot encode.
 //
 // It does NOT stamp spec.integration.failOpen explicitly — once the
 // defaulter materialises spec.integration above, the apiserver applies
@@ -76,11 +68,8 @@ type CacheBackendDefaulter struct{}
 //     are applied.
 //   - Materialises spec.observation when omitted so
 //     spec.observation.firstEventTimeout carries the readiness-gate deadline.
-//   - Computes spec.autoscaling.minReplicas from spec.replicas when
-//     autoscaling is opted in and minReplicas is left unset.
 //
-// Every other Phase-1 default (spec.type=LMCache, deploymentKind=Deployment,
-// replicas=1, integration.mode=Offload,
+// Every other default (spec.type=LMCache, integration.mode=Offload,
 //
 //	integration.role=ReadWrite,
 //
@@ -108,31 +97,6 @@ func (d *CacheBackendDefaulter) Default(ctx context.Context, cb *cachev1alpha1.C
 	}
 	if cb.Spec.Observation.FirstEventTimeout == nil {
 		cb.Spec.Observation.FirstEventTimeout = &metav1.Duration{Duration: defaultFirstEventTimeout}
-	}
-
-	// autoscaling.minReplicas defaults to spec.replicas when autoscaling is
-	// opted into and the operator left the floor unset. The literal
-	// spec.replicas default (=1) is applied by the apiserver from the
-	// `+kubebuilder:default` marker before this handler runs, so reading
-	// cb.Spec.Replicas here sees either the operator's explicit value or
-	// the schema default — never nil for a CR that came through admission.
-	// The nil guard is defence-in-depth for tests that construct a
-	// CacheBackend directly and call Default without the apiserver in the
-	// loop; we leave minReplicas alone in that case rather than dereference
-	// a nil pointer.
-	//
-	// The `>= 1` guard mirrors the CRD schema's `minimum: 1` on
-	// autoscaling.minReplicas: spec.replicas allows 0 (scale-to-zero), so a
-	// CR with `replicas: 0` + opted-in autoscaling would otherwise have the
-	// defaulter stamp `minReplicas: 0`, which the apiserver then rejects
-	// against the schema's minimum. Refusing to default in that case leaves
-	// the field unset so the operator's misconfiguration surfaces as a
-	// missing-required-field validation error against autoscaling rather
-	// than a webhook-introduced schema violation.
-	if cb.Spec.Autoscaling != nil && cb.Spec.Autoscaling.MinReplicas == nil &&
-		cb.Spec.Replicas != nil && *cb.Spec.Replicas >= 1 {
-		v := *cb.Spec.Replicas
-		cb.Spec.Autoscaling.MinReplicas = &v
 	}
 
 	return nil

@@ -6,17 +6,39 @@ package v1alpha1
 
 import (
 	"context"
+	"testing"
+
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
-	"strings"
-	"testing"
 )
+
+func TestValidatorRejectsTypedMPReservedOverride(t *testing.T) {
+	cb := validPodLocalMPBackend()
+	cb.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
+		SuppressArgs: []string{"--disable-hybrid-kv-cache-manager"},
+	}
+	requireInvalidWithCause(t, shippingValidator(), cb,
+		"spec.integration.engineOverrides.suppressArgs[0]", "--disable-hybrid-kv-cache-manager")
+}
+
+func withVLLMOverrides(overrides cachev1alpha1.EngineInjectionOverrides) *cachev1alpha1.CacheBackend {
+	backend := validPodLocalMPBackend()
+	backend.Spec.Integration.EngineOverrides = &overrides
+	return backend
+}
+
+func withSGLangOverrides(overrides cachev1alpha1.EngineInjectionOverrides) *cachev1alpha1.CacheBackend {
+	backend := validPodLocalMPBackend()
+	backend.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	backend.Spec.Integration.EngineOverrides = &overrides
+	return backend
+}
 
 func TestValidator_EngineOverrides_NoOverrideAdmitted(t *testing.T) {
 	// Sanity baseline: a CacheBackend whose integration is set but carries
 	// no engineOverrides block must admit unchanged. Locked decision #7
 	// (byte-identical default) hinges on this.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := newBackend()
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
@@ -26,7 +48,7 @@ func TestValidator_EngineOverrides_NoOverrideAdmitted(t *testing.T) {
 }
 
 func TestValidator_EngineOverrides_SuppressReservedArgRejected(t *testing.T) {
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		SuppressArgs: []string{"--kv-transfer-config"},
 	})
@@ -40,22 +62,8 @@ func TestValidator_EngineOverrides_SuppressReservedArgRejected(t *testing.T) {
 		"spec.integration.engineOverrides.suppressArgs[0]", "\"vllm\"")
 }
 
-func TestValidator_TypedVLLMMPReservedSurfaceRejected(t *testing.T) {
-	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
-	cb := validPodLocalMPBackend()
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		EngineOverrides: &cachev1alpha1.EngineInjectionOverrides{
-			SuppressArgs: []string{"--disable-hybrid-kv-cache-manager"},
-		},
-	}
-	requireInvalidWithCause(t, v, cb,
-		"spec.integration.engineOverrides.suppressArgs[0]",
-		"--disable-hybrid-kv-cache-manager")
-}
-
 func TestValidator_EngineOverrides_OverrideReservedArgRejected(t *testing.T) {
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	// Two forms: bare flag and equals form. Both must trip the rule, since
 	// both express the same leading flag token.
 	for _, form := range []string{"--kv-transfer-config", "--kv-transfer-config=alt"} {
@@ -68,31 +76,11 @@ func TestValidator_EngineOverrides_OverrideReservedArgRejected(t *testing.T) {
 	}
 }
 
-func TestValidator_EngineOverrides_SuppressReservedEnvRejected(t *testing.T) {
-	v := &CacheBackendValidator{Registry: stubRegistry()}
-	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
-		SuppressEnv: []string{"VLLM_USE_V1"},
-	})
-	requireInvalidWithCause(t, v, cb,
-		"spec.integration.engineOverrides.suppressEnv[0]",
-		"VLLM_USE_V1")
-}
-
-func TestValidator_EngineOverrides_OverrideReservedEnvRejected(t *testing.T) {
-	v := &CacheBackendValidator{Registry: stubRegistry()}
-	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
-		Env: []corev1.EnvVar{{Name: "INFERENCECACHE_FAIL_OPEN", Value: "false"}},
-	})
-	requireInvalidWithCause(t, v, cb,
-		"spec.integration.engineOverrides.env[0].name",
-		"INFERENCECACHE_FAIL_OPEN")
-}
-
 func TestValidator_EngineOverrides_OverridePythonHashSeedRejected(t *testing.T) {
 	// PYTHONHASHSEED is reserved (the deterministic-NONE_HASH correctness
 	// invariant). An operator override must be hard-rejected, not silently
 	// applied — re-randomizing the seed 0-hits LMCache reload under TP>1.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		Env: []corev1.EnvVar{{Name: "PYTHONHASHSEED", Value: "1"}},
 	})
@@ -104,7 +92,7 @@ func TestValidator_EngineOverrides_OverridePythonHashSeedRejected(t *testing.T) 
 func TestValidator_EngineOverrides_SuppressPythonHashSeedRejected(t *testing.T) {
 	// ...and suppression is equally rejected: the operator must not be able to
 	// drop the invariant either.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		SuppressEnv: []string{"PYTHONHASHSEED"},
 	})
@@ -169,7 +157,7 @@ func TestValidator_EngineOverrides_NonReservedAdmitted(t *testing.T) {
 	// suppresses a flag the adapter wouldn't inject anyway (no-op) and
 	// adds a perf knob. We pin the happy path here so a future tightening
 	// of the rule doesn't accidentally reject legitimate overrides.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		Args:         []string{"--max-model-len", "8192"},
 		SuppressArgs: []string{"--enforce-eager"},
@@ -188,7 +176,7 @@ func TestValidator_EngineOverrides_PositionalArgIgnored(t *testing.T) {
 	// because the merge classifies them differently. Admission must treat
 	// them the same way and not surface a spurious rejection — the engine
 	// would happily accept the positional, so admission must too.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		Args: []string{"some-positional"},
 	})
@@ -198,7 +186,7 @@ func TestValidator_EngineOverrides_PositionalArgIgnored(t *testing.T) {
 }
 
 func TestValidator_EngineOverrides_RejectsEmptyEnvName(t *testing.T) {
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		Env: []corev1.EnvVar{{Name: "", Value: "x"}},
 	})
@@ -208,7 +196,7 @@ func TestValidator_EngineOverrides_RejectsEmptyEnvName(t *testing.T) {
 }
 
 func TestValidator_EngineOverrides_RejectsInvalidEnvName(t *testing.T) {
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		// "=" is forbidden in K8s env var names.
 		Env: []corev1.EnvVar{{Name: "FOO=BAR", Value: "x"}},
@@ -219,7 +207,7 @@ func TestValidator_EngineOverrides_RejectsInvalidEnvName(t *testing.T) {
 }
 
 func TestValidator_EngineOverrides_RejectsValueAndValueFrom(t *testing.T) {
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		Env: []corev1.EnvVar{{
 			Name:  "BOTH",
@@ -237,7 +225,7 @@ func TestValidator_EngineOverrides_RejectsValueAndValueFrom(t *testing.T) {
 func TestValidator_EngineOverrides_RejectsEmptyValueFrom(t *testing.T) {
 	// valueFrom with zero sources fails K8s Pod validation; admission
 	// must catch it before it reaches engine pods.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		Env: []corev1.EnvVar{{
 			Name:      "BAD",
@@ -250,7 +238,7 @@ func TestValidator_EngineOverrides_RejectsEmptyValueFrom(t *testing.T) {
 }
 
 func TestValidator_EngineOverrides_RejectsMultipleValueFromSources(t *testing.T) {
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		Env: []corev1.EnvVar{{
 			Name: "BAD",
@@ -314,7 +302,7 @@ func TestEnvVarSourceCount_CountsAllNonNilPointerFields(t *testing.T) {
 func TestValidator_EngineOverrides_ValueFromAloneAdmitted(t *testing.T) {
 	// Positive case: a ValueFrom-only entry (no Value) is a valid K8s env
 	// shape and must pass.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
+	v := shippingValidator()
 	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
 		Env: []corev1.EnvVar{{
 			Name: "POD_NAME",
@@ -328,105 +316,12 @@ func TestValidator_EngineOverrides_ValueFromAloneAdmitted(t *testing.T) {
 	}
 }
 
-func TestValidator_EngineOverrides_ExternalBackendChecksReservedSet(t *testing.T) {
-	// engineOverrides on an externally owned binding is structurally meaningful:
-	// the same canonical
-	// LMCache wire reaches the engine pod whether the cache is managed
-	// or operator-supplied, so suppressing `--kv-transfer-config` would
-	// silently un-wire the integration in both cases. The
-	// reserved-args/env check must therefore fire regardless of ownership.
-	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
-	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
-		SuppressArgs: []string{"--kv-transfer-config"},
-	})
-	setCanonicalExternalStorage(cb, "shared.team-a.svc.cluster.local:9000")
-	_, err := v.ValidateCreate(context.Background(), cb)
-	if err == nil {
-		t.Fatalf("External CR suppressing --kv-transfer-config admitted; reserved-arg check must fire on External too")
+func TestValidatorAdmitsNonReservedOverride(t *testing.T) {
+	cb := validPodLocalMPBackend()
+	cb.Spec.Integration.EngineOverrides = &cachev1alpha1.EngineInjectionOverrides{
+		Args: []string{"--max-model-len=4096"},
 	}
-	if !strings.Contains(err.Error(), "--kv-transfer-config") {
-		t.Fatalf("reserved-arg rejection should name the offending flag; got %v", err)
+	if _, err := shippingValidator().ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("non-reserved override rejected: %v", err)
 	}
-}
-
-func TestValidator_EngineOverrides_MooncakeBackendChecksReservedSet(t *testing.T) {
-	// A Mooncake binding reuses the LMCache connector wire (pointed at a
-	// mooncakestore:// remote), so the same runtime adapter declares the same
-	// reserved args/env. An operator must not be able to
-	// un-wire it via engineOverrides any more than on LMCache/External. Use the
-	// explicitly injected built-in shipping registry so the shipping
-	// adapter's ReservedArgs/ReservedEnv drive the admission check.
-	v := shippingValidator()
-
-	// Arg side: suppressing the connector arg must hard-reject, naming the flag.
-	cbArg := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
-		SuppressArgs: []string{"--kv-transfer-config"},
-	})
-	setCanonicalMooncakeStorage(cbArg)
-	if _, err := v.ValidateCreate(context.Background(), cbArg); err == nil ||
-		!strings.Contains(err.Error(), "--kv-transfer-config") {
-		t.Fatalf("Mooncake CR suppressing --kv-transfer-config must reject naming the flag; got %v", err)
-	}
-
-	// Env side: overriding the reserved remote-URL env must hard-reject too.
-	cbEnv := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
-		Env: []corev1.EnvVar{{Name: "LMCACHE_REMOTE_URL", Value: "mooncakestore://evil:50051"}},
-	})
-	setCanonicalMooncakeStorage(cbEnv)
-	if _, err := v.ValidateCreate(context.Background(), cbEnv); err == nil ||
-		!strings.Contains(err.Error(), "LMCACHE_REMOTE_URL") {
-		t.Fatalf("Mooncake CR overriding reserved LMCACHE_REMOTE_URL must reject naming the env; got %v", err)
-	}
-}
-
-func TestValidator_EngineOverrides_NilRegistry_FallsBackToShippingSet(t *testing.T) {
-	// A zero-value validator (Registry: nil) must consult the SAME
-	// shipping adapter set in BOTH checkRuntimeAdapter and
-	// checkEngineOverrides — otherwise an external binding could admit and then
-	// silently bypass reserved-arg enforcement, letting an
-	// operator un-wire the cache at the engine pod. Pin both halves of
-	// the contract: nil-registry rejects External + suppressed
-	// --kv-transfer-config with a field-scoped error.
-	v := shippingValidator()
-	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
-		SuppressArgs: []string{"--kv-transfer-config"},
-	})
-	setCanonicalExternalStorage(cb, "shared.team-a.svc.cluster.local:9000")
-	_, err := v.ValidateCreate(context.Background(), cb)
-	if err == nil {
-		t.Fatalf("nil-registry validator admitted External + suppressed --kv-transfer-config; reserved-arg check must fire via the shipping-set fallback")
-	}
-	if !strings.Contains(err.Error(), "--kv-transfer-config") {
-		t.Fatalf("expected rejection naming the offending flag; got %v", err)
-	}
-}
-
-func TestValidator_EngineOverrides_ExternalBackendAdmittedWhenSafe(t *testing.T) {
-	// An externally owned CR carrying engineOverrides that DON'T touch the
-	// adapter's reserved set must still admit. The LMCache wire is shared across
-	// ownership modes. LMCACHE_CHUNK_SIZE
-	// is a perf knob, not reserved; suppressing or amending it is fine.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
-	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
-		Env: []corev1.EnvVar{{Name: "LMCACHE_CHUNK_SIZE", Value: "512"}},
-	})
-	setCanonicalExternalStorage(cb, "shared.team-a.svc.cluster.local:9000")
-	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-		t.Fatalf("External CR with non-reserved override rejected: %v", err)
-	}
-}
-
-func TestValidator_EngineOverrides_ExternalRejectsPythonHashSeedOverride(t *testing.T) {
-	// The shared LMCache runtime adapter reserves the same env across ownership
-	// modes, so a PYTHONHASHSEED override on an externally owned CR
-	// is hard-rejected for the same reason — proving the correctness
-	// invariant holds across both ownership modes, not just managed.
-	v := &CacheBackendValidator{Registry: stubRegistry()}
-	cb := withVLLMOverrides(cachev1alpha1.EngineInjectionOverrides{
-		Env: []corev1.EnvVar{{Name: "PYTHONHASHSEED", Value: "1"}},
-	})
-	setCanonicalExternalStorage(cb, "shared.team-a.svc.cluster.local:9000")
-	requireInvalidWithCause(t, v, cb,
-		"spec.integration.engineOverrides.env[0].name",
-		"PYTHONHASHSEED")
 }

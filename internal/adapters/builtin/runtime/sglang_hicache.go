@@ -253,9 +253,6 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 			return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.failOpen must be true")
 		}
 	}
-	if cache.Spec.Autoscaling != nil {
-		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: autoscaling is unsupported for an engine-local backend")
-	}
 	if cache.Spec.EngineSelector == nil || len(cache.Spec.EngineSelector.MatchLabels) == 0 {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: spec.engineSelector.matchLabels is required")
 	}

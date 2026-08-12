@@ -17,8 +17,8 @@ import (
 // dispatch routes a CacheBackend by integration mode and effective remote
 // storage ownership. EventsOnly and canonical host-only configurations shed
 // managed provider workloads; External storage mirrors its configured endpoint
-// to status; Managed Redis, LMCacheServer, and Mooncake storage is rendered by
-// the selected runtime/provider adapter. Unsupported combinations also shed any
+// to status; Managed Redis storage is rendered by the selected provider
+// adapter. Unsupported combinations also shed any
 // previously managed workload.
 func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
 	if r.Registry == nil || r.BackendRegistry == nil {
@@ -34,7 +34,7 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 	// generation owned, then run the server-less status path (the KV-event
 	// readiness gate, no Service/endpoint/cascade). Checked before the
 	// StatefulSet routing because the mode decides provisioning regardless of
-	// deploymentKind (a server-less backend ignores deploymentKind).
+	// provider workload.
 	//
 	// EventsOnly is checked before external remote-storage ownership so it takes
 	// precedence over provider lifecycle. An admission-bypassed object carrying
@@ -103,16 +103,6 @@ func (r *CacheBackendReconciler) dispatch(ctx context.Context, logger logr.Logge
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, r.reconcileExternal(ctx, backend)
-	}
-
-	// StatefulSet (per-replica PVCs via volumeClaimTemplates) is a later
-	// module. Phase 1 manages a Deployment only. SGLangHiCache is engine-local,
-	// so the schema-defaulted deploymentKind is inert for it.
-	if backend.Spec.DeploymentKind == cachev1alpha1.CacheBackendDeploymentKindStatefulSet &&
-		storage != nil {
-		logger.V(1).Info("StatefulSet deploymentKind not yet supported; skipping",
-			"namespace", backend.Namespace, "name", backend.Name)
-		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
 
 	if storage == nil {

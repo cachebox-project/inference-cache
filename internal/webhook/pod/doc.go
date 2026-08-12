@@ -11,7 +11,7 @@
 //  2. picks the first whose Spec.EngineSelector.MatchLabels match the pod;
 //  3. resolves a runtime adapter from the controller's runtime.Registry;
 //  4. resolves the cache endpoint from Spec.RemoteStorage.Endpoint for
-//     externally owned storage or Status.Endpoint for managed providers.
+//     externally owned storage or Status.RemoteStorage.Endpoint for managed providers.
 //     Endpoint-free adapters such
 //     as native SGLang HiCache bypass this gate; and
 //  5. calls adapter.InjectEngineConfig(pod.Spec, binding, cache) to merge
@@ -26,6 +26,6 @@
 // pod produces an empty JSON-patch set and the handler does not need a
 // separate env-presence short-circuit. Trusting the adapter — rather than a
 // lenient env-only check at the handler — avoids the trap where a
-// partially-wired pod (e.g. only LMCACHE_REMOTE_URL set by hand) is
+// partially-wired pod (for example, only one MP connector argument set by hand) is
 // admitted permanently missing the rest of the wiring.
 package pod

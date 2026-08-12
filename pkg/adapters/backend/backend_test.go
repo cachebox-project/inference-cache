@@ -13,12 +13,12 @@ import (
 
 func TestBindingForKeepsResolvedExternalEndpoint(t *testing.T) {
 	storage := &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
 		Endpoint:  "  cache.example:65432  ",
 	}
 
-	got := BindingFor(storage, ProtocolLMCache, "cache.example:65432")
+	got := BindingFor(storage, ProtocolRESP, "cache.example:65432")
 	if got == nil {
 		t.Fatal("BindingFor returned nil")
 	}

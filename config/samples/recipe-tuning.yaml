@@ -36,7 +36,6 @@ metadata:
 spec:
   runtime: VLLM
   type: LMCache
-  replicas: 1
   integration:
     role: ReadWrite
     engineOverrides:

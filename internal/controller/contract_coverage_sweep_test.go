@@ -57,7 +57,7 @@ func TestWebhookPollerSelectorFallbackAgreement(t *testing.T) {
 	// Two CacheBackends with identical selectors. "alpha" should win on
 	// both surfaces (lexicographically before "zebra"). The two helpers
 	// produce different shapes — readyCacheBackendForSweep includes
-	// status.endpoint (the webhook needs it to inject) and cbFixture is
+	// status.remoteStorage.endpoint (the webhook needs it for Redis) and cbFixture is
 	// selector-only (the poller's attribution doesn't depend on endpoint).
 	cbAlphaWebhook := readyCacheBackendForSweep("alpha", ns, labels)
 	cbZebraWebhook := readyCacheBackendForSweep("zebra", ns, labels)
@@ -303,33 +303,19 @@ func TestRefreshSamePodNameAcrossTenantsIsFailSoft(t *testing.T) {
 
 // readyCacheBackendForSweep mirrors the unexported readyCacheBackend helper
 // in internal/webhook/pod (which we can't import across packages). The
-// webhook injects only when status.endpoint is populated, so the agreement
+// webhook injects only when the managed remote-storage endpoint is populated, so the agreement
 // test needs a CacheBackend that the webhook will pick up — not the
 // selector-only cbFixture form the poller tests use.
 func readyCacheBackendForSweep(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
-	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			UID:       types.UID("cb-" + namespace + "-" + name + "-uid"),
-		},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
-			},
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
-		},
-		Status: cachev1alpha1.CacheBackendStatus{
-			Endpoint: name + ".cache-ns.svc.cluster.local:65432",
-		},
+	backend := lmcacheBackend(name, namespace)
+	backend.UID = types.UID("cb-" + namespace + "-" + name + "-uid")
+	backend.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector}
+	backend.Status.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageStatus{
+		Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Endpoint: name + ".cache-ns.svc.cluster.local:6379",
+		Ready:    metav1.ConditionTrue,
 	}
+	return backend
 }
 
 // runPodWebhookAndCaptureInjectedBy admits an engine pod via the

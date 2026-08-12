@@ -124,7 +124,7 @@ type Deps struct {
 	// means doctor probes the unauthenticated path and flags the auth state.
 	Token string
 
-	// DialTCP probes raw reachability of a CacheBackend's status.endpoint. nil
+	// DialTCP probes raw reachability of a CacheBackend's remote-storage endpoint. nil
 	// disables the TCP sub-probe (endpoint presence is still checked).
 	DialTCP TCPDialer
 

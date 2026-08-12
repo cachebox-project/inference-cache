@@ -164,7 +164,7 @@ func kernelCheckResources() corev1.ResourceRequirements {
 // a vLLM+LMCache engine pod, or nil when the configured gate does not apply.
 // Auto mode checks GPU pods in report-only mode; report-only and strict force
 // injection; off disables it.
-func (vllmLMCacheAdapter) KernelCheckInitContainer(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
+func (vllmLMCacheMPAdapter) KernelCheckInitContainer(cache *cachev1alpha1.CacheBackend, pod *corev1.Pod) (*corev1.Container, error) {
 	if cache == nil || pod == nil {
 		return nil, nil
 	}

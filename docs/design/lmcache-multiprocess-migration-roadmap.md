@@ -1,6 +1,6 @@
 # Design Roadmap: LMCache Multiprocess Migration
 
-Status: **Phases 0–4 complete (2026-08-11)** · Scope:
+Status: **Phases 0–5 and 7 complete; Phase 6 was not required (2026-08-11)** · Scope:
 deprecate and remove this project's LMCache in-process data plane, converge vLLM
 and SGLang on LMCache multiprocess (MP) mode, and model
 Pod-local and node-local MP server placement without conflating either with
@@ -104,7 +104,11 @@ code lands.
 | D11 | Each supported vLLM integration explicitly identifies its MP connector implementation; the initial reference baseline uses the LMCache-shipped connector. | With vLLM 0.20 or newer, `LMCacheMPConnector` without a module path selects vLLM's built-in implementation. The initial adapter uses `kv_connector_module_path: lmcache.integration.vllm.lmcache_mp_connector` so the tested client tracks the pinned LMCache server protocol; a future adapter revision may validate a different implementation explicitly. |
 | D12 | CacheBackend never owns or rewrites the inference engine image. Engine images in validation matrices are reproducible fixtures only; CacheBackend digest-pins only cache components it injects or manages. | The inference system owns its runtime lifecycle. The selected adapter renders its engine-specific connector contract, while normal engine initialization is the authoritative compatibility check; tested images are neither an admission allowlist nor a mutation default. |
 
-## Current state
+## Migration baseline (before Phase 1)
+
+This table records the implementation state that motivated the roadmap. It is
+historical, not the current production contract; Phase completion and the
+current MP-only contract are tracked below.
 
 | Area | Current behavior | Gap to target |
 |---|---|---|
@@ -362,7 +366,7 @@ the legacy deprecation writer is only implemented if Phase 6 is activated.
 | 4 | vLLM PodLocal MP | Phase 3 | complete |
 | 5 | Repository consumer migration; migration tooling only if needed | Phase 4 | complete |
 | 6 | Conditional compatibility gate if legacy consumers appear | Phase 5 | not required by Phase 0 and Phase 5 findings |
-| 7 | Remove IP, `lm://`, and LMCacheServer provider | Phase 5; Phase 6 only when applicable | not started |
+| 7 | Remove IP, `lm://`, and LMCacheServer provider | Phase 5; Phase 6 only when applicable | in progress |
 | 8 | NodeLocal shared MP server topology | Phases 3–4; does not block Phase 7 | not started |
 
 ## Phase 0 — design freeze and compatibility baseline
@@ -680,88 +684,69 @@ probe, so traffic tests waited for the engine health endpoint.
 
 ### Objective
 
-Convert repository-owned consumers to MP without silently changing cross-Pod
-sharing or remote-L3 semantics.
+Convert every repository-owned LMCache consumer to typed MP without silently
+changing cross-Pod sharing or remote-L3 semantics.
 
 ### Scope
 
-Repository migration is required. Inventory/migration tooling is conditional
-because Phase 0 found no external users or installed legacy objects.
+Includes samples, reference manifests, support tables, CLI/docs, and ordinary
+test fixtures. Legacy implementation and intentional compatibility coverage
+remain until Phase 7. Physical removal is outside this phase.
+
+The Phase 0 owner audit and Phase 5 repository inventory found zero external
+consumers and zero installed legacy objects. This evidence covers this
+repository and the recorded owner audit, not every organization source or OCI
+cluster. Because no input population appeared, migration tooling and Phase 6
+were not activated.
+
+LMCacheServer and Mooncake are never translated to Redis automatically; the
+operator must choose host-only MP, Redis, or a future typed adapter.
+`remoteSerde` has no generic replacement and is removed unless a future typed
+adapter validates equivalent semantics.
 
 ### Deliverables
 
-- [x] Convert canonical samples, reference-stack manifests, support tables, CLI
-      output, documentation, screenshots, and non-transition fixtures to MP.
-- [x] Remove language that presents the legacy LMCache server as a CPU profile
-      or default backend.
-- [x] Reconfirm the zero-external-consumer assumption before removal, within the
-      evidence boundary recorded below.
-- [x] Re-evaluate the conditional tooling trigger. No external consumer or
-      installed legacy-object evidence appeared, so migration tooling,
-      deprecation Events, and a compatibility gate were not activated.
-
-### Phase 5 inventory and disposition
-
-The repository-wide `rg` inventory was classified before editing:
-
-| Class | Findings | Disposition |
-|---|---|---|
-| Production/current consumers | Legacy LMCache samples (`cachebackend-lmcache*`, External, CPU override, paired/override), five recipes, flat SGLang samples, vLLM/SGLang reference manifests, quickstart/concepts/site pages, support tables, and the reference Helm values file. | Converted to typed PodLocal MP with explicit host-only or Redis semantics. The unvalidated Helm mapping, legacy CPU-only LMCache sample, and Mooncake sample were removed rather than translated inaccurately. |
-| Legacy implementation for Phase 7 | Topology-less API fields/provider enums and CRD schema, LMCacheServer/Mooncake renderers, vLLM IP connector/wire helpers, endpoint parser, lifecycle/status code, and the doctor endpoint-scheme parser. | Retained unchanged so legacy alpha objects remain reconcilable until Phase 7. |
-| Historical/migration documentation | This roadmap, the SGLang MP spike, LMCache-server persistence decision, and legacy portions of the API design. | Retained with explicit history/compatibility banners; current sections and links point to typed MP. |
-| Intentional compatibility tests | Go tests for legacy render/admission behavior; C2/C6 scripts/workflows; legacy portions of default-install smoke. | Retained for Phase 7 safety, labelled legacy-only. C2/C6 scheduled triggers were removed; default-install smoke uses inline legacy fixtures instead of current samples. |
-
-No repository-owned screenshot asset contained a legacy deployment. CLI golden
-output contained no legacy backend recommendation, so no output fixture changed;
-the `doctor` `lm://` parsing branch is implementation compatibility for Phase 7.
-
-**External-consumer evidence boundary.** The Phase 5 repository inventory found
-no cross-repository manifest, API client, generated consumer, or migration input,
-and the Phase 0 owner audit remains zero for external consumers and installed
-legacy objects. This phase did not query every OCI cluster or organization-wide
-source repository, so the zero claim is limited to the repository evidence and
-the recorded owner/Phase 0 confirmation. No contrary evidence appeared; adding
-tooling without an input population would therefore create an unused migration
-surface.
-
-Migration rules:
-
-| Existing object | Automatic portion | Required operator choice |
-|---|---|---|
-| SGLang MP with flat worker fields | Move image, port, and host-memory capacity into `lmCache.podLocal.server` and set `lmCache.topology: PodLocal`. | Confirm pinned image/resources and supported Kubernetes version. |
-| vLLM IP host-only | Move host-memory capacity to PodLocal MP L1; select vLLM MP wire. | Confirm sidecar resources and accept the process/topology change. |
-| vLLM IP + managed/external LMCacheServer | Preserve local capacity; remove `lm://`. | Select no L3 and lose cross-Pod sharing, or explicitly select a supported Redis/other L3. Never choose automatically. |
-| vLLM IP + existing engine-side Mooncake provider | Preserve local intent only. | Wait for MP + Mooncake Store L3 support or migrate explicitly to Redis; URL config is not equivalent to MP adapter config. |
-| Any IP object with `remoteSerde` | None. | Remove it or map it to a future typed L3 serde only when that adapter supports and validates the same semantics. |
+- [x] Classify repository references as current consumers, Phase 7 legacy
+      implementation, history, or intentional compatibility coverage.
+- [x] Convert current samples and manifests to typed `PodLocal` MP with explicit
+      host-only or Redis semantics.
+- [x] Convert current documentation, support tables, CLI guidance, and ordinary
+      fixtures to typed MP.
+- [x] Remove the unvalidated Helm mapping, legacy CPU-only LMCache sample, and
+      Mooncake sample instead of inventing unsafe translations.
+- [x] Stop presenting the legacy LMCache server as a default backend or CPU
+      profile.
+- [x] Retain the legacy implementation only for Phase 7 and clearly label all
+      history and compatibility coverage.
+- [x] Reconfirm the zero-consumer finding and leave conditional migration
+      tooling inactive.
 
 ### Validation
 
-- [x] Repository search finds no repository-owned production LMCache workload
-      still using IP, `lm://`, `LMCacheServer`, or flat SGLang MP fields.
-- [x] `make verify-samples` admits every applicable migrated sample (25 passed,
-      2 pre-existing explicit opt-outs, 0 failed); reference YAML parses, and
-      the typed vLLM/SGLang default-install smoke fixtures remain the current
-      admission path. The live kind default-install workflow was not run locally.
-- [x] Every retained legacy reference is classified as Phase 7 implementation,
-      history/migration documentation, or intentional compatibility coverage.
+Validation completed on 2026-08-11:
+
+| Item | Evidence |
+|---|---|
+| Repository inventory | No additional repository-owned/generated consumer, migration input, legacy screenshot, or CLI recommendation was found. |
+| Production search | No current manifest retained `LMCacheConnectorV1`, `lm://`, `LMCacheServer`, IP wiring, or flat SGLang MP fields. |
+| Automated tests | `git diff --check`, `go test ./...`, `make verify-samples` (25 passed, 2 explicit opt-outs), reference YAML parsing, shell checks, and `make ci` passed. |
+| Optional check | The Python golden-vector check skipped because `xxhash` was unavailable; `make ci` still passed. |
+| Environment | No Kubernetes cluster or GPU was needed or used. The live kind workflow was not run locally in this phase. |
+
+- [x] Every current repository consumer uses typed MP.
+- [x] Ambiguous remote-storage examples were removed or require an explicit
+      operator choice; none was silently mapped to Redis.
+- [x] Every remaining legacy reference is Phase 7 implementation, explicit
+      history, or intentional compatibility coverage.
+- [x] The zero-consumer assumption was rechecked within its stated evidence
+      boundary.
 
 ### Exit criteria
 
-- [x] Every repository-owned production/current LMCache workload uses typed MP.
-- [x] No migration silently changes cross-Pod sharing behavior: each converted
-      object explicitly selects host-only or Redis, and ambiguous legacy
-      LMCacheServer/Mooncake examples were not auto-mapped.
-- [x] Conditional tooling was not activated because the re-audit found no input
-      population or unknown legacy shape.
-
-Validation completed on 2026-08-11: `git diff --check`, `go test ./...`,
-`make verify-samples`, shell syntax checks for the modified canaries/smoke,
-reference-manifest YAML parsing, production/current negative searches, and
-`make ci` all passed. `make ci` reported its optional golden-vector check as
-skipped because the local Python environment lacked `xxhash`; the target itself
-completed successfully. No Kubernetes cluster or GPU was required or used for
-this repository-consumer migration, and the live kind default-install workflow
-was not run locally.
+- [x] Repository-owned production/current consumers use typed MP only.
+- [x] Migration preserves explicit host-only versus shared-L3 intent.
+- [x] Conditional tooling remains inactive because the audited input population
+      is zero.
 
 ## Phase 6 — reject new IP objects
 
@@ -801,55 +786,86 @@ Otherwise this phase adds a temporary compatibility gate, not new IP features.
 
 ## Phase 7 — remove IP and the legacy LMCache server
 
-- **Status:** Not started
+- **Status:** Complete after QA review and revalidation (2026-08-11)
 - **Depends on:** Phase 5; Phase 6 only if activated
 
 ### Objective
 
-Delete the IP data plane and all code/schema that exists only to support it.
+Delete the legacy IP data plane and every production API/code path that exists
+only to support it. LMCache selects typed MP only after this phase.
 
 ### Scope
 
-Includes runtime adapters, provider protocols, controller workloads, status,
-samples, tests, and legacy API fields. Historical migration documentation may
-remain when clearly marked.
+Includes runtime adapters, engine wire, provider lifecycle, API/schema, status,
+metrics, Events, tests, samples, and documentation. Clearly marked history and
+negative assertions may remain; compatibility implementation may not.
+
+Redis is the only current typed remote L3. Host-only MP creates no provider
+workload, and managed Redis is a fixed standalone singleton. Useful managed
+provider Pod scheduling/security fields live under
+`spec.remoteStorage.workload`; generic replicas, autoscaling, deployment kind,
+and legacy top-level template fields are removed.
+
+Mooncake remains future typed MP L2 work. Managed backend clusters, NodeLocal,
+directional roles, SGLang TP>1, distributed execution, MLA, and robust MP-server
+re-registration are outside this phase. None restores the old IP wire.
+Inference-cache does not replace engine images; engine startup remains the
+connector/package compatibility verdict.
 
 ### Deliverables
 
-- [ ] Remove the vLLM legacy LMCache adapter.
-- [ ] Remove `LMCacheConnectorV1` rendering.
-- [ ] Remove `LMCACHE_REMOTE_URL`, `LMCACHE_REMOTE_SERDE`, and other IP-only
-      injected settings.
-- [ ] Remove `ProtocolLMCache` and the `lm://` endpoint parser/binding.
-- [ ] Remove the managed and external `LMCacheServer` provider surface.
-- [ ] Remove the standalone LMCache-server workload renderer.
-- [ ] Remove IP-only status fields, metrics, Events, samples, and tests.
-- [ ] Remove compatibility defaulting/validation and migration-only code after
-      any supported migration window closes.
-- [ ] Remove legacy flat LMCache fields after their replacement is complete.
-- [ ] Remove `LMCacheServer` from CRD enums and provider-specific schema.
-- [ ] Remove or relocate top-level managed-provider workload fields according to
-      the Phase 0 decision.
-- [ ] Regenerate CRDs, deepcopy code, examples, and reference documentation.
+- [x] Delete the vLLM IP adapter, SGLang legacy wire helpers,
+      `LMCacheConnectorV1`, `LMCACHE_REMOTE_URL`, `LMCACHE_REMOTE_SERDE`,
+      `ProtocolLMCache`, and the `lm://` parser/binding.
+- [x] Delete managed/external LMCacheServer, the IP-wired Mooncake
+      implementation, standalone LMCache-server workloads, restart cascade, and
+      IP endpoint lifecycle/status behavior.
+- [x] Remove flat LMCache fields, legacy provider schemas/enums, IP-only
+      status/metrics/Events, and compatibility defaulting/validation.
+- [x] Move managed-provider scheduling/security to
+      `spec.remoteStorage.workload`; reject it for External ownership and remove
+      generic scaling/deployment fields.
+- [x] Remove legacy canaries and compatibility fixtures; retain only explicit
+      history and negative assertions.
+- [x] Regenerate CRDs and deepcopy code, and update current samples and docs.
+- [x] Reconfirm zero consumers within the Phase 5 evidence boundary and skip
+      Phase 6/migration tooling.
 
 ### Validation
 
-- [ ] `go test ./...` passes.
-- [ ] `make verify-samples` passes.
-- [ ] Default-install and upgrade smoke pass.
-- [ ] Repository search finds no production-code references to:
-  - `LMCacheConnectorV1`;
-  - `LMCACHE_REMOTE_URL`;
-  - `ProtocolLMCache`;
-  - `lm://`;
-  - the managed `LMCacheServer` provider.
-- [ ] Any retained historical reference is clearly marked as removed behavior.
+Repository and CPU-only validation completed on 2026-08-11; post-QA GPU
+regression ran in SJC dev on 2026-08-11 PDT (2026-08-12 UTC):
+
+| Item | Evidence |
+|---|---|
+| Repository gates | `git diff --check`, `go test ./...`, `make verify-samples` (25 passed, 1 explicit skip), generated-code checks, production searches, `make ci`, and `make cover-check` (90.1%) passed. |
+| Fresh install | A kind smoke verified the MP-only schema, real Pod admission, managed Redis lifecycle/workload propagation, current samples, doctor, server surfaces, and idempotent re-apply. |
+| Phase 5 upgrade | A separate kind smoke installed commit `10178558bfca308ee3a4b0d584efe4ed3b91197d`, created typed host-only and managed-Redis objects, upgraded to Phase 7, and preserved identity, topology, reconciliation, and Pod admission. |
+| GPU environment | Kubernetes 1.31.1; one A100-SXM4-80GB per engine; LMCache 0.5.3 CUDA 12.9 client wheel; standalone sidecar `sha256:0df30fc70a7d689e1f12823789208a0ee8ef31537316eba6a4c2fa83b0abe61b`; temporary Phase 7 controller `sha256:cd5c4da653bc5a8581e75f9e0668a103f920bc88fd230ce47b1aea6f6f90efc5`. |
+| vLLM TP=1 | Engine `sha256:f72dd35b1efd50fd7646ebce708f173a4040fddf3f2363759c67ad732d912d0a` (0.25.1). A 910-token prompt stored 768 tokens; after `/reset_prefix_cache`, the same request retrieved 768 from MP L1. `Ready`, `ConnectorReady`, and `EngineKernelsHealthy` were True. |
+| SGLang TP=1 | Engine `sha256:920df39109c60429b0a23eaacfd2786fcf1595c12f3ca4fc6e153b2abe34865f` (0.5.13.post1). A 1,091-token prompt stored 1,024 tokens; after `/flush_cache`, the same request reported 1,024 host-cached tokens and the server logged a 1,024-token retrieve. `Ready` and `ConnectorReady` were True. |
+| Cleanup and limits | Test objects were deleted and the SJC control plane restored. The regression covers steady-state PodLocal only, not SGLang TP>1, NodeLocal, server restart/re-registration, or remote L3. |
+
+Both engines used a test-only init-container/shared-volume overlay for the
+checksummed LMCache wheel. This is validation scaffolding, not the production
+engine-image installation model. The optional Python golden-vector check
+skipped because `xxhash` was unavailable; `make ci` still passed.
+
+- [x] Production search finds no current `LMCacheConnectorV1`,
+      `LMCACHE_REMOTE_URL`, `ProtocolLMCache`, `lm://`, or managed LMCacheServer
+      implementation.
+- [x] Fresh-install and real Phase 5 typed-object upgrade smokes pass.
+- [x] vLLM and SGLang TP=1 store → engine-cache reset → MP L1 retrieve pass on
+      GPU.
+- [x] Retained legacy terms are clearly marked history or negative assertions.
 
 ### Exit criteria
 
-- [ ] Only MP adapters can be selected for `spec.type: LMCache`.
-- [ ] No controller workload or engine wire implements IP.
-- [ ] No supported stored object requires the legacy schema.
+- [x] `spec.type: LMCache` selects typed MP adapters only.
+- [x] No controller workload, engine wire, served schema, or current manifest
+      implements the legacy IP path.
+- [x] No supported stored object requires the removed schema.
+- [x] Repository, upgrade, and required PodLocal GPU regressions pass.
 
 ## Phase 8 — NodeLocal shared MP servers
 
@@ -926,6 +942,42 @@ exit criteria and do not block migration away from the legacy IP data plane:
       arbitrary mismatched-version test pair.
 - [ ] Add each profile to the supported validation matrix only after its own
       GPU correctness, failure-recovery, and operability gates pass.
+
+### Typed MP Mooncake L2 adapter
+
+Mooncake remains a supported provider direction, but its removed implementation
+was coupled to the legacy IP connector and is not safe to restore. Future work
+must add a new typed MP binding using LMCache's `mooncake_store` L2 adapter:
+
+- [ ] Add a provider-specific typed configuration for Mooncake metadata/master
+      addresses, protocol, segment sizing, local buffer sizing, credentials,
+      networking, and managed-versus-external lifecycle.
+- [ ] Render `--l2-adapter` configuration through the common MP server without
+      exposing `lm://` or `LMCacheConnectorV1`.
+- [ ] Define provider-scoped host-network/RDMA placement and security; do not
+      reuse an engine-global hostNetwork toggle.
+- [ ] Validate cross-Pod sharing, restart/re-registration, failure isolation,
+      and both vLLM and SGLang client paths against pinned released artifacts.
+- [ ] Never translate a legacy Mooncake object to Redis or infer typed adapter
+      settings from its old URL; migration requires an explicit operator choice.
+
+### Managed backend clusters
+
+The current managed Redis renderer intentionally creates one standalone Redis
+Pod. Multiple replicas behind its Service would be independent keyspaces, not a
+cluster. A future managed backend-cluster capability must therefore be
+provider-specific:
+
+- [ ] Define Redis topology explicitly (for example standalone versus cluster),
+      including shard count, replicas per shard, stable identity, discovery,
+      failover, resharding, persistence, and readiness semantics.
+- [ ] Decide whether inference-cache owns those resources directly or composes
+      with a dedicated Redis operator; keep the core runtime/provider boundary
+      inference-system-neutral.
+- [ ] Verify that the selected LMCache RESP adapter or proxy endpoint supports
+      the advertised cluster behavior before exposing it in the support matrix.
+- [ ] Keep generic `remoteStorage.workload` limited to Pod scheduling/security;
+      do not add replicas or autoscaling that silently changes provider semantics.
 
 ### Directional LMCache roles for PD separation
 
@@ -1105,17 +1157,17 @@ dated closure sections or separate phase documents.
 
 The migration is complete only when all of the following are true:
 
-- [ ] `spec.type: LMCache` selects only MP implementations.
+- [x] `spec.type: LMCache` selects only MP implementations.
 - [x] Both SGLang and vLLM pass the required PodLocal GPU matrix.
 - [x] Host-only MP is supported for both engines; optional L3 implementations
       are validated and versioned independently from the engine connector gate.
 - [x] Current MP server health is observable and steady-state cache behavior is
       tested.
-- [ ] `remoteStorage` is optional L3 and no longer contains LMCacheServer.
-- [ ] No production code injects `LMCacheConnectorV1`, `lm://`, or
+- [x] `remoteStorage` is optional L3 and no longer contains LMCacheServer.
+- [x] No production code injects `LMCacheConnectorV1`, `lm://`, or
       `LMCACHE_REMOTE_URL`.
 - [x] Remote-L3 lifecycle events do not automatically roll MP engines.
-- [ ] Every old IP object has been migrated or intentionally deleted.
+- [x] Every old IP object has been migrated or intentionally deleted.
 - [x] Canonical samples, reference manifests, CLI output, and design documents
       describe only the implemented MP behavior.
 - [x] NodeLocal, if enabled, guarantees same-node server selection and accurate

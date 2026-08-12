@@ -107,7 +107,7 @@ type EngineInjector struct {
 	// Reader lists CacheBackends in the pod's namespace. Production wiring
 	// passes the manager's APIReader (an uncached live client) — pod
 	// CREATE is a one-shot injection opportunity, so a stale informer view
-	// of the owning CacheBackend (in particular a status.endpoint that
+	// of the owning CacheBackend (in particular remote-storage status that
 	// lags reality) would leave the pod permanently unwired. Live reads
 	// also avoid a cold-cache window at controller startup. Tests inject
 	// a fake.NewClientBuilder()-derived reader, which also satisfies the
@@ -188,18 +188,16 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			runtimeID, cache.Spec.Type, err))
 	}
 
-	// The typed LMCache topology is the Phase-1 boundary between the legacy
-	// in-process/flat-field wire and the final MP adapters. Never pass a typed MP
-	// object to a legacy adapter: doing so would silently inject the old vLLM IP
-	// connector or ignore the new PodLocal server settings. Until an adapter
-	// implements LMCacheMPRuntimeAdapter, admit the engine Pod untouched.
+	// A typed LMCache topology requires the runtime-specific MP compatibility
+	// check. A registry extension that selects LMCache without implementing this
+	// contract is admitted without mutation instead of receiving a partial wire.
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology != "" {
 		mpAdapter, ok := adapter.(adapterruntime.LMCacheMPRuntimeAdapter)
 		if !ok {
 			log.V(1).Info("fail-open: selected adapter does not implement typed LMCache MP topology",
 				"runtime", string(runtimeID), "topology", string(cache.Spec.LMCache.Topology))
 			return failOpen(req, &pod, fmt.Sprintf(
-				"runtime=%q adapter does not implement typed LMCache topology=%q (fail-open, no legacy injection)",
+				"runtime=%q adapter does not implement typed LMCache topology=%q (fail-open, no injection)",
 				runtimeID, cache.Spec.LMCache.Topology))
 		}
 		if err := mpAdapter.ValidateMPEnginePod(&pod, cache); err != nil {
@@ -224,8 +222,8 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 	// Events-only (tier-1 routing) backends provision no server, so they publish
 	// no endpoint — and they wire no KV connector, so they need none. The
-	// endpoint gate exists ONLY because the connector requires a dial target
-	// (an empty/malformed LMCACHE_REMOTE_URL crashes the engine at startup); an
+	// endpoint gate exists only because an optional remote-storage adapter
+	// requires a dial target; an
 	// events-only pod injects only the observation sidecar (InjectEngineConfig
 	// is a no-op in this mode), so bypass the gate and inject without one.
 	// Engine-local adapters such as native SGLang HiCache have a nil binding and
@@ -233,7 +231,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	if binding != nil && binding.Endpoint == "" && !cache.Spec.IsEventsOnly() {
 		// The endpoint source is ownership-scoped (see effectiveEndpoint).
 		// Three reasons we can land here:
-		//   - managed CR: reconciler hasn't published status.endpoint
+		//   - managed CR: reconciler hasn't published status.remoteStorage.endpoint
 		//     yet (steady-state during initial rollout).
 		//   - externally owned CR: spec.remoteStorage.endpoint is empty
 		//     (current admission rejects this; reachable only for objects that
@@ -250,7 +248,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		// inbound pod get stripped — otherwise the events controller
 		// would falsely emit InjectedByCacheBackend even though the
 		// webhook bailed out without injecting.
-		missingField := "status.endpoint"
+		missingField := "status.remoteStorage.endpoint"
 		extra := ""
 		if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
 			missingField = "spec.remoteStorage.endpoint"
@@ -266,8 +264,8 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// No env-presence short-circuit here: the adapter is the source of truth
 	// for the full injected contract (env + the adapter-required args/flags),
 	// and lenient short-circuits risk admitting a pod that carries only a
-	// subset of the wiring (e.g. a pre-set LMCACHE_REMOTE_URL but missing the
-	// engine's connector flag — vLLM's --kv-transfer-config or SGLang's
+	// subset of the wiring (e.g. a pre-set connector argument but missing the
+	// engine's required MP configuration — vLLM's --kv-transfer-config or SGLang's
 	// --enable-lmcache) permanently un-converged. Call the adapter
 	// unconditionally; it merges idempotently (upsertEnv / upsertArgPair /
 	// upsertFlag) and a no-op merge produces an
@@ -483,7 +481,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 //
 // A CacheBackend with no EngineSelector or with an empty MatchLabels map is
 // skipped: a "match everything" selector at admission time would silently
-// claim every pod (including the controller's own and the lmcache-server's),
+// claim every pod (including control-plane and provider pods),
 // which is the kind of broad mutation the fail-open posture is meant to
 // prevent.
 func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod) (*cachev1alpha1.CacheBackend, error) {
@@ -607,15 +605,15 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 // to for the given CacheBackend. The source is ownership-scoped:
 //
 //   - External ownership: spec.remoteStorage.endpoint is authoritative — the operator owns it,
-//     admission validates it, status.endpoint is just a reconciler
+//     admission validates it, status.remoteStorage.endpoint is just a reconciler
 //     mirror that may briefly lag during an update. If a new pod
 //     admits between an operator's spec.remoteStorage.endpoint update and the
-//     status patch, status would still hold the OLD value and the
+//     status patch, status would still hold the old value and the
 //     pod would boot wired to the stale address; pod admission is
 //     CREATE-only so that bad wiring is permanent. Preferring the trimmed
 //     remoteStorage endpoint over status here avoids that race and is
 //     consistent with admission's view of the truth.
-//   - Managed storage: status.endpoint is the only
+//   - Managed storage: status.remoteStorage.endpoint is the only
 //     source — the reconciler builds it from the live Service it
 //     provisions, and spec.remoteStorage.endpoint is admission-rejected for
 //     managed ownership, so there's nothing else to fall back on. The webhook
@@ -628,12 +626,9 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 // Every return path is `strings.TrimSpace`-d so a whitespace-only value
 // (a pre-admission CR that mirrored whitespace into status, an
 // externally-edited Service endpoint that picked up stray padding) is
-// treated as missing and fails open instead of injecting
-// `LMCACHE_REMOTE_URL=lm://   ` which the engine connector would reject
-// at runtime. The reconciler already trims before publishing
-// status.endpoint, but the webhook trims defensively here too so a
-// race against an old controller build can't leak whitespace to the
-// engine wire.
+// treated as missing and fails open instead of injecting an invalid remote
+// adapter target. The reconciler already trims before publishing
+// status.remoteStorage.endpoint, but the webhook trims defensively here too.
 //
 // For external storage with an empty/whitespace spec.remoteStorage.endpoint there is NO
 // fallback to status. The reconciler treats that state as
@@ -672,7 +667,7 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology != "" && cache.Status.RemoteStorage != nil {
 		return strings.TrimSpace(cache.Status.RemoteStorage.Endpoint)
 	}
-	return strings.TrimSpace(cache.Status.Endpoint)
+	return ""
 }
 
 // hasContainer reports whether containers already includes one named name.

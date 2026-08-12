@@ -25,9 +25,6 @@ patches:
     kind: Deployment
     name: inference-cache-controller-manager
   patch: |
-    - op: replace
-      path: /spec/template/spec/containers/0/args/1
-      value: --lmcache-server-image=lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
     - op: add
       path: /spec/template/spec/containers/0/args/-
       value: --kvevent-subscriber-image=sjc.ocir.io/idqj093njucb/inference-cache-subscriber@sha256:2fdaa611642a0f2c48b6c7a7257ff28d75030e4bf6df3cebb589319f2e48e504

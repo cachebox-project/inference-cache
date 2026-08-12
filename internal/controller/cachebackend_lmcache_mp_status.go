@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -144,6 +145,9 @@ func (r *CacheBackendReconciler) refreshLMCacheMPConnectorStatus(ctx context.Con
 		Message:            message,
 		ObservedGeneration: backend.Generation,
 	})
+	if equality.Semantic.DeepEqual(before.Status, backend.Status) {
+		return
+	}
 	if err := r.Status().Patch(ctx, backend, client.MergeFrom(before)); err != nil {
 		backend.Status = before.Status
 		log.FromContext(ctx).V(1).Info("LMCache MP connector status refresh skipped: patch failed",

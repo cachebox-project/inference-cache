@@ -35,10 +35,11 @@ import (
 // TestWebhookOnEnvtest_EndToEnd boots a real apiserver via envtest, installs
 // the controller's MutatingWebhookConfiguration, starts the controller-runtime
 // manager with the Pod admission handler registered, then creates a
-// CacheBackend whose status.endpoint is populated and a matching engine Pod.
+// typed CacheBackend whose managed Redis status endpoint is populated and a
+// matching engine Pod.
 // On admission the apiserver routes the CREATE through the webhook over the
-// local serving cert and asserts the persisted pod carries the LMCache env +
-// the kv-transfer-config arg the adapter writes.
+// local serving cert and asserts the persisted pod carries the typed MP
+// sidecar and kv-transfer-config the adapter writes.
 //
 // Skips when KUBEBUILDER_ASSETS is unset so default CI stays green.
 // Run locally via:
@@ -141,10 +142,23 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+				PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+					Image:      "registry.example.com/lmcache@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+					Port:       65432,
+					L1Capacity: resource.MustParse("1Gi"),
+					MaxWorkers: 2,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+						Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+					},
+				}},
+			},
 			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
 				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
@@ -161,7 +175,10 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if err := mgr.GetClient().Create(ctx, cb); err != nil {
 		t.Fatalf("create CacheBackend: %v", err)
 	}
-	cb.Status.Endpoint = "envtest-cb.default.svc.cluster.local:65432"
+	cb.Status.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageStatus{
+		Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Endpoint: "envtest-cb.default.svc.cluster.local:6379",
+	}
 	if err := mgr.GetClient().Status().Update(ctx, cb); err != nil {
 		t.Fatalf("set CacheBackend status: %v", err)
 	}
@@ -189,8 +206,14 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("get pod after create: %v", err)
 	}
 
-	mustHaveContainerEnv(t, &got, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
-	mustHaveContainerEnv(t, &got, testEnvVLLMUseV1, "1")
+	config := envtestArgValue(got.Spec.Containers[0].Args, "--kv-transfer-config")
+	if !strings.Contains(config, `"kv_connector":"LMCacheMPConnector"`) {
+		t.Fatalf("typed vLLM kv-transfer-config = %q", config)
+	}
+	server := envtestFindInitContainer(&got, "lmcache-mp-server")
+	if server == nil || !containsArgPair(server.Args, "--l2-adapter", `{"host":"envtest-cb.default.svc.cluster.local","port":6379,"type":"resp"}`) {
+		t.Fatalf("typed MP server does not carry managed Redis binding: %+v", server)
+	}
 	if got.Annotations[AnnotationInjectedBy] != ns+"/"+cb.Name {
 		t.Fatalf("annotation %s: got %q want %q",
 			AnnotationInjectedBy, got.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name)
@@ -250,7 +273,9 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: pod2.Name}, &got2); err != nil {
 		t.Fatalf("get second pod: %v", err)
 	}
-	mustHaveContainerEnv(t, &got2, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	if envtestFindInitContainer(&got2, "lmcache-mp-server") == nil {
+		t.Fatalf("second admitted Pod is missing typed MP sidecar: %+v", got2.Spec.InitContainers)
+	}
 
 	skipped := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -280,9 +305,9 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if got := gotSkipped.Annotations[AnnotationInjectedBy]; got != "" {
 		t.Fatalf("annotation %s: got %q want absent on skipped pod", AnnotationInjectedBy, got)
 	}
-	if envtestHasContainerEnv(&gotSkipped, testEnvLMCacheRemoteURL) {
-		t.Fatalf("skipped pod unexpectedly has %s env; webhook must not inject engine wiring when %s=true",
-			testEnvLMCacheRemoteURL, AnnotationSkip)
+	if envtestFindInitContainer(&gotSkipped, "lmcache-mp-server") != nil ||
+		containsArgFlag(gotSkipped.Spec.Containers[0].Args, "--kv-transfer-config") {
+		t.Fatalf("skipped pod unexpectedly has typed MP wiring; webhook must not inject when %s=true", AnnotationSkip)
 	}
 
 	// Typed SGLang PodLocal smoke: this goes through a real apiserver so the
@@ -445,36 +470,6 @@ func envtestHasContainerEnvValue(pod *corev1.Pod, name, value string) bool {
 	return false
 }
 
-// mustHaveContainerEnv fails the test if the first container's env array
-// does not include name=value.
-func mustHaveContainerEnv(t *testing.T, pod *corev1.Pod, name, value string) {
-	t.Helper()
-	if len(pod.Spec.Containers) == 0 {
-		t.Fatalf("no containers on pod %s", pod.Name)
-	}
-	for _, e := range pod.Spec.Containers[0].Env {
-		if e.Name == name {
-			if e.Value != value {
-				t.Fatalf("env %s on %s: got %q want %q", name, pod.Name, e.Value, value)
-			}
-			return
-		}
-	}
-	t.Fatalf("env %s missing on %s; have %v", name, pod.Name, pod.Spec.Containers[0].Env)
-}
-
-func envtestHasContainerEnv(pod *corev1.Pod, name string) bool {
-	if len(pod.Spec.Containers) == 0 {
-		return false
-	}
-	for _, e := range pod.Spec.Containers[0].Env {
-		if e.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
 // envtestFindContainer returns the container in pod with the given name, or
 // nil if absent. The non-envtest unit tests have a similarly named helper —
 // the two test files don't share state (envtest_integration_test.go skips
@@ -483,6 +478,15 @@ func envtestFindContainer(pod *corev1.Pod, name string) *corev1.Container {
 	for i := range pod.Spec.Containers {
 		if pod.Spec.Containers[i].Name == name {
 			return &pod.Spec.Containers[i]
+		}
+	}
+	return nil
+}
+
+func envtestFindInitContainer(pod *corev1.Pod, name string) *corev1.Container {
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == name {
+			return &pod.Spec.InitContainers[i]
 		}
 	}
 	return nil

@@ -15,7 +15,7 @@
 #   * The engine Deployment requests a GPU (`nvidia.com/gpu: 1`) and uses the
 #     CUDA vLLM image — schedule it onto GPU nodes.
 #   * Redis is intentionally a singleton soft-state L3; this recipe does not
-#     map the legacy LMCacheServer autoscaling shape because independent Redis
+#     map the removed LMCacheServer scaling shape because independent Redis
 #     replicas would partition the keyspace rather than preserve semantics.
 #   * A CachePolicy tunes eviction for the namespace (see the CachePolicy doc
 #     pointer in config/samples/README.md).

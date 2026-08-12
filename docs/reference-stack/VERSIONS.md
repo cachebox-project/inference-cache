@@ -10,7 +10,7 @@ engine startup is the authoritative package/connector compatibility check.
 
 | Component | Reference value | Notes |
 |---|---|---|
-| LMCache standalone server | `docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13` | Pinned by the typed `CacheBackend`; runs `lmcache server`. This exact reference digest is structurally tested, while the GPU evidence below used the separately recorded validation digest. |
+| LMCache MP-server sidecar | `docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13` | Pinned by the typed `CacheBackend`; runs `lmcache server` as the PodLocal native sidecar. This exact reference digest is structurally tested, while the GPU evidence below used the separately recorded validation digest. |
 | vLLM engine | non-pullable all-zero placeholder | Replace with a digest-pinned image containing the LMCache MP connector/package. The repository deliberately supplies no default engine image. |
 | SGLang engine | non-pullable all-zero placeholder | Replace with a digest-pinned SGLang image containing a compatible LMCache client. The repository deliberately supplies no default engine image. |
 | Redis | `docker.io/library/redis:7.4-alpine` | Used only by the SGLang reference as an explicit external L3 choice. Digest-pin it for production. |
@@ -18,7 +18,7 @@ engine startup is the authoritative package/connector compatibility check.
 | SGLang model | `meta-llama/Meta-Llama-3-8B-Instruct` | Gated; keep the served model, request model, and `observation.modelID` aligned. |
 | CPU-only engine | `vllm/vllm-openai-cpu:latest-{x86_64,arm64}` | Event/prefix-cache check only; no LMCache MP data plane. Mutable development tag, not a production pin. |
 
-The standalone reference digest and the GPU-validation digest differ. Do not
+The MP-server reference digest and the GPU-validation digest differ. Do not
 interpret structural manifest coverage as a claim that this exact engine/server
 tuple has completed the live GPU matrix.
 
@@ -40,11 +40,12 @@ path with those exact test inputs; they are not universal image endorsements.
 Before production rollout:
 
 1. Build or select the engine image in the inference-system release process.
-2. Pin both engine and standalone-server images by digest.
+2. Pin both engine and MP-server sidecar images by digest.
 3. Create the typed `CacheBackend` and let the webhook inject MP wiring.
 4. Treat engine startup/readiness as the compatibility verdict, then run a
    store, local-cache reset, and retrieve test on the target GPU/CUDA stack.
 
-Do not map legacy `LMCacheServer` or Mooncake objects to Redis automatically.
+Do not map removed `LMCacheServer` or legacy IP-wired Mooncake objects to Redis automatically.
 The operator must explicitly choose host-only MP or a supported L3 because the
-choice changes cross-Pod sharing and persistence semantics.
+choice changes cross-Pod sharing and persistence semantics. Mooncake support
+returns only through a separately validated typed MP L2 adapter.

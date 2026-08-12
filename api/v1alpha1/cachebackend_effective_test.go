@@ -13,7 +13,7 @@ func TestEffectiveRemoteStorageUsesOnlyExplicitDeclaration(t *testing.T) {
 	}
 
 	want := &CacheBackendRemoteStorageSpec{
-		Provider:  CacheBackendRemoteStorageProviderMooncake,
+		Provider:  CacheBackendRemoteStorageProviderRedis,
 		Ownership: CacheBackendRemoteStorageOwnershipManaged,
 	}
 	spec.RemoteStorage = want

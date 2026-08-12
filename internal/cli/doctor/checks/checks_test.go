@@ -98,14 +98,14 @@ func healthyBackend(now time.Time) *cachev1alpha1.CacheBackend {
 			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 			Type:    cachev1alpha1.CacheBackendTypeLMCache,
 			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 			},
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "engine"}},
 		},
 		Status: cachev1alpha1.CacheBackendStatus{
-			Endpoint:          "10.0.0.5:8200",
+			RemoteStorage:     &cachev1alpha1.CacheBackendRemoteStorageStatus{Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, Endpoint: "10.0.0.5:8200", Ready: metav1.ConditionTrue},
 			MatchedEnginePods: ptr(int32(2)),
 			Conditions:        []metav1.Condition{readyCond(metav1.ConditionTrue, "KVEventObserved", "ready")},
 			IndexParticipation: &cachev1alpha1.CacheBackendIndexParticipation{
@@ -404,9 +404,9 @@ func TestCacheBackendHealth(t *testing.T) {
 				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 				Type:    cachev1alpha1.CacheBackendTypeLMCache,
 				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-					Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-					Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-					LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+					Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 				},
 				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": "missing"}},
 			},
@@ -532,14 +532,14 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 				Type:    cachev1alpha1.CacheBackendTypeLMCache,
 				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
 					Endpoint:  "h:1",
 				},
 			},
 			Status: cachev1alpha1.CacheBackendStatus{
-				Endpoint:   "h:1",
-				Conditions: []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ok")},
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageStatus{Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, Endpoint: "h:1", Ready: metav1.ConditionTrue},
+				Conditions:    []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ok")},
 			},
 		}
 		c := fakeClient(t, cb)
@@ -617,14 +617,14 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 				Type:    cachev1alpha1.CacheBackendTypeLMCache,
 				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
 					Endpoint:  "cache.example.com:8200",
 				},
 			},
 			Status: cachev1alpha1.CacheBackendStatus{
-				Endpoint:   "cache.example.com:8200",
-				Conditions: []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageStatus{Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, Endpoint: "cache.example.com:8200", Ready: metav1.ConditionTrue},
+				Conditions:    []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
 			},
 		}
 		c := fakeClient(t, cb)
@@ -641,14 +641,14 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 				Type:    cachev1alpha1.CacheBackendTypeLMCache,
 				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
 					Endpoint:  "cache.example.com:8200",
 				},
 			},
 			Status: cachev1alpha1.CacheBackendStatus{
-				Endpoint:   "cache.example.com:8200",
-				Conditions: []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
+				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageStatus{Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, Endpoint: "cache.example.com:8200", Ready: metav1.ConditionTrue},
+				Conditions:    []metav1.Condition{readyCond(metav1.ConditionTrue, "EndpointAccepted", "ready")},
 			},
 		}
 		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, okDial)
@@ -665,7 +665,7 @@ func TestCacheBackendHealthMessageBranches(t *testing.T) {
 		cb.Name = "host-only"
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
 		cb.Spec.RemoteStorage = nil
-		cb.Status.Endpoint = ""
+		cb.Status.RemoteStorage = nil
 		fs := CacheBackendHealth(ctx, fakeClient(t, cb), "", now, DefaultStaleWindow, okDial)
 		if len(fs) != 1 || fs[0].Code != doctor.CodeBackendHealthy {
 			t.Fatalf("canonical host-only backend should be CB006, got %v", codesOf(fs))

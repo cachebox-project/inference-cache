@@ -22,7 +22,7 @@ LMCache server. Normal engine startup is the authoritative compatibility check.
 | [`manifests/deployment.yaml`](manifests/deployment.yaml) | vLLM + typed host-only LMCache MP. |
 | [`manifests/sglang-lmcache/`](manifests/sglang-lmcache/) | SGLang + typed LMCache MP + explicit external Redis. |
 | [`manifests/cpu-local/`](manifests/cpu-local/) | CPU-only engine/event check without LMCache. |
-| [`scripts/`](scripts/) | Event subscriber, prefix-hit test, and compatibility canaries. |
+| [`scripts/`](scripts/) | Event subscriber, prefix-hit test, and MP-only install smoke. |
 
 There is no Helm values reference in this phase. The repository has not
 validated an upstream chart API that can faithfully express the operator-owned
@@ -65,11 +65,12 @@ kubectl apply -f manifests/deployment.yaml -f manifests/service.yaml
 kubectl -n cache-substrate rollout status deploy/vllm-lmcache-llama-8b --timeout=20m
 ```
 
-The vLLM reference is host-only: `status.endpoint` is intentionally empty.
+The vLLM reference is host-only: `status.remoteStorage` is intentionally absent.
 For cross-Pod sharing, explicitly select Redis as shown by the SGLang reference
 or [`config/samples/cachebackend-lmcache.yaml`](../../config/samples/cachebackend-lmcache.yaml).
-Legacy `LMCacheServer` and Mooncake providers are not automatically translated
-because doing so would silently change L3 and sharing semantics.
+The removed `LMCacheServer` and legacy IP-wired Mooncake provider shapes are not
+automatically translated because doing so would silently change L3 and sharing
+semantics. Mooncake remains future typed MP L2 work.
 
 ## Verify traffic and KV events
 
@@ -114,13 +115,9 @@ python scripts/kv_events_subscriber.py --endpoint tcp://localhost:5557 --max 4
 python scripts/test_kv_events.py
 ```
 
-## Legacy compatibility canaries
-
-`canary_c2_reconcile.sh` and `canary_c6_engine_wiring.sh` intentionally exercise
-the legacy IP implementation retained until Phase 7. They are manual
-compatibility tests, not current deployment references, and their workflows are
-not scheduled. Current typed MP rendering and admission are covered by Go tests
-and `default_install_smoke.sh`.
+The `default_install_smoke.sh` gate installs the current MP-only schema, checks
+typed Pod admission and managed Redis, and re-applies the bundle to cover the
+in-place alpha upgrade path without starting a real engine.
 
 ## Teardown
 

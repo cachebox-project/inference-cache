@@ -111,11 +111,9 @@ type KVCacheRuntimeAdapter interface {
 	EngineContainerName() string
 }
 
-// LMCacheMPRuntimeAdapter is the Phase-1 gate for adapters that understand the
-// final typed LMCache topology. Legacy adapters intentionally do not implement
-// it: the Pod webhook then admits a new MP Pod unmodified instead of silently
-// applying the legacy in-process/flat-field wire. Phases 2-4 implement this
-// interface as the shared renderer and runtime-specific MP adapters land.
+// LMCacheMPRuntimeAdapter identifies adapters that understand the typed LMCache
+// MP topology. The Pod webhook uses the additional validation hook before
+// mutating a selected engine Pod.
 type LMCacheMPRuntimeAdapter interface {
 	KVCacheRuntimeAdapter
 

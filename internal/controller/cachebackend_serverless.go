@@ -17,12 +17,11 @@ import (
 	"time"
 )
 
-// reconcileExternal mirrors an externally owned backend's configured endpoint
-// to status. For legacy backends, admission acceptance of the endpoint remains
-// the only readiness signal because there is no Service to wait on. Typed
-// PodLocal MP additionally aggregates the independently observed connector;
-// endpoint acceptance alone must not report a missing/unhealthy native sidecar
-// as Ready.
+// reconcileExternal mirrors an externally owned provider's configured endpoint
+// to status. Endpoint acceptance is the provider readiness signal because there
+// is no Service to wait on. Typed PodLocal MP also aggregates the independently
+// observed connector, so endpoint acceptance alone cannot report a missing or
+// unhealthy native sidecar as Ready.
 //
 // Three terminal states, each driven by the SAME shape rule the
 // validating webhook applies on CREATE/UPDATE — so the reconciler is
@@ -52,11 +51,6 @@ import (
 // it on its own; an External backend whose engine pods still report KV events
 // legitimately keeps it).
 func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
-	// Wipe the in-memory cascade shadow + rate-limit timestamp
-	// alongside the on-cluster status clearing below — see
-	// clearServerInstanceLatchShadow for why a lingering shadow
-	// across managed→External→managed would false-cascade.
-	r.clearServerInstanceLatchShadow(backend)
 	// Wipe the functional-probe rate-limit entry alongside removing
 	// the FunctionalProbeOK condition below. Without this, a CR that
 	// flips managed → External → managed within the 30s rate-limit
@@ -70,7 +64,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		// TrimSpace before every decision. Admission rejects a
 		// whitespace-only endpoint at write time, but a pre-existing
 		// CR in etcd from before admission was installed can still
-		// carry one. Publishing the trimmed value as status.endpoint
+		// carry one. Publishing the trimmed value in remote-storage status
 		// means the pod webhook's `endpoint == ""` short-circuit
 		// naturally catches whitespace too without a second TrimSpace
 		// at the consumer.
@@ -79,13 +73,6 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 		if storage != nil {
 			endpoint = strings.TrimSpace(storage.Endpoint)
 		}
-		backend.Status.Endpoint = endpoint
-		// Clear the cache-server-instance latch — External backends
-		// have no controller-managed cache-server pods, and
-		// cleanupOwnedWorkload above has just deleted any prior
-		// managed Deployment. Leaving the latch set would expose a
-		// stale UID to operators.
-		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
 
 		// Decide the Ready reason + message in one place so the
@@ -171,7 +158,7 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 }
 
 // reconcileEventsOnly drives an events-only (tier-1 routing) backend: it
-// provisions NO cache-server workload and publishes no endpoint, but still runs
+// provisions no remote-provider workload and publishes no endpoint, but still runs
 // the KV-event readiness gate so Ready reflects "the engine is reporting state"
 // exactly as a managed backend does. The kvevent-subscriber sidecar is injected
 // engine-side by the (mode-aware) pod webhook, and status.indexParticipation is
@@ -179,9 +166,9 @@ func (r *CacheBackendReconciler) reconcileExternal(ctx context.Context, backend 
 // per-backend index slice behave identically to a managed backend; only the
 // offload tier (a server + KV connector) is absent.
 //
-// Like reconcileExternal it clears the in-memory cascade shadow and the
-// functional-probe rate-limit entry (there is no server to cascade-restart or
-// probe) and clears the managed-only FunctionalProbeOK / T2Degraded conditions.
+// Like reconcileExternal it clears the functional-probe rate-limit entry (there
+// is no managed provider to probe) and clears the managed-only FunctionalProbeOK
+// and T2Degraded conditions.
 // Events-only also clears EngineKernelsHealthy / EngineCompatibility because it
 // loads no connector; host-only evaluates both engine-side diagnostics normally.
 // The firstEventTimeout window is anchored on status.firstAvailableAt, latched
@@ -203,9 +190,9 @@ func (r *CacheBackendReconciler) reconcileHostOnly(ctx context.Context, backend 
 func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backend *cachev1alpha1.CacheBackend, activeReason, activeMessage string) (ctrl.Result, error) {
 	now := time.Now()
 	// A backend flipping INTO a serverless mode (events-only or host-only) from a
-	// server-bearing mode still carries that mode's status.endpoint /
-	// observedServerInstance at the top of this reconcile. Serverless modes clear
-	// both below, so a non-empty value here uniquely marks the first reconcile
+	// remote-storage mode may still carry that mode's status at the top of this
+	// reconcile. Serverless modes clear it below, so a non-empty value here
+	// uniquely marks the first reconcile
 	// after the flip.
 	// On that transition any latched firstAvailableAt reflects the OLD mode's
 	// availability (e.g. an Offload workload that went Available long ago), not the
@@ -213,7 +200,7 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 	// anchor could breach the window the instant we flip and strand the backend at
 	// NoKVEventsObserved/Degraded. Re-anchor to now so the new mode gets a fresh
 	// first-event window from when it took effect.
-	transitionedFromServerMode := backend.Status.Endpoint != "" || backend.Status.ObservedServerInstance != ""
+	transitionedFromServerMode := backend.Status.RemoteStorage != nil
 	// Base readiness is unconditionally True (no workload to gate on); the
 	// KV-event gate layers AwaitingFirstKVEvent → KVEventsObserved /
 	// NoKVEventsObserved on top, anchored on the firstAvailableAt latch.
@@ -251,17 +238,11 @@ func (r *CacheBackendReconciler) reconcileServerless(ctx context.Context, backen
 	}
 	progressingStatus, progressingReason, progressingMessage := progressingFromReady(gate.readyStatus, gate.readyReason, gate.readyMessage)
 
-	// No server to cascade-restart or functionally probe — drop both in-memory
-	// trackers so a later Offload re-entry inside their windows starts clean
-	// (mirrors reconcileExternal).
-	r.clearServerInstanceLatchShadow(backend)
+	// No server to functionally probe; a later Offload re-entry starts clean.
 	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 
 	err := r.patchStatus(ctx, backend, func() {
-		// No provisioned server: no endpoint, no server-instance latch.
-		// status.indexParticipation stays poller-owned.
-		backend.Status.Endpoint = ""
-		backend.Status.ObservedServerInstance = ""
+		// No provisioned server. status.indexParticipation stays poller-owned.
 		backend.Status.ObservedGeneration = backend.Generation
 		if eventsOnly {
 			backend.Status.RemoteStorage = nil
@@ -363,9 +344,6 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
 		return err
 	}
-	// Wipe the in-memory cascade shadow + rate-limit timestamp
-	// alongside the on-cluster status clearing below.
-	r.clearServerInstanceLatchShadow(backend)
 	// Wipe the functional-probe rate-limit entry alongside removing
 	// the FunctionalProbeOK condition below. Same reasoning as in
 	// reconcileExternal — without this, a managed → Unmanaged →
@@ -374,14 +352,8 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 	// no fresh probe verdict.
 	r.probeLimiter.forget(client.ObjectKeyFromObject(backend).String())
 	return r.patchStatus(ctx, backend, func() {
-		backend.Status.Endpoint = ""
 		backend.Status.Connector = nil
 		backend.Status.RemoteStorage = nil
-		// Clear the cache-server-instance latch — cleanupOwnedWorkload
-		// above has just deleted any prior managed Deployment and we
-		// no longer provision one, so a retained UID would advertise
-		// a stale identifier.
-		backend.Status.ObservedServerInstance = ""
 		backend.Status.ObservedGeneration = backend.Generation
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeReady)
 		meta.RemoveStatusCondition(&backend.Status.Conditions, conditionTypeProgressing)
@@ -403,7 +375,7 @@ func (r *CacheBackendReconciler) reconcileUnmanaged(ctx context.Context, backend
 		// firstEventTimeout window. An unmanaged backend is not up in any sense,
 		// so a stale anchor from a prior managed generation must not survive:
 		// otherwise a later re-entry — in particular Offload→Unmanaged→EventsOnly,
-		// which clears endpoint/observedServerInstance so the events-only
+		// which clears remote-storage status so the events-only
 		// re-anchor heuristic can't see the transition — would reuse a
 		// long-past availability time and breach the window on the first
 		// events-only reconcile.

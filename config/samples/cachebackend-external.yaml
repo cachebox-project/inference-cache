@@ -8,8 +8,8 @@
 # trusted private network: LMCache 0.5.3 authentication is supported, but TLS is
 # not, and admission rejects a TLS block rather than silently ignoring it.
 #
-# This sample explicitly chooses Redis. A legacy external LMCacheServer endpoint
-# cannot be converted automatically because replacing lm:// changes sharing and
+# This sample explicitly chooses Redis. A removed external LMCacheServer endpoint
+# cannot be converted automatically because replacing its IP wire changes sharing and
 # data-plane semantics.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend

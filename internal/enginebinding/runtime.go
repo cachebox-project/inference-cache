@@ -46,9 +46,3 @@ func IsValidKernelCheckMode(s string) bool {
 		return false
 	}
 }
-
-// EngineHostNetworkRequested reports whether the operator opted an engine pod
-// using a Mooncake remote binding into host networking.
-func EngineHostNetworkRequested(cache *cachev1alpha1.CacheBackend) bool {
-	return cache != nil && cache.Spec.Integration != nil && cache.Spec.Integration.EngineHostNetwork
-}

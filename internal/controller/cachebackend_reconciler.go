@@ -11,7 +11,6 @@ import (
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
-	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -28,7 +27,7 @@ import (
 // between otherwise-unrelated reconcile triggers. The reconciler does not
 // Watch Pods by design (see refreshMatchedEnginePods godoc); without a
 // self-requeue, the count would only refresh when the CR, the owned
-// Deployment, Service, or HPA changed. 30s strikes a balance between
+// Deployment or Service changed. 30s strikes a balance between
 // operator responsiveness and reconcile pressure on a large fleet. Tests
 // override via the `MatchedEnginePodsRequeueInterval` reconciler field to
 // avoid baking the 30s delay into the suite.
@@ -95,20 +94,6 @@ type CacheBackendReconciler struct {
 	// sync.Map inside is usable from struct construction — the rate-limit
 	// gate works on the first reconcile without explicit initialization.
 	probeLimiter probeRateLimiter
-
-	// MinServerRestartCascadeInterval overrides the rate-limit window for
-	// the cache-server restart cascade. Zero means "use
-	// [DefaultMinServerRestartCascadeInterval]". Production wiring leaves
-	// this zero; envtest / unit tests shrink the window to keep per-test
-	// runtime cheap.
-	MinServerRestartCascadeInterval time.Duration
-
-	// serverInstanceCascade tracks the last cascade-restart time per
-	// backend so the rate-limit window is enforced in-process. Lazily
-	// initialized in SetupWithManager AND defensively in
-	// reconcileServerInstance (the latter so unit tests that bypass
-	// SetupWithManager get a working reconciler).
-	serverInstanceCascade *serverInstanceCascade
 }
 
 // probeRateLimit returns the effective rate-limit for the functional-probe
@@ -148,16 +133,13 @@ func (r *CacheBackendReconciler) matchedEnginePodsChurnRequeueInterval() time.Du
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// Reconcile drives a CacheBackend toward its desired state. External backends
-// only mirror their configured endpoint to status; managed backends (LMCache
-// in Phase 1) ask the registered runtime adapter for the cache-server pod
-// spec + service spec, wrap them into a Deployment + Service the controller
-// owns, optionally reconcile an HPA from spec.autoscaling, and publish the
-// resolved endpoint.
+// Reconcile drives a CacheBackend toward its desired state. External Redis
+// bindings mirror their configured endpoint to remote-storage status; managed
+// Redis bindings render a singleton Deployment and Service. LMCache connector
+// health is derived independently from the selected engine Pods.
 //
 // On every reconcile — including ones that return an apply error — transitions
 // in the observed Ready condition (entering/leaving Ready=False/
@@ -250,8 +232,7 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // SetupWithManager sets up the controller with the Manager. Owns(Deployment)
 // guarantees that a child's status flipping (e.g. AvailableReplicas dropping
 // to zero) re-triggers a Reconcile so emitTransitionEvents observes the
-// change; the HPA is owned so the controller re-reconciles when the
-// autoscaler updates spec.replicas or its own status.
+// change.
 func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("cachebackend-controller")
@@ -264,9 +245,6 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// passes Client, not APIReader).
 		r.APIReader = mgr.GetAPIReader()
 	}
-	if r.serverInstanceCascade == nil {
-		r.serverInstanceCascade = newServerInstanceCascade()
-	}
 	return ctrl.NewControllerManagedBy(mgr).
 		// NOTE: DO NOT add a predicate that filters status-only updates here.
 		// The KV-event readiness gate depends on the CacheIndex poller's
@@ -277,6 +255,5 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&cachev1alpha1.CacheBackend{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
-		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Complete(r)
 }

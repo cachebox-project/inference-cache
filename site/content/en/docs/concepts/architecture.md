@@ -18,8 +18,9 @@ the cache-state index.
 
 The controller-runtime manager. It:
 
-- **Reconciles the CRDs** — provisions the managed cache-server workload and Service for a
-  `CacheBackend`, computes readiness, and writes status.
+- **Reconciles the CRDs** — provisions an explicitly selected managed Redis
+  provider for a `CacheBackend`, computes connector and provider readiness, and
+  writes status. Host-only MP and engine-local modes create no provider workload.
 - **Serves six CR admission webhook entries** (over TLS, via cert-manager): defaulting +
   validation for `CacheBackend`, `CachePolicy`, and `CacheTenant`.
 - **Serves the seventh entry, a mutating Pod webhook** — the *linker*. When an engine pod

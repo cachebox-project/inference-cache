@@ -367,10 +367,16 @@ func TestReconcileMatchedEnginePodsWriteOnlyOnChange(t *testing.T) {
 		t.Fatalf("after first reconcile: matchedEnginePods = %v, want 2", got)
 	}
 
-	// Second reconcile sees an identical world. The matchedEnginePods
-	// writer must skip its patch entirely (count unchanged). Other
-	// status fields are also at steady state, so the SubResourcePatch
-	// counter must not advance at all.
+	// Typed MP status is layered: the first pass observes the remote store and
+	// connector independently, and the next pass folds those observations into
+	// Ready. Allow that bounded convergence before measuring steady state.
+	reconcile(t, r, "cache", "ns1")
+	reconcile(t, r, "cache", "ns1")
+	reconcile(t, r, "cache", "ns1")
+	firstPasses = atomic.LoadInt32(&cbStatusPatches)
+
+	// The next reconcile sees an identical, fully converged world. The
+	// matchedEnginePods writer must skip its patch because the count is unchanged.
 	reconcile(t, r, "cache", "ns1")
 	if got := atomic.LoadInt32(&cbStatusPatches); got != firstPasses {
 		t.Fatalf("steady-state reconcile patched CacheBackend status %d more time(s); want 0", got-firstPasses)
@@ -578,8 +584,8 @@ func TestReconcileMatchedEnginePodsCoexistsWithOtherStatusWriters(t *testing.T) 
 	if got.Status.MatchedEnginePods == nil || *got.Status.MatchedEnginePods != 2 {
 		t.Fatalf("matchedEnginePods = %v, want 2", got.Status.MatchedEnginePods)
 	}
-	if got.Status.Endpoint == "" {
-		t.Fatalf("status.endpoint dropped — the matchedEnginePods patch should not stomp on the other status writers")
+	if got.Status.RemoteStorage == nil || got.Status.RemoteStorage.Endpoint == "" {
+		t.Fatalf("status.remoteStorage.endpoint dropped — the matchedEnginePods patch should not stomp on the other status writers")
 	}
 	if got.Status.ObservedGeneration == 0 {
 		t.Fatalf("status.observedGeneration = 0 — the matchedEnginePods patch should not stomp on dispatch's status writes")

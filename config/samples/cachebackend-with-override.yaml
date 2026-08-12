@@ -31,8 +31,6 @@ metadata:
 spec:
   runtime: VLLM
   type: LMCache
-  deploymentKind: Deployment
-  replicas: 1
   integration:
     role: ReadWrite
     # Amend the engine container the mutating Pod webhook injects.

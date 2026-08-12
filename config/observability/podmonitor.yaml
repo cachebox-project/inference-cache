@@ -5,11 +5,9 @@
 # PodMonitor for `inference-cache-controller-manager`. Without this, a
 # prometheus-operator install scrapes ONLY the server-binary metrics
 # (covered by servicemonitor.yaml) and silently misses every
-# controller-binary series — including
+# controller-binary series, including
 # `inferencecache_backend_probe_result_total` (which `ServerProbeFail`
-# in this same overlay depends on) and
-# `inferencecache_backend_server_restart_cascades_total` (no alert
-# reads it today; reserved for a future cascade-loop alert).
+# in this same overlay depends on).
 #
 # A PodMonitor (not a ServiceMonitor) is the right shape here because the
 # controller binary does not front its /metrics endpoint with a Service —

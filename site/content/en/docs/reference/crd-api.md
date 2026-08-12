@@ -33,22 +33,18 @@ contract follows its own compatibility policy for external consumers.
 | `type` | `LMCache`, `SGLangHiCache` | `LMCache` | Engine-side cache implementation. |
 | `lmCache` | object | — | Typed LMCache MP topology and server configuration. Current offload uses `topology: PodLocal`. |
 | `lmCache.podLocal.server.resources` | ResourceRequirements | required | Resources for the injected MP server; memory covers L1 plus 1Gi and CPU request is positive. |
-| `remoteStorage` | object | — | Optional Redis L3 with `Managed` or `External` ownership. Legacy providers remain in the alpha schema only until Phase 7. |
+| `remoteStorage` | object | — | Optional Redis L3 with `Managed` or `External` ownership. |
+| `remoteStorage.workload` | object | — | Scheduling and Pod security for a managed provider; rejected for External and has no generic replica count. |
 | `observation` | object | — | Model identity and first-event timeout. |
-| `deploymentKind` | `Deployment`, `StatefulSet` | `Deployment` | `StatefulSet` reserved/no-op. |
-| `replicas` | int32 | `1` | Min 0. |
-| `autoscaling` | object | — | `minReplicas`, `maxReplicas` (required), `targetCPUUtilizationPercent` (default 80). |
 | `integration.mode` | `Offload`, `EventsOnly` | `Offload` | Events-only = routing only. |
 | `integration.role` | `ReadOnly`, `WriteOnly`, `ReadWrite` | `ReadWrite` | LMCache currently admits only `ReadWrite`; directional semantics are future work. |
 | `integration.failOpen` | bool | `true` | `false` fails closed. |
 | `integration.engineOverrides` | object | — | `args` / `suppressArgs` / `env` / `suppressEnv`. |
-| `integration.engineHostNetwork` | bool | `false` | Legacy engine-side Mooncake compatibility field; not used by typed MP. |
 | `engineSelector.matchLabels` | map | — | Equality selector over engine pod labels. |
-| `template` | object | — | Narrow pod-level overrides (no containers). |
 | `remoteStorage.<provider>.resources` | ResourceRequirements | renderer default: `requests.memory 4Gi` / `limits.memory 8Gi` | Resources for the selected managed provider container. |
 | `allowCrossNamespace` | bool | `false` | Opt-in cross-namespace endpoints. |
 
-**Key `status` fields:** `endpoint`, `matchedEnginePods` (`*int32`),
+**Key `status` fields:** `connector`, `remoteStorage`, `matchedEnginePods` (`*int32`),
 `firstKVEventObservedAt` (`*Time`), `indexParticipation`
 (`prefixCount`, `lastEventAt`, `hitRate *string`, `t2HitRate *string`), `failOpen`,
 `observedGeneration`, `conditions`.

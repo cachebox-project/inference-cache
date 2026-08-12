@@ -9,7 +9,6 @@ import (
 	"errors"
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
-	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,14 +25,13 @@ import (
 func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(2)
 	r := newReconciler(scheme, cb)
 
 	reconcile(t, r, "cache", "ns1")
 
 	dep := getDeployment(t, r, "cache", "ns1")
-	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 2 {
-		t.Fatalf("deployment replicas = %v, want 2", dep.Spec.Replicas)
+	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 1 {
+		t.Fatalf("deployment replicas = %v, want fixed managed-Redis singleton", dep.Spec.Replicas)
 	}
 	owner := metav1.GetControllerOf(dep)
 	if owner == nil || owner.Kind != "CacheBackend" || owner.Name != "cache" || owner.Controller == nil || !*owner.Controller {
@@ -45,17 +43,17 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 		t.Fatalf("containers = %d, want 1", len(containers))
 	}
 	c := containers[0]
-	if c.Name != "lmcache-server" {
-		t.Fatalf("container name = %q, want lmcache-server (standalone server, not the all-in-one vLLM)", c.Name)
+	if c.Name != "redis-l2" {
+		t.Fatalf("container name = %q, want redis-l2", c.Name)
 	}
 	if c.Image == "" {
 		t.Fatalf("container image is empty")
 	}
-	if !containsStr(c.Command, "lmcache_server") {
-		t.Fatalf("container command = %v, want to start with lmcache_server", c.Command)
+	if !containsStr(c.Args, "redis-server") {
+		t.Fatalf("container args = %v, want redis-server while preserving the image entrypoint", c.Args)
 	}
-	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 65432 {
-		t.Fatalf("ports = %v, want exactly one port on 65432 (lm:// scheme)", c.Ports)
+	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 6379 {
+		t.Fatalf("ports = %v, want exactly one Redis port on 6379", c.Ports)
 	}
 
 	svc := &corev1.Service{}
@@ -65,8 +63,8 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
 		t.Fatalf("service type = %q, want ClusterIP", svc.Spec.Type)
 	}
-	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 65432 {
-		t.Fatalf("service ports = %v, want exactly one port on 65432", svc.Spec.Ports)
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 6379 {
+		t.Fatalf("service ports = %v, want exactly one port on 6379", svc.Spec.Ports)
 	}
 	if so := metav1.GetControllerOf(svc); so == nil || so.Name != "cache" {
 		t.Fatalf("service controller owner = %+v, want CacheBackend/cache", so)
@@ -83,19 +81,22 @@ func TestReconcileLMCacheCreatesWorkload(t *testing.T) {
 	}
 
 	updated := getBackend(t, r, "cache", "ns1")
-	wantEndpoint := "cache.ns1.svc.cluster.local:65432"
-	if updated.Status.Endpoint != wantEndpoint {
-		t.Fatalf("status.endpoint = %q, want %q (engine-agnostic host:port; lm:// prefix is the adapter's job)", updated.Status.Endpoint, wantEndpoint)
+	wantEndpoint := "cache.ns1.svc.cluster.local:6379"
+	if updated.Status.RemoteStorage == nil || updated.Status.RemoteStorage.Endpoint != wantEndpoint {
+		t.Fatalf("status.remoteStorage = %+v, want endpoint %q", updated.Status.RemoteStorage, wantEndpoint)
 	}
 	if updated.Status.ObservedGeneration != 1 {
 		t.Fatalf("status.observedGeneration = %d, want 1", updated.Status.ObservedGeneration)
 	}
-	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != conditionReasonRolloutInProgress {
-		t.Fatalf("Ready condition = %+v, want False/RolloutInProgress (no ready replicas yet)", cond)
+	if cond := findCondition(updated.Status.Conditions, conditionTypeRemoteStorageReady); cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != reasonRemoteStoragePending {
+		t.Fatalf("RemoteStorageReady = %+v, want Unknown/%s (no ready replicas yet)", cond, reasonRemoteStoragePending)
+	}
+	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != reasonConnectorUnverified {
+		t.Fatalf("Ready = %+v, want Unknown/%s until an engine Pod is observed", cond, reasonConnectorUnverified)
 	}
 }
 
-func TestReconcileLegacyCacheWithTypedObservationRetainsProviderWorkload(t *testing.T) {
+func TestReconcileManagedRedisWithObservationRetainsProviderWorkload(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("legacy-observed", "ns1")
 	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"}
@@ -111,89 +112,9 @@ func TestReconcileLegacyCacheWithTypedObservationRetainsProviderWorkload(t *test
 		t.Fatalf("managed service was not retained: %v", err)
 	}
 	got := getBackend(t, r, cb.Name, cb.Namespace)
-	wantEndpoint := "legacy-observed.ns1.svc.cluster.local:65432"
-	if got.Status.Endpoint != wantEndpoint {
-		t.Fatalf("status.endpoint = %q, want %q", got.Status.Endpoint, wantEndpoint)
-	}
-}
-
-// TestReconcileManagedMooncake is the C2-reconciles-Mooncake DoD: a canonical
-// Mooncake remote provider must reconcile into a managed mooncake_master
-// Deployment + Service, and
-// status.endpoint must be the master's RPC host:port (the engine-agnostic
-// address the pod webhook later turns into mooncakestore://). The RPC port
-// being first in the rendered Service is what makes serviceEndpoint resolve it.
-func TestReconcileManagedMooncake(t *testing.T) {
-	scheme := newScheme(t)
-	cb := mooncakeBackend("cache", "ns1")
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-
-	dep := getDeployment(t, r, "cache", "ns1")
-	owner := metav1.GetControllerOf(dep)
-	if owner == nil || owner.Kind != "CacheBackend" || owner.Name != "cache" {
-		t.Fatalf("deployment controller owner = %+v, want CacheBackend/cache", owner)
-	}
-	containers := dep.Spec.Template.Spec.Containers
-	if len(containers) != 1 {
-		t.Fatalf("containers = %d, want 1", len(containers))
-	}
-	c := containers[0]
-	if c.Name != "mooncake-master" {
-		t.Fatalf("container name = %q, want mooncake-master", c.Name)
-	}
-	if c.Image == "" {
-		t.Fatalf("container image is empty")
-	}
-	if !containsStr(c.Command, "mooncake_master") {
-		t.Fatalf("container command = %v, want to start with mooncake_master", c.Command)
-	}
-	if len(c.Ports) == 0 || c.Ports[0].ContainerPort != 50051 {
-		t.Fatalf("first container port = %v, want RPC port 50051 first", c.Ports)
-	}
-
-	svc := &corev1.Service{}
-	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, svc); err != nil {
-		t.Fatalf("get service: %v", err)
-	}
-	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
-		t.Fatalf("service type = %q, want ClusterIP", svc.Spec.Type)
-	}
-	if len(svc.Spec.Ports) == 0 || svc.Spec.Ports[0].Port != 50051 {
-		t.Fatalf("first service port = %v, want RPC port 50051 first (serviceEndpoint uses Ports[0])", svc.Spec.Ports)
-	}
-
-	updated := getBackend(t, r, "cache", "ns1")
-	wantEndpoint := "cache.ns1.svc.cluster.local:50051"
-	if updated.Status.Endpoint != wantEndpoint {
-		t.Fatalf("status.endpoint = %q, want %q (master RPC host:port; mooncakestore:// prefix is the adapter's job)", updated.Status.Endpoint, wantEndpoint)
-	}
-	if updated.Status.ObservedGeneration != 1 {
-		t.Fatalf("status.observedGeneration = %d, want 1", updated.Status.ObservedGeneration)
-	}
-}
-
-func TestReconcileCanonicalManagedMooncake(t *testing.T) {
-	scheme := newScheme(t)
-	cb := lmcacheBackend("canonical-mooncake", "ns1")
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
-	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-		Mooncake:  &cachev1alpha1.MooncakeRemoteStorageSpec{},
-	}
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, cb.Name, cb.Namespace)
-
-	dep := getDeployment(t, r, cb.Name, cb.Namespace)
-	if got := dep.Spec.Template.Spec.Containers[0].Name; got != "mooncake-master" {
-		t.Fatalf("container name = %q, want mooncake-master", got)
-	}
-	got := getBackend(t, r, cb.Name, cb.Namespace)
-	if want := "canonical-mooncake.ns1.svc.cluster.local:50051"; got.Status.Endpoint != want {
-		t.Fatalf("status.endpoint = %q, want %q", got.Status.Endpoint, want)
+	wantEndpoint := "legacy-observed.ns1.svc.cluster.local:6379"
+	if got.Status.RemoteStorage == nil || got.Status.RemoteStorage.Endpoint != wantEndpoint {
+		t.Fatalf("status.remoteStorage = %+v, want endpoint %q", got.Status.RemoteStorage, wantEndpoint)
 	}
 }
 
@@ -236,9 +157,11 @@ func TestReconcileLMCacheIdempotent(t *testing.T) {
 	}
 }
 
-func TestReconcileLMCacheCaseInsensitiveEngine(t *testing.T) {
-	// The canonical VLLM runtime must route to the managed adapter path.
-	for _, runtime := range []cachev1alpha1.CacheBackendRuntime{cachev1alpha1.CacheBackendRuntimeVLLM} {
+func TestReconcileManagedRedisForSupportedLMCacheRuntimes(t *testing.T) {
+	for _, runtime := range []cachev1alpha1.CacheBackendRuntime{
+		cachev1alpha1.CacheBackendRuntimeVLLM,
+		cachev1alpha1.CacheBackendRuntimeSGLang,
+	} {
 		t.Run(string(runtime), func(t *testing.T) {
 			scheme := newScheme(t)
 			cb := lmcacheBackend("cache", "ns1")
@@ -251,8 +174,8 @@ func TestReconcileLMCacheCaseInsensitiveEngine(t *testing.T) {
 			if err != nil {
 				t.Fatalf("expected a managed Deployment for runtime=%q, got error: %v", runtime, err)
 			}
-			if got := dep.Spec.Template.Spec.Containers[0].Name; got != "lmcache-server" {
-				t.Fatalf("container = %q, want lmcache-server (runtime=%q must resolve to RuntimeVLLM)", got, runtime)
+			if got := dep.Spec.Template.Spec.Containers[0].Name; got != "redis-l2" {
+				t.Fatalf("container = %q, want redis-l2 for runtime=%q", got, runtime)
 			}
 		})
 	}
@@ -268,7 +191,6 @@ func TestReconcileLMCacheCaseInsensitiveEngine(t *testing.T) {
 func TestReconcileLMCacheConflictThenConverge(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 
 	var conflictsRemaining int32 = 3 // first 3 Deployment Updates → 409
 	funcs := interceptor.Funcs{
@@ -297,7 +219,7 @@ func TestReconcileLMCacheConflictThenConverge(t *testing.T) {
 	// (Image override mutates the managed container in-place; a no-op reconcile
 	// would not call Update at all.)
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v9"
+	live.Spec.RemoteStorage.Redis.Image = "example.com/redis:v9"
 	live.Generation = 2
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update CR: %v", err)
@@ -310,24 +232,23 @@ func TestReconcileLMCacheConflictThenConverge(t *testing.T) {
 	if remaining := atomic.LoadInt32(&conflictsRemaining); remaining != 0 {
 		t.Fatalf("conflictsRemaining = %d, want 0 (RetryOnConflict should consume them)", remaining)
 	}
-	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/lmcache-server:v9" {
-		t.Fatalf("deployment image = %q, want %q (apply did not converge under conflict)", got, "example.com/lmcache-server:v9")
+	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/redis:v9" {
+		t.Fatalf("deployment image = %q, want %q (apply did not converge under conflict)", got, "example.com/redis:v9")
 	}
 	updated := getBackend(t, r, "cache", "ns1")
-	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("Ready condition = %+v, want True (CR is stuck despite Deployment being ready)", cond)
+	if cond := findCondition(updated.Status.Conditions, conditionTypeRemoteStorageReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("RemoteStorageReady = %+v, want True after conflict convergence", cond)
 	}
 }
 
 // TestReconcileLMCacheEndpointHeldUntilServiceExists pins the endpoint
-// invariant: Status.Endpoint must only advertise an address that corresponds
+// invariant: status.remoteStorage.endpoint must only advertise an address that corresponds
 // to a *live* Service. When applyService is rejected on the first reconcile
 // (so the Service was never created), the CR must not publish the desired
 // endpoint — clients/gateways would route to a non-existent target.
 func TestReconcileLMCacheEndpointHeldUntilServiceExists(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 
 	gr := schema.GroupResource{Group: "", Resource: "services"}
 	funcs := interceptor.Funcs{
@@ -348,12 +269,12 @@ func TestReconcileLMCacheEndpointHeldUntilServiceExists(t *testing.T) {
 
 	// Deployment is created (only Service apply was blocked), so the status
 	// pass runs and publishes the Ready + Progressing conditions. But
-	// Status.Endpoint must stay empty until a live Service backs it.
+	// The remote-storage endpoint must stay empty until a live Service backs it.
 	if _, err := getOptionalDeployment(t, r, "cache", "ns1"); err != nil {
 		t.Fatalf("expected deployment to be created (only Service was blocked): %v", err)
 	}
-	if got := getBackend(t, r, "cache", "ns1").Status.Endpoint; got != "" {
-		t.Fatalf("status.endpoint = %q, want \"\" (no live Service exists yet)", got)
+	if got := getBackend(t, r, "cache", "ns1").Status.RemoteStorage; got == nil || got.Endpoint != "" {
+		t.Fatalf("status.remoteStorage = %+v, want empty endpoint (no live Service exists yet)", got)
 	}
 }
 
@@ -370,7 +291,6 @@ func TestReconcileLMCacheEndpointHeldUntilServiceExists(t *testing.T) {
 func TestReconcileLMCacheDeploymentVanishedAfterApply(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 
 	var depGetCount atomic.Int32
 	var armed atomic.Bool
@@ -419,7 +339,6 @@ func TestReconcileLMCacheDeploymentVanishedAfterApply(t *testing.T) {
 func TestReconcileLMCacheDeploymentLosesOwnershipAfterApply(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 
 	// The interceptor strips Deployment owner refs on the 2nd Get per
 	// reconcile (the post-apply read). The 1st Get (inside applyDeployment's
@@ -499,13 +418,6 @@ func TestReconcileLMCacheForeignDeploymentNoStatusLeak(t *testing.T) {
 		},
 	}
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
-	// Wire autoscaling so reconcileHPA would otherwise create an HPA targeting
-	// the same-named (foreign) Deployment. The fix must skip both Service and
-	// HPA applies when applyDeployment fails — running them after a
-	// foreign-ownership failure could scale another controller's workload or
-	// expose its pods through our Service.
-	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
 	r := newReconciler(scheme, cb, foreign)
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -527,21 +439,12 @@ func TestReconcileLMCacheForeignDeploymentNoStatusLeak(t *testing.T) {
 	if len(svcs.Items) != 0 {
 		t.Fatalf("services = %d, want 0 (dependent applies must be skipped when applyDeployment fails)", len(svcs.Items))
 	}
-	// And no HPA, despite spec.autoscaling being set — otherwise the HPA
-	// would scale the foreign Deployment by name.
-	var hpas autoscalingv2.HorizontalPodAutoscalerList
-	if err := r.List(context.Background(), &hpas, client.InNamespace("ns1")); err != nil {
-		t.Fatalf("list HPAs: %v", err)
-	}
-	if len(hpas.Items) != 0 {
-		t.Fatalf("HPAs = %d, want 0 (HPA must not target a foreign Deployment)", len(hpas.Items))
-	}
 }
 
 // TestReconcileLMCacheForeignServiceNoEndpointLeak pins the foreign-ownership
 // guard on the Service endpoint path: if a Service with the matching name
 // already exists but is owned by another controller, applyService fails
-// (AlreadyOwned). Status.Endpoint must NOT advertise that foreign Service's
+// (AlreadyOwned). status.remoteStorage.endpoint must NOT advertise that foreign Service's
 // address; clients/gateways would route to the wrong workload.
 func TestReconcileLMCacheForeignServiceNoEndpointLeak(t *testing.T) {
 	scheme := newScheme(t)
@@ -565,7 +468,6 @@ func TestReconcileLMCacheForeignServiceNoEndpointLeak(t *testing.T) {
 		},
 	}
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 	r := newReconciler(scheme, cb, foreign)
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -573,7 +475,7 @@ func TestReconcileLMCacheForeignServiceNoEndpointLeak(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("reconcile returned nil, want error (Service already owned by another controller)")
 	}
-	if got := getBackend(t, r, "cache", "ns1").Status.Endpoint; got != "" {
-		t.Fatalf("status.endpoint = %q, want empty (foreign Service must not leak into status)", got)
+	if got := getBackend(t, r, "cache", "ns1").Status.RemoteStorage; got == nil || got.Endpoint != "" {
+		t.Fatalf("status.remoteStorage = %+v, want empty endpoint (foreign Service must not leak into status)", got)
 	}
 }

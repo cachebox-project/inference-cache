@@ -20,9 +20,7 @@ import (
 type Protocol string
 
 const (
-	ProtocolLMCache       Protocol = "lm"
-	ProtocolRESP          Protocol = "resp"
-	ProtocolMooncakeStore Protocol = "mooncakestore"
+	ProtocolRESP Protocol = "resp"
 )
 
 // Binding is the structured connection information an engine adapter accepts.
@@ -121,10 +119,6 @@ func ProtocolFor(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) (Protocol
 	switch storage.Provider {
 	case cachev1alpha1.CacheBackendRemoteStorageProviderRedis:
 		return ProtocolRESP, nil
-	case cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer:
-		return ProtocolLMCache, nil
-	case cachev1alpha1.CacheBackendRemoteStorageProviderMooncake:
-		return ProtocolMooncakeStore, nil
 	default:
 		return "", fmt.Errorf("%w: unknown provider=%q", ErrNoProvider, storage.Provider)
 	}

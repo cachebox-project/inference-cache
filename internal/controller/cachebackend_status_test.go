@@ -22,10 +22,9 @@ import (
 	"time"
 )
 
-func TestReconcileLMCacheReadyWhenReplicasAvailable(t *testing.T) {
+func TestReconcileManagedRedisReadyWhenReplicaAvailable(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 	r := newReconciler(scheme, cb)
 
 	reconcile(t, r, "cache", "ns1")
@@ -42,14 +41,13 @@ func TestReconcileLMCacheReadyWhenReplicasAvailable(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	updated := getBackend(t, r, "cache", "ns1")
-	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("Ready condition = %+v, want True", cond)
+	if cond := findCondition(updated.Status.Conditions, conditionTypeRemoteStorageReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("RemoteStorageReady = %+v, want True", cond)
 	}
 }
 
 func TestManagedReadinessGatesReadyOnRollout(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(2)
 
 	cases := []struct {
 		name       string
@@ -58,16 +56,17 @@ func TestManagedReadinessGatesReadyOnRollout(t *testing.T) {
 		wantReason string
 	}{
 		{
-			name:       "fresh create, nothing ready",
-			dep:        appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Generation: 1}},
+			name: "fresh create, nothing ready",
+			dep: appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec: appsv1.DeploymentSpec{Replicas: ptrInt32(2)}},
 			wantStatus: metav1.ConditionFalse,
 			wantReason: conditionReasonRolloutInProgress,
 		},
 		{
 			name: "stale rollout after image change (old pods still available)",
 			dep: appsv1.Deployment{
-				ObjectMeta: metav1.ObjectMeta{Generation: 2},
-				Status:     appsv1.DeploymentStatus{ObservedGeneration: 1, UpdatedReplicas: 0, AvailableReplicas: 2, ReadyReplicas: 2},
+				ObjectMeta: metav1.ObjectMeta{Generation: 2}, Spec: appsv1.DeploymentSpec{Replicas: ptrInt32(2)},
+				Status: appsv1.DeploymentStatus{ObservedGeneration: 1, UpdatedReplicas: 0, AvailableReplicas: 2, ReadyReplicas: 2},
 			},
 			wantStatus: metav1.ConditionFalse,
 			wantReason: conditionReasonRolloutInProgress,
@@ -75,8 +74,8 @@ func TestManagedReadinessGatesReadyOnRollout(t *testing.T) {
 		{
 			name: "rolled out and available",
 			dep: appsv1.Deployment{
-				ObjectMeta: metav1.ObjectMeta{Generation: 2},
-				Status:     appsv1.DeploymentStatus{ObservedGeneration: 2, UpdatedReplicas: 2, AvailableReplicas: 2, ReadyReplicas: 2},
+				ObjectMeta: metav1.ObjectMeta{Generation: 2}, Spec: appsv1.DeploymentSpec{Replicas: ptrInt32(2)},
+				Status: appsv1.DeploymentStatus{ObservedGeneration: 2, UpdatedReplicas: 2, AvailableReplicas: 2, ReadyReplicas: 2},
 			},
 			wantStatus: metav1.ConditionTrue,
 			wantReason: conditionReasonBackendReady,
@@ -84,8 +83,8 @@ func TestManagedReadinessGatesReadyOnRollout(t *testing.T) {
 		{
 			name: "rolled out but replicas unavailable",
 			dep: appsv1.Deployment{
-				ObjectMeta: metav1.ObjectMeta{Generation: 2},
-				Status:     appsv1.DeploymentStatus{ObservedGeneration: 2, UpdatedReplicas: 2, AvailableReplicas: 1, ReadyReplicas: 1},
+				ObjectMeta: metav1.ObjectMeta{Generation: 2}, Spec: appsv1.DeploymentSpec{Replicas: ptrInt32(2)},
+				Status: appsv1.DeploymentStatus{ObservedGeneration: 2, UpdatedReplicas: 2, AvailableReplicas: 1, ReadyReplicas: 1},
 			},
 			wantStatus: metav1.ConditionFalse,
 			wantReason: conditionReasonReplicasUnavailable,
@@ -103,10 +102,10 @@ func TestManagedReadinessGatesReadyOnRollout(t *testing.T) {
 
 func TestManagedReadinessZeroReplicasNotReady(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(0)
 	// Even a fully-observed Deployment with 0/0 replicas must not be Ready.
 	dep := appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Generation: 1},
+		Spec:       appsv1.DeploymentSpec{Replicas: ptrInt32(0)},
 		Status:     appsv1.DeploymentStatus{ObservedGeneration: 1},
 	}
 	if status, reason, _ := managedReadiness(cb, &dep); status == metav1.ConditionTrue {
@@ -132,13 +131,13 @@ func TestReconcileLifecycleExitsClearProbeRateLimiter(t *testing.T) {
 			mutate: func(cb *cachev1alpha1.CacheBackend) {
 				cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
 				cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
-				cb.Spec.RemoteStorage = externalLMCacheStorage("external.ns1.svc:8080")
+				cb.Spec.RemoteStorage = externalRedisStorage("external.ns1.svc:6379")
 			},
 		},
 		{
-			name: "managed → Unmanaged (StatefulSet kind)",
+			name: "managed → Unmanaged (unsupported type)",
 			mutate: func(cb *cachev1alpha1.CacheBackend) {
-				cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+				cb.Spec.Type = cachev1alpha1.CacheBackendType("unsupported")
 			},
 		},
 	}
@@ -193,13 +192,13 @@ func TestReconcileLifecycleExitsClearEngineCompatibility(t *testing.T) {
 			mutate: func(cb *cachev1alpha1.CacheBackend) {
 				cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
 				cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
-				cb.Spec.RemoteStorage = externalLMCacheStorage("external.ns1.svc:8080")
+				cb.Spec.RemoteStorage = externalRedisStorage("external.ns1.svc:6379")
 			},
 		},
 		{
-			name: "managed → Unmanaged (StatefulSet kind)",
+			name: "managed → Unmanaged (unsupported type)",
 			mutate: func(cb *cachev1alpha1.CacheBackend) {
-				cb.Spec.DeploymentKind = cachev1alpha1.CacheBackendDeploymentKindStatefulSet
+				cb.Spec.Type = cachev1alpha1.CacheBackendType("unsupported")
 			},
 		},
 	}
@@ -316,7 +315,6 @@ func TestUpdateManagedStatusPreservesEngineCompatibilityOnListError(t *testing.T
 func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 
 	var blockDeploymentUpdate atomic.Bool
 	gr := schema.GroupResource{Group: "apps", Resource: "deployments"}
@@ -342,7 +340,7 @@ func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 	// an Update to happen by changing the image in the CR.
 	blockDeploymentUpdate.Store(true)
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v9"
+	live.Spec.RemoteStorage.Redis.Image = "example.com/redis:v9"
 	live.Generation = 2
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update CR: %v", err)
@@ -357,8 +355,8 @@ func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 	}
 
 	updated := getBackend(t, r, "cache", "ns1")
-	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.Status != metav1.ConditionTrue {
-		t.Fatalf("Ready condition = %+v, want True (status must reflect live Deployment regardless of apply error)", cond)
+	if cond := findCondition(updated.Status.Conditions, conditionTypeRemoteStorageReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("RemoteStorageReady = %+v, want True (status must reflect live Deployment regardless of apply error)", cond)
 	}
 	// Apply for generation 2 failed, so observedGeneration must NOT have
 	// advanced to 2 — it should still report 1 (the last generation we
@@ -371,7 +369,7 @@ func TestReconcileLMCacheStatusIndependentOfApplyError(t *testing.T) {
 	if cond := findCondition(updated.Status.Conditions, conditionTypeReady); cond == nil || cond.ObservedGeneration != 1 {
 		t.Fatalf("Ready condition ObservedGeneration = %d, want 1", cond.ObservedGeneration)
 	}
-	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got == "example.com/lmcache-server:v9" {
+	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got == "example.com/redis:v9" {
 		t.Fatalf("deployment image was updated despite Forbidden — interceptor was not exercised")
 	}
 }

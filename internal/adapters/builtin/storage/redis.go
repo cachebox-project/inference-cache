@@ -17,14 +17,9 @@ import (
 //
 // SGLang drives LMCache in multiprocess (MP) mode: the engine attaches to a
 // node-local MP worker, and the worker offloads its shared/cross-node tier to an
-// `--l2-adapter`. Unlike the vLLM `lm://` path, `lm://` is not a valid MP
-// `--l2-adapter` type, so the SGLang pair cannot reuse [ResolveLMCacheServer].
-// Redis (the `resp` adapter) is the shared L2: a network-addressable store that
-// fits the one-Service, engines-anywhere model exactly (a ClusterIP Service, no
-// hostNetwork/mesh — the opposite of Mooncake), it maps onto one Deployment +
-// Service, and it is proven end-to-end. The heavier tiers (`s3`, `mooncake_store`)
-// are future provider bindings, not the simple default. See
-// docs/design/sglang-lmcache-mp-mode.md.
+// `--l2-adapter`. Redis (the `resp` adapter) is the shared L2: a
+// network-addressable store that fits the one-Service, engines-anywhere model
+// exactly. It maps onto one Deployment and Service and is proven end-to-end.
 //
 // This render is the shared-store half of the MP data plane; the engine-side wire
 // (config-file + MP-worker sidecar pointed at this Redis) is injected by the
@@ -58,8 +53,7 @@ const (
 )
 
 // ResolveRedisL2Server renders the managed Redis L2 store's container set and the
-// Service's port set for the SGLang LMCache MP-mode data plane, mirroring the seam
-// [ResolveLMCacheServer] uses: the reconciler owns ObjectMeta, the Service
+// Service's port set for the SGLang LMCache MP-mode data plane. The reconciler owns ObjectMeta, the Service
 // Selector, the workload kind, and owner references (all CacheBackend-identity
 // dependent), so this returns only PodSpec.Containers and Service.Spec
 // Ports/Type.
@@ -127,8 +121,7 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 			PeriodSeconds:       10,
 			FailureThreshold:    6,
 		},
-		// Reuse the shared provider-resources helper plus the autoscaling CPU
-		// request fallback. The memory limit here is also what --maxmemory is
+		// Reuse the shared provider-resources helper. The memory limit here is also what --maxmemory is
 		// derived from, so the two stay consistent.
 		Resources: defaultServerResources(cache),
 	}

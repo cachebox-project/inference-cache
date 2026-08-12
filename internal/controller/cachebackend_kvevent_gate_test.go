@@ -26,19 +26,9 @@ import (
 // gate enabled (no opt-out annotation), used by the KV-event gate tests. The
 // shared lmcacheBackend fixture opts out, so gate tests use this instead.
 func gatedLMCacheBackend(name, ns string) *cachev1alpha1.CacheBackend {
-	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Generation: 1},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime:  cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:     cachev1alpha1.CacheBackendTypeLMCache,
-			Replicas: ptrInt32(1),
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
-			},
-		},
-	}
+	cb := lmcacheBackend(name, ns)
+	delete(cb.Annotations, annotationRequireKVEvents)
+	return cb
 }
 
 // setFirstAvailableAt patches the backend's write-once timeout anchor
@@ -332,7 +322,9 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 			Spec: cachev1alpha1.CacheBackendSpec{
 				Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
 				Type:          cachev1alpha1.CacheBackendTypeLMCache,
-				RemoteStorage: externalLMCacheStorage("external.example.svc:6379"),
+				LMCache:       lmcacheBackend("fixture", ns).Spec.LMCache.DeepCopy(),
+				RemoteStorage: externalRedisStorage("external.example.svc:6379"),
+				Integration:   &cachev1alpha1.CacheBackendIntegrationSpec{Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite},
 			},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
@@ -341,8 +333,8 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		reconcile(t, r, "ext", ns)
 
 		got := getBackend(t, r, "ext", ns)
-		if got.Status.Endpoint != "external.example.svc:6379" {
-			t.Fatalf("endpoint = %q, want mirrored external endpoint", got.Status.Endpoint)
+		if got.Status.RemoteStorage == nil || got.Status.RemoteStorage.Endpoint != "external.example.svc:6379" {
+			t.Fatalf("remoteStorage status = %+v, want mirrored external endpoint", got.Status.RemoteStorage)
 		}
 		// External never enters the KV-event gate: readiness comes from
 		// admission accepting the endpoint (reason ExternalEndpointAccepted),
@@ -438,7 +430,7 @@ func TestIntegrationKVEventGateAutoReconcileOnPollerWrite(t *testing.T) {
 // recorder so it runs without envtest.
 func TestKVEventGateEmitsTransitionEvents(t *testing.T) {
 	cb := gatedLMCacheBackend("cache", "ns1")
-	r, rec := newReconcilerWithRecorder(t, cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 
 	// Cold start: deployment not ready → no gate event yet.
 	reconcile(t, r, "cache", "ns1")
@@ -465,7 +457,7 @@ func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
 	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{
 		FirstEventTimeout: &metav1.Duration{Duration: time.Second},
 	}
-	r, rec := newReconcilerWithRecorder(t, cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 	reconcile(t, r, "cache", "ns1")
 
 	// Deployment Ready (managedReadiness keys on replica counts), and the latched
@@ -487,7 +479,7 @@ func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
 // Ready must NOT re-emit "first KV event observed".
 func TestKVEventGateKVEventsObservedFiresOnceAcrossRollout(t *testing.T) {
 	cb := gatedLMCacheBackend("cache", "ns1")
-	r, rec := newReconcilerWithRecorder(t, cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 	reconcile(t, r, "cache", "ns1")
 
 	// First event → KVEventsObserved fires once.
@@ -526,7 +518,8 @@ func TestKVEventGateKVEventsObservedFiresOnceAcrossRollout(t *testing.T) {
 // NOT a misleading second KVEventsObserved (events never stopped flowing).
 func TestKVEventGateDeploymentRecoveryIsBackendRecovered(t *testing.T) {
 	cb := gatedLMCacheBackend("cache", "ns1")
-	r, rec := newReconcilerWithRecorder(t, cb)
+	requireRemoteStorageForReadiness(cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 	reconcile(t, r, "cache", "ns1")
 
 	// Become Ready with events flowing.
@@ -541,13 +534,13 @@ func TestKVEventGateDeploymentRecoveryIsBackendRecovered(t *testing.T) {
 	// Lose replicas → Degraded (deployment cause, not KV).
 	markDeploymentDegraded(t, r, "cache", "ns1", 1)
 	reconcile(t, r, "cache", "ns1")
-	expectEvent(t, drainEvents(rec), eventReasonBackendDegraded)
+	expectEvent(t, drainEvents(rec), reasonRemoteStorageUnavailable)
 
 	// Replicas recover; lastEventAt is still set (events never lost).
 	markDeploymentReady(t, r, "cache", "ns1", 1)
 	reconcile(t, r, "cache", "ns1")
 	evs := drainEvents(rec)
-	expectEvent(t, evs, eventReasonBackendRecovered)
+	expectEvent(t, evs, reasonRemoteStorageReady)
 	expectNoEvent(t, evs, reasonKVEventsObserved)
 }
 
@@ -562,7 +555,7 @@ func TestKVEventGateRequeueDoesNotStarveMatchedPodsRefresh(t *testing.T) {
 	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
 		MatchLabels: map[string]string{"app": "vllm"},
 	}
-	r, _ := newReconcilerWithRecorder(t, cb)
+	r, _ := newReconcilerWithRecorderOptions(t, false, cb)
 	r.MatchedEnginePodsRequeueInterval = 7 * time.Second
 
 	reconcile(t, r, "cache", "ns1")
@@ -576,8 +569,8 @@ func TestKVEventGateRequeueDoesNotStarveMatchedPodsRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if rd := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); rd == nil || rd.Status != metav1.ConditionFalse || rd.Reason != reasonAwaitingFirstKVEvent {
-		t.Fatalf("Ready = %+v, want False/AwaitingFirstKVEvent (precondition)", rd)
+	if rd := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); rd == nil || rd.Status != metav1.ConditionFalse || rd.Reason != reasonNoEnginePods {
+		t.Fatalf("Ready = %+v, want False/NoEnginePods (connector observation wins before the KV-event gate)", rd)
 	}
 	if res.RequeueAfter != 7*time.Second {
 		t.Fatalf("RequeueAfter = %s, want 7s (matched-pods cadence must win over the gate's firstEventTimeout window)", res.RequeueAfter)

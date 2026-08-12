@@ -55,10 +55,9 @@ func newVLLMMPEnginePod(args ...string) *corev1.Pod {
 	}}}}
 }
 
-func TestVLLMLMCacheMPRegistrySelectionDoesNotChangeLegacy(t *testing.T) {
+func TestVLLMLMCacheMPRegistrySelection(t *testing.T) {
 	registry := runtimeadapter.NewRegistry()
 	registry.Register(NewVLLMLMCacheMPAdapter(SubscriberConfig{}))
-	registry.Register(NewVLLMLMCacheAdapter(SubscriberConfig{}))
 
 	typed, err := registry.Select(runtimeadapter.RuntimeVLLM, newTypedVLLMMPBackend())
 	if err != nil {
@@ -66,14 +65,6 @@ func TestVLLMLMCacheMPRegistrySelectionDoesNotChangeLegacy(t *testing.T) {
 	}
 	if _, ok := typed.(vllmLMCacheMPAdapter); !ok {
 		t.Fatalf("typed adapter = %T, want vllmLMCacheMPAdapter", typed)
-	}
-
-	legacy, err := registry.Select(runtimeadapter.RuntimeVLLM, newLMCacheBackend(nil))
-	if err != nil {
-		t.Fatalf("select legacy adapter: %v", err)
-	}
-	if _, ok := legacy.(vllmLMCacheAdapter); !ok {
-		t.Fatalf("legacy adapter = %T, want vllmLMCacheAdapter", legacy)
 	}
 }
 
@@ -84,6 +75,66 @@ func TestVLLMLMCacheMPReservedSurface(t *testing.T) {
 	}
 	if got, want := adapter.ReservedEnv(), []string{EnvPythonHashSeed, EnvInferenceCacheFailOpen}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReservedEnv = %v, want %v", got, want)
+	}
+}
+
+func TestEnginePortFromContainer(t *testing.T) {
+	mk := func(command, args []string, env []corev1.EnvVar) *corev1.Pod {
+		return &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: EngineContainerName, Command: command, Args: args, Env: env,
+		}}}}
+	}
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want string
+	}{
+		{name: "space form", pod: mk(nil, []string{"--port", "40000"}, nil), want: "40000"},
+		{name: "equals form", pod: mk(nil, []string{"--port=41000"}, nil), want: "41000"},
+		{name: "absent", pod: mk(nil, []string{"--model", "m"}, nil)},
+		{name: "malformed", pod: mk(nil, []string{"--port", "abc"}, nil)},
+		{name: "out of range", pod: mk(nil, []string{"--port", "70000"}, nil)},
+		{name: "last valid wins", pod: mk(nil, []string{"--port=30000", "--port", "31000"}, nil), want: "31000"},
+		{name: "invalid last keeps prior valid", pod: mk(nil, []string{"--port=33000", "--port", "abc"}, nil), want: "33000"},
+		{name: "command and args", pod: mk([]string{"launch", "--port=30000"}, []string{"--port=31000"}, nil), want: "31000"},
+		{name: "literal env reference", pod: mk(nil, []string{"--port=$(ENGINE_PORT)"}, []corev1.EnvVar{{Name: "ENGINE_PORT", Value: "42000"}}), want: "42000"},
+		{name: "valueFrom is not statically resolvable", pod: mk(nil, []string{"--port=$(ENGINE_PORT)"}, []corev1.EnvVar{{Name: "ENGINE_PORT", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}})},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := enginePortFromContainer(tc.pod, EngineContainerName); got != tc.want {
+				t.Fatalf("enginePortFromContainer() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if got := enginePortFromContainer(nil, EngineContainerName); got != "" {
+		t.Fatalf("enginePortFromContainer(nil) = %q, want empty", got)
+	}
+}
+
+func TestVLLMLMCacheMPObservationSidecarMetricsURL(t *testing.T) {
+	adapter := NewVLLMLMCacheMPAdapter(SubscriberConfig{Image: DefaultSubscriberImage})
+	cache := newTypedVLLMMPBackend()
+	cache.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "default port", args: []string{"--model", "m"}, want: "http://127.0.0.1:8000/metrics"},
+		{name: "custom port", args: []string{"--model", "m", "--port", "40000"}, want: "http://127.0.0.1:40000/metrics"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := newVLLMMPEnginePod(tc.args...)
+			sidecar, err := adapter.ObservationSidecar(cache, pod)
+			if err != nil || sidecar == nil {
+				t.Fatalf("ObservationSidecar() = (%+v, %v)", sidecar, err)
+			}
+			if got, ok := testArgValue(sidecar.Args, "--engine-metrics-url"); !ok || got != tc.want {
+				t.Fatalf("--engine-metrics-url = %q (present=%t), want %q; args=%v", got, ok, tc.want, sidecar.Args)
+			}
+		})
 	}
 }
 
@@ -128,8 +179,6 @@ func TestVLLMLMCacheMPKVTransferConfigRoles(t *testing.T) {
 		role cachev1alpha1.CacheBackendIntegrationRole
 		want string
 	}{
-		{role: cachev1alpha1.CacheBackendIntegrationRoleReadOnly, want: kvRoleConsumer},
-		{role: cachev1alpha1.CacheBackendIntegrationRoleWriteOnly, want: kvRoleProducer},
 		{role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite, want: kvRoleBoth},
 		{role: "", want: kvRoleBoth},
 	}
@@ -163,8 +212,6 @@ func TestVLLMLMCacheMPInjectsCommonServerAndExternalConnector(t *testing.T) {
 	pod := newVLLMMPEnginePod("--model", "meta-llama/Meta-Llama-3-8B-Instruct", "--tensor-parallel-size=2")
 	pod.Spec.Containers[0].Env = []corev1.EnvVar{
 		{Name: "KEEP_ME", Value: "yes"},
-		{Name: EnvLMCacheRemoteURL, Value: "lm://legacy:8200"},
-		{Name: EnvLMCacheChunkSize, Value: "128"},
 		{Name: EnvPythonHashSeed, Value: "random"},
 	}
 
@@ -195,12 +242,6 @@ func TestVLLMLMCacheMPInjectsCommonServerAndExternalConnector(t *testing.T) {
 	if got, ok := lookupEnv(engine.Env, "KEEP_ME"); !ok || got != "yes" {
 		t.Fatalf("unrelated env was not preserved: %q, %v", got, ok)
 	}
-	for _, legacy := range []string{EnvLMCacheRemoteURL, EnvLMCacheChunkSize} {
-		if _, ok := lookupEnv(engine.Env, legacy); ok {
-			t.Fatalf("legacy env %s survived typed MP injection: %+v", legacy, engine.Env)
-		}
-	}
-
 	server := findInitContainer(pod.Spec.InitContainers, lmCacheMPServerContainerName)
 	if server == nil {
 		t.Fatalf("common MP server missing: %+v", pod.Spec.InitContainers)

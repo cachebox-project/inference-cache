@@ -22,8 +22,6 @@ metadata:
 spec:
   runtime: VLLM
   type: LMCache
-  deploymentKind: Deployment
-  replicas: 1
   integration:
     role: ReadWrite
     # Per-engine overrides applied AFTER the runtime adapter produces its

@@ -16,6 +16,13 @@ import (
 )
 
 const (
+	EnvLMCacheUseExperimental = "LMCACHE_USE_EXPERIMENTAL"
+	lmcacheUseExperimentalVal = "True"
+	SGLangEngineContainerName = "sglang"
+	SGLangEnableLMCacheArg    = "--enable-lmcache"
+	SGLangEnableMetricsArg    = "--enable-metrics"
+	SGLangConfigFileArg       = "--lmcache-config-file"
+
 	// subscriberHashScheme is the canonical hash-scheme tag the SGLang
 	// subscriber carries. Kept distinct from the runtime id and from vLLM's
 	// "vllm" tag: the cache plane keys the index on (tenant, model,
@@ -47,18 +54,17 @@ const (
 // sglangLMCacheAdapter wires SGLang engine pods to LMCache for the (SGLang, LMCache)
 // pair. SGLang drives LMCache in MULTIPROCESS (MP) mode:
 //
-//   - Typed PodLocal objects use the shared CacheBackend-owned MP-server native
+//   - Typed PodLocal objects use the shared CacheBackend-configured MP-server native
 //     sidecar + a config file (mp_host/mp_port) the engine reads via
 //     --lmcache-config-file. A nil binding is L1-only; an optional RESP binding
-//     offloads to independently selected Redis storage. Topology-less legacy
-//     objects retain the prior SGLang-specific worker during compatibility.
+//     offloads to independently selected Redis storage.
 //   - It turns LMCache on with
 //     --enable-lmcache + LMCACHE_USE_EXPERIMENTAL (not vLLM's --kv-transfer-config)
-//     and does NOT inject the lm:// LMCACHE_REMOTE_URL env, which MP mode ignores.
+//     and does not inject any IP-connector environment.
 //     See InjectSGLangLMCache.
 //
-// The legacy SGLang spike was GPU-validated; the typed common-renderer path is
-// intentionally not production-claimed until the Phase 3 GPU matrix passes.
+// The typed common-renderer path has been GPU-validated for the supported TP=1
+// SGLang configuration.
 // The kvevent-subscriber sidecar rendering remains engine-agnostic.
 type sglangLMCacheAdapter struct {
 	subscriber SubscriberConfig
@@ -71,14 +77,18 @@ func NewSGLangLMCacheAdapter(subscriber SubscriberConfig) runtimeadapter.KVCache
 
 // Supports matches SGLang engines against an LMCache CacheBackend. Every other
 // (runtime, backend) combination is left for another adapter — vLLM+LMCache,
-// an externally owned remote binding, or a future SGLang+Mooncake binding — and an
+// an externally owned Redis binding — and an
 // unsupported pair surfaces as ErrNoAdapter at admission.
 func (sglangLMCacheAdapter) Supports(runtime runtimeadapter.RuntimeID, cache *cachev1alpha1.CacheBackend) bool {
 	if cache == nil {
 		return false
 	}
-	return runtime == runtimeadapter.RuntimeSGLang &&
-		cache.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache
+	if runtime != runtimeadapter.RuntimeSGLang ||
+		cache.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache {
+		return false
+	}
+	return cache.Spec.IsEventsOnly() ||
+		(cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal)
 }
 
 // SupportedPairs lets the registry surface this adapter's canonical pair in the
@@ -98,20 +108,7 @@ func (sglangLMCacheAdapter) SupportsBinding(binding *backendadapter.Binding) boo
 // InjectEngineConfig renders SGLang's LMCache MP-mode launch surface from a
 // host-only nil binding or a RESP binding for Redis L2 storage.
 func (a sglangLMCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
-	var err error
-	if cache != nil && cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology != "" {
-		err = injectSGLangLMCachePodLocal(pod, binding, cache)
-	} else {
-		endpoint := ""
-		if binding != nil {
-			if binding.Protocol != backendadapter.ProtocolRESP {
-				return fmt.Errorf("SGLang LMCache adapter does not support remote binding protocol %q", binding.Protocol)
-			}
-			endpoint = binding.Endpoint
-		}
-		err = InjectSGLangLMCache(pod, endpoint, cache)
-	}
-	if err != nil {
+	if err := injectSGLangLMCachePodLocal(pod, binding, cache); err != nil {
 		return err
 	}
 	return ensureSGLangMetricsForSubscriber(pod, cache, a.subscriber)
@@ -158,9 +155,6 @@ func (sglangLMCacheAdapter) ValidateMPEnginePod(pod *corev1.Pod, cache *cachev1a
 		effectiveLMCacheChunkSize(cache.Spec.LMCache),
 	); err != nil {
 		return err
-	}
-	if findContainerByName(pod.Spec.InitContainers, sglangMPWorkerContainerName) != nil {
-		return fmt.Errorf("legacy LMCache MP sidecar %q is present; recreate the Pod from an un-injected template before enabling typed PodLocal", sglangMPWorkerContainerName)
 	}
 	return nil
 }
@@ -300,7 +294,7 @@ func (sglangLMCacheAdapter) ReservedArgs() []string {
 
 // ReservedEnv returns the env var names this adapter injects and blocks
 // engineOverrides from touching. SGLang drives LMCache in MP mode (config-file +
-// node-local worker), so — unlike the old lm:// wire — LMCACHE_REMOTE_URL and the
+// node-local worker), so legacy IP-connector environment and the
 // serde/local-CPU tunables are NOT injected and NOT reserved. What remains:
 //
 //   - LMCACHE_USE_EXPERIMENTAL (set to "True") gates SGLang's experimental LMCache

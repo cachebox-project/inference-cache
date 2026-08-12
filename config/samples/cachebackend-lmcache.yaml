@@ -7,7 +7,7 @@
 # matching engine Pod and points it at Redis; it never replaces the
 # inference-owner's engine image. This sample explicitly selects Redis to keep
 # cross-Pod sharing. It is not an automatic mapping from the legacy
-# LMCacheServer provider, whose lm:// data plane had different semantics.
+# removed LMCacheServer provider, whose IP data plane had different semantics.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -43,6 +43,11 @@ spec:
   remoteStorage:
     provider: Redis
     ownership: Managed
+    # Optional scheduling/security applies only to the controller-managed
+    # provider Pod. It never mutates the inference-engine Pod.
+    workload:
+      nodeSelector:
+        kubernetes.io/os: linux
     redis:
       image: docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
       resources:

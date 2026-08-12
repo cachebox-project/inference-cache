@@ -34,11 +34,6 @@ func TestIntegrationCacheBackendResources(t *testing.T) {
 	newCanonicalBackend := func(namespace string) *cachev1alpha1.CacheBackend {
 		cb := lmcacheBackend("cache", namespace)
 		cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
-		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
-			Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-			Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-			LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
-		}
 		return cb
 	}
 
@@ -53,9 +48,9 @@ func TestIntegrationCacheBackendResources(t *testing.T) {
 		reconcile(t, r, "cache", ns)
 
 		cb := getBackend(t, r, "cache", ns)
-		if cb.Spec.RemoteStorage.LMCacheServer.Resources != nil {
-			t.Fatalf("renderer default leaked into spec.remoteStorage.lmCacheServer.resources: %+v",
-				cb.Spec.RemoteStorage.LMCacheServer.Resources)
+		if cb.Spec.RemoteStorage.Redis.Resources != nil {
+			t.Fatalf("renderer default leaked into spec.remoteStorage.redis.resources: %+v",
+				cb.Spec.RemoteStorage.Redis.Resources)
 		}
 
 		wantReq := resource.MustParse("4Gi")
@@ -75,7 +70,7 @@ func TestIntegrationCacheBackendResources(t *testing.T) {
 		// rendered container MUST reflect it byte-for-byte.
 		ns := freshNS(t, k8s)
 		cb := newCanonicalBackend(ns)
-		cb.Spec.RemoteStorage.LMCacheServer.Resources = &corev1.ResourceRequirements{
+		cb.Spec.RemoteStorage.Redis.Resources = &corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceMemory: resource.MustParse("12Gi"),
 			},
@@ -97,6 +92,29 @@ func TestIntegrationCacheBackendResources(t *testing.T) {
 		wantLim := resource.MustParse("16Gi")
 		if got := container.Resources.Limits[corev1.ResourceMemory]; got.Cmp(wantLim) != 0 {
 			t.Fatalf("container Limits[memory] = %v, want operator-supplied %v", got.String(), wantLim.String())
+		}
+	})
+
+	t.Run("ManagedWorkloadSchedulingHonored", func(t *testing.T) {
+		ns := freshNS(t, k8s)
+		cb := newCanonicalBackend(ns)
+		grace := int64(45)
+		cb.Spec.RemoteStorage.Workload = &cachev1alpha1.CacheBackendManagedWorkloadSpec{
+			NodeSelector:                  map[string]string{"kubernetes.io/os": "linux"},
+			ServiceAccountName:            "cache-provider",
+			TerminationGracePeriodSeconds: &grace,
+		}
+		if err := k8s.Create(ctx, cb); err != nil {
+			t.Fatalf("create CacheBackend: %v", err)
+		}
+		reconcile(t, r, "cache", ns)
+
+		pod := getDeployment(t, r, "cache", ns).Spec.Template.Spec
+		if pod.NodeSelector["kubernetes.io/os"] != "linux" || pod.ServiceAccountName != "cache-provider" {
+			t.Fatalf("managed workload scheduling not rendered: %+v", pod)
+		}
+		if pod.TerminationGracePeriodSeconds == nil || *pod.TerminationGracePeriodSeconds != 45 {
+			t.Fatalf("terminationGracePeriodSeconds = %v, want 45", pod.TerminationGracePeriodSeconds)
 		}
 	})
 }

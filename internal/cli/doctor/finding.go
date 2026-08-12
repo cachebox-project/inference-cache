@@ -152,7 +152,7 @@ const (
 	// CodeBackendStale: status.indexParticipation.lastEventAt is older than the
 	// staleness window — KV events have stopped flowing.
 	CodeBackendStale = "CB004"
-	// CodeBackendEndpointUnreachable: status.endpoint is empty or not reachable
+	// CodeBackendEndpointUnreachable: the remote-storage endpoint is empty or not reachable
 	// over TCP.
 	CodeBackendEndpointUnreachable = "CB005"
 	// CodeBackendHealthy: the CacheBackend passed every per-backend check.

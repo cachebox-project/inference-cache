@@ -58,7 +58,6 @@ alerts have no series to evaluate.
 |---|---|---|
 | `inferencecache_backend_probe_result_total` | `backend`, `stage` (`ingest`/`routing`/`t2`), `result` (`ok`/`failed`/`skipped`) | Functional-probe stage results — three increments per successful call. |
 | `inferencecache_backend_t2_query_tokens_total` | `backend` | Monotonic tier-2 activity signal (positive deltas only). |
-| `inferencecache_backend_server_restart_cascades_total` | `namespace`, `backend`, `reason` (`server_instance_changed`) | Cache-server restart cascades, rate-limited (~30s). |
 
 ## Endpoints
 

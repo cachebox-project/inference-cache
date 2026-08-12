@@ -53,14 +53,10 @@ var DefaultValidationRules = []ValidationRule{
 	validateLMCacheTopology,
 	rejectUnimplementedRedisBindingFeatures,
 	rejectCrossNamespaceEndpointWithoutOptIn,
-	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
-	rejectMooncakeMasterScaleOut,
-	rejectEngineHostNetworkOnBackendThatDoesNotNeedIt,
 	rejectResourceLimitsBelowRequests,
 	rejectRequestsOnlyForNonOvercommittableResources,
 	rejectResourceClaims,
 	rejectNegativeResourceQuantities,
-	rejectNonPositiveHostMemoryCapacity,
 	rejectInvalidResourceNames,
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
@@ -68,7 +64,6 @@ var DefaultValidationRules = []ValidationRule{
 	validateSGLangHiCache,
 	rejectInvalidKernelCheckAnnotation,
 	rejectUnsupportedLMCacheRole,
-	rejectSGLangRedisL2ScaleOut,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -107,9 +102,7 @@ func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1a
 // itself cannot express and the controller cannot close on the operator's behalf —
 // never for something a validation rule could simply reject.
 func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
-	var w admission.Warnings
-	w = append(w, warnMooncakeEngineHostNetwork(cb)...)
-	return w
+	return nil
 }
 
 // ValidateUpdate implements [admission.Validator]. Updates only reject

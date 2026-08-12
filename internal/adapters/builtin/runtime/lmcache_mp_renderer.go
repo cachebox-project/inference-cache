@@ -89,10 +89,6 @@ func renderLMCachePodLocalServer(pod *corev1.PodSpec, engineContainerName string
 	engine := &work.Containers[engineIndex]
 	owned := lmCacheMPWireIsOurs(pod)
 
-	if legacy := findContainerByName(work.InitContainers, sglangMPWorkerContainerName); legacy != nil {
-		return "", fmt.Errorf("render LMCache MP server: pod already has legacy native sidecar %q; remove the legacy topology-less injection before enabling typed PodLocal", legacy.Name)
-	}
-
 	if cfg.WriteClientConfig {
 		if existing := mountAtPath(engine.VolumeMounts, lmCacheMPConfigMountPath); existing != nil &&
 			!(owned && existing.Name == lmCacheMPConfigVolumeName) {

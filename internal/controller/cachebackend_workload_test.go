@@ -13,16 +13,75 @@ import (
 	"testing"
 )
 
+func TestReconcileManagedWorkloadOverrides(t *testing.T) {
+	scheme := newScheme(t)
+	cb := lmcacheBackend("cache", "ns1")
+	grace := int64(45)
+	runtimeClass := "gvisor"
+	cb.Spec.RemoteStorage.Workload = &cachev1alpha1.CacheBackendManagedWorkloadSpec{
+		NodeSelector:                  map[string]string{"pool": "cache"},
+		Affinity:                      &corev1.Affinity{},
+		Tolerations:                   []corev1.Toleration{{Key: "cache", Operator: corev1.TolerationOpExists}},
+		TopologySpreadConstraints:     []corev1.TopologySpreadConstraint{{MaxSkew: 1, TopologyKey: "topology.kubernetes.io/zone", WhenUnsatisfiable: corev1.ScheduleAnyway}},
+		ImagePullSecrets:              []corev1.LocalObjectReference{{Name: "registry-auth"}},
+		ServiceAccountName:            "cache-provider",
+		SecurityContext:               &corev1.PodSecurityContext{RunAsNonRoot: func() *bool { v := true; return &v }()},
+		PriorityClassName:             "cache-critical",
+		SchedulerName:                 "cache-scheduler",
+		RuntimeClassName:              &runtimeClass,
+		TerminationGracePeriodSeconds: &grace,
+	}
+	r := newReconciler(scheme, cb)
+
+	reconcile(t, r, "cache", "ns1")
+
+	pod := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec
+	if pod.NodeSelector["pool"] != "cache" || pod.Affinity == nil || len(pod.Tolerations) != 1 || len(pod.TopologySpreadConstraints) != 1 {
+		t.Fatalf("managed workload scheduling not applied: %+v", pod)
+	}
+	if pod.ServiceAccountName != "cache-provider" || pod.SchedulerName != "cache-scheduler" || pod.PriorityClassName != "cache-critical" {
+		t.Fatalf("managed workload identity/scheduler not applied: %+v", pod)
+	}
+	if len(pod.ImagePullSecrets) != 1 || pod.ImagePullSecrets[0].Name != "registry-auth" ||
+		pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot == nil || !*pod.SecurityContext.RunAsNonRoot {
+		t.Fatalf("managed workload pull/security settings not applied: %+v", pod)
+	}
+	if pod.RuntimeClassName == nil || *pod.RuntimeClassName != "gvisor" ||
+		pod.TerminationGracePeriodSeconds == nil || *pod.TerminationGracePeriodSeconds != 45 {
+		t.Fatalf("managed workload runtime/grace settings not applied: %+v", pod)
+	}
+
+	// Removing the block must clear every controller-owned override and restore
+	// materialized Kubernetes defaults rather than stranding stale placement on
+	// the existing Deployment.
+	live := getBackend(t, r, "cache", "ns1")
+	live.Spec.RemoteStorage.Workload = nil
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatalf("remove managed workload overrides: %v", err)
+	}
+	reconcile(t, r, "cache", "ns1")
+	pod = getDeployment(t, r, "cache", "ns1").Spec.Template.Spec
+	if pod.NodeSelector != nil || pod.Affinity != nil || pod.Tolerations != nil || pod.TopologySpreadConstraints != nil || pod.ImagePullSecrets != nil ||
+		pod.ServiceAccountName != "" || pod.SecurityContext != nil || pod.PriorityClassName != "" ||
+		pod.RuntimeClassName != nil {
+		t.Fatalf("removed managed workload settings survived reconciliation: %+v", pod)
+	}
+	if pod.SchedulerName != "default-scheduler" ||
+		pod.TerminationGracePeriodSeconds == nil || *pod.TerminationGracePeriodSeconds != 30 {
+		t.Fatalf("managed workload defaults not restored after removal: %+v", pod)
+	}
+}
+
 func TestReconcileLMCacheImageOverride(t *testing.T) {
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.RemoteStorage.LMCacheServer.Image = "registry.example.com/lmcache-server:pinned"
+	cb.Spec.RemoteStorage.Redis.Image = "registry.example.com/redis:pinned"
 	r := newReconciler(scheme, cb)
 
 	reconcile(t, r, "cache", "ns1")
 
 	dep := getDeployment(t, r, "cache", "ns1")
-	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "registry.example.com/lmcache-server:pinned" {
+	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "registry.example.com/redis:pinned" {
 		t.Fatalf("container image = %q, want overridden image", got)
 	}
 }
@@ -34,35 +93,14 @@ func TestReconcileLMCacheUpdatesImage(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v2"
+	live.Spec.RemoteStorage.Redis.Image = "example.com/redis:v2"
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update image: %v", err)
 	}
 	reconcile(t, r, "cache", "ns1")
 
-	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/lmcache-server:v2" {
+	if got := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec.Containers[0].Image; got != "example.com/redis:v2" {
 		t.Fatalf("deployment image = %q, want updated image", got)
-	}
-}
-
-func TestReconcileLMCacheScalesReplicas(t *testing.T) {
-	scheme := newScheme(t)
-	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
-	r := newReconciler(scheme, cb)
-
-	reconcile(t, r, "cache", "ns1")
-
-	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.Replicas = ptrInt32(3)
-	if err := r.Update(context.Background(), live); err != nil {
-		t.Fatalf("update replicas: %v", err)
-	}
-	reconcile(t, r, "cache", "ns1")
-
-	dep := getDeployment(t, r, "cache", "ns1")
-	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 3 {
-		t.Fatalf("deployment replicas = %v, want 3 after scale", dep.Spec.Replicas)
 	}
 }
 
@@ -72,7 +110,7 @@ func TestReconcileServicePortDriftCorrected(t *testing.T) {
 
 	reconcile(t, r, "cache", "ns1")
 
-	// Drift the owned Service out-of-band: drop two ports.
+	// Drift the owned Service out-of-band: drop its Redis port.
 	var svc corev1.Service
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &svc); err != nil {
 		t.Fatalf("get service: %v", err)
@@ -86,41 +124,16 @@ func TestReconcileServicePortDriftCorrected(t *testing.T) {
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "cache", Namespace: "ns1"}, &svc); err != nil {
 		t.Fatalf("re-get service: %v", err)
 	}
-	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 65432 {
-		t.Fatalf("service ports = %v, want lm:// 65432 restored after drift", svc.Spec.Ports)
-	}
-}
-
-func TestReconcileLMCacheUpdatesPodOverrides(t *testing.T) {
-	scheme := newScheme(t)
-	r := newReconciler(scheme, lmcacheBackend("cache", "ns1"))
-
-	reconcile(t, r, "cache", "ns1")
-
-	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.Template = &cachev1alpha1.CacheBackendPodSpecOverride{
-		NodeSelector:       map[string]string{"accelerator": "h100"},
-		ServiceAccountName: "backend-sa",
-	}
-	if err := r.Update(context.Background(), live); err != nil {
-		t.Fatalf("update template overrides: %v", err)
-	}
-	reconcile(t, r, "cache", "ns1")
-
-	spec := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec
-	if spec.NodeSelector["accelerator"] != "h100" {
-		t.Fatalf("nodeSelector not reconciled: %v", spec.NodeSelector)
-	}
-	if spec.ServiceAccountName != "backend-sa" {
-		t.Fatalf("serviceAccountName = %q, want backend-sa", spec.ServiceAccountName)
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 6379 {
+		t.Fatalf("service ports = %v, want Redis 6379 restored after drift", svc.Spec.Ports)
 	}
 }
 
 func TestReconcileLMCacheUpgradeFromColocatedAllInOne(t *testing.T) {
 	// Upgrading an existing Deployment that the retired colocated all-in-one
 	// builder created (single container named "vllm" referencing pod-level
-	// volumes "cache-home" + "shm") to the standalone shape (single
-	// container named "lmcache-server", no pod-level volumes) must REPLACE
+	// volumes "cache-home" + "shm") to the managed Redis shape (single
+	// container named "redis-l2", no pod-level volumes) must REPLACE
 	// both the container set AND the dangling adapter-owned volumes. Leaving
 	// the old volumes would carry stale config from the previous shape
 	// forever.
@@ -151,8 +164,8 @@ func TestReconcileLMCacheUpgradeFromColocatedAllInOne(t *testing.T) {
 	reconcile(t, r, "cache", "ns1")
 
 	pod := getDeployment(t, r, "cache", "ns1").Spec.Template.Spec
-	if len(pod.Containers) != 1 || pod.Containers[0].Name != "lmcache-server" {
-		t.Fatalf("containers = %v, want exactly 1 lmcache-server after upgrade", containerNames(pod.Containers))
+	if len(pod.Containers) != 1 || pod.Containers[0].Name != "redis-l2" {
+		t.Fatalf("containers = %v, want exactly 1 redis-l2 after upgrade", containerNames(pod.Containers))
 	}
 	for _, v := range pod.Volumes {
 		if v.Name == "cache-home" || v.Name == "shm" {

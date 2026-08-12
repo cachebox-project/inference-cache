@@ -16,11 +16,11 @@ import (
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 )
 
-const testLMCacheServerImage = "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const testMPServerImage = "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func testLMCacheMPConfig() lmCacheMPServerConfig {
 	return lmCacheMPServerConfig{
-		Image:             testLMCacheServerImage,
+		Image:             testMPServerImage,
 		Port:              6500,
 		ChunkSizeTokens:   256,
 		L1Capacity:        resource.MustParse("4Gi"),
@@ -69,7 +69,7 @@ func TestRenderLMCachePodLocalServerGolden(t *testing.T) {
 	if server == nil {
 		t.Fatalf("MP server missing: %+v", pod.InitContainers)
 	}
-	if server.Image != testLMCacheServerImage || server.Image == pod.Containers[0].Image {
+	if server.Image != testMPServerImage || server.Image == pod.Containers[0].Image {
 		t.Fatalf("server image = %q, engine image = %q", server.Image, pod.Containers[0].Image)
 	}
 	if server.RestartPolicy == nil || *server.RestartPolicy != corev1.ContainerRestartPolicyAlways {

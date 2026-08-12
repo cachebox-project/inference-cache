@@ -256,7 +256,6 @@ install:
 - **The CR uses `spec.remoteStorage.ownership: External`.** Externally owned backends are wholly
   exempt from the probe gate — the controller never drives a
   round-trip against a cache it does not manage.
-- **The CR is on an Unmanaged path** (unsupported runtime, deferred
-  `deploymentKind: StatefulSet`, or other reconcile branch that sheds
-  the managed workload). The probe gate is exempt from these paths
+- **The CR is on an Unmanaged path** (for example, an unsupported runtime or
+  provider binding that bypassed admission). The probe gate is exempt from these paths
   and any prior `FunctionalProbeOK` condition is removed on transition.

@@ -206,8 +206,7 @@ kubectl get cacheindex cluster-default -o yaml
 Both binaries expose Prometheus metrics on their pod's `:8080/metrics`
 (prefixed `inferencecache_*`) — the server binary's series cover the
 in-memory index and gRPC handlers; the controller binary's series cover
-the reconcilers (e.g. `inferencecache_backend_probe_result_total`,
-`inferencecache_backend_server_restart_cascades_total`). A default
+the reconcilers (for example, `inferencecache_backend_probe_result_total`). A default
 alert bundle for the operational silent-failure patterns this code has
 hit in production ships under
 [`config/observability/`](config/observability/) and is **not** included
@@ -262,8 +261,7 @@ use the flat [`alerting-rules.yaml`](config/observability/alerting-rules.yaml).
 **You must also configure scraping yourself for the server, the controller
 pod, and every injected PodLocal LMCache sidecar.** The server's `:8080` exposes the index, lookup,
 and auth series; the controller pod's `:8080` exposes the per-stage
-probe-result counter (`inferencecache_backend_probe_result_total`)
-and the cache-server restart-cascade counter; each LMCache sidecar exposes
+probe-result counter (`inferencecache_backend_probe_result_total`); each LMCache sidecar exposes
 its own `lmcache_mp_*` series on `:8080/metrics` — the controller-side
 alerts (`ServerProbeFail` today) load against the controller's
 series, so a server-only scrape leaves them inert.

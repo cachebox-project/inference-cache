@@ -142,8 +142,7 @@ func TestResolveRedisL2Server(t *testing.T) {
 func TestResolveRedisL2ServerResourceContract(t *testing.T) {
 	// The renderer's resource contract, asserted on the surface its consumer uses
 	// (the rendered container) rather than only on the shared helper: spec.remoteStorage.redis.resources
-	// is the operator-owned baseline and passes through; autoscaling adds the
-	// CPU-request fallback the HPA needs as a utilization denominator; and the
+	// is the operator-owned baseline and passes through; the
 	// rendered resources must not ALIAS the CR — a caller mutating the pod it got
 	// back would otherwise be writing into the CacheBackend's spec.
 	t.Run("spec.remoteStorage.redis.resources passes through", func(t *testing.T) {
@@ -158,19 +157,6 @@ func TestResolveRedisL2ServerResourceContract(t *testing.T) {
 		}
 		if q := got.Requests[corev1.ResourceMemory]; q.String() != "1Gi" {
 			t.Errorf("requests.memory = %q, want the operator's 1Gi", q.String())
-		}
-	})
-
-	t.Run("autoscaling adds the CPU-request fallback", func(t *testing.T) {
-		cb := withMemory(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"), "3Gi", "1Gi")
-		cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-		pod, _, err := ResolveRedisL2Server(cb)
-		if err != nil {
-			t.Fatalf("ResolveRedisL2Server: %v", err)
-		}
-		cpu := pod.Containers[0].Resources.Requests[corev1.ResourceCPU]
-		if cpu.IsZero() {
-			t.Fatalf("requests.cpu is zero/absent under autoscaling — a targetCPUUtilization HPA would divide by zero: %+v", pod.Containers[0].Resources)
 		}
 	})
 
@@ -345,8 +331,7 @@ func TestResolveRedisL2ServerNilCache(t *testing.T) {
 
 // TestResolveRedisL2ServerStaysClusterIP bounds the blast radius: the managed L2
 // stays a plain in-cluster virtual IP — no hostNetwork, no NodePort — so it fits
-// the engines-anywhere model (the whole reason Redis is the default L2, not the
-// Mooncake mesh).
+// the engines-anywhere model.
 func TestResolveRedisL2ServerStaysClusterIP(t *testing.T) {
 	pod, svc, err := ResolveRedisL2Server(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"))
 	if err != nil {

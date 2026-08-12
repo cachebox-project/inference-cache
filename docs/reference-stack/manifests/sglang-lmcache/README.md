@@ -17,7 +17,7 @@ same production renderer exercised by admission and controller tests.
 - One NVIDIA GPU; this TP=1 reference has no supported CPU fallback.
 - The inference-cache controller and mutating webhook installed first.
 - A digest-pinned SGLang engine image containing an LMCache client compatible
-  with the pinned standalone server. The manifest's all-zero digest is
+  with the pinned MP-server sidecar. The manifest's all-zero digest is
   deliberately non-pullable.
 - A Hugging Face token for the gated model.
 
@@ -40,8 +40,9 @@ external Redis Service in this manifest
 ```
 
 Redis is an explicit operator choice. Omitting `remoteStorage` produces a
-host-only MP backend. A legacy LMCacheServer or Mooncake configuration is not
-silently converted to Redis because that would change cross-Pod/L3 semantics.
+host-only MP backend. A removed LMCacheServer or legacy IP-wired Mooncake
+configuration is not silently converted to Redis because that would change
+cross-Pod/L3 semantics. Mooncake requires a future typed MP L2 adapter.
 
 ## Deploy
 

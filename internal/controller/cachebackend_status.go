@@ -140,9 +140,8 @@ const (
 	// no port, embedded whitespace, unbracketed IPv6, …). Current admission
 	// rejects all of these; this defensive reason covers objects that bypassed
 	// admission. Status reflects the gap loudly rather than advertising the
-	// malformed value as Ready=True (which would let the pod webhook then inject
-	// an LMCACHE_REMOTE_URL the engine connector refuses at startup — turning a
-	// cache misconfiguration into a serving outage).
+	// malformed value as Ready=True (which would let the pod webhook inject a
+	// remote adapter target the engine rejects at startup).
 	conditionReasonExternalEndpointInvalid = "ExternalEndpointInvalid"
 )
 
@@ -228,7 +227,6 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	engineCompatMsg, engineCompatObserved := r.detectEngineConnectorCrashLoop(ctx, backend)
 	prevEngineIncompatible := meta.IsStatusConditionFalse(backend.Status.Conditions, conditionTypeEngineCompatibility)
 	err := r.patchStatus(ctx, backend, func() {
-		backend.Status.Endpoint = endpoint
 		setRemoteStorageStatus(backend, endpoint, remoteStatus, remoteReason, remoteMessage, publishedGen)
 		backend.Status.ObservedGeneration = publishedGen
 		// Latch the first KV-event observation write-once. The poller can later
@@ -608,13 +606,6 @@ const (
 // to have observed its current generation and to have enough updated +
 // available replicas, so a stale rollout (e.g. mid image change) is never
 // reported Ready.
-//
-// When the CacheBackend is autoscaled the HPA owns the desired replica count,
-// so the comparison target is the live Deployment's spec.replicas (which the
-// HPA writes) rather than the CacheBackend's spec.replicas (which is ignored
-// in that mode). This keeps Ready accurate when an HPA decides to run more
-// pods than spec.replicas, and avoids a false ScaledToZero when spec.replicas
-// happens to be 0 with autoscaling configured.
 func managedReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (metav1.ConditionStatus, string, string) {
 	want := desiredReplicas(backend, dep)
 
@@ -659,37 +650,12 @@ func progressingFromReady(readyStatus metav1.ConditionStatus, reason, message st
 	}
 }
 
-// desiredReplicas is the per-reconcile source of truth for "how many replicas
-// should this backend be running". With autoscaling enabled the HPA writes
-// spec.replicas on the Deployment, so the live value is authoritative; without
-// it, the user's spec.replicas (default 1) wins.
-//
-// It applies the same singleton clamp the render path does (clampSingletonReplicas):
-// readiness must expect the count actually DEPLOYED, not the CR's grandfathered
-// spec.replicas. Without this, a singleton backend (SGLang Redis L2, or a
-// host-network Mooncake master) whose spec.replicas was set to 3 before admission
-// rejected it deploys one pod but expects three, and reports RolloutInProgress
-// forever. spec.replicas 0 (disabled) is preserved.
-func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
-	want := unclampedDesiredReplicas(backend, dep)
-	if want > 1 && cacheServerIsSingleton(backend, &dep.Spec.Template.Spec) {
-		return 1
-	}
-	return want
-}
-
-func unclampedDesiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
-	if backend.Spec.Autoscaling != nil {
-		// First reconcile after an HPA spec is added may briefly see
-		// dep.Spec.Replicas still set by the controller; the HPA will overwrite
-		// it within one cycle. Until then, fall back to the controller value.
-		if dep.Spec.Replicas != nil {
-			return *dep.Spec.Replicas
-		}
-		// Fall through to the floor.
-	}
-	if backend.Spec.Replicas != nil {
-		return *backend.Spec.Replicas
+// desiredReplicas reads the live managed Redis Deployment. The controller
+// renders one replica, and the live value keeps readiness aligned with the
+// workload actually observed.
+func desiredReplicas(_ *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
+	if dep.Spec.Replicas != nil {
+		return *dep.Spec.Replicas
 	}
 	return 1
 }
