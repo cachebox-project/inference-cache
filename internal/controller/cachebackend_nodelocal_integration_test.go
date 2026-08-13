@@ -69,7 +69,11 @@ func TestIntegrationCacheBackendNodeLocalServerPod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !nodeLocalServerHasShmIdentity(&server, wantShmName) {
+	wantShmPath, err := builtinruntime.NodeLocalServerShmHostPath(&live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nodeLocalServerHasShmIdentity(&server, wantShmName, wantShmPath) {
 		t.Fatalf("server Pod lacks UID-scoped shm identity: annotations=%v args=%v", server.Annotations, server.Spec.Containers[0].Args)
 	}
 

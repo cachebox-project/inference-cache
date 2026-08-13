@@ -86,8 +86,10 @@ func TestRenderLMCacheNodeLocalServerPod(t *testing.T) {
 		!reflect.DeepEqual(required.NodeSelectorTerms[0].MatchFields[0].Values, []string{"gpu-node-a"}) {
 		t.Fatalf("exact-node scheduler affinity = %+v", required)
 	}
-	if len(pod.Volumes) != 1 || pod.Volumes[0].HostPath == nil || pod.Volumes[0].HostPath.Path != "/dev/shm" {
-		t.Fatalf("volumes = %+v, want host /dev/shm", pod.Volumes)
+	wantShmPath := "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555"
+	if len(pod.Volumes) != 1 || pod.Volumes[0].HostPath == nil || pod.Volumes[0].HostPath.Path != wantShmPath ||
+		pod.Volumes[0].HostPath.Type == nil || *pod.Volumes[0].HostPath.Type != corev1.HostPathDirectoryOrCreate {
+		t.Fatalf("volumes = %+v, want UID-scoped hostPath %q", pod.Volumes, wantShmPath)
 	}
 	if len(pod.Containers) != 1 {
 		t.Fatalf("containers = %d, want one", len(pod.Containers))
@@ -210,6 +212,25 @@ func TestNodeLocalServerShmNameIsStableAndUIDScoped(t *testing.T) {
 	}
 }
 
+func TestNodeLocalServerShmHostPathIsStableAndUIDScoped(t *testing.T) {
+	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
+	want := "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555"
+	got, err := NodeLocalServerShmHostPath(cache)
+	if err != nil || got != want {
+		t.Fatalf("NodeLocalServerShmHostPath = %q, %v; want %q", got, err, want)
+	}
+	cache.Generation++
+	stable, err := NodeLocalServerShmHostPath(cache)
+	if err != nil || stable != want {
+		t.Fatalf("same-UID replacement host path = %q, %v; want %q", stable, err, want)
+	}
+	cache.UID = types.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	distinct, err := NodeLocalServerShmHostPath(cache)
+	if err != nil || distinct == want {
+		t.Fatalf("different-UID host path = %q, %v; must differ from %q", distinct, err, want)
+	}
+}
+
 func TestNodeLocalServerShmNameRejectsUnsafeUID(t *testing.T) {
 	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
 	cache.UID = types.UID("unsafe/uid")
@@ -253,8 +274,20 @@ func TestVLLMNodeLocalEngineInjection(t *testing.T) {
 	if !strings.Contains(joined, `tcp://$(INFERENCECACHE_NODE_IP)`) || !strings.Contains(joined, `"lmcache.mp.port":"6555"`) {
 		t.Fatalf("vLLM args do not carry node-derived endpoint: %s", joined)
 	}
-	if mountAtPath(engine.VolumeMounts, "/dev/shm") == nil {
+	shmMount := mountAtPath(engine.VolumeMounts, "/dev/shm")
+	if shmMount == nil {
 		t.Fatalf("engine mounts = %+v, want host /dev/shm", engine.VolumeMounts)
+	}
+	var shmVolume *corev1.Volume
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == shmMount.Name {
+			shmVolume = &pod.Spec.Volumes[i]
+			break
+		}
+	}
+	if shmVolume == nil || shmVolume.HostPath == nil || shmVolume.HostPath.Path != "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555" ||
+		shmVolume.HostPath.Type == nil || *shmVolume.HostPath.Type != corev1.HostPathDirectoryOrCreate {
+		t.Fatalf("engine SHM volume = %+v, want backend UID directory", shmVolume)
 	}
 	gate := pod.Spec.InitContainers[0]
 	if !strings.Contains(gate.Args[0], "/config") || !strings.Contains(gate.Args[0], "EXPECTED_INSTANCE_ID") ||
@@ -383,7 +416,16 @@ func TestNodeLocalEngineInjectionRejectsReservedWireCollisionsAtomically(t *test
 				pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
 				pod.Containers[0].VolumeMounts = append(pod.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "shm", MountPath: "/dev/shm"})
 			},
-			want: "must use hostPath",
+			want: "UID-scoped hostPath",
+		},
+		{
+			name: "whole host shared memory",
+			mutate: func(pod *corev1.PodSpec) {
+				pathType := corev1.HostPathDirectory
+				pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "shm", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/dev/shm", Type: &pathType}}})
+				pod.Containers[0].VolumeMounts = append(pod.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "shm", MountPath: "/dev/shm"})
+			},
+			want: "UID-scoped hostPath",
 		},
 		{
 			name: "missing shared memory volume",

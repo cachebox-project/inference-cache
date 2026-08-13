@@ -8,7 +8,8 @@
 # nodes and never rewrites engine placement. The 5556/8081 host-port pair is
 # intentionally disjoint from the sibling vLLM sample if both backends have
 # engines on the same node. Set scheduling.runtimeClassName when the engine's
-# runtime does not provide the server's required NVIDIA visibility.
+# runtime does not provide the server's required NVIDIA visibility. The server
+# and engines mount only this backend UID's host SHM directory as `/dev/shm`.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:

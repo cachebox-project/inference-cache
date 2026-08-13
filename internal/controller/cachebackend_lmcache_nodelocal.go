@@ -52,6 +52,10 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 	if err != nil {
 		return err
 	}
+	wantShmHostPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if err != nil {
+		return err
+	}
 
 	var servers corev1.PodList
 	if err := r.Client.List(ctx, &servers,
@@ -76,7 +80,7 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 		current := pod.Annotations[enginebinding.AnnotationNodeLocalOwnerUID] == string(backend.UID) &&
 			pod.Annotations[enginebinding.AnnotationNodeLocalGeneration] == wantGeneration &&
 			pod.Name == builtinruntime.NodeLocalServerPodName(backend.Name, targetNode) &&
-			nodeLocalServerHasShmIdentity(pod, wantShmName)
+			nodeLocalServerHasShmIdentity(pod, wantShmName, wantShmHostPath)
 		if !current {
 			if pod.DeletionTimestamp == nil {
 				if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
@@ -165,17 +169,41 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 	return nil
 }
 
-func nodeLocalServerHasShmIdentity(pod *corev1.Pod, want string) bool {
-	if pod == nil || want == "" || pod.Annotations[enginebinding.AnnotationNodeLocalShmName] != want {
+func nodeLocalServerHasShmIdentity(pod *corev1.Pod, wantName, wantHostPath string) bool {
+	if pod == nil || wantName == "" || wantHostPath == "" || pod.Annotations[enginebinding.AnnotationNodeLocalShmName] != wantName {
 		return false
 	}
 	for i := range pod.Spec.Containers {
 		if pod.Spec.Containers[i].Name != lmCacheMPServerStatusContainerName {
 			continue
 		}
-		args := pod.Spec.Containers[i].Args
+		container := &pod.Spec.Containers[i]
+		var shmVolumeName string
+		for j := range container.VolumeMounts {
+			mount := &container.VolumeMounts[j]
+			if mount.MountPath == "/dev/shm" && !mount.ReadOnly && mount.SubPath == "" && mount.SubPathExpr == "" {
+				shmVolumeName = mount.Name
+				break
+			}
+		}
+		if shmVolumeName == "" {
+			return false
+		}
+		validHostPath := false
+		for j := range pod.Spec.Volumes {
+			volume := &pod.Spec.Volumes[j]
+			if volume.Name == shmVolumeName && volume.HostPath != nil && volume.HostPath.Path == wantHostPath &&
+				volume.HostPath.Type != nil && *volume.HostPath.Type == corev1.HostPathDirectoryOrCreate {
+				validHostPath = true
+				break
+			}
+		}
+		if !validHostPath {
+			return false
+		}
+		args := container.Args
 		for j := 0; j+1 < len(args); j++ {
-			if args[j] == "--shm-name" && args[j+1] == want {
+			if args[j] == "--shm-name" && args[j+1] == wantName {
 				return true
 			}
 		}

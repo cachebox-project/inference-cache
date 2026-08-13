@@ -27,7 +27,7 @@ multi-tenant, Namespaces):
   available for [vLLM](cachebackend-vllm-nodelocal-host-only.yaml) and
   [SGLang](cachebackend-sglang-nodelocal-host-only.yaml); the inference system
   owns their placement and they opt into server host networking plus shared
-  host `/dev/shm`.
+  the backend UID's host `/dev/shm/inference-cache/<uid>` directory.
   `EventsOnly` intentionally carries no LMCache data plane.
 
 ## Recipe catalog

@@ -32,8 +32,19 @@ func setNodeLocalShmIdentity(t *testing.T, backend *cachev1alpha1.CacheBackend, 
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
 	}
+	path, err := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathType := corev1.HostPathDirectoryOrCreate
 	pod.Annotations[enginebinding.AnnotationNodeLocalShmName] = name
-	pod.Spec.Containers = []corev1.Container{{Name: lmCacheMPServerStatusContainerName, Args: []string{"server", "--shm-name", name}}}
+	pod.Spec.Containers = []corev1.Container{{
+		Name: lmCacheMPServerStatusContainerName, Args: []string{"server", "--shm-name", name},
+		VolumeMounts: []corev1.VolumeMount{{Name: "shm", MountPath: "/dev/shm"}},
+	}}
+	pod.Spec.Volumes = []corev1.Volume{{Name: "shm", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+		Path: path, Type: &pathType,
+	}}}}
 }
 
 func typedMPStatusBackend() *cachev1alpha1.CacheBackend {
@@ -322,6 +333,13 @@ func TestRefreshLMCacheNodeLocalConnectorStatusFailureModes(t *testing.T) {
 			name: "server is missing UID-scoped shared-memory identity",
 			mutate: func(_ *cachev1alpha1.CacheBackend, servers *[]*corev1.Pod, _ *corev1.Pod) {
 				delete((*servers)[0].Annotations, enginebinding.AnnotationNodeLocalShmName)
+			},
+			wantCondition: reasonNodeLocalPoolPending, wantCoverage: reasonMPServersNotReady, wantReadyServers: 0,
+		},
+		{
+			name: "server mounts another shared-memory directory",
+			mutate: func(_ *cachev1alpha1.CacheBackend, servers *[]*corev1.Pod, _ *corev1.Pod) {
+				(*servers)[0].Spec.Volumes[0].HostPath.Path = "/dev/shm/inference-cache/another-backend-uid"
 			},
 			wantCondition: reasonNodeLocalPoolPending, wantCoverage: reasonMPServersNotReady, wantReadyServers: 0,
 		},

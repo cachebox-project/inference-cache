@@ -224,6 +224,11 @@ func (r *CacheBackendReconciler) refreshLMCacheNodeLocalConnectorStatus(ctx cont
 		log.FromContext(ctx).V(1).Info("LMCache NodeLocal status refresh skipped: shared-memory identity is invalid", "error", shmNameErr.Error())
 		return
 	}
+	wantShmHostPath, shmPathErr := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if shmPathErr != nil {
+		log.FromContext(ctx).V(1).Info("LMCache NodeLocal status refresh skipped: shared-memory host path is invalid", "error", shmPathErr.Error())
+		return
+	}
 	readyByNode := map[string]int32{}
 	conflictByNode := map[string]bool{}
 	for i := range servers.Items {
@@ -235,7 +240,7 @@ func (r *CacheBackendReconciler) refreshLMCacheNodeLocalConnectorStatus(ctx cont
 		if annotations[enginebinding.AnnotationNodeLocalOwner] != wantOwner ||
 			annotations[enginebinding.AnnotationNodeLocalOwnerUID] != wantUID ||
 			annotations[enginebinding.AnnotationNodeLocalGeneration] != wantGeneration ||
-			!nodeLocalServerHasShmIdentity(pod, wantShmName) {
+			!nodeLocalServerHasShmIdentity(pod, wantShmName, wantShmHostPath) {
 			continue
 		}
 		targetNode := annotations[enginebinding.AnnotationNodeLocalTargetNode]

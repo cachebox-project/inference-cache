@@ -38,8 +38,10 @@ PVC**:
    mount storage nothing writes KV to.
 2. **LMCache's only on-server local-disk path is node-local.** Its MP-mode (the
    L2 NIXL POSIX backend writing to a `file_path`) requires `hostNetwork` and a
-   shared host `/dev/shm`, where the control socket is ZMQ-only and KV bytes move
-   over CUDA-IPC or POSIX shared memory. A server reachable only through a
+   shared node tmpfs path. NodeLocal mounts the CacheBackend UID's
+   `/dev/shm/inference-cache/<uid>` directory as `/dev/shm` in its server and
+   engines; the control socket is ZMQ-only and KV bytes move over CUDA-IPC or
+   POSIX shared memory. A server reachable only through a
    ClusterIP Service therefore has **no data plane** in that mode. The current
    implementation creates one directly scheduled server Pod per active engine
    node and CacheBackend; multiple pools on one node require disjoint host ports.

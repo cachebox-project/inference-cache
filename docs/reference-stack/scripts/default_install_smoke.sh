@@ -368,6 +368,10 @@ grep -Fq 'EXPECTED_SHM_NAME' "$node_pod_json" || fail "NodeLocal startup gate do
 grep -Fq 'INFERENCECACHE_NODE_IP' "$node_pod_json" || fail "NodeLocal hostIP Downward API was not injected"
 grep -Fq 'status.hostIP' "$node_pod_json" || fail "NodeLocal endpoint is not derived from status.hostIP"
 grep -Fq 'kubernetes.io/os' "$node_pod_json" || fail "inference-owned nodeSelector was not preserved"
+node_local_backend_uid="$(kubectl -n "$SMOKE_NAMESPACE" get cachebackend node-local -o jsonpath='{.metadata.uid}')"
+node_local_shm_path="/dev/shm/inference-cache/${node_local_backend_uid}"
+grep -Fq "$node_local_shm_path" "$node_pod_json" || fail "NodeLocal engine does not mount its UID-scoped host SHM directory"
+grep -Fq 'DirectoryOrCreate' "$node_pod_json" || fail "NodeLocal engine UID-scoped SHM hostPath is not DirectoryOrCreate"
 if grep -Fq 'podAffinity' "$node_pod_json"; then
   fail "NodeLocal injection unexpectedly added server-first PodAffinity"
 fi
@@ -394,9 +398,10 @@ kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o json >"$LOG_DIR/node-loc
 node_local_host_ipc="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.spec.hostIPC}')"
 [ -z "$node_local_host_ipc" ] || [ "$node_local_host_ipc" = "false" ] \
   || fail "NodeLocal server unexpectedly uses hostIPC"
-[ "$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.spec.volumes[0].hostPath.path}')" = "/dev/shm" ] \
-  || fail "NodeLocal server does not mount host /dev/shm"
-node_local_backend_uid="$(kubectl -n "$SMOKE_NAMESPACE" get cachebackend node-local -o jsonpath='{.metadata.uid}')"
+[ "$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.spec.volumes[0].hostPath.path}')" = "$node_local_shm_path" ] \
+  || fail "NodeLocal server does not mount its UID-scoped host SHM directory"
+[ "$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.spec.volumes[0].hostPath.type}')" = "DirectoryOrCreate" ] \
+  || fail "NodeLocal server UID-scoped SHM hostPath is not DirectoryOrCreate"
 node_local_shm_name="lmcache_l1_pool_inferencecache_${node_local_backend_uid}"
 [ "$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.metadata.annotations.inferencecache\.io/node-local-shm-name}')" = "$node_local_shm_name" ] \
   || fail "NodeLocal server does not carry its UID-scoped shared-memory identity"

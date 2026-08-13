@@ -220,9 +220,10 @@ serving if its image does not contain a compatible LMCache client/API;
 admission does not pull, execute, or otherwise introspect the engine image.
 
 For PodLocal the webhook injects a digest-pinned `lmcache-mp-server` native
-sidecar. For NodeLocal it preserves engine placement, mounts host `/dev/shm`,
-and adds a blocking identity/health gate while the controller follows the
-scheduled engine with a same-node server Pod. Both add the following vLLM
+sidecar. For NodeLocal it preserves engine placement, mounts only the
+backend-UID host SHM directory as `/dev/shm`, and adds a blocking
+identity/health gate while the controller follows the scheduled engine with a
+same-node server Pod. Both add the following vLLM
 launch contract:
 
 - `--kv-transfer-config` selects `LMCacheMPConnector` through
@@ -258,12 +259,14 @@ for LMCache metadata and shared-memory allocator overhead.
 For NodeLocal, `l1Capacity` is instead one shared per-node budget. CacheBackend
 creation alone creates no server and never changes engine placement. After an
 injected engine has been scheduled, the controller owns one host-networked
-server Pod for each distinct active engine node, declares the MP and FastAPI
-listeners as host ports, and mounts the node's `/dev/shm` into both the server
-and selected engine Pods. Exact node-name affinity sends the server through the
-normal scheduler on the engine's node; `status.hostIP` prevents ClusterIP or
-cross-node CUDA IPC. `maxGPUWorkers` must cover all selected engine instances on
-one node. Every server receives the controller-derived
+server Pod for each distinct active engine node and declares the MP and FastAPI
+listeners as host ports. Both the server and selected engines mount only the
+backend's `/dev/shm/inference-cache/<cacheBackendUID>` host directory as their
+container `/dev/shm`; they do not mount the whole node SHM namespace. Exact
+node-name affinity sends the server through the normal scheduler on the
+engine's node; `status.hostIP` prevents ClusterIP or cross-node CUDA IPC.
+`maxGPUWorkers` must cover all selected engine instances on one node. Every
+server receives the controller-derived
 `lmcache_l1_pool_inferencecache_<cacheBackendUID>` through `--shm-name`; the
 engine gate verifies both the declared MP value and the effective L1
 memory-manager value before startup. Different CacheBackend UIDs therefore do
@@ -275,9 +278,11 @@ image-pull secrets, priority class, and scheduler unless optional
 are unauthenticated and host networking bypasses NetworkPolicy, so this topology
 requires one trusted tenant domain per pool plus node firewall controls.
 CacheBackend name/UID/generation verification detects wrong ownership but is
-not cryptographic authentication, and unique names do not isolate hostile
-processes that already have compatible access to host `/dev/shm`. Co-located
-pools therefore remain limited to one trusted node domain. After the last
+not cryptographic authentication. The UID-scoped mount prevents normal pool
+processes from seeing another pool through their container `/dev/shm`, but does
+not isolate host root, privileged Pods, or processes that independently mount
+the parent host directory. Co-located pools therefore remain limited to one
+trusted node domain. After the last
 selected engine leaves a
 node, `nodeLocal.idleRetentionSeconds` keeps the server and shared L1 warm for
 the configured window (300 seconds by default); new demand on that node reuses

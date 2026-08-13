@@ -55,8 +55,10 @@ focused NodeLocal samples for
 NodeLocal is an advanced host-bound topology. The inference system schedules
 each engine without CacheBackend changing its placement; the controller then
 creates one shared server Pod on every node that actually has an active
-selected engine. The server mounts host `/dev/shm` and declares MP and HTTP host
-ports. Engines are held in an init gate until their own node's server reports
+selected engine. The server and engine mount only the backend's
+`/dev/shm/inference-cache/<uid>` host directory as `/dev/shm` and declare MP
+and HTTP host ports. Engines are held in an init gate until their own node's
+server reports
 the exact CacheBackend name/UID/generation and healthy config. Co-schedule only
 mutually trusted engines and enforce host-port access with node firewalls;
 hostNetwork bypasses Kubernetes NetworkPolicy. L1 capacity is per node, and

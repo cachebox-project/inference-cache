@@ -329,8 +329,52 @@ func TestReconcileNodeLocalReplacesServerMissingUIDScopedShmIdentity(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !nodeLocalServerHasShmIdentity(&replaced, want) {
+	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nodeLocalServerHasShmIdentity(&replaced, want, wantPath) {
 		t.Fatalf("replacement server lacks UID-scoped shm identity: annotations=%v args=%v", replaced.Annotations, replaced.Spec.Containers[0].Args)
+	}
+}
+
+func TestReconcileNodeLocalReplacesServerWithWrongUIDScopedShmDirectory(t *testing.T) {
+	backend := nodeLocalBackend("node-cache", "ns1")
+	engine := nodeLocalEngine(backend, "engine-a", "node-a")
+	reconciler := newReconciler(newScheme(t), backend, engine)
+	reconcile(t, reconciler, backend.Name, backend.Namespace)
+
+	key := types.NamespacedName{Name: builtinruntime.NodeLocalServerPodName(backend.Name, "node-a"), Namespace: backend.Namespace}
+	var old corev1.Pod
+	if err := reconciler.Get(context.Background(), key, &old); err != nil {
+		t.Fatalf("get original server Pod: %v", err)
+	}
+	if err := reconciler.Delete(context.Background(), &old); err != nil {
+		t.Fatalf("delete original server Pod: %v", err)
+	}
+	old.ResourceVersion = ""
+	old.UID = ""
+	old.CreationTimestamp = metav1.Time{}
+	old.Spec.Volumes[0].HostPath.Path = "/dev/shm/inference-cache/foreign-cachebackend-uid"
+	if err := reconciler.Create(context.Background(), &old); err != nil {
+		t.Fatalf("create server Pod with foreign SHM directory: %v", err)
+	}
+
+	reconcile(t, reconciler, backend.Name, backend.Namespace)
+	var replaced corev1.Pod
+	if err := reconciler.Get(context.Background(), key, &replaced); err != nil {
+		t.Fatalf("get replacement server Pod: %v", err)
+	}
+	wantName, err := builtinruntime.NodeLocalServerShmName(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nodeLocalServerHasShmIdentity(&replaced, wantName, wantPath) {
+		t.Fatalf("replacement server lacks UID-scoped SHM directory: volumes=%v", replaced.Spec.Volumes)
 	}
 }
 

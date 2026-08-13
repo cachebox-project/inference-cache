@@ -30,6 +30,7 @@ const (
 	lmCacheNodeLocalConfigFilePath    = lmCacheNodeLocalConfigMountPath + "/client.yaml"
 	lmCacheNodeIPEnv                  = "INFERENCECACHE_NODE_IP"
 	lmCacheNodeLocalShmNamePrefix     = "lmcache_l1_pool_inferencecache_"
+	lmCacheNodeLocalShmHostRoot       = "/dev/shm/inference-cache"
 	posixShmNameMaxLength             = 255
 )
 
@@ -65,6 +66,10 @@ func RenderLMCacheNodeLocalServerPod(cache *cachev1alpha1.CacheBackend, binding 
 
 	identity := lmCacheNodeLocalInstanceID(cache)
 	shmName, err := NodeLocalServerShmName(cache)
+	if err != nil {
+		return nil, err
+	}
+	shmHostPath, err := NodeLocalServerShmHostPath(cache)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +133,7 @@ func RenderLMCacheNodeLocalServerPod(cache *cachev1alpha1.CacheBackend, binding 
 		enginebinding.AnnotationNodeLocalTargetNode: nodeName,
 		enginebinding.AnnotationNodeLocalShmName:    shmName,
 	}
-	pathType := corev1.HostPathDirectory
+	pathType := corev1.HostPathDirectoryOrCreate
 	noToken := false
 	enableServiceLinks := false
 	grace := int64(30)
@@ -177,7 +182,7 @@ func RenderLMCacheNodeLocalServerPod(cache *cachev1alpha1.CacheBackend, binding 
 		Volumes: []corev1.Volume{{
 			Name: lmCacheNodeLocalShmVolumeName,
 			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-				Path: lmCacheMPShmMountPath, Type: &pathType,
+				Path: shmHostPath, Type: &pathType,
 			}},
 		}},
 	}
@@ -229,6 +234,17 @@ func NodeLocalServerShmName(cache *cachev1alpha1.CacheBackend) (string, error) {
 		return "", fmt.Errorf("derive LMCache NodeLocal shm name: %d-byte name exceeds POSIX limit %d", len(name), posixShmNameMaxLength)
 	}
 	return name, nil
+}
+
+// NodeLocalServerShmHostPath returns the host tmpfs directory mounted as
+// /dev/shm by one CacheBackend's NodeLocal servers and engines. Mounting only
+// the UID directory keeps normally behaving co-located pools out of each
+// other's POSIX SHM namespace while retaining the node-local CUDA IPC path.
+func NodeLocalServerShmHostPath(cache *cachev1alpha1.CacheBackend) (string, error) {
+	if _, err := NodeLocalServerShmName(cache); err != nil {
+		return "", err
+	}
+	return lmCacheNodeLocalShmHostRoot + "/" + string(cache.UID), nil
 }
 
 func exactNodeAffinity(nodeName string) *corev1.Affinity {
@@ -306,9 +322,9 @@ func lmCacheMPHTTPProbeForPort(portName string, period, failures int32) *corev1.
 	return probe
 }
 
-// renderLMCacheNodeLocalEngine injects the shared host /dev/shm mount and a
-// startup gate. It deliberately leaves every engine placement field unchanged;
-// the controller follows the engine onto its scheduled node.
+// renderLMCacheNodeLocalEngine injects the backend-UID-scoped host SHM mount
+// and a startup gate. It deliberately leaves every engine placement field
+// unchanged; the controller follows the engine onto its scheduled node.
 func renderLMCacheNodeLocalEngine(pod *corev1.PodSpec, engineContainerName string, cache *cachev1alpha1.CacheBackend, writeClientConfig bool) (string, error) {
 	if pod == nil {
 		return "", fmt.Errorf("render LMCache NodeLocal engine: pod spec is nil")
@@ -326,6 +342,10 @@ func renderLMCacheNodeLocalEngine(pod *corev1.PodSpec, engineContainerName strin
 		return "", err
 	}
 	shmName, err := NodeLocalServerShmName(cache)
+	if err != nil {
+		return "", err
+	}
+	shmHostPath, err := NodeLocalServerShmHostPath(cache)
 	if err != nil {
 		return "", err
 	}
@@ -347,16 +367,16 @@ func renderLMCacheNodeLocalEngine(pod *corev1.PodSpec, engineContainerName strin
 
 	shmMount := corev1.VolumeMount{Name: lmCacheNodeLocalShmVolumeName, MountPath: lmCacheMPShmMountPath}
 	if existing := mountAtPath(engine.VolumeMounts, lmCacheMPShmMountPath); existing != nil {
-		if err := checkNodeLocalHostShm(work.Volumes, *existing); err != nil {
+		if err := checkNodeLocalHostShm(work.Volumes, *existing, shmHostPath); err != nil {
 			return "", err
 		}
 		shmMount.Name = existing.Name
 	} else {
-		pathType := corev1.HostPathDirectory
+		pathType := corev1.HostPathDirectoryOrCreate
 		work.Volumes, err = adoptVolume(work.Volumes, corev1.Volume{
 			Name: lmCacheNodeLocalShmVolumeName,
 			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-				Path: lmCacheMPShmMountPath, Type: &pathType,
+				Path: shmHostPath, Type: &pathType,
 			}},
 		}, owned)
 		if err != nil {
@@ -467,7 +487,7 @@ while True:
 	}
 }
 
-func checkNodeLocalHostShm(volumes []corev1.Volume, mount corev1.VolumeMount) error {
+func checkNodeLocalHostShm(volumes []corev1.Volume, mount corev1.VolumeMount, wantHostPath string) error {
 	if mount.ReadOnly || mount.SubPath != "" || mount.SubPathExpr != "" {
 		return fmt.Errorf("render LMCache NodeLocal engine: /dev/shm must be a writable whole-volume hostPath mount")
 	}
@@ -476,8 +496,8 @@ func checkNodeLocalHostShm(volumes []corev1.Volume, mount corev1.VolumeMount) er
 			continue
 		}
 		hostPath := volumes[i].HostPath
-		if hostPath == nil || hostPath.Path != lmCacheMPShmMountPath {
-			return fmt.Errorf("render LMCache NodeLocal engine: /dev/shm must use hostPath /dev/shm for cross-Pod CUDA IPC")
+		if hostPath == nil || hostPath.Path != wantHostPath || hostPath.Type == nil || *hostPath.Type != corev1.HostPathDirectoryOrCreate {
+			return fmt.Errorf("render LMCache NodeLocal engine: /dev/shm must use UID-scoped hostPath %q with type DirectoryOrCreate for cross-Pod CUDA IPC", wantHostPath)
 		}
 		return nil
 	}

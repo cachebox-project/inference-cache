@@ -5,8 +5,9 @@
 # Typed vLLM NodeLocal LMCache MP with one on-demand shared server on every node
 # that actually hosts a selected engine. The inference system remains the
 # scheduling authority; CacheBackend does not select nodes or change engine
-# placement. The server uses hostNetwork and host /dev/shm; node firewall policy
-# must restrict the unauthenticated MP/HTTP host ports. CacheBackend does not
+# placement. The server uses hostNetwork; the server and engines mount only this
+# backend UID's host /dev/shm/inference-cache/<uid> directory. Node firewall
+# policy must restrict the unauthenticated MP/HTTP host ports. CacheBackend does not
 # install LMCache into or replace the engine image. If NVIDIA is not the
 # engine/server runtime, set nodeLocal.scheduling.runtimeClassName.
 apiVersion: inferencecache.io/v1alpha1

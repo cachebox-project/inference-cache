@@ -13,7 +13,8 @@ NodeLocal topology. At Pod CREATE, the webhook:
 1. finds the one matching CacheBackend in the Pod's namespace;
 2. selects the runtime-specific MP adapter;
 3. injects the vLLM or SGLang connector launch surface plus either a PodLocal
-   native sidecar or a NodeLocal same-node startup gate and host `/dev/shm`;
+   native sidecar or a NodeLocal same-node startup gate and the backend UID's
+   host SHM directory mounted as `/dev/shm`;
 4. optionally binds the MP server to a Redis L3; and
 5. stamps `inferencecache.io/injected-by` and
    `inferencecache.io/injected-by-uid`.
@@ -32,10 +33,13 @@ engine startup until `/config` and `/healthcheck` verify the same
 name/UID/generation and live server configuration. Each CacheBackend UID also
 derives an explicit `lmcache_l1_pool_inferencecache_<uid>` POSIX SHM name; the
 gate verifies both the declared and effective live name before starting the
-engine. This prevents accidental unlink/rebind between co-located pools but is
-ownership verification, not cryptographic authentication, so the
-host-network/server pool and node-wide `/dev/shm` still require one trusted
-tenant domain.
+engine. The server and engines mount only
+`/dev/shm/inference-cache/<cacheBackendUID>` from the host as their container
+`/dev/shm`, so normally behaving co-located pools do not see one another's SHM
+objects. This remains ownership isolation rather than cryptographic
+authentication: host root, privileged Pods, or processes mounting the parent
+directory can bypass it, so the host-network/server pool still requires one
+trusted tenant domain.
 When the final selected engine leaves a node, the server enters the configured
 `idleRetentionSeconds` window instead of being coupled to that engine Pod's
 restart. Demand returning during the window clears the idle marker and reuses
