@@ -116,109 +116,43 @@ tier is `resp` (Redis; simplest, proven), `s3`, `mooncake_store` (the RDMA path)
 or `p2p` (peer discovery). `resp` config schema (`RESPL2AdapterConfig`):
 `{"type":"resp","host":<str>,"port":<int>,"num_workers":8,"username":"","password":""}`.
 
-## The three pieces, and how they map onto the interface
+## Current implementation mapping
 
-A working `(sglang, LMCache)` deployment needs three things:
+A current `(SGLang, LMCache)` deployment has three independently owned pieces:
 
-1. **Engine wire** — `--enable-lmcache`, `LMCACHE_USE_EXPERIMENTAL=True`,
-   `--lmcache-config-file <path>`; the file carries `mp_host`/`mp_port`/`chunk_size`.
-2. **A node-local MP worker** reachable at `mp_host:mp_port`, co-located with the
-   engine (shared-memory data path), configured with the shared `--l2-adapter`.
-3. **A shared L2 store** (Redis) the worker offloads to, reachable cluster-wide.
+1. The runtime adapter mutates the engine Pod through `InjectEngineConfig`.
+2. The common MP renderer creates either a PodLocal native sidecar or an
+   on-demand NodeLocal server Pod from the typed `spec.lmCache` declaration.
+3. The storage adapter optionally renders or binds Redis from
+   `spec.remoteStorage`; omitting it is the supported host-only configuration.
 
-The `KVCacheRuntimeAdapter` interface already accommodates all three **without a
-new method**:
+The removed `ResolveCacheServer` path is not part of the current runtime
+interface. Managed Redis lifecycle belongs to
+`internal/adapters/builtin/storage/redis.go`; runtime-specific engine wiring
+belongs to `sglang_lmcache.go`; shared MP server rendering belongs to
+`lmcache_mp_renderer.go` and `lmcache_mp_nodelocal.go`.
 
-### `ResolveCacheServer` → the shared L2 (Redis)
+For **PodLocal**, the webhook injects a native sidecar named
+`lmcache-mp-server`. Its image, port, L1 capacity, worker count, and resources
+come from `spec.lmCache.podLocal.server`; the image never defaults from the
+engine container. The server uses the `lmcache server` entrypoint, mounts the
+shared memory volume, and writes the engine-specific config file. SGLang gets
+`--enable-lmcache`, `--lmcache-config-file`, and
+`LMCACHE_USE_EXPERIMENTAL=True`; the native sidecar must be Ready before the
+engine starts.
 
-The reconciler wraps the returned `(*PodSpec, *Service)` into one Deployment +
-Service owned by the CR. For SGLang, that workload becomes the **shared Redis L2**,
-with three constraints the design must honor:
+For **NodeLocal**, the controller creates one direct server Pod per active
+engine node using exact-node affinity, host networking, declared host ports,
+and a UID-scoped `--shm-name`. The engine receives a same-node endpoint derived
+from the Downward API and a startup gate that verifies server ownership,
+generation, shared-memory identity, and health. No load-balanced MP Service is
+created.
 
-- **Pinned image** — a digest/tag tracked in `VERSIONS.md`, consistent with the
-  lmcache-server image-pin policy, never a floating `redis` tag.
-- **Single replica (enforced) — specific to the SGLang Redis L2.** A plain Redis is
-  not clustered; multiple pods behind one Service would shard requests across
-  independent key spaces and silently partition the L2. So **this** backend is
-  **clamped to one replica** and HPA is not attached: admission rejects
-  `spec.replicas>1` / `spec.autoscaling` for `(sglang, LMCache)`
-  (`rejectSGLangRedisL2ScaleOut`), and the reconciler clamps as a backstop for
-  grandfathered objects (`clampSingletonReplicas`). This is **not** shared with
-  vLLM's `lm://` lmcache-server, which is an ordinary pod-network workload that
-  **does** scale out and autoscale — the singleton rule is scoped to the pair whose
-  managed server is a non-clustered Redis (and to the host-network Mooncake master,
-  for a different reason). A genuinely clustered/HA Redis is an operator-provided or
-  future option, out of scope for the managed default.
-- **Bounded memory.** `--maxmemory-policy allkeys-lru` only evicts once
-  `--maxmemory` is set; without it Redis grows until the container is OOM-killed.
-  The render derives `--maxmemory` from the pod's memory limit (with headroom),
-  falling back to an explicit bounded default — so LRU eviction, not the OOM
-  killer, reclaims space.
-
-It listens on ClusterIP `:6379` and `status.endpoint` becomes the Redis Service
-DNS. The provider-owned Redis renderer replaces the provider-owned `lm://`
-lmcache-server renderer for the SGLang pair only — vLLM keeps `lm://`. Redis is
-a shared, network-addressable store that fits the one-Service, engines-anywhere
-model exactly (unlike Mooncake's mesh), so **no `hostNetwork` is required for
-the L2**.
-
-### `InjectEngineConfig` → MP-worker native sidecar (writes its own config) + engine wire
-
-The mutating Pod webhook already adds volumes, init containers, and sidecar
-containers to engine pods. For SGLang it adds, to the engine pod:
-
-- **the MP config file** — `/etc/lmcache/config.yaml` (`chunk_size`,
-  `mp_host: 127.0.0.1`, `mp_port`) in a shared `emptyDir` (`lmcache-config`).
-  **As built, the worker sidecar writes this itself** and then `exec`s the MP
-  server, rather than a separate `lmcache-config` init container doing it: the two
-  always agree on `mp_port` because one process renders both sides, and the worker's
-  `startupProbe` already gates the engine on the server listening — which implies the
-  file exists, since the `exec` happens after the write. A separate init container
-  would have been a second place to keep in sync for no added ordering guarantee.
-  No ConfigMap needed (the webhook cannot create cluster resources; the values are
-  static and small).
-- **native sidecar `lmcache-mp-worker`** — runs the upstream-documented worker CLI
-  `python3 -m lmcache.v1.multiprocess.server --host 127.0.0.1 --port <mpPort>
-  --chunk-size <n> --l1-size-gb <n> --eviction-policy LRU
-  --l2-adapter '{"type":"resp","host":<endpoint-host>,"port":<endpoint-port>}'`
-  (the documented `lmcache server` subcommand is the equivalent entrypoint; the
-  rendered wire uses the `python3 -m` form, which is what validation exercised).
-  `<endpoint>` is the Redis address passed to `InjectEngineConfig`. Its
-  **image defaults to the engine's own image (and should be digest-pinned in
-  production)**, keeping it version-aligned with the engine's LMCache connector —
-  the two speak the LMCache MP wire (ZMQ + shared memory), so a version skew between
-  worker and engine is a correctness hazard, and defaulting to the same image makes
-  the aligned case the zero-config one. `spec.lmCache.workerImage` overrides it, at
-  which point the alignment (and the digest pin) is the operator's to maintain; the
-  tuple is tracked in
-  `VERSIONS.md` alongside the engine image (validation used the engine's own
-  `pip install lmcache`→0.5.1, so the simplest pin is the same image and `lmcache`
-  version for both). Mounts the shared `/dev/shm`
-  (`emptyDir{medium: Memory, sizeLimit ≥ l1-size}`) and `/etc/lmcache`. **Startup
-  ordering matters** — the engine dials the worker at launch, and K8s does not
-  order ordinary containers within a pod. So this is a **native sidecar** (a
-  `restartPolicy: Always` entry in `initContainers` — beta and on-by-default since
-  K8s 1.29, stable since 1.33) with a `startupProbe`. The ZMQ port binds
-  `127.0.0.1`, which a pod-IP-targeted `tcpSocket`/`httpGet` probe cannot reach, so
-  the probe is either an **`exec`** loopback check (runs inside the container) or —
-  cleaner — an **`httpGet` on the worker's HTTP management endpoint (`:8080`)**,
-  which `lmcache server` exposes and which can bind the pod interface; Phase 2
-  picks whichever the pinned build supports. Native sidecars start and gate ready
-  **before** the main engine container, so the worker is listening when the engine
-  connects. (An ordinary sidecar would race the engine.) The adapter's minimum is
-  K8s ≥ 1.29. Fail-open interaction is resolved below.
-- **engine container** — add `--enable-lmcache`, `--lmcache-config-file
-  /etc/lmcache/config.yaml`, `LMCACHE_USE_EXPERIMENTAL=True`,
-  `INFERENCECACHE_FAIL_OPEN`; mount the shared `/dev/shm` + `/etc/lmcache`. **Drop**
-  the MP-ignored `LMCACHE_REMOTE_URL` / `LMCACHE_REMOTE_SERDE` / `LMCACHE_LOCAL_CPU` /
-  `LMCACHE_MAX_LOCAL_CPU_SIZE` env.
-
-`mp_host=127.0.0.1` works because the worker is a **same-pod sidecar** — it shares
-the engine's network namespace, so ZMQ over loopback reaches it and the shared
-`/dev/shm` `emptyDir` gives the data path. This is the key divergence from
-Mooncake: Mooncake needs `hostNetwork` on the engine (its mesh dials real host
-IPs on dynamic ports); SGLang's MP worker is in-pod, so the engine stays on the
-pod network.
+Redis is an optional remote tier for either topology. Managed Redis is a
+single-replica Deployment and Service; external Redis publishes the declared
+endpoint without creating a workload. Its state is reported under
+`status.remoteStorage`, independently from required connector health under
+`status.connector` and `ConnectorReady`.
 
 ### Fail-open semantics (resolving the startup-gate tension)
 

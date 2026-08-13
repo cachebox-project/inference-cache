@@ -8,7 +8,7 @@ Status: locked · Scope: managed-backend durability (`CacheBackend`)
 > Redis. Do not treat the providers below as current defaults and do not map
 > them automatically to Redis; the operator must choose the desired L3 semantics.
 
-## Decision
+## Current decision
 
 `CacheBackend.spec.storage` — and the nested `storage.pvc.*` plus the
 `status.capacity` field — is **retired at `v1alpha1`**. Durability of a managed
@@ -17,17 +17,14 @@ per-`CacheBackend` volume knob:
 
 - Omitting canonical `spec.remoteStorage` selects an engine-local host tier and
   provisions no provider workload.
-- Historically, the managed **in-memory `lm://` LMCache server**
-  (`spec.remoteStorage.provider: LMCacheServer`) is the simple shared tier. It
-  keeps KV in process memory; it is not durable and does not persist across pod
-  restarts.
-- Historically, the managed **Mooncake provider**
-  (`spec.remoteStorage.provider: Mooncake`) is the durable / shared / scalable
-  path: a network-addressable store the engine reaches over the
-  `mooncakestore://` remote wire. See
-  [Mooncake provider configuration](cachebackend-api.md#mooncake-provider-configuration).
+- `spec.remoteStorage.provider: Redis` is the only current remote tier. Managed
+  ownership renders a single Redis Deployment and Service; external ownership
+  binds the declared endpoint without creating a workload.
+- Removed `LMCacheServer` and Mooncake objects are not translated to Redis.
+  Reintroducing either technology requires a separately validated typed MP
+  adapter and an explicit operator migration choice.
 
-## Why a local PVC cannot honestly back the `lm://` server
+## Historical rationale: why a local PVC could not back the removed IP server
 
 An investigation into LMCache's storage model found **no mechanism by which a
 network-addressable, per-`CacheBackend` LMCache server persists KV to a local
@@ -47,18 +44,21 @@ PVC**:
    implementation creates one directly scheduled server Pod per active engine
    node and CacheBackend; multiple pools on one node require disjoint host ports.
 
-MP-mode is thus incompatible with this project's per-backend Deployment +
-ClusterIP, engines-anywhere model.
+That finding invalidated the old per-backend Deployment + ClusterIP model. The
+current typed MP design instead uses a PodLocal native sidecar or one directly
+scheduled NodeLocal server per active engine node; neither exposes the MP CUDA
+data plane through a load-balanced Service.
 
 ## Consequences
 
 - `spec.storage{,.pvc}` + `status.capacity` were removed as a category error:
   the Kubernetes-side PVC plumbing could be provisioned, but could never
   honestly back the in-memory server.
-- The historical durable/shared recommendation was the **Mooncake backend**. Its
-  managed workload lifecycle lives in the provider adapter
-  (`internal/adapters/builtin/storage/mooncake.go`), while the vLLM runtime adapter
-  (`internal/adapters/builtin/runtime/vllm_lmcache.go`) owns engine wiring.
+- Current managed Redis lifecycle lives in
+  `internal/adapters/builtin/storage/redis.go`. Common typed MP rendering lives
+  in `internal/adapters/builtin/runtime/lmcache_mp_renderer.go` and
+  `lmcache_mp_nodelocal.go`; the SGLang and vLLM adapters own only their
+  engine-specific launch surfaces.
 - **Generalizable rule:** surface a `max*` / storage / quota field on a CRD only
   when the cache plane **authoritatively owns** the resource being limited. When
   it does not, omit the field or express the capability as a backend choice

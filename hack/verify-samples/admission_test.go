@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -140,6 +142,23 @@ func TestVerifySamplesAdmissionEndToEnd(t *testing.T) {
 			Spec: cachev1alpha1.CacheBackendSpec{
 				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 				Type:    cachev1alpha1.CacheBackendTypeLMCache,
+				LMCache: &cachev1alpha1.LMCacheEngineSpec{
+					Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+					PodLocal: &cachev1alpha1.LMCachePodLocalSpec{
+						Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+							Image:      "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+							Port:       6500,
+							L1Capacity: resource.MustParse("1Gi"),
+							MaxWorkers: 1,
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("2Gi"),
+								},
+								Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+							},
+						},
+					},
+				},
 			},
 		}
 		if err := cl.Create(ctx, good, client.DryRunAll); err != nil {

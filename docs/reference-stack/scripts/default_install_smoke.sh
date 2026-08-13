@@ -57,6 +57,9 @@ collect_diagnostics() {
   kubectl -n "$SYSTEM_NAMESPACE" get all -o wide >"$LOG_DIR/system.txt" 2>&1 || true
   kubectl -n "$SYSTEM_NAMESPACE" get events --sort-by=.lastTimestamp >"$LOG_DIR/events.txt" 2>&1 || true
   kubectl -n "$SYSTEM_NAMESPACE" logs deployment/inference-cache-controller-manager --all-containers >"$LOG_DIR/controller.log" 2>&1 || true
+  kubectl -n "$SMOKE_NAMESPACE" get all -o wide >"$LOG_DIR/smoke-system.txt" 2>&1 || true
+  kubectl -n "$SMOKE_NAMESPACE" get pods -o json >"$LOG_DIR/smoke-pods.json" 2>&1 || true
+  kubectl -n "$SMOKE_NAMESPACE" get events --sort-by=.lastTimestamp >"$LOG_DIR/smoke-events.txt" 2>&1 || true
 }
 
 cleanup() {
@@ -383,6 +386,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 [ -n "${engine_node:-}" ] && [ -n "${server_name:-}" ] || fail "scheduled engine did not create an on-demand NodeLocal server"
+kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o json >"$LOG_DIR/node-local-server.json"
 [ "$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.metadata.annotations.inferencecache\.io/node-local-target-node}')" = "$engine_node" ] \
   || fail "NodeLocal server target does not match the engine-selected node"
 [ "$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.spec.hostNetwork}')" = "true" ] \
@@ -397,11 +401,11 @@ node_local_shm_name="lmcache_l1_pool_inferencecache_${node_local_backend_uid}"
 [ "$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.metadata.annotations.inferencecache\.io/node-local-shm-name}')" = "$node_local_shm_name" ] \
   || fail "NodeLocal server does not carry its UID-scoped shared-memory identity"
 node_local_shm_arg="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" \
-  -o jsonpath='{range .spec.containers[0].args[*]}{.}{"\n"}{end}' | \
+  -o jsonpath='{range .spec.containers[?(@.name=="lmcache-mp-server")].args[*]}{@}{"\n"}{end}' | \
   awk 'previous == "--shm-name" { print; exit } { previous = $0 }')"
 [ "$node_local_shm_arg" = "$node_local_shm_name" ] \
   || fail "NodeLocal server does not pass its UID-scoped --shm-name: $node_local_shm_arg"
-node_local_ports="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{range .spec.containers[0].ports[*]}{.containerPort}:{.hostPort}{" "}{end}')"
+node_local_ports="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{range .spec.containers[?(@.name=="lmcache-mp-server")].ports[*]}{.containerPort}:{.hostPort}{" "}{end}')"
 [ "$node_local_ports" = "5556:5556 8081:8081 " ] || fail "NodeLocal host ports were not declared: $node_local_ports"
 node_affinity_target="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0].values[0]}')"
 [ "$node_affinity_target" = "$engine_node" ] || fail "server does not use scheduler-bound exact-node affinity"

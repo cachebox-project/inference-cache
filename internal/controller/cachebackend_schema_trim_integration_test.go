@@ -79,6 +79,19 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 		if err := unstructured.SetNestedStringMap(u.Object, map[string]string{"app.kubernetes.io/name": "vllm"}, "spec", "engineSelector", "matchLabels"); err != nil {
 			t.Fatalf("set spec.engineSelector: %v", err)
 		}
+		if err := unstructured.SetNestedMap(u.Object, map[string]any{
+			"topology": "PodLocal",
+			"podLocal": map[string]any{"server": map[string]any{
+				"image": "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"port":  int64(6500), "l1Capacity": "1Gi", "maxWorkers": int64(1),
+				"resources": map[string]any{
+					"requests": map[string]any{"cpu": "1", "memory": "2Gi"},
+					"limits":   map[string]any{"memory": "2Gi"},
+				},
+			}},
+		}, "spec", "lmCache"); err != nil {
+			t.Fatalf("set spec.lmCache: %v", err)
+		}
 		return u
 	}
 

@@ -5,8 +5,8 @@ available, and how to size it: **GPU memory, card count, tensor-parallelism, and
 host resources**.
 
 The stack is cloud-neutral — it needs an NVIDIA GPU advertising `nvidia.com/gpu`,
-nothing more. §4 gives a concrete OCI-shape mapping as one worked example; any
-equivalent NVIDIA card on any cloud or on-prem works the same.
+nothing more. Select any cloud or on-prem node whose card count, VRAM, host
+memory, and interconnect satisfy the requirements below.
 
 ---
 
@@ -76,31 +76,11 @@ Rules of thumb:
 | `/dev/shm` | ≥ typed L1 + 1Gi | Shared by the engine and injected MP server; the reference uses 8Gi. |
 | Local disk | model size × 1.5 | HF weight cache. The host-only reference does not claim a local-disk LMCache tier. |
 | Network | 100 Gb+ RDMA for multi-node | Only if you later shard across nodes; single-node TP uses NVLink. |
-| Driver/runtime | NVIDIA driver + Container Toolkit; `nvidia` default Docker runtime | So kind/OKE pods can request `nvidia.com/gpu`. |
+| Driver/runtime | NVIDIA driver + Container Toolkit; `nvidia` default Docker runtime | So local or managed-cluster pods can request `nvidia.com/gpu`. |
 
 ---
 
-## 4. Worked example — OCI GPU shapes
-
-One concrete cloud mapping (Oracle Cloud Infrastructure). Any equivalent NVIDIA
-card on another cloud or on-prem works the same. GPU memory **per card**: A10 =
-24 GB, L40S = 48 GB, A100 = 80 GB (also a 40 GB variant), H100 = 80 GB, H200 =
-141 GB.
-
-| Target | OCI shape | Cards × VRAM | Good for |
-|---|---|---|---|
-| **This reference (recommended)** | `VM.GPU.A10.1` | 1 × 24 GB | 8B, single card, cheapest |
-| Single card with headroom | `BM.GPU.L40S.4` (use 1 GPU) | 4 × 48 GB | 8B–34B comfortably; room for LMCache |
-| Single bigger model | `VM.GPU.A100.1` / `VM.GPU.H100.1` | 1 × 80 GB | up to ~34B, or 70B quantized |
-| 70B BF16 (TP) | `BM.GPU4.8` / `BM.GPU.A100-v2.8` | 8 × 40/80 GB (use 4, NVLink) | `--tensor-parallel-size 4` |
-| Largest / fastest | `BM.GPU.H100.8` / `BM.GPU.H200.8` | 8 × 80/141 GB | 70B–100B+, full-node TP |
-
-For the **8B reference**, a single 24 GB card (e.g. `VM.GPU.A10.1`) is the
-cheapest option. Pick a bare-metal multi-GPU shape only when you need TP ≥ 2.
-
----
-
-## 5. Deploy (once the GPU node is up)
+## 4. Deploy (once the GPU node is up)
 
 Builds on [`README.md`](README.md) "Deploy and test on a GPU". Summary:
 
@@ -139,7 +119,7 @@ Then run the verification in [`README.md`](README.md) ("What success looks
 like"): subscribe with `scripts/kv_events_subscriber.py` and fire
 `scripts/prefix_cache_hit_test.sh`.
 
-## 6. Sizing-related failure cheatsheet
+## 5. Sizing-related failure cheatsheet
 
 | Symptom | Likely cause | Fix |
 |---|---|---|

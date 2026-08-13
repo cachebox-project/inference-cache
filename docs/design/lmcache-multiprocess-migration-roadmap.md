@@ -651,7 +651,7 @@ Live validation ran on 2026-08-10/11 in SJC dev:
 | Item | Evidence |
 |---|---|
 | Environment | Kubernetes 1.31.1; A100-SXM4-80GB; driver 550.163.01; CUDA 12.9 |
-| Engine | `us-sanjose-1.ocir.io/idqj093njucb/vllm-openai@sha256:f72dd35b1efd50fd7646ebce708f173a4040fddf3f2363759c67ad732d912d0a` (vLLM 0.25.1) |
+| Engine | Private validation image at `sha256:f72dd35b1efd50fd7646ebce708f173a4040fddf3f2363759c67ad732d912d0a` (vLLM 0.25.1) |
 | LMCache | Client wheel 0.5.3 CUDA 12.9, test-only runtime-owner overlay; standalone sidecar `sha256:0df30fc70a7d689e1f12823789208a0ee8ef31537316eba6a4c2fa83b0abe61b` |
 | Host-only TP=1 | Stored and retrieved 1,024 external tokens after clearing only vLLM's local prefix cache. |
 | Host-only TP=2 | Both ranks registered and retrieved correctly on one node. |
@@ -704,9 +704,9 @@ remain until Phase 7. Physical removal is outside this phase.
 
 The Phase 0 owner audit and Phase 5 repository inventory found zero external
 consumers and zero installed legacy objects. This evidence covers this
-repository and the recorded owner audit, not every organization source or OCI
-cluster. Because no input population appeared, migration tooling and Phase 6
-were not activated.
+repository and the recorded owner audit, not every organization source or
+private validation cluster. Because no input population appeared, migration
+tooling and Phase 6 were not activated.
 
 LMCacheServer and Mooncake are never translated to Redis automatically; the
 operator must choose host-only MP, Redis, or a future typed adapter.

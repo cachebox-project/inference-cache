@@ -29,7 +29,7 @@ Phase 3 and Phase 4 ran on 2026-08-10/11 in the SJC development environment:
 | Path | Engine evidence | LMCache evidence | Result |
 |---|---|---|---|
 | SGLang TP=1 | `docker.io/lmsysorg/sglang@sha256:920df39109c60429b0a23eaacfd2786fcf1595c12f3ca4fc6e153b2abe34865f` (`0.5.13.post1-cu129`) | Client wheel 0.5.3 CUDA 12.9 via a test-only runtime-owner overlay; standalone `sha256:0df30fc70a7d689e1f12823789208a0ee8ef31537316eba6a4c2fa83b0abe61b` | Host-only store/retrieve, bounded L1 eviction, events/status, and managed-Redis replacement-Pod retrieval passed. |
-| vLLM TP=1/2 | `us-sanjose-1.ocir.io/idqj093njucb/vllm-openai@sha256:f72dd35b1efd50fd7646ebce708f173a4040fddf3f2363759c67ad732d912d0a` (`0.25.1`) | Client wheel 0.5.3 CUDA 12.9 via a test-only runtime-owner overlay; same validation standalone digest | Host-only TP=1/2 retrieval, events/status, shared-memory budget, native extension checks, and supplemental Redis replacement-Pod retrieval passed. |
+| vLLM TP=1/2 | Private validation image at `sha256:f72dd35b1efd50fd7646ebce708f173a4040fddf3f2363759c67ad732d912d0a` (`0.25.1`) | Client wheel 0.5.3 CUDA 12.9 via a test-only runtime-owner overlay; same validation standalone digest | Host-only TP=1/2 retrieval, events/status, shared-memory budget, native extension checks, and supplemental Redis replacement-Pod retrieval passed. |
 
 The runtime-owner wheel overlays were validation scaffolding, not authority for
 `CacheBackend` to mutate an engine image. These records prove the controller

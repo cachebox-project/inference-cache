@@ -85,12 +85,11 @@ func UpsertArgPair(args []string, flag, value string) []string {
 			}
 			return append(args, value)
 		case strings.HasPrefix(arg, prefix):
+			args = append(args, "")
+			copy(args[i+2:], args[i+1:])
 			args[i] = flag
-			out := make([]string, 0, len(args)+1)
-			out = append(out, args[:i+1]...)
-			out = append(out, value)
-			out = append(out, args[i+1:]...)
-			return out
+			args[i+1] = value
+			return args
 		}
 	}
 	return append(args, flag, value)
