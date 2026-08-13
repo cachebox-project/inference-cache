@@ -171,6 +171,14 @@ kubectl create namespace "$SMOKE_NAMESPACE" --dry-run=client -o yaml | kubectl a
 
 log "creating typed PodLocal and NodeLocal MP backends"
 cat <<'EOF' | kubectl -n "$SMOKE_NAMESPACE" apply -f - >/dev/null
+apiVersion: v1
+kind: Secret
+metadata:
+  name: managed-redis-auth
+type: Opaque
+stringData:
+  password: install-smoke-password
+---
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -232,7 +240,11 @@ spec:
       nodeSelector:
         kubernetes.io/os: linux
       terminationGracePeriodSeconds: 45
-    redis: {}
+    redis:
+      authentication:
+        password:
+          name: managed-redis-auth
+          key: password
 ---
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
@@ -311,6 +323,21 @@ managed_os="$(kubectl -n "$SMOKE_NAMESPACE" get deployment managed-redis -o json
 [ "$managed_os" = "linux" ] || fail "managed workload nodeSelector was not rendered"
 managed_grace="$(kubectl -n "$SMOKE_NAMESPACE" get deployment managed-redis -o jsonpath='{.spec.template.spec.terminationGracePeriodSeconds}')"
 [ "$managed_grace" = "45" ] || fail "managed workload terminationGracePeriodSeconds was not rendered"
+managed_command="$(kubectl -n "$SMOKE_NAMESPACE" get deployment managed-redis -o jsonpath='{.spec.template.spec.containers[0].command}')"
+[ -z "$managed_command" ] || fail "authenticated managed Redis overrides its image entrypoint: $managed_command"
+managed_requirepass_arg="$(kubectl -n "$SMOKE_NAMESPACE" get deployment managed-redis -o jsonpath='{.spec.template.spec.containers[0].args[-2]}')"
+[ "$managed_requirepass_arg" = "--requirepass" ] || fail "authenticated managed Redis is missing --requirepass"
+managed_password_arg="$(kubectl -n "$SMOKE_NAMESPACE" get deployment managed-redis -o jsonpath='{.spec.template.spec.containers[0].args[-1]}')"
+[ "$managed_password_arg" = '$(REDIS_PASSWORD)' ] || fail "authenticated managed Redis does not use the Secret-backed password environment reference"
+kubectl -n "$SMOKE_NAMESPACE" rollout status deployment/managed-redis --timeout="$READY_TIMEOUT" >/dev/null \
+  || fail "authenticated managed Redis did not become available"
+managed_pod="$(kubectl -n "$SMOKE_NAMESPACE" get pod -l app.kubernetes.io/instance=managed-redis -o jsonpath='{.items[0].metadata.name}')"
+[ -n "$managed_pod" ] || fail "authenticated managed Redis Pod was not found"
+unauthenticated_ping="$(kubectl -n "$SMOKE_NAMESPACE" exec "$managed_pod" -- sh -c 'unset REDISCLI_AUTH; redis-cli ping' 2>&1 || true)"
+grep -Fq 'NOAUTH Authentication required' <<<"$unauthenticated_ping" \
+  || fail "managed Redis accepted an unauthenticated PING: $unauthenticated_ping"
+[ "$(kubectl -n "$SMOKE_NAMESPACE" exec "$managed_pod" -- redis-cli ping)" = "PONG" ] \
+  || fail "managed Redis Secret-backed authenticated PING failed"
 
 log "checking NodeLocal creates no speculative server before an engine is scheduled"
 [ "$(kubectl -n "$SMOKE_NAMESPACE" get pods -l inferencecache.io/lmcache-node-server=true --no-headers 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \

@@ -188,6 +188,7 @@ func TestResolveRedisL2ServerImageOverride(t *testing.T) {
 
 func TestResolveRedisL2ServerPasswordAuthentication(t *testing.T) {
 	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang")
+	cb.Spec.RemoteStorage.Redis.Image = "registry.example/redis-compatible@sha256:deadbeef"
 	cb.Spec.RemoteStorage.Redis.Authentication = &cachev1alpha1.RedisAuthenticationSpec{
 		Password: corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: "credential-source"},
@@ -199,12 +200,18 @@ func TestResolveRedisL2ServerPasswordAuthentication(t *testing.T) {
 		t.Fatalf("ResolveRedisL2Server: %v", err)
 	}
 	c := pod.Containers[0]
-	if len(c.Command) != 2 || c.Command[0] != "/bin/sh" || c.Command[1] != "-c" {
-		t.Fatalf("authenticated Redis command = %v", c.Command)
+	if c.Image != "registry.example/redis-compatible@sha256:deadbeef" {
+		t.Fatalf("authenticated Redis image = %q, want custom compatible image", c.Image)
+	}
+	if len(c.Command) != 0 {
+		t.Fatalf("authenticated Redis command = %v, want the custom image entrypoint preserved", c.Command)
+	}
+	if password, found := argVal(c.Args, "--requirepass"); !found || password != "$(REDIS_PASSWORD)" {
+		t.Fatalf("authenticated Redis --requirepass = %q (found=%v), want kubelet-expanded environment reference", password, found)
 	}
 	joined := strings.Join(c.Args, " ")
-	if !strings.Contains(joined, "/usr/local/bin/docker-entrypoint.sh") || !strings.Contains(joined, `--requirepass "$REDIS_PASSWORD"`) {
-		t.Fatalf("authenticated Redis args = %s", joined)
+	if strings.Contains(joined, "docker-entrypoint.sh") || strings.Contains(joined, "/bin/sh") {
+		t.Fatalf("authenticated Redis args depend on an image-private shell or entrypoint: %s", joined)
 	}
 	if strings.Contains(joined, "credential-source") {
 		t.Fatalf("secret name leaked into args: %s", joined)

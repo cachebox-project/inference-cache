@@ -129,9 +129,10 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 	// Managed authentication configures BOTH ends of the binding: this Redis
 	// process requires the Secret-backed password, while the MP renderer maps
 	// the same selector to LMCACHE_RESP_PASSWORD. The secret value never enters
-	// the PodSpec or CacheBackend status. The shell expands it only inside the
-	// container and then explicitly invokes the official image entrypoint, which
-	// preserves its root-to-redis privilege drop.
+	// the PodSpec or CacheBackend status. Kubelet expands the environment
+	// reference in Args before invoking the image's own entrypoint, so managed
+	// authentication does not depend on the official Redis image's private
+	// docker-entrypoint.sh path.
 	if storage := cache.Spec.EffectiveRemoteStorage(); storage != nil && storage.Redis != nil && storage.Redis.Authentication != nil {
 		redis := storage.Redis
 		auth := redis.Authentication
@@ -143,10 +144,7 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 			corev1.EnvVar{Name: redisPasswordEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: passwordRef}},
 			corev1.EnvVar{Name: redisCLIAuthEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: auth.Password.DeepCopy()}},
 		)
-		const authScript = `set -eu
-exec /usr/local/bin/docker-entrypoint.sh "$@" --requirepass "$REDIS_PASSWORD"`
-		container.Command = []string{"/bin/sh", "-c"}
-		container.Args = append([]string{authScript, "inference-cache-redis-auth"}, container.Args...)
+		container.Args = append(container.Args, "--requirepass", "$("+redisPasswordEnv+")")
 		// REDISCLI_AUTH lets redis-cli authenticate without placing the password
 		// in the probe command. A TCP-only probe would declare a server Ready even
 		// if AUTH setup were unusable.
