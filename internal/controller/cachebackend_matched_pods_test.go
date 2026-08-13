@@ -598,9 +598,9 @@ func TestReconcileMatchedEnginePodsCoexistsWithOtherStatusWriters(t *testing.T) 
 // TestReconcileMatchedEnginePodsUsesAPIReaderForPods pins the structural
 // invariant the locked design called out: the pod List backing
 // matchedEnginePods MUST go through the manager's APIReader (uncached live
-// client), not the manager's cached Client. Using Client would make
-// controller-runtime register a cluster-wide Pod informer just to maintain
-// this snapshot count — exactly what the "no Pod watch" rule rejects.
+// client), not the manager's cached Client. The Pod watch supplies the trigger;
+// the live List supplies an authoritative snapshot even when the informer that
+// delivered that trigger has not yet converged.
 //
 // The test plumbs Client and APIReader to two DIFFERENT fake clients (the
 // Client carries the CB but ZERO pods; the APIReader carries ZERO CBs but

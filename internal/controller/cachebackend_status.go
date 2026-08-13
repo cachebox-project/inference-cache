@@ -698,18 +698,15 @@ type matchedEnginePodsRefresh struct {
 // reconciler and with any future status writers (e.g. an index-participation
 // projector) that touch different sub-fields.
 //
-// Cadence-by-reconcile, not real-time: counts via a single namespaced
-// client.List with the engineSelector — there is no Pod watch, and pod
-// births/deaths between reconciles are not reflected until the next pass.
-// To keep the count from going indefinitely stale between unrelated
-// reconcile triggers, the Reconcile path sets `result.RequeueAfter =
-// matchedEnginePodsRequeueInterval` whenever the CR has a non-empty
-// EngineSelector, giving the field a bounded staleness without paying
-// for a Pod informer. The real-time per-pod signal lives on the engine
-// pods themselves (the `InjectedByCacheBackend` Event the
-// engine-pod-events controller emits on every annotated pod); this
-// status field answers the cluster-wide "is anyone connected at all?"
-// question.
+// Pod changes mapped to this CacheBackend normally trigger the refresh
+// immediately. The count itself comes from one namespaced APIReader List with
+// the engineSelector so reconciliation uses an authoritative snapshot rather
+// than a potentially lagging informer cache. The periodic
+// matchedEnginePodsRequeueInterval remains a bounded-staleness fallback for a
+// missed or coalesced watch event. The real-time per-pod signal also lives on
+// the engine pods themselves (the `InjectedByCacheBackend` Event the
+// engine-pod-events controller emits on every annotated pod); this status field
+// answers the cluster-wide "is anyone connected at all?" question.
 //
 // Selector resolution mirrors the mutating webhook's policy: a nil or
 // empty MatchLabels matches nothing (a broad selector at admission time

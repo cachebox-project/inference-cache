@@ -55,9 +55,10 @@ func isTypedLMCachePodLocal(backend *cachev1alpha1.CacheBackend) bool {
 // from the optional remote L3. Native sidecars report their state under
 // status.initContainerStatuses, not containerStatuses.
 //
-// Like matchedEnginePods, this is a bounded-cadence observation rather than a
-// cluster-wide Pod watch. List/patch errors preserve the prior verdict and are
-// fail-soft so connector observability cannot block normal reconciliation.
+// Mapped engine and NodeLocal-server Pod changes normally trigger this
+// observation immediately; periodic reconciliation is the bounded-staleness
+// fallback. List/patch errors preserve the prior verdict and are fail-soft so
+// connector observability cannot block normal reconciliation.
 func (r *CacheBackendReconciler) refreshLMCacheMPConnectorStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend) {
 	if !isTypedLMCacheMP(backend) {
 		if backend.Status.Connector == nil && meta.FindStatusCondition(backend.Status.Conditions, conditionTypeConnectorReady) == nil {
