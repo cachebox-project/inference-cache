@@ -407,7 +407,7 @@ node_local_shm_name="lmcache_l1_pool_inferencecache_${node_local_backend_uid}"
   || fail "NodeLocal server does not carry its UID-scoped shared-memory identity"
 node_local_shm_arg="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" \
   -o jsonpath='{range .spec.containers[?(@.name=="lmcache-mp-server")].args[*]}{@}{"\n"}{end}' | \
-  awk 'previous == "--shm-name" { print; exit } { previous = $0 }')"
+  awk 'previous == "--shm-name" && value == "" { value = $0 } { previous = $0 } END { print value }')"
 [ "$node_local_shm_arg" = "$node_local_shm_name" ] \
   || fail "NodeLocal server does not pass its UID-scoped --shm-name: $node_local_shm_arg"
 node_local_ports="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{range .spec.containers[?(@.name=="lmcache-mp-server")].ports[*]}{.containerPort}:{.hostPort}{" "}{end}')"

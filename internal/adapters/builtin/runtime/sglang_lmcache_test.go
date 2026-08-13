@@ -160,6 +160,18 @@ func TestSGLangInjectsMetricsOnlyWhenSubscriberWillAttach(t *testing.T) {
 	}
 }
 
+func TestSGLangMetricsInjectionRequiresEngineContainer(t *testing.T) {
+	cache := observedTypedSGLangBackend("gemma")
+	err := ensureSGLangMetricsForSubscriber(
+		&corev1.PodSpec{Containers: []corev1.Container{{Name: "worker"}, {Name: "sidecar"}}},
+		cache,
+		SubscriberConfig{Image: "subscriber:pinned"},
+	)
+	if err == nil || !strings.Contains(err.Error(), SGLangEngineContainerName) {
+		t.Fatalf("ensureSGLangMetricsForSubscriber error = %v, want missing engine container", err)
+	}
+}
+
 func TestSGLangValidateTypedMPEnginePodPageSize(t *testing.T) {
 	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{}).(runtimeadapter.LMCacheMPRuntimeAdapter)
 	tests := []struct {
@@ -191,6 +203,84 @@ func TestSGLangValidateTypedMPEnginePodPageSize(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("ValidateMPEnginePod error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestSGLangValidateRejectsIncompleteTopology(t *testing.T) {
+	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{}).(runtimeadapter.LMCacheMPRuntimeAdapter)
+	validPod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Args: []string{"--page-size", "64"}}}}}
+	tests := []struct {
+		name    string
+		pod     *corev1.Pod
+		cache   *cachev1alpha1.CacheBackend
+		wantErr string
+	}{
+		{name: "nil pod", cache: typedSGLangBackend(), wantErr: "pod is nil"},
+		{name: "nil cache", pod: validPod, wantErr: "configuration is missing"},
+		{name: "missing LMCache", pod: validPod, cache: &cachev1alpha1.CacheBackend{}, wantErr: "configuration is missing"},
+		{name: "missing PodLocal server", pod: validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := typedSGLangBackend()
+			cache.Spec.LMCache.PodLocal = nil
+			return cache
+		}(), wantErr: "PodLocal server configuration is missing"},
+		{name: "missing NodeLocal server", pod: validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := typedSGLangBackend()
+			cache.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
+			cache.Spec.LMCache.PodLocal = nil
+			return cache
+		}(), wantErr: "NodeLocal server configuration is missing"},
+		{name: "unsupported topology", pod: validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := typedSGLangBackend()
+			cache.Spec.LMCache.Topology = "Remote"
+			return cache
+		}(), wantErr: "topology \"Remote\" is not implemented"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := adapter.ValidateMPEnginePod(tc.pod, tc.cache)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateMPEnginePod error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestSGLangInjectRejectsInvalidInputs(t *testing.T) {
+	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{})
+	validPod := corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName}}}
+	tests := []struct {
+		name    string
+		pod     *corev1.PodSpec
+		cache   *cachev1alpha1.CacheBackend
+		wantErr string
+	}{
+		{name: "nil pod", cache: typedSGLangBackend(), wantErr: "pod is nil"},
+		{name: "nil cache", pod: &validPod, wantErr: "cache is nil"},
+		{name: "missing LMCache", pod: &validPod, cache: &cachev1alpha1.CacheBackend{}, wantErr: "typed server configuration is required"},
+		{name: "missing PodLocal server", pod: &validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := typedSGLangBackend()
+			cache.Spec.LMCache.PodLocal = nil
+			return cache
+		}(), wantErr: "typed PodLocal server configuration is required"},
+		{name: "missing NodeLocal server", pod: &validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := typedSGLangBackend()
+			cache.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
+			cache.Spec.LMCache.PodLocal = nil
+			return cache
+		}(), wantErr: "typed NodeLocal server configuration is required"},
+		{name: "unsupported topology", pod: &validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := typedSGLangBackend()
+			cache.Spec.LMCache.Topology = "Remote"
+			return cache
+		}(), wantErr: "topology \"Remote\" is not implemented"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := adapter.InjectEngineConfig(tc.pod, nil, tc.cache)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("InjectEngineConfig error = %v, want substring %q", err, tc.wantErr)
 			}
 		})
 	}

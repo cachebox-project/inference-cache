@@ -30,19 +30,17 @@ import (
 // DefaultMatchedEnginePodsRequeueInterval is the steady-state cadence at
 // which a CacheBackend with a configured spec.engineSelector self-requeues,
 // so the `status.matchedEnginePods` snapshot does not stay stale forever
-// between otherwise-unrelated reconcile triggers. The reconciler does not
-// Watch Pods by design (see refreshMatchedEnginePods godoc); without a
-// self-requeue, the count would only refresh when the CR, the owned
-// Deployment or Service changed. 30s strikes a balance between
-// operator responsiveness and reconcile pressure on a large fleet. Tests
-// override via the `MatchedEnginePodsRequeueInterval` reconciler field to
-// avoid baking the 30s delay into the suite.
+// if a Pod watch event is missed or coalesced. Pod events normally trigger an
+// immediate reconcile; the 30s safety net balances eventual correction with
+// reconcile pressure on a large fleet. Tests override via the
+// `MatchedEnginePodsRequeueInterval` reconciler field to avoid baking the 30s
+// delay into the suite.
 const DefaultMatchedEnginePodsRequeueInterval = 30 * time.Second
 
 // DefaultMatchedEnginePodsChurnRequeueInterval is the faster cadence used when
 // the observed pod count disagrees with the desired-replica sum of Deployments
 // whose pod-template labels match the CacheBackend's engineSelector. It keeps
-// rolling restarts and scale churn visible without adding a Pod watch.
+// rolling restarts and scale churn visible while Pod watch events converge.
 const DefaultMatchedEnginePodsChurnRequeueInterval = 5 * time.Second
 
 // CacheBackendReconciler reconciles a CacheBackend object.
@@ -51,13 +49,11 @@ type CacheBackendReconciler struct {
 	Scheme   *runtime.Scheme
 	Log      logr.Logger
 	Recorder events.EventRecorder
-	// APIReader is an uncached live client used for the per-reconcile pod
-	// List that backs status.matchedEnginePods. The cached client would
-	// register a Pod informer with controller-runtime, which the locked
-	// design explicitly rejected (would watch all pods cluster-wide
-	// just to count per-CR; the per-reconcile namespaced live List is
-	// cheaper at the cluster sizes we target). Production wiring passes
-	// mgr.GetAPIReader(); tests that don't exercise the
+	// APIReader is an uncached live client used for per-reconcile Pod lists that
+	// back engine demand and status. The Pod watch supplies prompt reconcile
+	// events, while the live reader avoids acting on an informer snapshot that
+	// has not yet observed the scheduling, readiness, or deletion event.
+	// Production wiring passes mgr.GetAPIReader(); tests that don't exercise the
 	// matchedEnginePods writer can leave it nil (a nil APIReader makes
 	// refreshMatchedEnginePods fall through to the embedded
 	// client.Client so existing fake-client tests still work).

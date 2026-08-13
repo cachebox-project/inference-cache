@@ -152,10 +152,13 @@ func TestVLLMLMCacheMPValidateEngineParallelism(t *testing.T) {
 		{name: "TP malformed", args: []string{"--tensor-parallel-size"}, wantErr: "malformed"},
 		{name: "TP zero", args: []string{"--tensor-parallel-size=0"}, wantErr: "positive integer"},
 		{name: "PP two", args: []string{"--pipeline-parallel-size=2"}, wantErr: "pipeline parallel size 2"},
+		{name: "PP malformed", args: []string{"--pipeline-parallel-size"}, wantErr: "pipeline parallelism"},
 		{name: "DP two", args: []string{"-dp", "2"}, wantErr: "data parallel size 2"},
+		{name: "DP malformed", args: []string{"--data-parallel-size"}, wantErr: "data parallelism"},
 		{name: "external DP rank", args: []string{"--data-parallel-rank=0"}, wantErr: "multi-process data parallel flag"},
 		{name: "hybrid flag value", args: []string{"--disable-hybrid-kv-cache-manager=false"}, wantErr: "boolean flag"},
 		{name: "hybrid split value", args: []string{"--disable-hybrid-kv-cache-manager", "false"}, wantErr: "boolean flag"},
+		{name: "duplicate hybrid flag", args: []string{"--disable-hybrid-kv-cache-manager", "--disable-hybrid-kv-cache-manager"}, wantErr: "duplicated"},
 		{name: "duplicate transfer config", args: []string{"--kv-transfer-config", "{}", "--kv-transfer-config={}"}, wantErr: "at most once"},
 	}
 	for _, tc := range tests {
@@ -174,11 +177,52 @@ func TestVLLMLMCacheMPValidateEngineParallelism(t *testing.T) {
 	}
 }
 
+func TestVLLMLMCacheMPValidateRejectsIncompleteTopology(t *testing.T) {
+	adapter := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(runtimeadapter.LMCacheMPRuntimeAdapter)
+	validPod := newVLLMMPEnginePod()
+	tests := []struct {
+		name    string
+		pod     *corev1.Pod
+		cache   *cachev1alpha1.CacheBackend
+		wantErr string
+	}{
+		{name: "nil pod", cache: newTypedVLLMMPBackend(), wantErr: "pod is nil"},
+		{name: "nil cache", pod: validPod, wantErr: "configuration is missing"},
+		{name: "missing LMCache", pod: validPod, cache: &cachev1alpha1.CacheBackend{}, wantErr: "configuration is missing"},
+		{name: "missing PodLocal server", pod: validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := newTypedVLLMMPBackend()
+			cache.Spec.LMCache.PodLocal = nil
+			return cache
+		}(), wantErr: "PodLocal server configuration is missing"},
+		{name: "missing NodeLocal server", pod: validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := newTypedVLLMMPBackend()
+			cache.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
+			cache.Spec.LMCache.PodLocal = nil
+			return cache
+		}(), wantErr: "NodeLocal server configuration is missing"},
+		{name: "unsupported topology", pod: validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := newTypedVLLMMPBackend()
+			cache.Spec.LMCache.Topology = "Remote"
+			return cache
+		}(), wantErr: "topology \"Remote\" is not implemented"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := adapter.ValidateMPEnginePod(tc.pod, tc.cache)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateMPEnginePod error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestVLLMLMCacheMPKVTransferConfigRoles(t *testing.T) {
 	tests := []struct {
 		role cachev1alpha1.CacheBackendIntegrationRole
 		want string
 	}{
+		{role: cachev1alpha1.CacheBackendIntegrationRoleReadOnly, want: kvRoleConsumer},
+		{role: cachev1alpha1.CacheBackendIntegrationRoleWriteOnly, want: kvRoleProducer},
 		{role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite, want: kvRoleBoth},
 		{role: "", want: kvRoleBoth},
 	}
@@ -203,6 +247,50 @@ func TestVLLMLMCacheMPKVTransferConfigRoles(t *testing.T) {
 	}
 	if _, err := vllmMPKVTransferConfigJSON("future", 6500); err == nil {
 		t.Fatal("unknown role unexpectedly admitted")
+	}
+}
+
+func TestVLLMLMCacheMPInjectRejectsInvalidInputs(t *testing.T) {
+	adapter := NewVLLMLMCacheMPAdapter(SubscriberConfig{})
+	validPod := newVLLMMPEnginePod().Spec
+	tests := []struct {
+		name    string
+		pod     *corev1.PodSpec
+		binding *backendadapter.Binding
+		cache   *cachev1alpha1.CacheBackend
+		wantErr string
+	}{
+		{name: "nil pod", cache: newTypedVLLMMPBackend(), wantErr: "pod is nil"},
+		{name: "nil cache", pod: &validPod, wantErr: "cache is nil"},
+		{name: "missing LMCache", pod: &validPod, cache: &cachev1alpha1.CacheBackend{}, wantErr: "typed server configuration is required"},
+		{name: "unsupported binding", pod: &validPod, cache: newTypedVLLMMPBackend(), binding: &backendadapter.Binding{Protocol: backendadapter.Protocol("grpc")}, wantErr: "does not support remote binding"},
+		{name: "missing PodLocal server", pod: &validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := newTypedVLLMMPBackend()
+			cache.Spec.LMCache.PodLocal = nil
+			return cache
+		}(), wantErr: "typed PodLocal server configuration is required"},
+		{name: "missing NodeLocal server", pod: &validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := newTypedVLLMMPBackend()
+			cache.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
+			cache.Spec.LMCache.PodLocal = nil
+			return cache
+		}(), wantErr: "typed NodeLocal server configuration is required"},
+		{name: "unsupported topology", pod: &validPod, cache: func() *cachev1alpha1.CacheBackend {
+			cache := newTypedVLLMMPBackend()
+			cache.Spec.LMCache.Topology = "Remote"
+			return cache
+		}(), wantErr: "topology \"Remote\" is not implemented"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := adapter.InjectEngineConfig(tc.pod, tc.binding, tc.cache)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("InjectEngineConfig error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+	if err := adapter.InjectRouterConfig(nil, nil, nil); err != nil {
+		t.Fatalf("InjectRouterConfig = %v, want nil", err)
 	}
 }
 

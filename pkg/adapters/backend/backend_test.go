@@ -5,11 +5,32 @@
 package backend
 
 import (
+	"strings"
 	"testing"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 )
+
+func TestValidateExternalEndpointRejectsMissingProtocolAndAddress(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider cachev1alpha1.CacheBackendRemoteStorageProvider
+		endpoint string
+		want     string
+	}{
+		{name: "unsupported provider", provider: cachev1alpha1.CacheBackendRemoteStorageProvider("future"), endpoint: "cache.example:6379", want: "no endpoint protocol"},
+		{name: "empty endpoint", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, want: "endpoint is empty"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateExternalEndpoint(tc.provider, tc.endpoint)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateExternalEndpoint error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
 
 func TestBindingForKeepsResolvedExternalEndpoint(t *testing.T) {
 	storage := &cachev1alpha1.CacheBackendRemoteStorageSpec{

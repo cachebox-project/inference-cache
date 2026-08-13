@@ -194,6 +194,29 @@ func TestRenderLMCachePodLocalServerCollisionIsAtomic(t *testing.T) {
 				Volumes:    []corev1.Volume{{Name: lmCacheMPConfigVolumeName, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "foreign"}}}},
 			},
 		},
+		{
+			name: "foreign config mount",
+			pod: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "engine", VolumeMounts: []corev1.VolumeMount{{Name: "foreign-config", MountPath: lmCacheMPConfigMountPath}}}},
+				Volumes:    []corev1.Volume{{Name: "foreign-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{}}}},
+			},
+		},
+		{
+			name: "read-only shm mount",
+			pod: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "engine", VolumeMounts: []corev1.VolumeMount{{Name: "engine-shm", MountPath: lmCacheMPShmMountPath, ReadOnly: true}}}},
+				Volumes: []corev1.Volume{{Name: "engine-shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium: corev1.StorageMediumMemory, SizeLimit: func() *resource.Quantity { q := resource.MustParse("6Gi"); return &q }(),
+				}}}},
+			},
+		},
+		{
+			name: "foreign reserved shm volume",
+			pod: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "engine"}},
+				Volumes:    []corev1.Volume{{Name: lmCacheMPShmVolumeName, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "foreign"}}}},
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -205,6 +228,43 @@ func TestRenderLMCachePodLocalServerCollisionIsAtomic(t *testing.T) {
 				t.Fatalf("failed render mutated pod\nbefore=%+v\nafter=%+v", before, &tc.pod)
 			}
 		})
+	}
+}
+
+func TestRenderLMCachePodLocalServerRejectsInvalidInputs(t *testing.T) {
+	validPod := func() *corev1.PodSpec {
+		return &corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}}}
+	}
+	tests := []struct {
+		name    string
+		pod     *corev1.PodSpec
+		cfg     lmCacheMPServerConfig
+		wantErr string
+	}{
+		{name: "nil pod", cfg: testLMCacheMPConfig(), wantErr: "pod spec is nil"},
+		{name: "ambiguous engine", pod: &corev1.PodSpec{Containers: []corev1.Container{{Name: "worker"}, {Name: "sidecar"}}}, cfg: testLMCacheMPConfig(), wantErr: "none is named \"engine\""},
+		{name: "invalid config", pod: validPod(), cfg: lmCacheMPServerConfig{}, wantErr: "image is empty"},
+		{name: "unsupported binding", pod: validPod(), cfg: func() lmCacheMPServerConfig {
+			cfg := testLMCacheMPConfig()
+			cfg.Binding = &backendadapter.Binding{Protocol: backendadapter.Protocol("grpc")}
+			return cfg
+		}(), wantErr: "unsupported remote protocol"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := renderLMCachePodLocalServer(tc.pod, "engine", tc.cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("renderLMCachePodLocalServer error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+
+	budget := resource.MustParse("5Gi")
+	if err := checkLMCacheMPShmBudget(nil, corev1.VolumeMount{Name: "missing"}, budget); err == nil || !strings.Contains(err.Error(), "missing volume") {
+		t.Fatalf("checkLMCacheMPShmBudget error = %v, want missing volume", err)
+	}
+	if _, err := lmCacheMPServerContainer(lmCacheMPServerConfig{}, "", nil, corev1.VolumeMount{}); err == nil || !strings.Contains(err.Error(), "greater than zero") {
+		t.Fatalf("lmCacheMPServerContainer error = %v, want invalid capacity", err)
 	}
 }
 
