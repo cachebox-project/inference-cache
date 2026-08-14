@@ -5,23 +5,80 @@
 package backend
 
 import (
+	"strings"
 	"testing"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 )
+
+func TestValidateExternalEndpointRejectsMissingProtocolAndAddress(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider cachev1alpha1.CacheBackendRemoteStorageProvider
+		endpoint string
+		want     string
+	}{
+		{name: "unsupported provider", provider: cachev1alpha1.CacheBackendRemoteStorageProvider("future"), endpoint: "cache.example:6379", want: "no endpoint protocol"},
+		{name: "empty endpoint", provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, want: "endpoint is empty"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateExternalEndpoint(tc.provider, tc.endpoint)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateExternalEndpoint error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
 
 func TestBindingForKeepsResolvedExternalEndpoint(t *testing.T) {
 	storage := &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
 		Endpoint:  "  cache.example:65432  ",
 	}
 
-	got := BindingFor(storage, ProtocolLMCache, "cache.example:65432")
+	got := BindingFor(storage, ProtocolRESP, "cache.example:65432")
 	if got == nil {
 		t.Fatal("BindingFor returned nil")
 	}
 	if got.Endpoint != "cache.example:65432" {
 		t.Fatalf("binding endpoint = %q, want caller-resolved endpoint", got.Endpoint)
+	}
+}
+
+func TestBindingForCarriesOnlyTypedRedisConnectionSettings(t *testing.T) {
+	database := int32(3)
+	storage := &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+		Endpoint:  "redis.example:6379",
+		Redis: &cachev1alpha1.RedisRemoteStorageSpec{
+			Image:    "must-not-be-part-of-runtime-binding",
+			Database: &database,
+			Authentication: &cachev1alpha1.RedisAuthenticationSpec{
+				Password: corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"},
+					Key:                  "password",
+				},
+			},
+		},
+	}
+
+	got := BindingFor(storage, ProtocolRESP, "redis.example:6379")
+	if got == nil || got.Redis == nil {
+		t.Fatalf("BindingFor = %+v, want typed Redis binding", got)
+	}
+	if got.Redis.Authentication == nil || got.Redis.Authentication.Password.Name != "redis-auth" {
+		t.Fatalf("Redis authentication = %+v, want secret selector", got.Redis.Authentication)
+	}
+	if got.Redis.Database == nil || *got.Redis.Database != 3 {
+		t.Fatalf("Redis database = %v, want 3", got.Redis.Database)
+	}
+	*storage.Redis.Database = 9
+	storage.Redis.Authentication.Password.Name = "changed"
+	if *got.Redis.Database != 3 || got.Redis.Authentication.Password.Name != "redis-auth" {
+		t.Fatalf("binding aliases mutable spec data: %+v", got.Redis)
 	}
 }

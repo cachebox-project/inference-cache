@@ -6,38 +6,41 @@ package controller
 
 import (
 	"context"
+	"strings"
+	"time"
+
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
-	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"time"
+	ctrlreconcile "sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // DefaultMatchedEnginePodsRequeueInterval is the steady-state cadence at
 // which a CacheBackend with a configured spec.engineSelector self-requeues,
 // so the `status.matchedEnginePods` snapshot does not stay stale forever
-// between otherwise-unrelated reconcile triggers. The reconciler does not
-// Watch Pods by design (see refreshMatchedEnginePods godoc); without a
-// self-requeue, the count would only refresh when the CR, the owned
-// Deployment, Service, or HPA changed. 30s strikes a balance between
-// operator responsiveness and reconcile pressure on a large fleet. Tests
-// override via the `MatchedEnginePodsRequeueInterval` reconciler field to
-// avoid baking the 30s delay into the suite.
+// if a Pod watch event is missed or coalesced. Pod events normally trigger an
+// immediate reconcile; the 30s safety net balances eventual correction with
+// reconcile pressure on a large fleet. Tests override via the
+// `MatchedEnginePodsRequeueInterval` reconciler field to avoid baking the 30s
+// delay into the suite.
 const DefaultMatchedEnginePodsRequeueInterval = 30 * time.Second
 
 // DefaultMatchedEnginePodsChurnRequeueInterval is the faster cadence used when
 // the observed pod count disagrees with the desired-replica sum of Deployments
 // whose pod-template labels match the CacheBackend's engineSelector. It keeps
-// rolling restarts and scale churn visible without adding a Pod watch.
+// rolling restarts and scale churn visible while Pod watch events converge.
 const DefaultMatchedEnginePodsChurnRequeueInterval = 5 * time.Second
 
 // CacheBackendReconciler reconciles a CacheBackend object.
@@ -46,13 +49,11 @@ type CacheBackendReconciler struct {
 	Scheme   *runtime.Scheme
 	Log      logr.Logger
 	Recorder events.EventRecorder
-	// APIReader is an uncached live client used for the per-reconcile pod
-	// List that backs status.matchedEnginePods. The cached client would
-	// register a Pod informer with controller-runtime, which the locked
-	// design explicitly rejected (would watch all pods cluster-wide
-	// just to count per-CR; the per-reconcile namespaced live List is
-	// cheaper at the cluster sizes we target). Production wiring passes
-	// mgr.GetAPIReader(); tests that don't exercise the
+	// APIReader is an uncached live client used for per-reconcile Pod lists that
+	// back engine demand and status. The Pod watch supplies prompt reconcile
+	// events, while the live reader avoids acting on an informer snapshot that
+	// has not yet observed the scheduling, readiness, or deletion event.
+	// Production wiring passes mgr.GetAPIReader(); tests that don't exercise the
 	// matchedEnginePods writer can leave it nil (a nil APIReader makes
 	// refreshMatchedEnginePods fall through to the embedded
 	// client.Client so existing fake-client tests still work).
@@ -95,20 +96,6 @@ type CacheBackendReconciler struct {
 	// sync.Map inside is usable from struct construction — the rate-limit
 	// gate works on the first reconcile without explicit initialization.
 	probeLimiter probeRateLimiter
-
-	// MinServerRestartCascadeInterval overrides the rate-limit window for
-	// the cache-server restart cascade. Zero means "use
-	// [DefaultMinServerRestartCascadeInterval]". Production wiring leaves
-	// this zero; envtest / unit tests shrink the window to keep per-test
-	// runtime cheap.
-	MinServerRestartCascadeInterval time.Duration
-
-	// serverInstanceCascade tracks the last cascade-restart time per
-	// backend so the rate-limit window is enforced in-process. Lazily
-	// initialized in SetupWithManager AND defensively in
-	// reconcileServerInstance (the latter so unit tests that bypass
-	// SetupWithManager get a working reconciler).
-	serverInstanceCascade *serverInstanceCascade
 }
 
 // probeRateLimit returns the effective rate-limit for the functional-probe
@@ -147,17 +134,14 @@ func (r *CacheBackendReconciler) matchedEnginePodsChurnRequeueInterval() time.Du
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// Reconcile drives a CacheBackend toward its desired state. External backends
-// only mirror their configured endpoint to status; managed backends (LMCache
-// in Phase 1) ask the registered runtime adapter for the cache-server pod
-// spec + service spec, wrap them into a Deployment + Service the controller
-// owns, optionally reconcile an HPA from spec.autoscaling, and publish the
-// resolved endpoint.
+// Reconcile drives a CacheBackend toward its desired state. External Redis
+// bindings mirror their configured endpoint to remote-storage status; managed
+// Redis bindings render a singleton Deployment and Service. LMCache connector
+// health is derived independently from the selected engine Pods.
 //
 // On every reconcile — including ones that return an apply error — transitions
 // in the observed Ready condition (entering/leaving Ready=False/
@@ -197,14 +181,16 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// transient List/Patch errors so it never escalates a transient
 	// apiserver hiccup into a Reconcile error.
 	matchedRefresh := r.refreshMatchedEnginePods(ctx, &backend)
+	// Typed LMCache health comes from PodLocal native sidecars or NodeLocal
+	// on-demand server Pods and same-node engine coverage, independently from
+	// Redis readiness.
+	r.refreshLMCacheMPConnectorStatus(ctx, &backend)
 	// Self-requeue when there's matchedEnginePods work to keep doing on
 	// the next tick:
 	//
-	//   - A non-empty engineSelector is configured. The cadence tracks
-	//     pod birth/death between unrelated reconcile triggers. We
-	//     deliberately don't Watch Pods (see refreshMatchedEnginePods
-	//     godoc); the periodic self-requeue gives a bounded staleness
-	//     without the watch's overhead.
+	//   - A non-empty engineSelector is configured. Pod watches provide the
+	//     normal trigger; this cadence is a bounded-staleness fallback for
+	//     missed events and selector/annotation transitions.
 	//   - The selector is gone but status.matchedEnginePods is still
 	//     populated. That's the operator-just-removed-the-selector +
 	//     clear-patch-failed case: without a requeue the stale printer-
@@ -244,25 +230,18 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return result, err
 }
 
-// SetupWithManager sets up the controller with the Manager. Owns(Deployment)
-// guarantees that a child's status flipping (e.g. AvailableReplicas dropping
-// to zero) re-triggers a Reconcile so emitTransitionEvents observes the
-// change; the HPA is owned so the controller re-reconciles when the
-// autoscaler updates spec.replicas or its own status.
+// SetupWithManager sets up the controller with the Manager. Owned provider
+// workload changes and mapped engine/NodeLocal-server Pod changes re-trigger a
+// Reconcile so lifecycle, coverage, and transition Events track live state.
 func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder("cachebackend-controller")
 	}
 	if r.APIReader == nil {
-		// Default to the manager's uncached APIReader so production
-		// wiring doesn't have to thread it explicitly, AND envtest
-		// integration tests that boot a real manager still skip the
-		// Pod informer per the locked design (the test setup just
-		// passes Client, not APIReader).
+		// Use the uncached reader for demand/status snapshots. The Pod watch is
+		// the event trigger; an authoritative list avoids acting on an informer
+		// snapshot that has not yet observed the scheduling or deletion event.
 		r.APIReader = mgr.GetAPIReader()
-	}
-	if r.serverInstanceCascade == nil {
-		r.serverInstanceCascade = newServerInstanceCascade()
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		// NOTE: DO NOT add a predicate that filters status-only updates here.
@@ -274,6 +253,26 @@ func (r *CacheBackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&cachev1alpha1.CacheBackend{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
-		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(cacheBackendRequestForPod)).
 		Complete(r)
+}
+
+// cacheBackendRequestForPod maps controller-owned NodeLocal server Pods and
+// webhook-injected engine Pods back to their CacheBackend. Node assignment,
+// readiness, deletion, and server scheduling updates therefore drive on-demand
+// lifecycle and status immediately.
+func cacheBackendRequestForPod(_ context.Context, obj client.Object) []ctrlreconcile.Request {
+	if obj == nil {
+		return nil
+	}
+	if owner := metav1.GetControllerOf(obj); owner != nil && owner.Kind == "CacheBackend" && owner.APIVersion == cachev1alpha1.GroupVersion.String() {
+		return []ctrlreconcile.Request{{NamespacedName: client.ObjectKey{Namespace: obj.GetNamespace(), Name: owner.Name}}}
+	}
+	annotations := obj.GetAnnotations()
+	ref := annotations[enginebinding.AnnotationInjectedBy]
+	if !validCacheBackendRef(ref) || annotations[enginebinding.AnnotationInjectedByUID] == "" {
+		return nil
+	}
+	parts := strings.SplitN(ref, "/", 2)
+	return []ctrlreconcile.Request{{NamespacedName: client.ObjectKey{Namespace: parts[0], Name: parts[1]}}}
 }

@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Typed vLLM NodeLocal LMCache MP with one on-demand shared server on every node
+# that actually hosts a selected engine. The inference system remains the
+# scheduling authority; CacheBackend does not select nodes or change engine
+# placement. The server uses hostNetwork; the server and engines mount only this
+# backend UID's host /dev/shm/inference-cache/<uid> directory. Node firewall
+# policy must restrict the unauthenticated MP/HTTP host ports. CacheBackend does not
+# install LMCache into or replace the engine image. If NVIDIA is not the
+# engine/server runtime, set nodeLocal.scheduling.runtimeClassName.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: vllm-nodelocal-host-only
+spec:
+  runtime: VLLM
+  type: LMCache
+  integration:
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      inferencecache.io/cache-domain: vllm-node-mp
+  lmCache:
+    topology: NodeLocal
+    chunkSizeTokens: 256
+    nodeLocal:
+      idleRetentionSeconds: 300
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        httpPort: 8080
+        l1Capacity: 32Gi
+        maxGPUWorkers: 4
+        maxCPUWorkers: 4
+        resources:
+          requests:
+            cpu: "2"
+            memory: 33Gi
+          limits:
+            cpu: "4"
+            memory: 34Gi
+  observation:
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct

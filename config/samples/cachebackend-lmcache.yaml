@@ -2,28 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# A managed LMCache backend the controller reconciles into a standalone
-# lmcache-server Deployment + Service. Engine pods (vLLM) are user-owned;
-# spec.engineSelector identifies the pods the controller's mutating Pod
-# admission webhook auto-wires to the resolved cache endpoint published
-# in status.endpoint (as an engine-agnostic host:port — the adapter adds
-# the lm:// scheme on the engine env). Pods labeled to match are
-# auto-injected at admission with LMCACHE_REMOTE_URL/SERDE/CHUNK_SIZE/
-# LOCAL_CPU/MAX_LOCAL_CPU_SIZE + VLLM_USE_V1 + the LMCache
-# `--kv-transfer-config` arg; user-set env/args on the pod template
-# survive injection (the adapter merges, never clobbers). A pod can opt
-# out per-instance with the annotation `inferencecache.io/skip-inject`.
-#
-# Phase 1 manages a Deployment + ClusterIP Service on port 65432 (the
-# canonical LMCache lm:// port), plus an optional HorizontalPodAutoscaler
-# from spec.autoscaling. The lmcache-server keeps KV in memory; for a
-# durable / shared cache pick a backend designed for it (the planned
-# Mooncake backend) rather than a volume knob on this one — see
-# docs/design/lmcache-server-persistence.md.
-#
-# The engine cache and remote provider are explicit and independently owned:
-# spec.lmCache configures the vLLM-side connector/host tier, while
-# spec.remoteStorage.lmCacheServer configures the managed server workload.
+# Canonical vLLM PodLocal LMCache MP backend with a controller-managed Redis
+# remote L3. CacheBackend injects one native LMCache MP server sidecar per
+# matching engine Pod and points it at Redis; it never replaces the
+# inference-owner's engine image. This sample explicitly selects Redis to keep
+# cross-Pod sharing. It is not an automatic mapping from the legacy
+# removed LMCacheServer provider, whose IP data plane had different semantics.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -33,32 +17,43 @@ metadata:
 spec:
   runtime: VLLM
   type: LMCache
-  lmCache:
-    chunkSizeTokens: 256
-    hostMemory:
-      capacity: 20Gi
-  deploymentKind: Deployment
-  replicas: 1
   integration:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app.kubernetes.io/name: vllm
+      inferencecache.io/cache-domain: vllm-lmcache
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
   observation:
-    # Served model identifier the matched engine pods are loaded with.
-    # Plumbed to the auto-attached kvevent-subscriber sidecar's --model-id
-    # so the index keys per-replica entries by model. Omit (or set empty)
-    # to skip the subscriber sidecar (engine wiring still happens).
     modelID: meta-llama/Meta-Llama-3-8B-Instruct
   remoteStorage:
-    provider: LMCacheServer
+    provider: Redis
     ownership: Managed
-    lmCacheServer:
-      # Pin to an `@sha256:` digest for non-local runs and keep it
-      # wire-compatible with the engine's lmcache client.
-      image: lmcache/standalone:v0.4.7
+    # Optional scheduling/security applies only to the controller-managed
+    # provider Pod. It never mutates the inference-engine Pod.
+    workload:
+      nodeSelector:
+        kubernetes.io/os: linux
+    redis:
+      image: docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
       resources:
         requests:
+          cpu: 500m
           memory: 4Gi
         limits:
+          cpu: "2"
           memory: 8Gi

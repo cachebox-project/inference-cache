@@ -14,11 +14,14 @@ import (
 )
 
 // This file decodes vLLM's KV-cache event stream. vLLM publishes an EventBatch
-// per step as msgpack over ZMQ, using msgspec array-like tagged structs:
+// per step as msgpack over ZMQ. The EventBatch envelope is array-like. Current
+// vLLM releases encode nested KVCacheEvent structs as tagged maps, while SGLang
+// and older vLLM-compatible publishers encode them as tagged tuples:
 //
 //	EventBatch  = [ts(float), events([...]), ...]  // trailing fields (e.g. a
 //	                                                // data-parallel rank) are ignored
-//	event       = [tag(string), ...fields]   // tag is the struct name
+//	event       = {"type": tag, ...fields}  // vLLM 0.25+
+//	            | [tag(string), ...fields]  // SGLang / legacy compatibility
 //	  BlockStored      = ["BlockStored", block_hashes, parent_block_hash, token_ids, block_size, lora_id]
 //	  BlockRemoved     = ["BlockRemoved", block_hashes]
 //	  AllBlocksCleared = ["AllBlocksCleared"]
@@ -120,12 +123,18 @@ func DecodeEventBatch(payload []byte) (*EventBatch, error) {
 	return out, nil
 }
 
-// decodeEvent decodes a single [tag, ...fields] event. Returns (nil, nil) for an
-// unknown tag so new vLLM event types don't break older subscribers.
+// decodeEvent decodes either a current vLLM tagged map or a legacy/SGLang
+// [tag, ...fields] tuple. Returns (nil, nil) for an unknown tag so new event
+// types don't break older subscribers.
 func decodeEvent(raw msgpack.RawMessage) (Event, error) {
+	var keyed map[string]msgpack.RawMessage
+	if err := msgpack.Unmarshal(raw, &keyed); err == nil {
+		return decodeMapEvent(keyed)
+	}
+
 	var fields []msgpack.RawMessage
 	if err := msgpack.Unmarshal(raw, &fields); err != nil {
-		return nil, fmt.Errorf("decode event tuple: %w", err)
+		return nil, fmt.Errorf("decode event: want tagged map or tuple: %w", err)
 	}
 	if len(fields) == 0 {
 		return nil, fmt.Errorf("event tuple is empty")
@@ -193,6 +202,89 @@ func decodeEvent(raw msgpack.RawMessage) (Event, error) {
 		return AllBlocksCleared{}, nil
 	default:
 		return nil, nil // unknown event type — skip
+	}
+}
+
+func decodeMapEvent(fields map[string]msgpack.RawMessage) (Event, error) {
+	tagRaw, ok := fields["type"]
+	if !ok {
+		return nil, fmt.Errorf("event map has no type tag")
+	}
+	var tag string
+	if err := msgpack.Unmarshal(tagRaw, &tag); err != nil {
+		return nil, fmt.Errorf("decode event type: %w", err)
+	}
+
+	switch tag {
+	case "BlockStored":
+		hashesRaw, ok := fields["block_hashes"]
+		if !ok {
+			return nil, fmt.Errorf("BlockStored.block_hashes is required")
+		}
+		hashes, err := decodeHashes(hashesRaw)
+		if err != nil {
+			return nil, fmt.Errorf("BlockStored.block_hashes: %w", err)
+		}
+
+		var parent []byte
+		if parentRaw, exists := fields["parent_block_hash"]; exists {
+			parent, err = decodeParent(parentRaw)
+			if err != nil {
+				return nil, fmt.Errorf("BlockStored.parent_block_hash: %w", err)
+			}
+		}
+
+		tokensRaw, ok := fields["token_ids"]
+		if !ok {
+			return nil, fmt.Errorf("BlockStored.token_ids is required")
+		}
+		tokenIDs, err := decodeTokenIDs(tokensRaw)
+		if err != nil {
+			return nil, fmt.Errorf("BlockStored.token_ids: %w", err)
+		}
+
+		blockSizeRaw, ok := fields["block_size"]
+		if !ok {
+			return nil, fmt.Errorf("BlockStored.block_size is required")
+		}
+		var blockSize int32
+		if err := msgpack.Unmarshal(blockSizeRaw, &blockSize); err != nil {
+			return nil, fmt.Errorf("BlockStored.block_size: %w", err)
+		}
+		if blockSize <= 0 {
+			return nil, fmt.Errorf("BlockStored.block_size must be positive, got %d", blockSize)
+		}
+
+		var loraID *int64
+		if loraRaw, exists := fields["lora_id"]; exists {
+			loraID, err = decodeLoRAID(loraRaw)
+			if err != nil {
+				return nil, fmt.Errorf("BlockStored.lora_id: %w", err)
+			}
+		}
+		return BlockStored{
+			BlockHashes:     hashes,
+			ParentBlockHash: parent,
+			TokenIDs:        tokenIDs,
+			BlockSize:       blockSize,
+			LoRAID:          loraID,
+		}, nil
+
+	case "BlockRemoved":
+		hashesRaw, ok := fields["block_hashes"]
+		if !ok {
+			return nil, fmt.Errorf("BlockRemoved.block_hashes is required")
+		}
+		hashes, err := decodeHashes(hashesRaw)
+		if err != nil {
+			return nil, fmt.Errorf("BlockRemoved.block_hashes: %w", err)
+		}
+		return BlockRemoved{BlockHashes: hashes}, nil
+
+	case "AllBlocksCleared":
+		return AllBlocksCleared{}, nil
+	default:
+		return nil, nil
 	}
 }
 

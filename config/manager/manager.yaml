@@ -25,7 +25,6 @@ spec:
       containers:
       - args:
         - --leader-elect
-        - --lmcache-server-image=lmcache/standalone:v0.4.7
         command:
         - /controller
         image: controller:latest

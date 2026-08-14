@@ -11,7 +11,7 @@ spec:
   type: SGLangHiCache
   engineSelector:
     matchLabels:
-      app: sglang
+      inferencecache.io/cache-domain: sglang-hicache
   hiCache:
     ratio: "2.0"
     writePolicy: write_through

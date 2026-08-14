@@ -7,12 +7,16 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
+	"sort"
+
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	kvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -35,6 +39,11 @@ type CacheBackendValidator struct {
 	// Registry resolves the runtime adapter for a (runtime, backend) pair at
 	// admission time. The composition root must inject it.
 	Registry *adapterruntime.Registry
+
+	// Reader performs namespace-scoped cross-object checks that cannot be
+	// represented in the CRD schema. Production wiring uses the manager's live
+	// APIReader so a newly-created sibling is visible at admission time.
+	Reader client.Reader
 }
 
 // ValidationRule is the seam plugged-in admission rules implement. It
@@ -49,24 +58,22 @@ type ValidationRule func(cb *cachev1alpha1.CacheBackend) field.ErrorList
 // [CacheBackendValidator.Rules]) to extend admission; no other code in the
 // handler changes.
 var DefaultValidationRules = []ValidationRule{
+	validateEngineSelectorDomain,
 	validateCacheHierarchy,
+	validateLMCacheTopology,
+	rejectUnimplementedRedisBindingFeatures,
 	rejectCrossNamespaceEndpointWithoutOptIn,
-	requireExplicitMinReplicasOnScaleToZeroWithAutoscaling,
-	rejectMooncakeMasterScaleOut,
-	rejectEngineHostNetworkOnBackendThatDoesNotNeedIt,
 	rejectResourceLimitsBelowRequests,
 	rejectRequestsOnlyForNonOvercommittableResources,
 	rejectResourceClaims,
 	rejectNegativeResourceQuantities,
-	rejectNonPositiveHostMemoryCapacity,
 	rejectInvalidResourceNames,
 	rejectFractionalExtendedResources,
 	rejectMisalignedHugepageQuantities,
 	rejectEventsOnlyMisconfiguration,
 	validateSGLangHiCache,
 	rejectInvalidKernelCheckAnnotation,
-	rejectUnsupportedSGLangRole,
-	rejectSGLangRedisL2ScaleOut,
+	rejectUnsupportedLMCacheRole,
 }
 
 // SetupCacheBackendWebhookWithManager registers the defaulting and
@@ -85,7 +92,7 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 	}
 	return ctrl.NewWebhookManagedBy(mgr, &cachev1alpha1.CacheBackend{}).
 		WithDefaulter(&CacheBackendDefaulter{}).
-		WithValidator(&CacheBackendValidator{Registry: registry}).
+		WithValidator(&CacheBackendValidator{Registry: registry, Reader: mgr.GetAPIReader()}).
 		Complete()
 }
 
@@ -97,7 +104,14 @@ func SetupCacheBackendWebhookWithManager(mgr ctrl.Manager, registry *adapterrunt
 func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend create",
 		"namespace", cb.Namespace, "name", cb.Name, "type", cb.Spec.Type)
-	return collectWarnings(cb), v.validate(cb)
+	warnings := collectWarnings(cb)
+	errs := v.collectErrors(cb)
+	selectorErrs, err := v.checkOverlappingEngineSelectors(ctx, cb)
+	if err != nil {
+		return warnings, err
+	}
+	errs = append(errs, selectorErrs...)
+	return warnings, invalidCacheBackend(cb, errs)
 }
 
 // collectWarnings returns non-blocking advisories surfaced to the operator at
@@ -105,9 +119,7 @@ func (v *CacheBackendValidator) ValidateCreate(ctx context.Context, cb *cachev1a
 // itself cannot express and the controller cannot close on the operator's behalf —
 // never for something a validation rule could simply reject.
 func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
-	var w admission.Warnings
-	w = append(w, warnMooncakeEngineHostNetwork(cb)...)
-	return w
+	return nil
 }
 
 // ValidateUpdate implements [admission.Validator]. Updates only reject
@@ -120,19 +132,31 @@ func collectWarnings(cb *cachev1alpha1.CacheBackend) admission.Warnings {
 //
 // This is the standard pattern for tightening admission rules on a
 // v1alpha1 CRD: create-time is strict; update-time only rejects fresh
-// violations so existing CRs aren't trapped. Without it, adding a new
-// field-level rule would break every existing CR that happens to violate it
-// the moment an operator runs `kubectl annotate` on it.
+// single-object violations so existing CRs aren't trapped. The canonical
+// cache-domain selector contract and selector overlap are exceptions: both are
+// enforced on every UPDATE because they define live engine ownership.
 func (v *CacheBackendValidator) ValidateUpdate(ctx context.Context, oldCB, newCB *cachev1alpha1.CacheBackend) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating CacheBackend update",
 		"namespace", newCB.Namespace, "name", newCB.Name, "type", newCB.Spec.Type)
 	warnings := collectWarnings(newCB)
 	newErrs := v.collectErrors(newCB)
-	if len(newErrs) == 0 {
+	newSelectorErrs, err := v.checkOverlappingEngineSelectors(ctx, newCB)
+	if err != nil {
+		return warnings, err
+	}
+	if len(newErrs) == 0 && len(newSelectorErrs) == 0 {
 		return warnings, nil
 	}
 	oldErrs := v.collectErrors(oldCB)
 	introduced := filterIntroducedErrors(oldErrs, newErrs)
+	// Unlike ordinary validation tightening, engine ownership is never
+	// grandfathered: every updated object must use the canonical domain selector.
+	introduced = append(introduced,
+		filterIntroducedErrors(introduced, validateEngineSelectorDomain(newCB))...)
+	// Never grandfather a cross-object ownership conflict. This forces a
+	// concurrent-CREATE conflict to be corrected before any spec/metadata update
+	// can proceed, while DELETE remains unconditionally allowed by ValidateDelete.
+	introduced = append(introduced, newSelectorErrs...)
 	if len(introduced) == 0 {
 		return warnings, nil
 	}
@@ -141,6 +165,30 @@ func (v *CacheBackendValidator) ValidateUpdate(ctx context.Context, oldCB, newCB
 		newCB.Name,
 		introduced,
 	)
+}
+
+// validateEngineSelectorDomain keeps cache ownership independent of mutable
+// application, runtime, model, and environment labels. A CacheBackend either
+// has no selector or selects exactly one namespace-scoped compatibility-domain
+// value.
+func validateEngineSelectorDomain(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
+		return nil
+	}
+	path := field.NewPath("spec", "engineSelector", "matchLabels")
+	domain, found := cb.Spec.EngineSelector.MatchLabels[cachev1alpha1.CacheBackendDomainLabel]
+	if !found || domain == "" {
+		return field.ErrorList{field.Required(path.Key(cachev1alpha1.CacheBackendDomainLabel),
+			"every non-empty engineSelector must declare one cache compatibility domain")}
+	}
+	if problems := kvalidation.IsValidLabelValue(domain); len(problems) > 0 {
+		return field.ErrorList{field.Invalid(path.Key(cachev1alpha1.CacheBackendDomainLabel), domain, problems[0])}
+	}
+	if len(cb.Spec.EngineSelector.MatchLabels) != 1 {
+		return field.ErrorList{field.Forbidden(path,
+			fmt.Sprintf("must contain only %q; engine Pods may carry other labels, but they do not define CacheBackend ownership", cachev1alpha1.CacheBackendDomainLabel))}
+	}
+	return nil
 }
 
 // ValidateDelete implements [admission.Validator]. Deletion is always
@@ -156,7 +204,10 @@ func (v *CacheBackendValidator) ValidateDelete(_ context.Context, _ *cachev1alph
 // collectErrors directly so it can diff old vs new and only reject
 // newly introduced violations.
 func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
-	errs := v.collectErrors(cb)
+	return invalidCacheBackend(cb, v.collectErrors(cb))
+}
+
+func invalidCacheBackend(cb *cachev1alpha1.CacheBackend, errs field.ErrorList) error {
 	if len(errs) == 0 {
 		return nil
 	}
@@ -165,6 +216,40 @@ func (v *CacheBackendValidator) validate(cb *cachev1alpha1.CacheBackend) error {
 		cb.Name,
 		errs,
 	)
+}
+
+// checkOverlappingEngineSelectors rejects duplicate cache-domain ownership in
+// one namespace.
+// Like every list-then-admit cross-object rule, this is best effort under two
+// exactly concurrent CREATEs. The Pod webhook is the authoritative runtime
+// backstop: it rejects admission when racing objects produce more than one
+// match instead of choosing a backend by name.
+func (v *CacheBackendValidator) checkOverlappingEngineSelectors(ctx context.Context, cb *cachev1alpha1.CacheBackend) (field.ErrorList, error) {
+	selector := cb.Spec.EngineSelector
+	if selector == nil || len(selector.MatchLabels) == 0 || v.Reader == nil {
+		return nil, nil
+	}
+	var siblings cachev1alpha1.CacheBackendList
+	if err := v.Reader.List(ctx, &siblings, client.InNamespace(cb.Namespace)); err != nil {
+		return nil, fmt.Errorf("listing CacheBackends in namespace %q for engineSelector overlap: %w", cb.Namespace, err)
+	}
+	sort.Slice(siblings.Items, func(i, j int) bool { return siblings.Items[i].Name < siblings.Items[j].Name })
+	for i := range siblings.Items {
+		other := &siblings.Items[i]
+		if other.Name == cb.Name || other.Spec.EngineSelector == nil ||
+			len(other.Spec.EngineSelector.MatchLabels) == 0 {
+			continue
+		}
+		domain := selector.MatchLabels[cachev1alpha1.CacheBackendDomainLabel]
+		otherDomain := other.Spec.EngineSelector.MatchLabels[cachev1alpha1.CacheBackendDomainLabel]
+		if domain != "" && domain == otherDomain {
+			return field.ErrorList{field.Forbidden(
+				field.NewPath("spec", "engineSelector", "matchLabels").Key(cachev1alpha1.CacheBackendDomainLabel),
+				fmt.Sprintf("cache domain %q is already owned by CacheBackend %q in namespace %q", domain, other.Name, cb.Namespace),
+			)}, nil
+		}
+	}
+	return nil, nil
 }
 
 // collectErrors returns the field-scoped violations every configured

@@ -15,43 +15,71 @@ multi-tenant, Namespaces):
 - **`cachebackend-*.yaml`** — focused hand-curated canonical CacheBackend
   examples, including the
   [`cachebackend-sglang-hicache.yaml`](cachebackend-sglang-hicache.yaml)
-  engine-local example. The `recipe-*.yaml` catalog is the maintained entry
-  point for LMCache scenarios.
+  engine-local example and the typed SGLang PodLocal LMCache examples for
+  [host-only](cachebackend-sglang-podlocal-host-only.yaml),
+  [managed Redis](cachebackend-sglang-podlocal-managed-redis.yaml), and
+  [external Redis](cachebackend-sglang-podlocal-external-redis.yaml), plus the
+  equivalent typed vLLM PodLocal profiles for
+  [host-only](cachebackend-vllm-podlocal-host-only.yaml),
+  [managed Redis](cachebackend-vllm-podlocal-managed-redis.yaml), and
+  [external Redis](cachebackend-vllm-podlocal-external-redis.yaml). All LMCache
+  offload samples use the typed MP API. NodeLocal host-only profiles are
+  available for [vLLM](cachebackend-vllm-nodelocal-host-only.yaml) and
+  [SGLang](cachebackend-sglang-nodelocal-host-only.yaml); the inference system
+  owns their placement and they opt into server host networking plus shared
+  the backend UID's host `/dev/shm/inference-cache/<uid>` directory.
+  `EventsOnly` intentionally carries no LMCache data plane.
 
 ## Recipe catalog
 
 Each recipe is a single file with a top-of-file comment explaining the scenario
 and the apply steps. Most are self-contained; see "Prerequisites per recipe"
 below for the two that aren't (external cache, multi-tenant), and note
-`recipe-gpu-production` is a shape template whose placeholder images you pin
-before applying. All but `recipe-gpu-production` run without a GPU.
+`recipe-gpu-production` is a shape template whose engine image you pin before
+applying. Admission and sample validation require no GPU; actual LMCache MP
+startup requires a compatible engine connector/package and the selected
+runtime hardware.
 
 | Recipe | Use case |
 | --- | --- |
-| [`recipe-cpu-dev.yaml`](recipe-cpu-dev.yaml) | Fastest path on a laptop / kind — tiny ungated model, no GPU, single replica, no quotas. |
-| [`recipe-gpu-production.yaml`](recipe-gpu-production.yaml) | Typical production — real model on GPU engine pods, managed-backend autoscaling, a CachePolicy with production TTLs. |
-| [`recipe-external-cache.yaml`](recipe-external-cache.yaml) | External `LMCacheServer` ownership — point the operator at a cache server you manage yourself; the controller provisions nothing. |
+| [`recipe-cpu-dev.yaml`](recipe-cpu-dev.yaml) | Small single-replica typed-MP binding shape; engine startup still requires a connector-compatible image. |
+| [`recipe-gpu-production.yaml`](recipe-gpu-production.yaml) | Production shape — GPU engine Pods, per-Pod MP L1, explicit managed Redis L3, and a production CachePolicy. |
+| [`recipe-external-cache.yaml`](recipe-external-cache.yaml) | Typed MP with external Redis L3; the controller provisions no remote provider. |
 | [`recipe-multi-tenant.yaml`](recipe-multi-tenant.yaml) | Two CacheTenants + two CacheBackends across two namespaces — isolated cache identity and entry-count quotas; separate engines for per-tenant memory isolation. |
-| [`recipe-tuning.yaml`](recipe-tuning.yaml) | CPU-dev shape plus a meaningful `engineOverrides` block (tune `LMCACHE_CHUNK_SIZE`, add `LMCACHE_LOG_LEVEL=DEBUG`). |
+| [`recipe-tuning.yaml`](recipe-tuning.yaml) | Small typed-MP shape: typed `chunkSizeTokens` plus an `engineOverrides` log-level addition. |
 
 **Prerequisites per recipe.** Most recipes are self-contained. One has an
-external dependency: `recipe-external-cache.yaml` needs a cache server already
+external dependency: `recipe-external-cache.yaml` needs Redis already
 running at the endpoint you supply (replace the placeholder).
 `recipe-multi-tenant.yaml` has no external dependency but creates and deploys
 into two namespaces of its own.
 
 **Apply + observability.** Each recipe's `kubectl apply` wires matching engine
-pods to the cache. For *managed* backends the wiring becomes available once the
-controller publishes `status.endpoint`, so a pod admitted before then races past
-injection and runs unwired until recreated (see each recipe's header); externally
-owned backends wire straight from `spec.remoteStorage.endpoint` and have no such
-race. KV reuse then works, but a *managed* backend only reaches `Ready=True`
+pods to the cache. Host-only PodLocal wiring needs no provider endpoint. A
+managed Redis L3 is controller-resolved, so apply the CacheBackend before
+creating engine Pods; externally owned Redis uses the declared endpoint. KV
+reuse then works when the runtime-owned image is compatible, but a managed
+backend only reaches `Ready=True`
 and reports index entries once the `kvevent-subscriber` sidecar is auto-attached,
 which requires the controller to run with `--kvevent-subscriber-image` set
 (empty by default); otherwise it holds at `AwaitingFirstKVEvent` and then
 degrades to `NoKVEventsObserved`. Externally owned backends are exempt from that gate —
 they go `Ready` as soon as admission accepts the endpoint. See the
 [quickstart](../../docs/quickstart.md).
+
+NodeLocal focused samples are not five-minute recipes. Before applying one,
+reserve its MP and HTTP host ports on every node where the inference system may
+place a selected engine, and ensure all selected engine Pods belong to one
+mutually trusted tenant domain. CacheBackend does not select nodes or rewrite
+engine placement. The declared `l1Capacity` is a shared budget on every active
+engine node; `maxGPUWorkers` must cover the maximum selected engine instances on
+one node. `idleRetentionSeconds` keeps the per-node server and its L1 warm after
+the final engine leaves (300 seconds in the focused samples; zero deletes it
+immediately). The server requests no allocatable GPU, so set the optional
+`nodeLocal.scheduling.runtimeClassName` when the engine's inherited runtime does
+not provide the required NVIDIA visibility.
+Host-network listeners bypass Kubernetes NetworkPolicy, so restrict them with
+node firewall controls. Do not add a load-balanced Service for the MP port.
 
 `SGLangHiCache` is endpoint-free and has no endpoint publication race. Its
 first implementation intentionally publishes no `Ready` condition; the

@@ -22,7 +22,6 @@ type Registries struct {
 // It belongs to the built-in composition rather than the public adapter seam.
 type Options struct {
 	SubscriberImage         string
-	LMCacheServerImage      string
 	PolicyServerGRPCAddress string
 }
 
@@ -34,14 +33,12 @@ func New(opts Options) Registries {
 		PolicyServerGRPCAddress: opts.PolicyServerGRPCAddress,
 	}
 	runtimeRegistry := adapterruntime.NewRegistry()
-	runtimeRegistry.Register(builtinruntime.NewVLLMLMCacheAdapter(subscriber))
+	runtimeRegistry.Register(builtinruntime.NewVLLMLMCacheMPAdapter(subscriber))
 	runtimeRegistry.Register(builtinruntime.NewSGLangLMCacheAdapter(subscriber))
 	runtimeRegistry.Register(builtinruntime.NewSGLangHiCacheAdapter(subscriber))
 
 	return Registries{
 		Runtime: runtimeRegistry,
-		Storage: builtinstorage.DefaultRegistry(
-			builtinstorage.WithLMCacheServerImage(opts.LMCacheServerImage),
-		),
+		Storage: builtinstorage.DefaultRegistry(),
 	}
 }

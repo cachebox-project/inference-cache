@@ -7,12 +7,15 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -26,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
 
 // newReconcilerWithRecorder builds a reconciler wired with a buffered fake
@@ -33,6 +37,10 @@ import (
 // emit; assertions read from rec.Events with a select+default to avoid hanging
 // when an expected event is missing.
 func newReconcilerWithRecorder(t *testing.T, objs ...client.Object) (*CacheBackendReconciler, *events.FakeRecorder) {
+	return newReconcilerWithRecorderOptions(t, false, objs...)
+}
+
+func newReconcilerWithRecorderOptions(t *testing.T, addReadyEngine bool, objs ...client.Object) (*CacheBackendReconciler, *events.FakeRecorder) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -40,6 +48,15 @@ func newReconcilerWithRecorder(t *testing.T, objs ...client.Object) (*CacheBacke
 	}
 	if err := cachev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add cache scheme: %v", err)
+	}
+	if addReadyEngine {
+		for _, obj := range objs {
+			cb, ok := obj.(*cachev1alpha1.CacheBackend)
+			if !ok || !isTypedLMCachePodLocal(cb) {
+				continue
+			}
+			objs = append(objs, readyEnginePodForBackend(cb))
+		}
 	}
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -50,6 +67,41 @@ func newReconcilerWithRecorder(t *testing.T, objs ...client.Object) (*CacheBacke
 	r := &CacheBackendReconciler{Client: c, Scheme: scheme, Log: logr.Discard(), Recorder: rec}
 	configureTestRegistries(r)
 	return r, rec
+}
+
+func readyEnginePodForBackend(cb *cachev1alpha1.CacheBackend) *corev1.Pod {
+	if cb.UID == "" {
+		cb.UID = types.UID(fmt.Sprintf("uid-%s", cb.Name))
+	}
+	if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
+		cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{"app": cb.Name + "-engine"}}
+	}
+	labels := make(map[string]string, len(cb.Spec.EngineSelector.MatchLabels))
+	for key, value := range cb.Spec.EngineSelector.MatchLabels {
+		labels[key] = value
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: cb.Name + "-engine", Namespace: cb.Namespace, Labels: labels,
+			Annotations: map[string]string{
+				enginebinding.AnnotationInjectedBy:         cb.Namespace + "/" + cb.Name,
+				enginebinding.AnnotationInjectedByUID:      string(cb.UID),
+				enginebinding.AnnotationInjectedGeneration: strconv.FormatInt(cb.Generation, 10),
+			},
+		},
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{{Name: lmCacheMPServerStatusContainerName, Ready: true, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}},
+			Conditions:            []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+}
+
+func requireRemoteStorageForReadiness(cb *cachev1alpha1.CacheBackend) {
+	failOpen := false
+	if cb.Spec.Integration == nil {
+		cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
+	}
+	cb.Spec.Integration.FailOpen = &failOpen
 }
 
 // drainEvents pulls every event currently on the recorder channel. The channel
@@ -134,39 +186,35 @@ func reconcileN(t *testing.T, r *CacheBackendReconciler, name, namespace string,
 
 func TestReconcileEmitsBackendDegradedOnTransition(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(2)
-	r, rec := newReconcilerWithRecorder(t, cb)
+	requireRemoteStorageForReadiness(cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 
 	// Cold start: Pending → no event yet.
 	reconcile(t, r, "cache", "ns1")
-	if events := drainEvents(rec); len(events) != 0 {
-		t.Fatalf("unexpected events on cold start: %v", events)
-	}
+	expectNoEvent(t, drainEvents(rec), eventReasonBackendDegraded)
 
 	// Drive to Ready: no event for Pending → Ready (only Degraded entry/exit
 	// is loud enough to deserve an event by design).
-	markDeploymentReady(t, r, "cache", "ns1", 2)
+	markDeploymentReady(t, r, "cache", "ns1", 1)
 	reconcile(t, r, "cache", "ns1")
 	if !isReady(getBackend(t, r, "cache", "ns1")) {
 		t.Fatalf("Ready condition not True before degrading")
 	}
-	if events := drainEvents(rec); len(events) != 0 {
-		t.Fatalf("unexpected events on Ready transition: %v", events)
-	}
+	expectNoEvent(t, drainEvents(rec), eventReasonBackendDegraded)
 
 	// Backend dies under load: AvailableReplicas drops to 0 with the rollout
 	// already observed → managedReadiness reports Ready=False/ReplicasUnavailable.
-	markDeploymentDegraded(t, r, "cache", "ns1", 2)
+	markDeploymentDegraded(t, r, "cache", "ns1", 1)
 	reconcile(t, r, "cache", "ns1")
 
 	updated := getBackend(t, r, "cache", "ns1")
 	cond := findCondition(updated.Status.Conditions, conditionTypeReady)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != conditionReasonReplicasUnavailable {
-		t.Fatalf("Ready condition = %+v, want False/ReplicasUnavailable", cond)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonRemoteStorageUnavailable {
+		t.Fatalf("Ready condition = %+v, want False/RemoteStorageUnavailable", cond)
 	}
 	events := drainEvents(rec)
-	expectEvent(t, events, "Warning "+eventReasonBackendDegraded)
-	expectEvent(t, events, "0/2 replicas available")
+	expectEvent(t, events, "Warning "+reasonRemoteStorageUnavailable)
+	expectEvent(t, events, "0/1 replicas available")
 }
 
 // TestReconcileEmitsTransitionEventEvenWhenApplyErrors guards the
@@ -186,7 +234,8 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 	}
 
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(2)
+	requireRemoteStorageForReadiness(cb)
+	enginePod := readyEnginePodForBackend(cb)
 
 	// Block Deployment Updates after the first reconcile so the second pass
 	// returns an apply error while the live Deployment status drives a
@@ -207,7 +256,7 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
-		WithObjects(cb).
+		WithObjects(cb, enginePod).
 		WithInterceptorFuncs(funcs).
 		Build()
 	rec := events.NewFakeRecorder(16)
@@ -217,7 +266,7 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 	// First pass establishes the Deployment + drives Ready (no events; only
 	// Degraded transitions are loud by design).
 	reconcile(t, r, "cache", "ns1")
-	markDeploymentReady(t, r, "cache", "ns1", 2)
+	markDeploymentReady(t, r, "cache", "ns1", 1)
 	reconcile(t, r, "cache", "ns1")
 	_ = drainEvents(rec)
 
@@ -227,12 +276,17 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 	// drives the readiness transition.
 	blockUpdate.Store(true)
 	live := getBackend(t, r, "cache", "ns1")
-	live.Spec.RemoteStorage.LMCacheServer.Image = "example.com/lmcache-server:v9"
+	live.Spec.RemoteStorage.Redis.Image = "example.com/redis:v9"
 	live.Generation = 2
 	if err := r.Update(context.Background(), live); err != nil {
 		t.Fatalf("update CR: %v", err)
 	}
-	markDeploymentDegraded(t, r, "cache", "ns1", 2)
+	enginePod.Annotations[enginebinding.AnnotationInjectedGeneration] = "2"
+	if err := r.Update(context.Background(), enginePod); err != nil {
+		t.Fatalf("update engine Pod: %v", err)
+	}
+	r.refreshLMCacheMPConnectorStatus(context.Background(), getBackend(t, r, "cache", "ns1"))
+	markDeploymentDegraded(t, r, "cache", "ns1", 1)
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
@@ -240,11 +294,11 @@ func TestReconcileEmitsTransitionEventEvenWhenApplyErrors(t *testing.T) {
 		t.Fatalf("reconcile returned nil, want error (apply was blocked)")
 	}
 
-	if !isDegraded(getBackend(t, r, "cache", "ns1")) {
-		t.Fatalf("Ready condition not False/ReplicasUnavailable (status path runs independently of apply error)")
+	if ready := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); ready == nil || ready.Reason != reasonRemoteStorageUnavailable {
+		t.Fatalf("Ready condition = %+v, want RemoteStorageUnavailable (status path runs independently of apply error)", ready)
 	}
 	events := drainEvents(rec)
-	expectEvent(t, events, "Warning "+eventReasonBackendDegraded)
+	expectEvent(t, events, "Warning "+reasonRemoteStorageUnavailable)
 }
 
 // TestReconcileNoPhantomEventOnStatusPatchFailure pins the rollback semantics
@@ -264,7 +318,8 @@ func TestReconcileNoPhantomEventOnStatusPatchFailure(t *testing.T) {
 	}
 
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(2)
+	requireRemoteStorageForReadiness(cb)
+	enginePod := readyEnginePodForBackend(cb)
 
 	var blockStatusPatch atomic.Bool
 	funcs := interceptor.Funcs{
@@ -280,7 +335,7 @@ func TestReconcileNoPhantomEventOnStatusPatchFailure(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
-		WithObjects(cb).
+		WithObjects(cb, enginePod).
 		WithInterceptorFuncs(funcs).
 		Build()
 	rec := events.NewFakeRecorder(16)
@@ -290,7 +345,7 @@ func TestReconcileNoPhantomEventOnStatusPatchFailure(t *testing.T) {
 	// Drive to Ready first. Pending → Ready emits no event by design (only
 	// Degraded entry/exit are loud).
 	reconcile(t, r, "cache", "ns1")
-	markDeploymentReady(t, r, "cache", "ns1", 2)
+	markDeploymentReady(t, r, "cache", "ns1", 1)
 	reconcile(t, r, "cache", "ns1")
 	_ = drainEvents(rec)
 
@@ -299,7 +354,7 @@ func TestReconcileNoPhantomEventOnStatusPatchFailure(t *testing.T) {
 	// error — and must emit NO event, because the apiserver never saw the
 	// transition.
 	blockStatusPatch.Store(true)
-	markDeploymentDegraded(t, r, "cache", "ns1", 2)
+	markDeploymentDegraded(t, r, "cache", "ns1", 1)
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "cache", Namespace: "ns1"},
@@ -324,26 +379,26 @@ func TestReconcileNoPhantomEventOnStatusPatchFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("reconcile after unblock: %v", err)
 	}
-	if !isDegraded(getBackend(t, r, "cache", "ns1")) {
-		t.Fatalf("Ready condition not False/ReplicasUnavailable after unblock")
+	if ready := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); ready == nil || ready.Reason != reasonRemoteStorageUnavailable {
+		t.Fatalf("Ready condition = %+v, want RemoteStorageUnavailable after unblock", ready)
 	}
 	got := drainEvents(rec)
-	expectEvent(t, got, "Warning "+eventReasonBackendDegraded)
+	expectEvent(t, got, "Warning "+reasonRemoteStorageUnavailable)
 	count := 0
 	for _, e := range got {
-		if strings.Contains(e, eventReasonBackendDegraded) {
+		if strings.Contains(e, reasonRemoteStorageUnavailable) {
 			count++
 		}
 	}
 	if count != 1 {
-		t.Fatalf("BackendDegraded event count = %d, want exactly 1: %v", count, got)
+		t.Fatalf("RemoteStorageUnavailable event count = %d, want exactly 1: %v", count, got)
 	}
 }
 
 func TestReconcileEmitsBackendRecoveredOnReadyTransition(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
-	r, rec := newReconcilerWithRecorder(t, cb)
+	requireRemoteStorageForReadiness(cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 
 	reconcile(t, r, "cache", "ns1")
 	markDeploymentReady(t, r, "cache", "ns1", 1)
@@ -362,18 +417,20 @@ func TestReconcileEmitsBackendRecoveredOnReadyTransition(t *testing.T) {
 		t.Fatalf("Ready condition not True after recovery")
 	}
 	events := drainEvents(rec)
-	expectEvent(t, events, "Normal "+eventReasonBackendRecovered)
+	expectEvent(t, events, "Normal "+reasonRemoteStorageReady)
 	// No spurious second warning during recovery.
 	expectNoEvent(t, events, eventReasonBackendDegraded)
 }
 
 func TestReconcileSteadyStateDoesNotFloodEvents(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
-	r, rec := newReconcilerWithRecorder(t, cb)
+	requireRemoteStorageForReadiness(cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 
 	reconcile(t, r, "cache", "ns1")
 	markDeploymentReady(t, r, "cache", "ns1", 1)
+	reconcile(t, r, "cache", "ns1")
+	_ = drainEvents(rec)
 
 	// Five steady-state reconciles after Ready is established must not emit
 	// any events — Ready→Ready is the no-op transition that mattered most for
@@ -388,9 +445,8 @@ func TestReconcileSteadyStateDoesNotFloodEvents(t *testing.T) {
 func TestReconcileEmitsFailClosedWarningOnApply(t *testing.T) {
 	failOpen := false
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{FailOpen: &failOpen}
-	r, rec := newReconcilerWithRecorder(t, cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 
 	// First reconcile: previous status.failOpen is nil (effective true), spec
 	// is false → transition fires the FailClosedEnabled Warning. The status
@@ -417,9 +473,8 @@ func TestReconcileEmitsFailClosedWarningOnApply(t *testing.T) {
 func TestReconcileEmitsFailOpenRestoredWhenFlippedBack(t *testing.T) {
 	failOpen := false
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{FailOpen: &failOpen}
-	r, rec := newReconcilerWithRecorder(t, cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 
 	reconcile(t, r, "cache", "ns1")
 	_ = drainEvents(rec) // discard the FailClosedEnabled warning emitted above
@@ -443,7 +498,6 @@ func TestReconcileEmitsFailOpenRestoredWhenFlippedBack(t *testing.T) {
 
 func TestReconcileDefaultFailOpenIsSilent(t *testing.T) {
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 	r, rec := newReconcilerWithRecorder(t, cb)
 
 	reconcile(t, r, "cache", "ns1")
@@ -464,7 +518,6 @@ func TestReconcileNilRecorderIsSafe(t *testing.T) {
 	// directly in tests and may be in tests that don't care about events.
 	scheme := newScheme(t)
 	cb := lmcacheBackend("cache", "ns1")
-	cb.Spec.Replicas = ptrInt32(1)
 	r := newReconciler(scheme, cb) // no Recorder
 	reconcile(t, r, "cache", "ns1")
 	markDeploymentDegraded(t, r, "cache", "ns1", 1)

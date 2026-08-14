@@ -259,13 +259,13 @@ func (p *CacheIndexPoller) reconcileTenantStatuses(ctx context.Context, snap con
 //     replica_id=<pod-name>, tenant_id=<pod-namespace>. The CacheBackend
 //     points at the same engine pod via spec.engineSelector.matchLabels.
 //     So: look up the engine pod by (replica.Tenant, replica.ReplicaID),
-//     then attribute to the FIRST in-namespace CacheBackend whose
-//     EngineSelector matches the pod's labels — mirroring the pod
-//     webhook's "first-match wins" engine-wiring rule (see
-//     internal/webhook/pod/podinjector.go's selectCacheBackend). Two
-//     backends with overlapping selectors must agree on which one owns
-//     the pod, or status will disagree with what the engine was actually
-//     wired to.
+//     The webhook's inferencecache.io/injected-by annotation is the
+//     authoritative owner. For manually attached subscriber pods without that
+//     annotation, fall back to the first matching
+//     in-namespace CacheBackend in metadata.name order. New CacheBackend
+//     admission rejects overlapping selectors and fresh Pod admission denies
+//     an ambiguous match; the fallback is attribution only and never chooses a
+//     connector owner for an admitted engine.
 //   - A replica with no engine pod found (pod was deleted between events
 //     and now) is dropped — its contributions only show up in the
 //     cluster-wide CacheIndex.
@@ -313,10 +313,9 @@ func (p *CacheIndexPoller) refreshCacheBackendParticipation(ctx context.Context,
 		}
 		backendsByNS[cb.Namespace] = append(backendsByNS[cb.Namespace], i)
 	}
-	// Sort the per-namespace backend lists by metadata.name. This gives
-	// "first match" a deterministic meaning across poller restarts and
-	// makes the selector-fallback result independent of apiserver List
-	// ordering — operators who rely on the fallback can predict the winner.
+	// Sort the per-namespace backend lists by metadata.name so the historical
+	// selector fallback is stable across poller restarts and independent of
+	// apiserver List ordering.
 	for ns := range backendsByNS {
 		idxs := backendsByNS[ns]
 		sort.Slice(idxs, func(a, b int) bool {
@@ -504,11 +503,11 @@ func matchLabelsSelects(want, have map[string]string) bool {
 //     the authoritative signal: it records the CacheBackend the webhook
 //     actually wired the engine to. Annotation in another namespace is
 //     ignored (cross-namespace attribution would be misleading).
-//  2. Fallback for pods that bypassed the webhook (manual sidecar, opt-out
-//     annotation): iterate the namespace's CacheBackends sorted by name and
-//     take the first whose EngineSelector matches the pod's labels —
-//     mirroring the webhook's first-match rule but ordered deterministically
-//     by name so the poller is stable across restarts.
+//  2. Fallback for historical pods or pods that bypassed the webhook (manual
+//     sidecar, opt-out annotation): iterate the namespace's CacheBackends
+//     sorted by name and take the first whose EngineSelector matches the
+//     pod's labels. Admission prevents this ambiguity for new objects; the
+//     ordering only keeps legacy attribution stable across restarts.
 func (p *CacheIndexPoller) attributePod(pod *corev1.Pod, nsBackends []int, byNSName map[types.NamespacedName]int, items []cachev1alpha1.CacheBackend) int {
 	if raw := pod.Annotations[enginebinding.AnnotationInjectedBy]; raw != "" {
 		ns, name, ok := strings.Cut(raw, "/")

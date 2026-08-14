@@ -17,18 +17,20 @@ unknown `apiVersion`.
 kubectl apply -k config/observability
 ```
 
-This ships three resources in the `inference-cache-system` namespace:
+This ships four resources in the `inference-cache-system` namespace:
 
 - a **`ServiceMonitor`** — scrapes `inference-cache-server:8080/metrics`;
 - a **`PodMonitor`** — scrapes the controller pod's `:8080/metrics` (required for the
   controller-side alerts to have a series to evaluate — the controller has no Service in
   front of it);
+- a second **`PodMonitor`** — discovers successfully injected PodLocal LMCache native
+  sidecars across workload namespaces and scrapes `lmcache-http:8080/metrics`;
 - a **`PrometheusRule`** — the alerts.
 
 `make verify-prometheus` lints and unit-tests the rules.
 
 {{% alert title="Selector mismatch fails silently" color="warning" %}}
-All three custom resources carry example labels (`prometheus: k8s`) matching the upstream
+All four custom resources carry example labels (`prometheus: k8s`) matching the upstream
 kube-prometheus stack. The `kube-prometheus-stack` Helm chart uses a *different* convention
 (`release: <name>`, no `prometheus:` label). If your `Prometheus` custom resource's
 `ruleSelector` / `serviceMonitorSelector` / `podMonitorSelector` uses a different label set,
@@ -37,8 +39,8 @@ selectors with `kubectl get prometheus -A -o yaml` and relabel the CRs to match.
 {{% /alert %}}
 
 For vanilla Prometheus (ConfigMap mounts, `prometheus.serverFiles`), use the flat
-`config/observability/alerting-rules.yaml` and configure scraping yourself — **for both the
-server and the controller pod**. Scope per install with `kubernetes_sd_configs` + a
+`config/observability/alerting-rules.yaml` and configure scraping yourself — **for the
+server, controller pod, and injected PodLocal LMCache sidecars**. Scope per install with `kubernetes_sd_configs` + a
 `relabel_configs` that copies `__meta_kubernetes_namespace` to `namespace` (the alerts scope
 per install by that label).
 
@@ -60,7 +62,7 @@ traffic/rate/eviction thresholds).
 
 {{% alert title="LMCacheT2NoHits needs an extra scrape" color="warning" %}}
 `LMCacheT2NoHits` reads `vllm:external_prefix_cache_*` from the **engine pods directly**, not
-from inference-cache. The shipped `ServiceMonitor` covers only `inference-cache-server`. To
+from inference-cache. The shipped scrape configs do not collect vLLM's own metrics. To
 make this alert effective, add a separate `PodMonitor` for your engine Deployment (scoped to
 the pods your `CacheBackend.spec.engineSelector` matches) that preserves both `namespace` and
 `pod` labels.

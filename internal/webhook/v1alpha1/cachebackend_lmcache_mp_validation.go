@@ -1,0 +1,365 @@
+// SPDX-FileCopyrightText: 2026 The inference-cache Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package v1alpha1
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+
+	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	kvalidation "k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+)
+
+const (
+	lmcacheKVEventPort      int32 = 5557
+	lmcacheMPHTTPPort       int32 = 8080
+	lmcacheMPMemoryHeadroom       = "1Gi"
+)
+
+var sha256ImagePattern = regexp.MustCompile(`^[^[:space:]@]+@sha256:[a-f0-9]{64}$`)
+
+// validateLMCacheTopology enforces the canonical MP-only LMCache shape.
+func validateLMCacheTopology(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb == nil || cb.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache {
+		return nil
+	}
+	lmPath := field.NewPath("spec", "lmCache")
+	if cb.Spec.IsEventsOnly() {
+		if cb.Spec.LMCache != nil {
+			return field.ErrorList{field.Forbidden(lmPath,
+				"LMCache topology is invalid with integration.mode=EventsOnly because that mode injects no KV connector or MP server")}
+		}
+		return nil
+	}
+	if cb.Spec.LMCache == nil {
+		return field.ErrorList{field.Required(lmPath, "required for the LMCache multiprocess data plane")}
+	}
+
+	lm := cb.Spec.LMCache
+
+	var errs field.ErrorList
+
+	switch lm.Topology {
+	case "":
+		errs = append(errs, field.Required(lmPath.Child("topology"),
+			"required when podLocal or nodeLocal is configured"))
+	case cachev1alpha1.LMCacheTopologyPodLocal:
+		if lm.PodLocal == nil {
+			errs = append(errs, field.Required(lmPath.Child("podLocal"),
+				"required when topology=PodLocal"))
+		} else if lm.PodLocal.Server == nil {
+			errs = append(errs, field.Required(lmPath.Child("podLocal", "server"),
+				"required when topology=PodLocal"))
+		} else {
+			errs = append(errs, validatePodLocalServer(lm.PodLocal.Server, lmPath.Child("podLocal", "server"))...)
+		}
+		if lm.NodeLocal != nil {
+			errs = append(errs, field.Forbidden(lmPath.Child("nodeLocal"),
+				"must be omitted when topology=PodLocal"))
+		}
+	case cachev1alpha1.LMCacheTopologyNodeLocal:
+		if lm.NodeLocal == nil {
+			errs = append(errs, field.Required(lmPath.Child("nodeLocal"),
+				"required when topology=NodeLocal"))
+		} else if lm.NodeLocal.Server == nil {
+			errs = append(errs, field.Required(lmPath.Child("nodeLocal", "server"),
+				"required when topology=NodeLocal"))
+		} else {
+			errs = append(errs, validateNodeLocalServer(lm.NodeLocal.Server, lmPath.Child("nodeLocal", "server"))...)
+			if lm.NodeLocal.IdleRetentionSeconds < 0 || lm.NodeLocal.IdleRetentionSeconds > 86400 {
+				errs = append(errs, field.Invalid(lmPath.Child("nodeLocal", "idleRetentionSeconds"), lm.NodeLocal.IdleRetentionSeconds,
+					"must be between 0 and 86400 seconds"))
+			}
+		}
+		if lm.PodLocal != nil {
+			errs = append(errs, field.Forbidden(lmPath.Child("podLocal"),
+				"must be omitted when topology=NodeLocal"))
+		}
+		if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
+			errs = append(errs, field.Required(field.NewPath("spec", "engineSelector", "matchLabels"),
+				"NodeLocal requires a non-empty engine selector to define its trust domain"))
+		}
+	default:
+		errs = append(errs, field.NotSupported(lmPath.Child("topology"), lm.Topology,
+			[]string{string(cachev1alpha1.LMCacheTopologyPodLocal), string(cachev1alpha1.LMCacheTopologyNodeLocal)}))
+	}
+
+	return errs
+}
+
+func validatePodLocalServer(server *cachev1alpha1.LMCachePodLocalServerSpec, path *field.Path) field.ErrorList {
+	if server == nil {
+		return nil
+	}
+	errs := validateMPServer(
+		server.Image,
+		server.Port,
+		&server.L1Capacity,
+		server.Resources,
+		path,
+		map[int32]string{
+			lmcacheKVEventPort: "engine KV-event publisher",
+			lmcacheMPHTTPPort:  "LMCache MP HTTP health/control",
+		},
+	)
+	if server.MaxWorkers < 1 {
+		errs = append(errs, field.Invalid(path.Child("maxWorkers"), server.MaxWorkers, "must be at least 1"))
+	}
+	return errs
+}
+
+func validateNodeLocalServer(server *cachev1alpha1.LMCacheNodeLocalServerSpec, path *field.Path) field.ErrorList {
+	if server == nil {
+		return nil
+	}
+	errs := validateMPServer(
+		server.Image,
+		server.Port,
+		&server.L1Capacity,
+		server.Resources,
+		path,
+		nil,
+	)
+	if server.MaxGPUWorkers < 1 {
+		errs = append(errs, field.Invalid(path.Child("maxGPUWorkers"), server.MaxGPUWorkers, "must be at least 1"))
+	}
+	if server.MaxCPUWorkers < 1 {
+		errs = append(errs, field.Invalid(path.Child("maxCPUWorkers"), server.MaxCPUWorkers, "must be at least 1"))
+	}
+	ports := []struct {
+		name string
+		port int32
+	}{
+		{name: "port", port: server.Port},
+		{name: "httpPort", port: server.HTTPPort},
+	}
+	seen := map[int32]string{}
+	for _, item := range ports {
+		if item.port < 1 || item.port > 65535 {
+			errs = append(errs, field.Invalid(path.Child(item.name), item.port, "must be between 1 and 65535"))
+			continue
+		}
+		if prior, ok := seen[item.port]; ok {
+			errs = append(errs, field.Invalid(path.Child(item.name), item.port,
+				fmt.Sprintf("must be distinct from %s because both listeners bind the node network namespace", prior)))
+			continue
+		}
+		seen[item.port] = item.name
+	}
+	if _, requested := server.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")]; requested {
+		errs = append(errs, field.Forbidden(path.Child("resources", "requests").Key("nvidia.com/gpu"),
+			"NodeLocal MP servers use NVIDIA_VISIBLE_DEVICES=all for CUDA IPC and must not reserve engine allocatable GPUs"))
+	}
+	if _, limited := server.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]; limited {
+		errs = append(errs, field.Forbidden(path.Child("resources", "limits").Key("nvidia.com/gpu"),
+			"NodeLocal MP servers use NVIDIA_VISIBLE_DEVICES=all for CUDA IPC and must not reserve engine allocatable GPUs"))
+	}
+	return errs
+}
+
+func validateMPServer(
+	image string,
+	port int32,
+	l1Capacity *resource.Quantity,
+	resources corev1.ResourceRequirements,
+	path *field.Path,
+	reservedPorts map[int32]string,
+) field.ErrorList {
+	var errs field.ErrorList
+	trimmedImage := strings.TrimSpace(image)
+	switch {
+	case trimmedImage == "":
+		errs = append(errs, field.Required(path.Child("image"), "a CacheBackend-owned LMCache MP server image is required"))
+	case !sha256ImagePattern.MatchString(trimmedImage):
+		errs = append(errs, field.Invalid(path.Child("image"), image,
+			"must be pinned by sha256 digest (for example registry.example/lmcache@sha256:<64-hex-digest>)"))
+	}
+
+	if port < 1 || port > 65535 {
+		errs = append(errs, field.Invalid(path.Child("port"), port, "must be between 1 and 65535"))
+	} else if owner, reserved := reservedPorts[port]; reserved {
+		errs = append(errs, field.Invalid(path.Child("port"), port,
+			fmt.Sprintf("collides with the %s port %d", owner, port)))
+	}
+
+	if l1Capacity == nil || l1Capacity.Sign() <= 0 {
+		var bad any
+		if l1Capacity != nil {
+			bad = l1Capacity.String()
+		}
+		errs = append(errs, field.Invalid(path.Child("l1Capacity"), bad, "must be greater than zero"))
+	}
+	errs = append(errs, validateMPServerResourceRequirements(resources, path.Child("resources"))...)
+
+	cpuRequest, hasCPURequest := resources.Requests[corev1.ResourceCPU]
+	if !hasCPURequest || cpuRequest.Sign() <= 0 {
+		errs = append(errs, field.Required(path.Child("resources", "requests").Key(string(corev1.ResourceCPU)),
+			"a positive CPU request is required for the MP server"))
+	}
+	var memoryBudget *resource.Quantity
+	if l1Capacity != nil && l1Capacity.Sign() > 0 {
+		budget := l1Capacity.DeepCopy()
+		budget.Add(resource.MustParse(lmcacheMPMemoryHeadroom))
+		memoryBudget = &budget
+	}
+
+	memoryRequest, hasMemoryRequest := resources.Requests[corev1.ResourceMemory]
+	if !hasMemoryRequest || memoryRequest.Sign() <= 0 {
+		errs = append(errs, field.Required(path.Child("resources", "requests").Key(string(corev1.ResourceMemory)),
+			"a positive memory request is required for the MP server"))
+	} else if memoryBudget != nil && memoryRequest.Cmp(*memoryBudget) < 0 {
+		errs = append(errs, field.Invalid(path.Child("resources", "requests").Key(string(corev1.ResourceMemory)),
+			memoryRequest.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) so scheduling accounts for the memory-backed /dev/shm", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
+	}
+
+	memoryLimit, hasMemoryLimit := resources.Limits[corev1.ResourceMemory]
+	if !hasMemoryLimit || memoryLimit.Sign() <= 0 {
+		errs = append(errs, field.Required(path.Child("resources", "limits").Key(string(corev1.ResourceMemory)),
+			"a positive memory limit is required for the MP server"))
+	} else {
+		if hasMemoryRequest && memoryLimit.Cmp(memoryRequest) < 0 {
+			errs = append(errs, field.Invalid(path.Child("resources", "limits").Key(string(corev1.ResourceMemory)),
+				memoryLimit.String(), fmt.Sprintf("must be greater than or equal to the memory request %s", memoryRequest.String())))
+		}
+		if memoryBudget != nil && memoryLimit.Cmp(*memoryBudget) < 0 {
+			errs = append(errs, field.Invalid(path.Child("resources", "limits").Key(string(corev1.ResourceMemory)),
+				memoryLimit.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) to bound the memory-backed /dev/shm", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
+		}
+	}
+
+	return errs
+}
+
+// validateMPServerResourceRequirements mirrors the generic provider-resource
+// admission rules for the independently owned MP server resource block. Keep
+// this at the API boundary: otherwise malformed extended resources are only
+// discovered when the mutated engine Pod is submitted to the apiserver.
+func validateMPServerResourceRequirements(resources corev1.ResourceRequirements, path *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	if len(resources.Claims) > 0 {
+		errs = append(errs, field.Forbidden(path.Child("claims"),
+			"MP server resource claims are not supported because the injector does not own pod.spec.resourceClaims"))
+	}
+
+	checkList := func(list corev1.ResourceList, kind string) {
+		for name, quantity := range list {
+			itemPath := path.Child(kind).Key(string(name))
+			if msg, ok := validateContainerResourceName(name); !ok {
+				errs = append(errs, field.Invalid(itemPath, string(name), msg))
+				continue
+			}
+			if quantity.Sign() < 0 {
+				errs = append(errs, field.Invalid(itemPath, quantity.String(), "must be a non-negative quantity"))
+			}
+			if !isOvercommittableResource(name) && !strings.HasPrefix(string(name), "hugepages-") {
+				if _, ok := quantity.AsInt64(); !ok {
+					errs = append(errs, field.Invalid(itemPath, quantity.String(),
+						fmt.Sprintf("%q is an extended resource and must be an integer quantity", name)))
+				}
+			}
+			if strings.HasPrefix(string(name), "hugepages-") && quantity.Sign() > 0 {
+				pageSize, err := resource.ParseQuantity(strings.TrimPrefix(string(name), "hugepages-"))
+				if err == nil && pageSize.Sign() > 0 && quantity.Value()%pageSize.Value() != 0 {
+					errs = append(errs, field.Invalid(itemPath, quantity.String(),
+						fmt.Sprintf("must be a multiple of the page size %s", pageSize.String())))
+				}
+			}
+		}
+	}
+	checkList(resources.Requests, "requests")
+	checkList(resources.Limits, "limits")
+
+	for name, request := range resources.Requests {
+		limit, hasLimit := resources.Limits[name]
+		if !isOvercommittableResource(name) && !hasLimit {
+			errs = append(errs, field.Invalid(path.Child("requests").Key(string(name)), request.String(),
+				fmt.Sprintf("%q is non-overcommittable and must also have an equal limit", name)))
+			continue
+		}
+		if !hasLimit {
+			continue
+		}
+		if isOvercommittableResource(name) && limit.Cmp(request) < 0 {
+			errs = append(errs, field.Invalid(path.Child("limits").Key(string(name)), limit.String(),
+				fmt.Sprintf("must be greater than or equal to request %s", request.String())))
+		}
+		if !isOvercommittableResource(name) && limit.Cmp(request) != 0 {
+			errs = append(errs, field.Invalid(path.Child("limits").Key(string(name)), limit.String(),
+				fmt.Sprintf("must equal request %s for non-overcommittable resource %q", request.String(), name)))
+		}
+	}
+	return errs
+}
+
+// rejectUnimplementedRedisBindingFeatures permits authentication for typed
+// LMCache MP adapters while keeping every unsupported LMCache 0.5.3
+// RESP feature explicit. The common MP server renderer supports
+// username/password for both SGLang and vLLM, but not TLS or logical database
+// selection. Managed Redis currently provisions the default user, so its
+// password may be configured but an ACL username may not.
+func rejectUnimplementedRedisBindingFeatures(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+	if cb == nil || cb.Spec.RemoteStorage == nil || cb.Spec.RemoteStorage.Redis == nil {
+		return nil
+	}
+	redis := cb.Spec.RemoteStorage.Redis
+	path := field.NewPath("spec", "remoteStorage", "redis")
+	var errs field.ErrorList
+	if redis.Authentication != nil {
+		authPath := path.Child("authentication")
+		isTypedMP := cb.Spec.LMCache != nil &&
+			cb.Spec.EffectiveCacheType() == cachev1alpha1.CacheBackendTypeLMCache &&
+			(cb.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal ||
+				cb.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyNodeLocal) &&
+			(cb.Spec.Runtime == cachev1alpha1.CacheBackendRuntimeSGLang ||
+				cb.Spec.Runtime == cachev1alpha1.CacheBackendRuntimeVLLM)
+		if !isTypedMP {
+			errs = append(errs, field.Forbidden(authPath,
+				"Redis authentication is currently rendered only by a typed LMCache MP adapter"))
+		} else {
+			if redis.Authentication.Username != nil {
+				errs = append(errs, validateRedisSecretKeySelector(*redis.Authentication.Username, authPath.Child("username"))...)
+			}
+			errs = append(errs, validateRedisSecretKeySelector(redis.Authentication.Password, authPath.Child("password"))...)
+			if cb.Spec.RemoteStorage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged && redis.Authentication.Username != nil {
+				errs = append(errs, field.Forbidden(authPath.Child("username"),
+					"managed Redis provisions the default user and currently supports password authentication only"))
+			}
+		}
+	}
+	if redis.TLS != nil {
+		errs = append(errs, field.Forbidden(path.Child("tls"),
+			"the pinned LMCache 0.5.3 resp adapter does not support TLS; refusing inert TLS configuration"))
+	}
+	if redis.Database != nil {
+		errs = append(errs, field.Forbidden(path.Child("database"),
+			"the pinned LMCache 0.5.3 resp adapter does not support database selection; refusing inert adapter configuration"))
+	}
+	return errs
+}
+
+func validateRedisSecretKeySelector(selector corev1.SecretKeySelector, path *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	name := strings.TrimSpace(selector.Name)
+	if name == "" {
+		errs = append(errs, field.Required(path.Child("name"), "a namespace-local Secret name is required"))
+	} else if messages := kvalidation.IsDNS1123Subdomain(name); len(messages) > 0 {
+		errs = append(errs, field.Invalid(path.Child("name"), selector.Name, strings.Join(messages, "; ")))
+	}
+	key := strings.TrimSpace(selector.Key)
+	if key == "" {
+		errs = append(errs, field.Required(path.Child("key"), "a Secret data key is required"))
+	} else if messages := kvalidation.IsConfigMapKey(key); len(messages) > 0 {
+		errs = append(errs, field.Invalid(path.Child("key"), selector.Key, strings.Join(messages, "; ")))
+	}
+	if selector.Optional != nil && *selector.Optional {
+		errs = append(errs, field.Forbidden(path.Child("optional"),
+			"authentication Secret keys are required; optional credentials could start the cache plane unauthenticated or unusable"))
+	}
+	return errs
+}

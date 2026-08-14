@@ -6,6 +6,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -78,6 +79,19 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 		if err := unstructured.SetNestedStringMap(u.Object, map[string]string{"app.kubernetes.io/name": "vllm"}, "spec", "engineSelector", "matchLabels"); err != nil {
 			t.Fatalf("set spec.engineSelector: %v", err)
 		}
+		if err := unstructured.SetNestedMap(u.Object, map[string]any{
+			"topology": "PodLocal",
+			"podLocal": map[string]any{"server": map[string]any{
+				"image": "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"port":  int64(6500), "l1Capacity": "1Gi", "maxWorkers": int64(1),
+				"resources": map[string]any{
+					"requests": map[string]any{"cpu": "1", "memory": "2Gi"},
+					"limits":   map[string]any{"memory": "2Gi"},
+				},
+			}},
+		}, "spec", "lmCache"); err != nil {
+			t.Fatalf("set spec.lmCache: %v", err)
+		}
 		return u
 	}
 
@@ -111,22 +125,45 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 		})
 	}
 
+	for _, provider := range []string{"LMCacheServer", "Mooncake"} {
+		t.Run("reject-provider-"+provider, func(t *testing.T) {
+			u := newManaged("reject-provider-" + strings.ToLower(provider))
+			if err := unstructured.SetNestedMap(u.Object, map[string]any{
+				"provider": provider, "ownership": "Managed",
+			}, "spec", "remoteStorage"); err != nil {
+				t.Fatalf("set spec.remoteStorage: %v", err)
+			}
+			if err := c.Create(ctx, u); !apierrors.IsInvalid(err) {
+				t.Fatalf("create with remoteStorage.provider=%q error = %v, want Invalid from CRD enum", provider, err)
+			}
+		})
+	}
+
 	// Removed spec fields are pruned on create and never round-trip. obj is a
 	// separate RFC-1123 object name (the field name is mixed-case and cannot be
 	// used as metadata.name).
 	specCases := []struct {
-		name string
-		obj  string
-		path []string
+		name  string
+		obj   string
+		path  []string
+		value any
 	}{
-		{"lookupTimeoutMs", "retired-spec-lookup-timeout", []string{"spec", "integration", "lookupTimeoutMs"}},
-		{"minimumPrefixTokens", "retired-spec-min-prefix-tokens", []string{"spec", "integration", "minimumPrefixTokens"}},
+		{"lookupTimeoutMs", "retired-spec-lookup-timeout", []string{"spec", "integration", "lookupTimeoutMs"}, int64(7)},
+		{"minimumPrefixTokens", "retired-spec-min-prefix-tokens", []string{"spec", "integration", "minimumPrefixTokens"}, int64(7)},
+		{"deploymentKind", "retired-deployment-kind", []string{"spec", "deploymentKind"}, "Deployment"},
+		{"replicas", "retired-replicas", []string{"spec", "replicas"}, int64(1)},
+		{"autoscaling", "retired-autoscaling", []string{"spec", "autoscaling"}, map[string]any{"maxReplicas": int64(2)}},
+		{"template", "retired-template", []string{"spec", "template"}, map[string]any{"schedulerName": "default-scheduler"}},
+		{"hostMemory", "retired-host-memory", []string{"spec", "lmCache", "hostMemory"}, map[string]any{"capacity": "1Gi"}},
+		{"workerImage", "retired-worker-image", []string{"spec", "lmCache", "workerImage"}, "example.invalid/worker:v1"},
+		{"workerPort", "retired-worker-port", []string{"spec", "lmCache", "workerPort"}, int64(5555)},
+		{"remoteSerde", "retired-remote-serde", []string{"spec", "lmCache", "remoteSerde"}, "cachegen"},
 	}
 	for _, tc := range specCases {
 		t.Run(tc.name, func(t *testing.T) {
 			name := tc.obj
 			u := newManaged(name)
-			if err := unstructured.SetNestedField(u.Object, int64(7), tc.path...); err != nil {
+			if err := unstructured.SetNestedField(u.Object, tc.value, tc.path...); err != nil {
 				t.Fatalf("set %s: %v", tc.name, err)
 			}
 			if err := c.Create(ctx, u); err != nil {
@@ -138,23 +175,32 @@ func TestIntegrationCacheBackendSchemaTrim(t *testing.T) {
 		})
 	}
 
-	// Removed status field is pruned too. status.* needs the status subresource
+	// Removed status fields are pruned too. status.* needs the status subresource
 	// to round-trip at all, so write it via a status update and confirm it does
 	// not persist.
-	t.Run("indexEntries", func(t *testing.T) {
-		name := "retired-status-indexentries"
-		if err := c.Create(ctx, newManaged(name)); err != nil {
-			t.Fatalf("create: %v", err)
-		}
-		cur := get(name)
-		if err := unstructured.SetNestedField(cur.Object, int64(7), "status", "indexEntries"); err != nil {
-			t.Fatalf("set status.indexEntries: %v", err)
-		}
-		if err := c.Status().Update(ctx, cur); err != nil {
-			t.Fatalf("status update: %v", err)
-		}
-		if _, found, _ := unstructured.NestedFieldNoCopy(get(name).Object, "status", "indexEntries"); found {
-			t.Fatalf("status.indexEntries persisted; want pruned (field removed from schema)")
-		}
-	})
+	for _, fieldName := range []string{"indexEntries", "endpoint", "observedServerInstance"} {
+		t.Run(fieldName, func(t *testing.T) {
+			name := "retired-status-indexentries"
+			if fieldName != "indexEntries" {
+				name = "retired-status-" + strings.ToLower(fieldName)
+			}
+			if err := c.Create(ctx, newManaged(name)); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			cur := get(name)
+			value := any("removed")
+			if fieldName == "indexEntries" {
+				value = int64(7)
+			}
+			if err := unstructured.SetNestedField(cur.Object, value, "status", fieldName); err != nil {
+				t.Fatalf("set status.%s: %v", fieldName, err)
+			}
+			if err := c.Status().Update(ctx, cur); err != nil {
+				t.Fatalf("status update: %v", err)
+			}
+			if _, found, _ := unstructured.NestedFieldNoCopy(get(name).Object, "status", fieldName); found {
+				t.Fatalf("status.%s persisted; want pruned (field removed from schema)", fieldName)
+			}
+		})
+	}
 }

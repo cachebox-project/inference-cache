@@ -53,7 +53,6 @@ type options struct {
 	cacheIndexRefreshEvery  time.Duration
 	policyPushEvery         time.Duration
 	subscriberImage         string
-	lmCacheServerImage      string
 	policyServerGRPCAddress string
 	zapOpts                 zap.Options
 }
@@ -70,7 +69,6 @@ func defaultOptions() options {
 		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
 		policyPushEvery:         controller.DefaultPolicyPushInterval,
 		subscriberImage:         "",
-		lmCacheServerImage:      "",
 		policyServerGRPCAddress: "inference-cache-server.inference-cache-system.svc.cluster.local:9090",
 		zapOpts: zap.Options{
 			TimeEncoder: zapcore.RFC3339TimeEncoder,
@@ -91,7 +89,6 @@ func parseOptions() options {
 	flag.DurationVar(&opts.cacheIndexRefreshEvery, "cacheindex-refresh-interval", opts.cacheIndexRefreshEvery, "How often to refresh the CacheIndex status from the server snapshot.")
 	flag.DurationVar(&opts.policyPushEvery, "cachepolicy-push-interval", opts.policyPushEvery, "How often to re-push the full CachePolicy snapshot to the server (self-healing on server restart).")
 	flag.StringVar(&opts.subscriberImage, "kvevent-subscriber-image", opts.subscriberImage, "Image reference the pod-mutating webhook uses for the kvevent-subscriber sidecar it auto-attaches to managed-LMCache engine pods (vLLM and SGLang). Empty (default) disables auto-attach — the engine pod wiring still happens but no subscriber container is appended. Pin to a digest in production.")
-	flag.StringVar(&opts.lmCacheServerImage, "lmcache-server-image", opts.lmCacheServerImage, "Fallback image for managed LMCache servers when spec.remoteStorage.lmCacheServer.image is empty. Managed LMCache reconciliation requires one of these settings. Pin to a client-compatible digest in production.")
 	flag.StringVar(&opts.policyServerGRPCAddress, "policy-server-grpc-address", opts.policyServerGRPCAddress, "host:port the kvevent-subscriber sidecar dials to ReportCacheState. Defaults to the in-cluster Service DNS in the inference-cache-system namespace.")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -131,14 +128,13 @@ func main() {
 	// webhooks. Whatever admission accepts is therefore renderable and
 	// injectable without each caller remembering extra registrations.
 	//
-	// The kvevent-subscriber sidecar image, managed LMCache server fallback,
-	// and policy-server gRPC address are operator-supplied. Pinning images to
-	// compatible digests in production and selecting the right Service DNS are
+	// The kvevent-subscriber sidecar image and policy-server gRPC address are
+	// operator-supplied. Pinning images to compatible digests in production and
+	// selecting the right Service DNS are
 	// deployment concerns; a CacheBackend may still override its own provider
 	// image when needed.
 	adapterRegistries := builtinadapters.New(builtinadapters.Options{
 		SubscriberImage:         opts.subscriberImage,
-		LMCacheServerImage:      opts.lmCacheServerImage,
 		PolicyServerGRPCAddress: opts.policyServerGRPCAddress,
 	})
 	adapterRegistry := adapterRegistries.Runtime
@@ -219,7 +215,7 @@ func main() {
 	// The Pod admission handler uses the manager's APIReader (uncached
 	// live client) instead of the cached client: pod CREATE is a
 	// one-shot opportunity to inject, so a stale informer view of the
-	// owning CacheBackend (in particular a status.endpoint that lags
+	// owning CacheBackend (in particular remote-storage status that lags
 	// reality) would leave the pod permanently unwired. Live reads also
 	// avoid a cold-cache window on controller startup.
 	mgr.GetWebhookServer().Register(podwebhook.WebhookPath, &webhook.Admission{

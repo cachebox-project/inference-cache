@@ -11,7 +11,7 @@ control plane for LLM inference**. It makes routing and cache decisions *cache-a
 that requests land on replicas that already hold the prompt's KV cache warm — turning a
 prefix cache hit into lower time-to-first-token (TTFT) and lower cost.
 
-It **orchestrates** the KV-cache technology you already run (LMCache, Mooncake) rather than
+It **orchestrates** the KV-cache technology you already run (currently LMCache MP) rather than
 replacing it. inference-cache is **not** a new distributed cache, and it is **not** the
 data-plane gateway. It is the brain that decides *where a request should go*; the gateway
 follows the hint.
@@ -40,9 +40,8 @@ for every gateway client, and no routing logic fragmented across clients.
   webhook injects the KV-connector configuration automatically. The observation sidecar is
   also injected when the controller's opt-in `--kvevent-subscriber-image` is configured.
 
-- 🧩 **Pluggable KV-cache backends** — the default in-memory LMCache backend for the simple
-  path; Mooncake for a durable, shared, peer-to-peer store; or point at an `External`
-  endpoint you manage.
+- 🧩 **Typed LMCache MP** — one PodLocal MP server per engine Pod, with optional
+  managed or external Redis L3 selected explicitly when cross-Pod sharing is required.
 
 - 🏠 **Multi-tenant by construction** — the cache-state index is keyed by
   `(tenant, model, hash_scheme, adapter_id, prefix_hash)`, so tenants' hints can never

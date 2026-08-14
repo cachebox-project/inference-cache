@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Typed SGLang PodLocal LMCache MP with no remote tier. The inference-owner Pod
+# image must contain a compatible LMCache client/API; normal engine startup
+# fails before serving when it does not. No capability annotation is required.
+# Launch args must explicitly set --page-size to a divisor of chunkSizeTokens.
+apiVersion: inferencecache.io/v1alpha1
+kind: CacheBackend
+metadata:
+  name: sglang-podlocal-host-only
+spec:
+  runtime: SGLang
+  type: LMCache
+  integration:
+    role: ReadWrite
+  engineSelector:
+    matchLabels:
+      inferencecache.io/cache-domain: sglang-mp
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
+  observation:
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct

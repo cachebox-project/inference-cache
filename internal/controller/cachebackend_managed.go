@@ -18,9 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// reconcileManaged renders the cache-server PodSpec + Service via the runtime
-// adapter, wraps them into a Deployment + Service owned by the CR, and
-// publishes the resolved endpoint to status.
+// reconcileManaged receives a storage-provider PodSpec + Service, wraps them
+// in controller-owned resources, and publishes the observed remote endpoint.
 //
 // Apply drives desired state; status reflects observed state. The two must not
 // block each other: if a desired-state write fails (e.g. a transient API-server
@@ -31,10 +30,10 @@ import (
 func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger logr.Logger, backend *cachev1alpha1.CacheBackend, rendered *backendadapter.RenderedStorage) (ctrl.Result, error) {
 	podSpec, svcSpec := rendered.PodSpec, rendered.Service
 	if podSpec == nil || svcSpec == nil {
-		// Engine-local adapters such as native SGLang HiCache intentionally
-		// render no cache-server. Reuse the unmanaged lifecycle to shed any
+		// Engine-local adapters intentionally render no provider workload. Reuse
+		// the unmanaged lifecycle to shed any
 		// previously owned workload and clear server-backed status.
-		logger.V(1).Info("adapter rendered no cache-server; treating as unmanaged",
+		logger.V(1).Info("adapter rendered no provider workload; treating as unmanaged",
 			"namespace", backend.Namespace, "name", backend.Name)
 		return ctrl.Result{}, r.reconcileUnmanaged(ctx, backend)
 	}
@@ -42,19 +41,14 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	dep := r.buildDeployment(backend, podSpec)
 	svc := r.buildService(backend, svcSpec)
 
-	// Skip Service + HPA when applyDeployment failed. The HPA targets the
-	// Deployment by name, so running it after a foreign-ownership failure
-	// could scale another controller's workload; the Service is independent
-	// but pointless to expose alongside a Deployment we don't own. Status
+	// Skip the Service when applyDeployment failed. It is pointless and unsafe
+	// to expose pods alongside a Deployment we do not own. Status
 	// observation still runs below (it has its own ownership guards) so the
 	// CR isn't held hostage to apply churn.
 	applyErr := r.applyDeployment(ctx, backend, dep)
 	if applyErr == nil {
 		if svcErr := r.applyService(ctx, backend, svc); svcErr != nil {
 			applyErr = svcErr
-		}
-		if hpaErr := r.reconcileHPA(ctx, backend, dep); hpaErr != nil && applyErr == nil {
-			applyErr = hpaErr
 		}
 	}
 
@@ -102,70 +96,20 @@ func (r *CacheBackendReconciler) reconcileManaged(ctx context.Context, logger lo
 	}
 
 	requeueAfter, statusErr := r.updateManagedStatus(ctx, backend, endpoint, &live, applyErr == nil)
-	// Do NOT short-circuit on statusErr — the cascade is independent
-	// recovery for stale engine sockets and must not be skipped just
-	// because the unrelated managed-status patch (matchedEnginePods,
-	// Ready / Progressing / Degraded conditions, …) hit a
-	// transient conflict. The cascade has its own patchStatus path
-	// for the latch field, gated separately. Capture the error and
-	// return it AFTER the cascade has run.
-
-	// Cache-server restart cascade: when the Ready cache-server pod
-	// SERVER-INSTANCE IDENTIFIER changes (either a pod UID swap or a
-	// restart-sum advance from an in-place kubelet-driven container
-	// restart — see currentServerInstanceID's godoc for the shape),
-	// cascade-restart every engine Deployment that was injected
-	// against this backend so they re-establish their LMCache client
-	// socket (the upstream LMServerConnector opens its TCP socket in
-	// __init__ only and silently fails every subsequent PUT with EPIPE
-	// after a server restart, until the engine pod itself rolls). Always
-	// runs (even when applyErr != nil OR updateManagedStatus errored),
-	// since the cascade is independent of whether THIS reconcile pass
-	// made a successful apply or a successful unrelated status update:
-	// a transient apply / status-write churn must not delay engine
-	// recovery from a cache-server outage. A non-zero cascadeWait means
-	// the rate-limit window suppressed the cascade; honor it on the
-	// requeue so we retry exactly at the boundary.
-	cascadeWait := r.reconcileServerInstance(ctx, logger, backend)
-	if cascadeWait > 0 && (requeueAfter == 0 || cascadeWait < requeueAfter) {
-		requeueAfter = cascadeWait
-	}
-	// Schedule an unconditional periodic re-poll of the cache-server
-	// pod set on managed backends. Reason: an in-place container
-	// restart (kubelet respawning a crashed cache-server container
-	// without bumping pod.UID) does NOT change owned-Deployment status
-	// counts, and the controller deliberately does not watch Pods
-	// cluster-wide (see refreshMatchedEnginePods godoc). The
-	// matched-engine-pods cadence above does not cover this case
-	// either: when an operator removes spec.engineSelector after
-	// engines were injected, len(matchedEnginePods)→0 and that
-	// cadence stops firing, leaving in-place restarts unobservable
-	// until something unrelated triggers a reconcile. Pinning a
-	// floor at the rate-limit interval bounds the observation
-	// latency for in-place restarts at one cadence (cheap: one
-	// Pod List + one Deployment Get per backend per cadence).
-	pollCadence := r.minServerRestartCascadeInterval()
-	if requeueAfter == 0 || pollCadence < requeueAfter {
-		requeueAfter = pollCadence
-	}
-
+	requeueAfter = minNonZero(requeueAfter, r.matchedEnginePodsRequeueInterval())
 	if applyErr != nil {
 		// Return the error so controller-runtime's workqueue
 		// rate-limiter requeues the reconcile. Per the
 		// sigs.k8s.io/controller-runtime/pkg/reconcile contract, when
 		// the error is non-nil the `Result` is ignored — including any
 		// RequeueAfter we might set here — so there is no point
-		// pretending to schedule the cascade retry at the rate-limit
-		// boundary on this path. The rate-limiter's backoff cadence is
-		// the actual retry schedule; the next successful reconcile
-		// then re-enters the cascade path at its own boundary.
+		// pretending to schedule a timed retry on this path. The rate-limiter's
+		// backoff cadence is the actual retry schedule.
 		return ctrl.Result{}, applyErr
 	}
 	if statusErr != nil {
-		// Surface the deferred status-write failure after the cascade
-		// has had its chance to recover engine FDs. Same workqueue
-		// rate-limiter semantics as the applyErr path: Result is
-		// ignored when err != nil.
+		// Surface the deferred status-write failure. Same workqueue rate-limiter
+		// semantics as the applyErr path: Result is ignored when err != nil.
 		return ctrl.Result{}, statusErr
 	}
 

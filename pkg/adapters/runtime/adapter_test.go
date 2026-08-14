@@ -69,7 +69,7 @@ func newCacheBackend(t cachev1alpha1.CacheBackendType, engine string) *cachev1al
 }
 
 func referenceBinding(endpoint string) *backendadapter.Binding {
-	return &backendadapter.Binding{Protocol: backendadapter.ProtocolLMCache, Endpoint: endpoint}
+	return &backendadapter.Binding{Protocol: backendadapter.ProtocolRESP, Endpoint: endpoint}
 }
 
 func TestRegistrySelectFirstMatchWins(t *testing.T) {

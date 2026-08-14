@@ -6,9 +6,9 @@
 
 The substrate has two declarative halves:
 
-* **Engine ↔ cache backend** — the C6 mutating Pod webhook injects `--kv-transfer-config`
-  and `LMCACHE_*` env vars onto the engine container when a `CacheBackend` claims the pod
-  (`internal/webhook/pod/podinjector.go`).
+* **Engine ↔ cache backend** — the mutating Pod webhook injects the runtime-
+  specific typed LMCache MP connector plus a PodLocal native sidecar when a
+  `CacheBackend` claims the pod (`internal/webhook/pod/podinjector.go`).
 * **Engine ↔ policy server** — the engine publishes KV-cache events over ZMQ; a
   `kvevent-subscriber` process (`cmd/kvevent-subscriber`) consumes them and reports cache
   state to the policy server.
@@ -43,16 +43,17 @@ to turn it on.**
 Concretely:
 
 * `KVCacheRuntimeAdapter` gains `ObservationSidecar(cb, pod) (*corev1.Container, error)`.
-  The vLLM/LMCache, vLLM/Mooncake, SGLang/LMCache, and SGLang/HiCache adapters return the `kvevent-subscriber`
+  The vLLM/LMCache, SGLang/LMCache, and SGLang/HiCache adapters return the `kvevent-subscriber`
   container spec (via their shared internal subscriber renderer — the KV-event stream is the
   engine's own ZMQ publisher, independent of the L2 store; each adapter pins its engine's
   `--hash-scheme` tag + ZMQ port); the reference adapter returns `(nil, nil)`.
-  External ownership stays on the runtime/cache adapter and can attach observation.
+  External Redis ownership stays on the runtime/cache adapter and can attach
+  observation. The former IP adapters were removed in Phase 7.
 * The Pod webhook (`internal/webhook/pod/podinjector.go`) calls `ObservationSidecar` right
   after `InjectEngineConfig`. A non-nil container is appended to `pod.Spec.Containers`
   (idempotent — skipped if a container by the well-known name is already present). Errors
   fail open, matching the rest of the webhook.
-* **The vLLM/LMCache, vLLM/Mooncake, SGLang/LMCache, and SGLang/HiCache adapters return nil unless the
+* **The vLLM/LMCache, SGLang/LMCache, and SGLang/HiCache adapters return nil unless the
   controller's `--kvevent-subscriber-image` flag is set** (all go through the same shared
   internal renderer, so the opt-in behaviour is identical). An unconfigured image would put the sidecar
   container into `ImagePullBackOff`, which keeps the engine pod from going Ready — the
@@ -94,9 +95,7 @@ Concretely:
   The SGLang adapter reuses the same shared subscriber, only its `--hash-scheme` tag
   differs (SGLang adopted vLLM's ZMQ KV-event wire); the seam is what would let a genuinely
   different future engine return a different sidecar (e.g. a different ZMQ port or a
-  completely different observation mechanism). A Mooncake remote binding uses the same
-  vLLM kvevent-subscriber because the engine is still vLLM and its KV events still come
-  from vLLM's ZMQ publisher (scheme-tagged `vllm`); only the backend store differs. A
+  completely different observation mechanism). A
   future backend that fronts a non-vLLM engine, or exposes observation data some other way,
   could still return `nil` or a different container here. **DaemonSet remains an option for
   any future adapter** that wants it — it just isn't this PR.
@@ -123,8 +122,8 @@ the prefix becoming unreachable and the cache plane must drop the routing hint
 promptly — the subscriber's default behavior, forwarding `BlockRemoved` as
 `PREFIX_EVICTED`, is exactly right.
 
-When the engine is paired with a separate **L2 cache tier** (e.g. LMCache via
-`--kv-transfer-config '{"kv_connector":"LMCacheConnectorV1",...}'`) the
+When the engine is paired with a separate **host-cache tier** (current typed
+LMCache MP via `LMCacheMPConnector`) the
 semantics invert. LMCache retains the block after the engine offloads it from
 HBM, so the replica can still serve the prefix cheaply from the L2 tier. The
 vLLM-emitted `BlockRemoved` no longer means "the prefix is gone"; it means
@@ -138,7 +137,7 @@ The subscriber tags each reported prefix with a **cache tier** (`PrefixEntry.tie
 see `grpc-contract.md`) derived from the engine's block lifecycle. The available
 signals are only `BlockStored` / `BlockRemoved` / `AllBlocksCleared`: **vLLM's
 KV-event channel announces the T1 (HBM) lifecycle but emits nothing when
-LMCache offloads a block to L2** — the `LMCacheConnectorV1` offload is invisible
+LMCache offloads a block to the host tier** — LMCache offload is invisible
 to the KV-event surface. So T2 is not *directly observable*; it is *inferred*
 from a T1 eviction combined with knowledge that an L2 tier is configured:
 
@@ -181,13 +180,13 @@ left the entry stale at T1) and is kept for backward compatibility, but the
 signal it carries is unchanged. When set, a `BlockRemoved` becomes a T2 downgrade;
 when unset, it forwards `PREFIX_EVICTED`. `AllBlocksCleared` and `BlockStored`
 flow normally in both modes. The shared internal subscriber renderer
-(`internal/adapters/builtin/runtime/subscriber.go`) — which the vLLM/LMCache,
-vLLM/Mooncake, and SGLang/LMCache adapters all call — sets the flag **per
+(`internal/adapters/builtin/runtime/subscriber.go`) — which the typed
+vLLM/LMCache and SGLang/LMCache adapters call — sets the flag **per
 integration mode**, because the L2 tier is present only in one of them:
 
-- **`Offload` (default):** the adapter wires the LMCache KV connector (pointed at
-  an `lm://` LMCache server or a `mooncakestore://` Mooncake store), so an L2
-  tier retains the block after the engine offloads it — `BlockRemoved` means
+- **`Offload` (default):** the adapter wires the LMCache MP connector to the
+  PodLocal server, so the host tier can retain the block after the engine
+  offloads it — `BlockRemoved` means
   "moved tiers," not "gone." The helper sets `--ignore-block-removed=true` so the
   hint is re-reported at T2 and ages out on its freshness TTL.
 - **`EventsOnly`:** no KV connector is injected, so there is **no** L2 tier

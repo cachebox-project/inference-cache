@@ -5,8 +5,8 @@ available, and how to size it: **GPU memory, card count, tensor-parallelism, and
 host resources**.
 
 The stack is cloud-neutral — it needs an NVIDIA GPU advertising `nvidia.com/gpu`,
-nothing more. §4 gives a concrete OCI-shape mapping as one worked example; any
-equivalent NVIDIA card on any cloud or on-prem works the same.
+nothing more. Select any cloud or on-prem node whose card count, VRAM, host
+memory, and interconnect satisfy the requirements below.
 
 ---
 
@@ -39,8 +39,8 @@ you need a bigger card or more cards (tensor-parallel).
 - **On a 48 GB L40S:** ~27 GB KV pool — comfortable, and leaves host headroom for
   LMCache offload. **This is the recommended PoC card.**
 
-> **LMCache changes the GPU math only indirectly.** LMCache offloads KV blocks
-> off the GPU into **host RAM / disk**, so it relieves GPU KV pressure but adds a
+> **LMCache changes the GPU math only indirectly.** Typed PodLocal MP offloads
+> KV blocks from the GPU into the server's **host-memory L1**, so it relieves GPU KV pressure but adds a
 > **host-memory** requirement (see §3). It does not reduce the weights footprint.
 
 ---
@@ -72,35 +72,15 @@ Rules of thumb:
 
 | Resource | Reference (8B) | Why |
 |---|---|---|
-| Host RAM | ≥ 32 GB free | `LMCACHE_MAX_LOCAL_CPU_SIZE=20` GiB CPU offload tier + OS/engine. Scale with the offload buffer. |
-| `/dev/shm` | ≥ 8 GiB (set in `manifests/deployment.yaml`) | vLLM uses shared memory for tensor/IPC; small `/dev/shm` causes cryptic NCCL/loader hangs. |
-| Local disk | model size × 1.5 + LMCache disk tier | HF weight cache + optional LMCache disk offload. ~30 GB for 8B; size up for 70B. |
+| Host RAM | engine budget + MP L1 + headroom | The reference uses `l1Capacity: 4Gi`; the MP server request/limit and `/dev/shm` must cover L1 plus at least 1Gi. |
+| `/dev/shm` | ≥ typed L1 + 1Gi | Shared by the engine and injected MP server; the reference uses 8Gi. |
+| Local disk | model size × 1.5 | HF weight cache. The host-only reference does not claim a local-disk LMCache tier. |
 | Network | 100 Gb+ RDMA for multi-node | Only if you later shard across nodes; single-node TP uses NVLink. |
-| Driver/runtime | NVIDIA driver + Container Toolkit; `nvidia` default Docker runtime | So kind/OKE pods can request `nvidia.com/gpu`. |
+| Driver/runtime | NVIDIA driver + Container Toolkit; `nvidia` default Docker runtime | So local or managed-cluster pods can request `nvidia.com/gpu`. |
 
 ---
 
-## 4. Worked example — OCI GPU shapes
-
-One concrete cloud mapping (Oracle Cloud Infrastructure). Any equivalent NVIDIA
-card on another cloud or on-prem works the same. GPU memory **per card**: A10 =
-24 GB, L40S = 48 GB, A100 = 80 GB (also a 40 GB variant), H100 = 80 GB, H200 =
-141 GB.
-
-| Target | OCI shape | Cards × VRAM | Good for |
-|---|---|---|---|
-| **This reference (recommended)** | `VM.GPU.A10.1` | 1 × 24 GB | 8B, single card, cheapest |
-| Single card with headroom | `BM.GPU.L40S.4` (use 1 GPU) | 4 × 48 GB | 8B–34B comfortably; room for LMCache |
-| Single bigger model | `VM.GPU.A100.1` / `VM.GPU.H100.1` | 1 × 80 GB | up to ~34B, or 70B quantized |
-| 70B BF16 (TP) | `BM.GPU4.8` / `BM.GPU.A100-v2.8` | 8 × 40/80 GB (use 4, NVLink) | `--tensor-parallel-size 4` |
-| Largest / fastest | `BM.GPU.H100.8` / `BM.GPU.H200.8` | 8 × 80/141 GB | 70B–100B+, full-node TP |
-
-For the **8B reference**, a single 24 GB card (e.g. `VM.GPU.A10.1`) is the
-cheapest option. Pick a bare-metal multi-GPU shape only when you need TP ≥ 2.
-
----
-
-## 5. Deploy (once the GPU node is up)
+## 4. Deploy (once the GPU node is up)
 
 Builds on [`README.md`](README.md) "Deploy and test on a GPU". Summary:
 
@@ -116,7 +96,9 @@ kubectl get nodes -o json | jq '.items[].status.allocatable["nvidia.com/gpu"]'  
 kubectl create namespace cache-substrate
 kubectl -n cache-substrate create secret generic hf-token --from-literal=token="$HF_TOKEN"
 
-# 2. Apply. For multi-card, bump replicas/GPU + add --tensor-parallel-size (see below).
+# 2. Install inference-cache first, then apply. Replace the deliberately
+#    non-pullable engine-image placeholder before creating the Deployment.
+kubectl apply -k ../../config/default
 kubectl apply -f manifests/namespace.yaml -f manifests/deployment.yaml -f manifests/service.yaml
 kubectl -n cache-substrate rollout status deploy/vllm-lmcache-llama-8b --timeout=20m
 ```
@@ -137,7 +119,7 @@ Then run the verification in [`README.md`](README.md) ("What success looks
 like"): subscribe with `scripts/kv_events_subscriber.py` and fire
 `scripts/prefix_cache_hit_test.sh`.
 
-## 6. Sizing-related failure cheatsheet
+## 5. Sizing-related failure cheatsheet
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -145,4 +127,4 @@ like"): subscribe with `scripts/kv_events_subscriber.py` and fire
 | Loads but low throughput / frequent recompute | KV pool too small | bigger card, raise `gpu_memory_utilization`, or lean on LMCache offload |
 | `tensor-parallel-size` mismatch / hang at startup | TP ≠ GPU count, or heads not divisible | set TP = `nvidia.com/gpu`; check head count divisibility |
 | NCCL / loader hang on multi-GPU | small `/dev/shm`, or no NVLink (multi-GPU VM) | raise `/dev/shm`; use a bare-metal NVLink shape for TP |
-| Host OOM with LMCache enabled | `LMCACHE_MAX_LOCAL_CPU_SIZE` > free host RAM | lower the buffer or pick a higher-RAM shape |
+| Host OOM with LMCache enabled | typed `l1Capacity` + 1Gi headroom exceeds the sidecar/pod memory budget | lower `l1Capacity` consistently or raise the MP-server request/limit and `/dev/shm` size |

@@ -20,8 +20,8 @@ import (
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
 
-// EngineKernelsHealthy gate: surfaces the engine-side native CUDA-kernel
-// (lmcache c_ops) load health on the CacheBackend, read from the
+// EngineKernelsHealthy gate: surfaces the engine-side native CUDA-extension
+// (LMCache c_ops plus the vLLM native module) load health on the CacheBackend, read from the
 // lmcache-kernel-check init container the pod webhook injects into matched
 // engine pods. Default is fail-OPEN observability (report-only): the condition
 // surfaces the problem but does NOT downgrade Ready, so a degraded kernel tier
@@ -38,7 +38,7 @@ const (
 	conditionTypeEngineKernelsHealthy = "EngineKernelsHealthy"
 
 	reasonKernelsHealthy = "KernelsHealthy"
-	// reasonKernelLoadFailed covers every way the native lmcache c_ops
+	// reasonKernelLoadFailed covers every way the engine/LMCache native
 	// kernels did not load: a libcudart/CUDA-runtime mismatch (the root
 	// cause), a CPU/pure-python build with no compiled extension, or lmcache
 	// not being importable at all. The specific cause is carried verbatim in
@@ -111,7 +111,7 @@ func evaluateEngineKernelHealth(
 	if cond.Status == metav1.ConditionFalse && strictFail {
 		v.downgradeReady = true
 		v.readyReason = reasonEngineKernelDegraded
-		v.readyMessage = "lmcache CUDA kernels failed to load on one or more engine pods; in strict mode those pods stay in Init holding their GPU reservation without serving — fix the engine image's lmcache/CUDA alignment or set " + enginebinding.AnnotationLMCacheKernelCheck + "=report-only"
+		v.readyMessage = "vLLM/LMCache CUDA extensions failed to load on one or more engine pods; in strict mode those pods stay in Init holding their GPU reservation without serving — fix the engine image's vLLM/LMCache/CUDA alignment or set " + enginebinding.AnnotationLMCacheKernelCheck + "=report-only"
 	}
 	return v
 }
@@ -198,7 +198,7 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 	switch {
 	case nFail > 0:
 		return mk(metav1.ConditionFalse, reasonKernelLoadFailed,
-			fmt.Sprintf("native lmcache c_ops kernels failed to load on %d engine pod(s): %s", nFail, failMsg)), true, strictFail
+			fmt.Sprintf("native vLLM/LMCache CUDA extensions failed to load on %d engine pod(s): %s", nFail, failMsg)), true, strictFail
 	case nErr > 0:
 		return mk(metav1.ConditionUnknown, reasonKernelCheckError,
 			fmt.Sprintf("kernel-check init container on %d engine pod(s) terminated without a recognized result message (%s)", nErr, errDetail)), true, strictFail
@@ -207,7 +207,7 @@ func aggregateKernelHealth(backend *cachev1alpha1.CacheBackend, pods []corev1.Po
 			fmt.Sprintf("kernel-check init container has not completed on %d engine pod(s)", nPending)), true, strictFail
 	default:
 		return mk(metav1.ConditionTrue, reasonKernelsHealthy,
-			fmt.Sprintf("native lmcache c_ops kernels loaded on %d engine pod(s)", nOK)), true, strictFail
+			fmt.Sprintf("native vLLM/LMCache CUDA extensions loaded on %d engine pod(s)", nOK)), true, strictFail
 	}
 }
 

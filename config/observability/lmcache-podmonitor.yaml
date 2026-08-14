@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: 2026 The inference-cache Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# PodMonitor for PodLocal native sidecars and controller-owned NodeLocal server
+# Pods. Both expose the real FastAPI `/metrics` route on the named
+# `lmcache-http` port. NodeLocal targets use hostNetwork, so NetworkPolicy does
+# not isolate this unauthenticated listener; restrict its host port with node
+# firewall controls inside the backend's trust domain.
+#
+# Engine Pods can live in any workload namespace while this PodMonitor remains
+# in the inference-cache system/monitoring namespace. `namespaceSelector.any`
+# is therefore intentional. Prometheus still needs RBAC to discover/scrape Pods
+# in those namespaces, and a workload NetworkPolicy must allow traffic from the
+# Prometheus namespace to TCP 8080. The endpoint is unauthenticated; do not
+# expose it outside the cluster Pod network.
+#
+# Kubernetes Pod discovery includes declared init-container ports. That covers
+# native sidecars, which are represented as initContainers with
+# `restartPolicy: Always` but continue running for the Pod lifetime.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: inference-cache-lmcache-mp
+  namespace: inference-cache-system
+  labels:
+    app.kubernetes.io/name: inference-cache
+    app.kubernetes.io/component: observability
+    # Must match the target Prometheus CR's podMonitorSelector. See the sibling
+    # controller PodMonitor for common kube-prometheus-stack alternatives.
+    prometheus: k8s
+spec:
+  selector:
+    matchLabels:
+      inferencecache.io/lmcache-mp-metrics: "true"
+  namespaceSelector:
+    any: true
+  podMetricsEndpoints:
+    - port: lmcache-http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

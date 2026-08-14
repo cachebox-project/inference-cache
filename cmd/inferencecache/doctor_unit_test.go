@@ -28,7 +28,6 @@ func svc(ns, name string) *corev1.Service {
 
 func TestStripScheme(t *testing.T) {
 	cases := map[string]string{
-		"lm://host:1":    "host:1",
 		"http://host:2":  "host:2",
 		"https://host:3": "host:3",
 		"host:4":         "host:4",

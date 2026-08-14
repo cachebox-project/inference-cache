@@ -26,9 +26,9 @@ Five are namespaced; `CacheIndex` is the only cluster-scoped type. Controllers e
 
 ### [CacheBackend]({{< relref "/docs/concepts/cachebackend/" >}})
 
-The primary resource an operator writes. It binds to inference-engine pods by label,
-provisions a managed cache-server workload, and makes the engine's KV cache reusable across
-requests. Short name `cb`.
+The primary resource an operator writes. It binds to inference-engine pods by
+label, injects typed engine-side cache wiring, and optionally provisions managed
+Redis as a remote tier. Short name `cb`.
 
 ### [CachePolicy]({{< relref "/docs/concepts/cachepolicy/" >}})
 

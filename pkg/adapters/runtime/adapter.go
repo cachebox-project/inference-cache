@@ -111,6 +111,18 @@ type KVCacheRuntimeAdapter interface {
 	EngineContainerName() string
 }
 
+// LMCacheMPRuntimeAdapter identifies adapters that understand the typed LMCache
+// MP topology. The Pod webhook uses the additional validation hook before
+// mutating a selected engine Pod.
+type LMCacheMPRuntimeAdapter interface {
+	KVCacheRuntimeAdapter
+
+	// ValidateMPEnginePod validates version/parallelism/command/resource
+	// constraints visible only on the concrete engine Pod. An unclassifiable
+	// Pod returns an error and is never silently injected.
+	ValidateMPEnginePod(*corev1.Pod, *cachev1alpha1.CacheBackend) error
+}
+
 // ErrNoAdapter is returned by [Registry.Select] when no registered adapter
 // supports a given (runtime, CacheBackend) pair. An admission validator can
 // translate this into a user-visible rejection; the reconciler logs and skips.

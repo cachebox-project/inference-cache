@@ -27,7 +27,7 @@ order. Finding codes are stable and greppable; severity is shown in parentheses.
 | 3 | `/policy` wired | `PL001` (FAIL), `PL002` (OK), `PL003` (WARN) |
 | 4 | `/probe` wired | `PB001` (FAIL), `PB002` (OK), `PB003` (WARN) |
 | 5 | Per-`CacheBackend` health | `CB001`–`CB005` (WARN), `CB006` (OK), `CB007` (WARN — `FunctionalProbeOK` not True) |
-| 6 | Engine-pod injection audit | `EP001` (WARN), `EP002` (OK) |
+| 6 | Engine-pod injection audit | `EP001`/`EP003` (WARN), `EP002` (OK) |
 | 7 | Orphan-pod check | `OP001` (WARN) |
 | 8 | `CacheTenant` health | `CT001` (WARN), `CT002` (OK) |
 | 9 | `CachePolicy` coverage | `CP001` (INFO), `CP002` (OK), `CP003` (WARN — >1 CachePolicy in a namespace) |

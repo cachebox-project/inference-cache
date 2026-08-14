@@ -8,9 +8,9 @@
 #
 # Set spec.integration.mode: EventsOnly to select it. Compared to the default
 # Offload mode (see cachebackend-lmcache.yaml), the controller here:
-#   - provisions NO standalone lmcache-server Deployment or Service, and leaves
-#     status.endpoint empty (there is no server address to publish), and
-#   - injects NO `--kv-transfer-config` arg / LMCACHE_* env into the engine
+#   - provisions NO remote-storage Deployment or Service, and leaves
+#     connector/remote-storage status empty (there is no server address), and
+#   - injects NO KV-offload connector or MP server into the engine Pod
 #     container.
 # The mutating Pod webhook appends the kvevent-subscriber sidecar to matched
 # engine pods — but only when the controller runs with --kvevent-subscriber-image
@@ -34,12 +34,12 @@
 # it sits Ready=False/AwaitingFirstKVEvent until the auto-attached
 # kvevent-subscriber reports an event (requires the controller to run with
 # --kvevent-subscriber-image set; empty by default), then flips to
-# Ready=True/KVEventsObserved. status.endpoint stays empty throughout.
+# Ready=True/KVEventsObserved. Connector and remote-storage status stay empty.
 #
 # EventsOnly takes precedence over host-tier/offload configuration. Omit
 # spec.lmCache and spec.remoteStorage: no LMCache host tier is configured, and
 # admission rejects a remote provider because no connector would dial it.
-# Autoscaling is likewise rejected because there is no server workload.
+# There is no backend workload to scale in this mode.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -54,12 +54,11 @@ spec:
     mode: EventsOnly
   engineSelector:
     matchLabels:
-      app.kubernetes.io/name: vllm
+      inferencecache.io/cache-domain: vllm-events-only
   observation:
     # Served model identifier the matched engine pods are loaded with. Plumbed
     # to the auto-attached kvevent-subscriber sidecar's --model-id so the index
     # keys per-replica entries by model. A hybrid-attention model is the
     # canonical events-only use case.
     modelID: Qwen/Qwen3-Next-80B-A3B-Instruct
-  # No autoscaling: there is no server workload to scale (admission rejects it).
-  # No remoteStorage: events-only publishes no status.endpoint.
+  # No remoteStorage: events-only has no shared cache tier.

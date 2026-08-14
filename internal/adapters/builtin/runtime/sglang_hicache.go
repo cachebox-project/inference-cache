@@ -53,7 +53,7 @@ func (sglangHiCacheAdapter) SupportsBinding(binding *backendadapter.Binding) boo
 	return binding == nil
 }
 
-func (sglangHiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
+func (a sglangHiCacheAdapter) InjectEngineConfig(pod *corev1.PodSpec, binding *backendadapter.Binding, cache *cachev1alpha1.CacheBackend) error {
 	if binding != nil {
 		return fmt.Errorf("SGLang HiCache adapter does not support remote binding protocol %q", binding.Protocol)
 	}
@@ -252,9 +252,6 @@ func resolveHiCacheConfig(cache *cachev1alpha1.CacheBackend) (resolvedHiCacheCon
 		if !cachev1alpha1.IntegrationFailOpen(cache.Spec.Integration) {
 			return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: integration.failOpen must be true")
 		}
-	}
-	if cache.Spec.Autoscaling != nil {
-		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: autoscaling is unsupported for an engine-local backend")
 	}
 	if cache.Spec.EngineSelector == nil || len(cache.Spec.EngineSelector.MatchLabels) == 0 {
 		return resolvedHiCacheConfig{}, fmt.Errorf("resolve SGLang HiCache config: spec.engineSelector.matchLabels is required")

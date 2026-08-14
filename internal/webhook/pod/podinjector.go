@@ -7,8 +7,10 @@ package pod
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -69,6 +71,20 @@ const AnnotationInjectedBy = enginebinding.AnnotationInjectedBy
 // the event.
 const AnnotationInjectedByUID = enginebinding.AnnotationInjectedByUID
 
+// AnnotationInjectedGeneration records the CacheBackend generation rendered
+// into this immutable Pod. The MP status writer uses it to avoid reporting an
+// old sidecar configuration as current after the CacheBackend changes.
+const AnnotationInjectedGeneration = enginebinding.AnnotationInjectedGeneration
+
+// LabelLMCacheMPMetrics is stamped only after a typed PodLocal LMCache server
+// has been successfully rendered. The optional observability overlay uses it
+// to discover the native sidecar's lmcache-http port across engine namespaces.
+const LabelLMCacheMPMetrics = enginebinding.LabelLMCacheMPMetrics
+
+// LabelLMCacheMPMetricsEnabled is the stable selector value for
+// [LabelLMCacheMPMetrics].
+const LabelLMCacheMPMetricsEnabled = enginebinding.LabelLMCacheMPMetricsEnabled
+
 // AnnotationInjectSkipped is stamped when the webhook intentionally skips
 // injection because the operator set [AnnotationSkip]. It lets a persisted pod
 // distinguish an explicit opt-out from selector drift or fail-open admission.
@@ -83,16 +99,18 @@ const InjectSkippedReasonSkipAnnotation = enginebinding.InjectSkippedReasonSkipA
 // +kubebuilder:rbac:groups=inferencecache.io,resources=cachebackends,verbs=get;list;watch
 
 // EngineInjector is the admission.Handler that injects LMCache engine
-// configuration into user-provided engine pods. failurePolicy=ignore on the
-// MutatingWebhookConfiguration AND a fail-open posture in the handler give a
-// belt-and-suspenders guarantee: even if the controller is unreachable or
-// the handler returns an error response, pod admission is never blocked.
-// The cache is always an optimization, never a serving dependency.
+// configuration into user-provided engine pods. Operational lookup/adapter
+// failures remain fail-open because the cache is an optimization. A selector
+// ambiguity is different: choosing one of several trust domains would be an
+// unsafe mutation, so a live webhook explicitly denies that Pod. The
+// MutatingWebhookConfiguration still uses failurePolicy=Ignore for webhook
+// transport outages; CacheBackend admission prevents overlaps in the normal
+// path and this denial is the defense for historical/concurrent conflicts.
 type EngineInjector struct {
 	// Reader lists CacheBackends in the pod's namespace. Production wiring
 	// passes the manager's APIReader (an uncached live client) — pod
 	// CREATE is a one-shot injection opportunity, so a stale informer view
-	// of the owning CacheBackend (in particular a status.endpoint that
+	// of the owning CacheBackend (in particular remote-storage status that
 	// lags reality) would leave the pod permanently unwired. Live reads
 	// also avoid a cold-cache window at controller startup. Tests inject
 	// a fake.NewClientBuilder()-derived reader, which also satisfies the
@@ -109,11 +127,10 @@ type EngineInjector struct {
 	Log logr.Logger
 }
 
-// Handle implements [admission.Handler]. Any rejection at this layer
-// translates to admission.Allowed: a webhook error MUST NOT block pod
-// admission (the cache is an optimization). The reason string carries
-// enough context that an operator running `kubectl get events` can tell
-// why a pod was admitted without injection.
+// Handle implements [admission.Handler]. Operational failures translate to
+// admission.Allowed because the cache is an optimization. Selector ambiguity
+// is the deliberate exception: choosing a cache trust domain is unsafe, so a
+// live webhook denies the Pod. The reason string explains either outcome.
 func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admission.Response {
 	log := h.logger(ctx).WithValues(
 		"namespace", req.Namespace, "name", req.Name, "uid", string(req.UID),
@@ -146,6 +163,11 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 
 	cache, err := h.selectCacheBackend(ctx, &pod)
 	if err != nil {
+		var ambiguity *ambiguousCacheBackendMatchError
+		if errors.As(err, &ambiguity) {
+			log.Info("rejecting Pod: more than one CacheBackend engineSelector matches", "cachebackends", ambiguity.names)
+			return admission.Denied(err.Error())
+		}
 		log.V(1).Info("fail-open: backend lookup failed", "error", err.Error())
 		return failOpen(req, &pod, fmt.Sprintf("backend lookup failed (fail-open): %v", err))
 	}
@@ -173,6 +195,25 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 			runtimeID, cache.Spec.Type, err))
 	}
 
+	// A typed LMCache topology requires the runtime-specific MP compatibility
+	// check. A registry extension that selects LMCache without implementing this
+	// contract is admitted without mutation instead of receiving a partial wire.
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology != "" {
+		mpAdapter, ok := adapter.(adapterruntime.LMCacheMPRuntimeAdapter)
+		if !ok {
+			log.V(1).Info("fail-open: selected adapter does not implement typed LMCache MP topology",
+				"runtime", string(runtimeID), "topology", string(cache.Spec.LMCache.Topology))
+			return failOpen(req, &pod, fmt.Sprintf(
+				"runtime=%q adapter does not implement typed LMCache topology=%q (fail-open, no injection)",
+				runtimeID, cache.Spec.LMCache.Topology))
+		}
+		if err := mpAdapter.ValidateMPEnginePod(&pod, cache); err != nil {
+			log.V(1).Info("fail-open: typed LMCache MP adapter rejected engine pod",
+				"runtime", string(runtimeID), "error", err.Error())
+			return failOpen(req, &pod, fmt.Sprintf("typed LMCache MP compatibility check failed (fail-open): %v", err))
+		}
+	}
+
 	endpoint := effectiveEndpoint(cache)
 	storage := cache.Spec.EffectiveRemoteStorage()
 	protocol, protocolErr := backendadapter.ProtocolFor(storage)
@@ -188,8 +229,8 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	}
 	// Events-only (tier-1 routing) backends provision no server, so they publish
 	// no endpoint — and they wire no KV connector, so they need none. The
-	// endpoint gate exists ONLY because the connector requires a dial target
-	// (an empty/malformed LMCACHE_REMOTE_URL crashes the engine at startup); an
+	// endpoint gate exists only because an optional remote-storage adapter
+	// requires a dial target; an
 	// events-only pod injects only the observation sidecar (InjectEngineConfig
 	// is a no-op in this mode), so bypass the gate and inject without one.
 	// Engine-local adapters such as native SGLang HiCache have a nil binding and
@@ -197,7 +238,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	if binding != nil && binding.Endpoint == "" && !cache.Spec.IsEventsOnly() {
 		// The endpoint source is ownership-scoped (see effectiveEndpoint).
 		// Three reasons we can land here:
-		//   - managed CR: reconciler hasn't published status.endpoint
+		//   - managed CR: reconciler hasn't published status.remoteStorage.endpoint
 		//     yet (steady-state during initial rollout).
 		//   - externally owned CR: spec.remoteStorage.endpoint is empty
 		//     (current admission rejects this; reachable only for objects that
@@ -214,7 +255,7 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 		// inbound pod get stripped — otherwise the events controller
 		// would falsely emit InjectedByCacheBackend even though the
 		// webhook bailed out without injecting.
-		missingField := "status.endpoint"
+		missingField := "status.remoteStorage.endpoint"
 		extra := ""
 		if storage != nil && storage.Ownership == cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal {
 			missingField = "spec.remoteStorage.endpoint"
@@ -230,8 +271,8 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	// No env-presence short-circuit here: the adapter is the source of truth
 	// for the full injected contract (env + the adapter-required args/flags),
 	// and lenient short-circuits risk admitting a pod that carries only a
-	// subset of the wiring (e.g. a pre-set LMCACHE_REMOTE_URL but missing the
-	// engine's connector flag — vLLM's --kv-transfer-config or SGLang's
+	// subset of the wiring (e.g. a pre-set connector argument but missing the
+	// engine's required MP configuration — vLLM's --kv-transfer-config or SGLang's
 	// --enable-lmcache) permanently un-converged. Call the adapter
 	// unconditionally; it merges idempotently (upsertEnv / upsertArgPair /
 	// upsertFlag) and a no-op merge produces an
@@ -407,6 +448,13 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	delete(mutated.Annotations, AnnotationInjectSkipped)
 	mutated.Annotations[AnnotationInjectedBy] = cache.Namespace + "/" + cache.Name
 	mutated.Annotations[AnnotationInjectedByUID] = string(cache.UID)
+	mutated.Annotations[AnnotationInjectedGeneration] = strconv.FormatInt(cache.Generation, 10)
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology == cachev1alpha1.LMCacheTopologyPodLocal {
+		if mutated.Labels == nil {
+			mutated.Labels = map[string]string{}
+		}
+		mutated.Labels[LabelLMCacheMPMetrics] = LabelLMCacheMPMetricsEnabled
+	}
 
 	mutatedRaw, err := json.Marshal(mutated)
 	if err != nil {
@@ -418,29 +466,16 @@ func (h *EngineInjector) Handle(ctx context.Context, req admission.Request) admi
 	return resp
 }
 
-// selectCacheBackend returns the first CacheBackend in pod.Namespace whose
+// selectCacheBackend returns the only CacheBackend in pod.Namespace whose
 // Spec.EngineSelector.MatchLabels match pod.Labels, or nil when no backend
-// claims the pod. Selecting "the first match" is deliberately simple for
-// Phase 1: a future revision can grow a tie-break policy (e.g. an explicit
-// `inferencecache.io/cachebackend: <name>` annotation), but the current rule
-// matches the reconciler's "each CacheBackend owns its EngineSelector"
-// contract — an operator running two backends in the same namespace whose
-// selectors overlap is misconfigured, and the handler logs the chosen one
-// so the ambiguity is observable.
-//
-// Iteration order is metadata.name ascending so the "first match" is
-// deterministic across apiserver List cache states and is shared with the
-// CacheIndex poller's annotation-fallback path (see
-// internal/controller/cacheindex_controller.go's attributePod). The two
-// surfaces MUST agree on which backend owns a given engine pod — the
-// webhook stamps `inferencecache.io/injected-by` and the poller relies
-// on it as the authoritative signal, but on overlapping-selector
-// fallback both sides need to pick the same backend or status will
-// disagree with what the engine was wired to.
+// claims the pod. More than one match is rejected: silently choosing one would
+// route an engine into an unintended cache trust domain. CacheBackend admission
+// rejects overlapping selectors in the normal path; this runtime check covers
+// objects admitted before that rule and concurrent CREATE races.
 //
 // A CacheBackend with no EngineSelector or with an empty MatchLabels map is
 // skipped: a "match everything" selector at admission time would silently
-// claim every pod (including the controller's own and the lmcache-server's),
+// claim every pod (including control-plane and provider pods),
 // which is the kind of broad mutation the fail-open posture is meant to
 // prevent.
 func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod) (*cachev1alpha1.CacheBackend, error) {
@@ -456,6 +491,7 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 		return list.Items[idxs[a]].Name < list.Items[idxs[b]].Name
 	})
 	podLabels := labels.Set(pod.Labels)
+	matches := make([]*cachev1alpha1.CacheBackend, 0, 1)
 	for _, i := range idxs {
 		cb := &list.Items[i]
 		if cb.Spec.EngineSelector == nil || len(cb.Spec.EngineSelector.MatchLabels) == 0 {
@@ -463,10 +499,30 @@ func (h *EngineInjector) selectCacheBackend(ctx context.Context, pod *corev1.Pod
 		}
 		sel := labels.SelectorFromSet(cb.Spec.EngineSelector.MatchLabels)
 		if sel.Matches(podLabels) {
-			return cb, nil
+			matches = append(matches, cb)
 		}
 	}
-	return nil, nil
+	if len(matches) == 0 {
+		return nil, nil
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	names := make([]string, len(matches))
+	for i := range matches {
+		names[i] = matches[i].Name
+	}
+	return nil, &ambiguousCacheBackendMatchError{namespace: pod.Namespace, names: names}
+}
+
+type ambiguousCacheBackendMatchError struct {
+	namespace string
+	names     []string
+}
+
+func (e *ambiguousCacheBackendMatchError) Error() string {
+	return fmt.Sprintf("Pod labels match multiple CacheBackends in namespace %q (%s); engine admission requires exactly one CacheBackend owner",
+		e.namespace, strings.Join(e.names, ", "))
 }
 
 // SkipAnnotationOptsOut returns true when the value of [AnnotationSkip]
@@ -492,7 +548,8 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 
 // failOpen builds the admission response for any fail-open return path
 // AFTER the pod has been decoded. The webhook's contract is that
-// AnnotationInjectedBy and AnnotationInjectSkipped on the persisted pod mean
+// The injected-by identity/generation annotations and AnnotationInjectSkipped
+// on the persisted pod mean
 // "the webhook successfully made this decision" — those are what the
 // engine-pod-events controller keys `InjectedByCacheBackend` and
 // `SkippedByOperator` off of. The annotations are user-controllable (anyone
@@ -509,13 +566,15 @@ func (h *EngineInjector) logger(ctx context.Context) logr.Logger {
 func failOpen(req admission.Request, pod *corev1.Pod, reason string) admission.Response {
 	hasInjectedBy := pod.Annotations[AnnotationInjectedBy] != ""
 	hasInjectedByUID := pod.Annotations[AnnotationInjectedByUID] != ""
+	hasInjectedGeneration := pod.Annotations[AnnotationInjectedGeneration] != ""
 	hasInjectSkipped := pod.Annotations[AnnotationInjectSkipped] != ""
-	if !hasInjectedBy && !hasInjectedByUID && !hasInjectSkipped {
+	if !hasInjectedBy && !hasInjectedByUID && !hasInjectedGeneration && !hasInjectSkipped {
 		return admission.Allowed(reason)
 	}
 	cleared := pod.DeepCopy()
 	delete(cleared.Annotations, AnnotationInjectedBy)
 	delete(cleared.Annotations, AnnotationInjectedByUID)
+	delete(cleared.Annotations, AnnotationInjectedGeneration)
 	delete(cleared.Annotations, AnnotationInjectSkipped)
 	if len(cleared.Annotations) == 0 {
 		// Avoid emitting an empty-map annotations field; absent is the
@@ -541,11 +600,13 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 	}
 	delete(mutated.Annotations, AnnotationInjectedBy)
 	delete(mutated.Annotations, AnnotationInjectedByUID)
+	delete(mutated.Annotations, AnnotationInjectedGeneration)
 	mutated.Annotations[AnnotationInjectSkipped] = InjectSkippedReasonSkipAnnotation
 
 	if pod.Annotations[AnnotationInjectSkipped] == InjectSkippedReasonSkipAnnotation &&
 		pod.Annotations[AnnotationInjectedBy] == "" &&
-		pod.Annotations[AnnotationInjectedByUID] == "" {
+		pod.Annotations[AnnotationInjectedByUID] == "" &&
+		pod.Annotations[AnnotationInjectedGeneration] == "" {
 		return admission.Allowed("skipped via " + AnnotationSkip)
 	}
 	raw, err := json.Marshal(mutated)
@@ -559,15 +620,15 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 // to for the given CacheBackend. The source is ownership-scoped:
 //
 //   - External ownership: spec.remoteStorage.endpoint is authoritative — the operator owns it,
-//     admission validates it, status.endpoint is just a reconciler
+//     admission validates it, status.remoteStorage.endpoint is just a reconciler
 //     mirror that may briefly lag during an update. If a new pod
 //     admits between an operator's spec.remoteStorage.endpoint update and the
-//     status patch, status would still hold the OLD value and the
+//     status patch, status would still hold the old value and the
 //     pod would boot wired to the stale address; pod admission is
 //     CREATE-only so that bad wiring is permanent. Preferring the trimmed
 //     remoteStorage endpoint over status here avoids that race and is
 //     consistent with admission's view of the truth.
-//   - Managed storage: status.endpoint is the only
+//   - Managed storage: status.remoteStorage.endpoint is the only
 //     source — the reconciler builds it from the live Service it
 //     provisions, and spec.remoteStorage.endpoint is admission-rejected for
 //     managed ownership, so there's nothing else to fall back on. The webhook
@@ -580,12 +641,9 @@ func skipInjection(req admission.Request, pod *corev1.Pod) admission.Response {
 // Every return path is `strings.TrimSpace`-d so a whitespace-only value
 // (a pre-admission CR that mirrored whitespace into status, an
 // externally-edited Service endpoint that picked up stray padding) is
-// treated as missing and fails open instead of injecting
-// `LMCACHE_REMOTE_URL=lm://   ` which the engine connector would reject
-// at runtime. The reconciler already trims before publishing
-// status.endpoint, but the webhook trims defensively here too so a
-// race against an old controller build can't leak whitespace to the
-// engine wire.
+// treated as missing and fails open instead of injecting an invalid remote
+// adapter target. The reconciler already trims before publishing
+// status.remoteStorage.endpoint, but the webhook trims defensively here too.
 //
 // For external storage with an empty/whitespace spec.remoteStorage.endpoint there is NO
 // fallback to status. The reconciler treats that state as
@@ -621,7 +679,10 @@ func effectiveEndpoint(cache *cachev1alpha1.CacheBackend) string {
 		}
 		return ep
 	}
-	return strings.TrimSpace(cache.Status.Endpoint)
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.Topology != "" && cache.Status.RemoteStorage != nil {
+		return strings.TrimSpace(cache.Status.RemoteStorage.Endpoint)
+	}
+	return ""
 }
 
 // hasContainer reports whether containers already includes one named name.

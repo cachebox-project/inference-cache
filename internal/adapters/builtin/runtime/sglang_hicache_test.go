@@ -123,6 +123,7 @@ func TestHiCacheOptionalFieldsStayOmitted(t *testing.T) {
 		SGLangHiCacheWritePolicyArg,
 		SGLangHiCacheIOBackendArg,
 		SGLangHiCacheMemoryLayoutArg,
+		SGLangEnableMetricsArg,
 	} {
 		if _, ok := testArgValue(pod.Containers[0].Args, flag); ok {
 			t.Errorf("unset optional field injected %s: %v", flag, pod.Containers[0].Args)
@@ -252,9 +253,6 @@ func TestHiCacheRejectsInvalidBackendAtAdapterBoundary(t *testing.T) {
 		}},
 		{"fail closed", func(cache *cachev1alpha1.CacheBackend) {
 			cache.Spec.Integration.FailOpen = &falseValue
-		}},
-		{"autoscaling", func(cache *cachev1alpha1.CacheBackend) {
-			cache.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 2}
 		}},
 		{"missing selector", func(cache *cachev1alpha1.CacheBackend) {
 			cache.Spec.EngineSelector = nil

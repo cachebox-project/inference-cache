@@ -7,7 +7,7 @@ A **vendor-neutral, Kubernetes-native cache-policy control plane for LLM inferen
 inference-cache makes routing **cache-aware**: it tracks which replica already holds a
 prompt's prefix warm and returns that as a routing *hint*, so a gateway can reuse
 KV/prefill instead of recomputing it — cutting time-to-first-token and cost. It
-**orchestrates** existing KV-cache technology (LMCache, Mooncake); it is **not** a new
+**orchestrates** existing KV-cache technology (LMCache); it is **not** a new
 distributed cache and **not** the data-plane gateway. Guiding principle — **"we decide
 routing; the gateway follows"**: all routing intelligence lives in the server, and the
 gateway simply tokenizes → calls `LookupRoute` → routes to the returned replica →
@@ -27,16 +27,17 @@ The API separates three choices: `spec.runtime` selects the inference runtime,
 provider. Supporting another combination is an adapter addition; the core gRPC
 contract stays stable.
 
-- **vLLM + LMCache** supports host-only caching, a managed or external
-  `LMCacheServer`, and managed or external `Mooncake` storage.
-- **SGLang + LMCache** supports host-only caching or a managed/external Redis
-  remote store.
+- **vLLM + LMCache** supports typed PodLocal MP with host-only caching or an
+  optional managed/external Redis L3.
+- **SGLang + LMCache** supports the same typed PodLocal MP and Redis profiles;
+  the engine launch surface remains SGLang-specific.
 - **SGLang + SGLangHiCache** uses SGLang's native host tier and does not accept
   a remote-storage binding.
 
 See [`config/samples/`](config/samples/) for canonical manifests and
 [`docs/design/cachebackend-api.md`](docs/design/cachebackend-api.md) for the
-compatibility rules retained for older v1alpha1 resources.
+current contract and clearly labeled legacy-compatibility sections retained
+until Phase 7 of the migration.
 
 ## What's Inference Cache?
 
@@ -205,8 +206,7 @@ kubectl get cacheindex cluster-default -o yaml
 Both binaries expose Prometheus metrics on their pod's `:8080/metrics`
 (prefixed `inferencecache_*`) — the server binary's series cover the
 in-memory index and gRPC handlers; the controller binary's series cover
-the reconcilers (e.g. `inferencecache_backend_probe_result_total`,
-`inferencecache_backend_server_restart_cascades_total`). A default
+the reconcilers (for example, `inferencecache_backend_probe_result_total`). A default
 alert bundle for the operational silent-failure patterns this code has
 hit in production ships under
 [`config/observability/`](config/observability/) and is **not** included
@@ -219,13 +219,13 @@ For prometheus-operator / kube-prometheus installs:
 kubectl apply -k config/observability
 ```
 
-This ships THREE resources: a `ServiceMonitor` (so Prometheus scrapes
-`inference-cache-server:8080/metrics`), a `PodMonitor` (so Prometheus
-scrapes the controller pod's `:8080/metrics` — required for the
-controller-side alerts like `ServerProbeFail` to have a series to
-evaluate), and the `PrometheusRule` carrying the alerts.
+This ships FOUR resources: a `ServiceMonitor` for
+`inference-cache-server:8080/metrics`, one `PodMonitor` for the controller
+pod's `:8080/metrics`, one cross-namespace `PodMonitor` for successfully
+injected PodLocal LMCache sidecars on their named `lmcache-http` port, and
+the `PrometheusRule` carrying the alerts.
 
-> **Caveat — Prometheus Operator selectors.** All three CRs carry
+> **Caveat — Prometheus Operator selectors.** All four CRs carry
 > example labels (`prometheus: k8s`, plus `role: alert-rules` on the
 > PrometheusRule) that match the upstream kube-prometheus stack
 > (default `Prometheus` named `k8s`). The `kube-prometheus-stack`
@@ -250,7 +250,7 @@ expressions) and only fire when the conditions are met.
 > **The fifth alert needs a vLLM scrape this bundle does NOT ship.**
 > [`LMCacheT2NoHits`](docs/observability/alerts.md#lmcachet2nohits) reads
 > `vllm:external_prefix_cache_*` from vLLM engine pods directly. The
-> shipped `ServiceMonitor` covers only `inference-cache-server`. To make
+> shipped scrape configs do not collect vLLM's own metrics. To make
 > that alert effective, add a separate `PodMonitor` for your vLLM
 > Deployment (or `kubernetes_sd_configs: pod` for vanilla Prometheus)
 > so engine `/metrics` is scraped with both `namespace` and `pod` labels
@@ -258,11 +258,11 @@ expressions) and only fire when the conditions are met.
 
 For vanilla Prometheus, ConfigMap mounts, or Helm `prometheus.serverFiles`,
 use the flat [`alerting-rules.yaml`](config/observability/alerting-rules.yaml).
-**You must also configure scraping yourself, for BOTH the server AND
-the controller pod.** The server's `:8080` exposes the index, lookup,
+**You must also configure scraping yourself for the server, the controller
+pod, and every injected PodLocal LMCache sidecar.** The server's `:8080` exposes the index, lookup,
 and auth series; the controller pod's `:8080` exposes the per-stage
-probe-result counter (`inferencecache_backend_probe_result_total`)
-and the cache-server restart-cascade counter — the controller-side
+probe-result counter (`inferencecache_backend_probe_result_total`); each LMCache sidecar exposes
+its own `lmcache_mp_*` series on `:8080/metrics` — the controller-side
 alerts (`ServerProbeFail` today) load against the controller's
 series, so a server-only scrape leaves them inert.
 

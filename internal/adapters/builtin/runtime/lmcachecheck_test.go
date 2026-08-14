@@ -40,7 +40,7 @@ func cbWithKernelCheck(mode string) *cachev1alpha1.CacheBackend {
 }
 
 func TestKernelCheckAutoInjectsOnGPUPod(t *testing.T) {
-	a := NewVLLMLMCacheAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
+	a := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
 	c, err := a.KernelCheckInitContainer(cbWithKernelCheck(""), gpuEnginePod("vllm/img:cu129"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -78,7 +78,7 @@ func TestKernelCheckAutoInjectsOnGPUPod(t *testing.T) {
 }
 
 func TestKernelCheckCommandIdenticalAcrossModesEnvDiffers(t *testing.T) {
-	a := NewVLLMLMCacheAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
+	a := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
 	ro, _ := a.KernelCheckInitContainer(cbWithKernelCheck(enginebinding.KernelCheckModeReportOnly), gpuEnginePod("img"))
 	st, _ := a.KernelCheckInitContainer(cbWithKernelCheck(enginebinding.KernelCheckModeStrict), gpuEnginePod("img"))
 	if ro == nil || st == nil {
@@ -128,7 +128,7 @@ func strictEnvValue(c *corev1.Container) (string, int) {
 }
 
 func TestKernelCheckStripsInheritedStrictEnv(t *testing.T) {
-	a := NewVLLMLMCacheAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
+	a := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
 	pod := gpuEnginePod("img")
 	// The engine container carries a stray KERNEL_CHECK_STRICT=1. It must NOT
 	// leak into the report-only check (which would turn it fail-closed) and must
@@ -147,7 +147,7 @@ func TestKernelCheckStripsInheritedStrictEnv(t *testing.T) {
 }
 
 func TestKernelCheckAutoSkipsCPUPod(t *testing.T) {
-	a := NewVLLMLMCacheAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
+	a := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
 	cpuPod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
 		Name: EngineContainerName, Image: "vllm/cpu",
 	}}}}
@@ -161,7 +161,7 @@ func TestKernelCheckAutoSkipsCPUPod(t *testing.T) {
 }
 
 func TestKernelCheckOffSkipsEvenGPU(t *testing.T) {
-	a := NewVLLMLMCacheAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
+	a := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
 	c, _ := a.KernelCheckInitContainer(cbWithKernelCheck(enginebinding.KernelCheckModeOff), gpuEnginePod("img"))
 	if c != nil {
 		t.Fatal("off mode must never inject")
@@ -169,7 +169,7 @@ func TestKernelCheckOffSkipsEvenGPU(t *testing.T) {
 }
 
 func TestKernelCheckReportOnlyInjectsOnCPU(t *testing.T) {
-	a := NewVLLMLMCacheAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
+	a := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
 	cpuPod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: EngineContainerName, Image: "img"}}}}
 	c, _ := a.KernelCheckInitContainer(cbWithKernelCheck(enginebinding.KernelCheckModeReportOnly), cpuPod)
 	if c == nil {
@@ -183,7 +183,7 @@ func TestKernelCheckReportOnlyInjectsOnCPU(t *testing.T) {
 }
 
 func TestKernelCheckStrictSetsStrictEnv(t *testing.T) {
-	a := NewVLLMLMCacheAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
+	a := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
 	c, _ := a.KernelCheckInitContainer(cbWithKernelCheck(enginebinding.KernelCheckModeStrict), gpuEnginePod("img"))
 	if c == nil {
 		t.Fatal("strict must inject")
@@ -200,7 +200,7 @@ func TestKernelCheckStrictSetsStrictEnv(t *testing.T) {
 }
 
 func TestKernelCheckMultiContainerNoEngineNameSkips(t *testing.T) {
-	a := NewVLLMLMCacheAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
+	a := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
 	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
 		{Name: "foo", Image: "a", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{gpuResourceName: resource.MustParse("1")}}},
 		{Name: "bar", Image: "b"},
@@ -215,7 +215,7 @@ func TestKernelCheckMultiContainerNoEngineNameSkips(t *testing.T) {
 }
 
 func TestKernelCheckCopiesEngineEnvironment(t *testing.T) {
-	a := NewVLLMLMCacheAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
+	a := NewVLLMLMCacheMPAdapter(SubscriberConfig{}).(enginebinding.InitContainerProvider)
 	nonRoot := true
 	engineSC := &corev1.SecurityContext{RunAsNonRoot: &nonRoot}
 	pod := gpuEnginePod("img")

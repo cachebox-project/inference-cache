@@ -27,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -37,80 +36,22 @@ import (
 	podwebhook "github.com/cachebox-project/inference-cache/internal/webhook/pod"
 )
 
-// TestWebhookPollerSelectorFallbackAgreement is the load-bearing
-// agreement test for the selector fallback. The pod webhook
-// (internal/webhook/pod.selectCacheBackend) and the CacheIndex poller
-// (attributePod) BOTH sort CacheBackends by metadata.name ascending and
-// take the first selector match. They are two independent code paths
-// against the same contract: when an engine pod matches more than one
-// CacheBackend, both surfaces must converge on the same backend, or the
-// webhook will wire the engine to one backend's endpoint while the
-// poller's status writer attributes its participation to another. Each
-// surface has its own first-by-name test already; this test is the one
-// place that asserts the two surfaces agree. A future rename of the
-// sort key (or accidental switch to creationTimestamp) on either side
-// must fail HERE.
-func TestWebhookPollerSelectorFallbackAgreement(t *testing.T) {
+// TestWebhookRejectsSelectorAmbiguity is the runtime backstop for historical
+// CacheBackends and concurrent CREATE races that bypass the normal
+// cross-object admission check. A fresh engine must never be wired to an
+// arbitrary first-by-name cache trust domain.
+func TestWebhookRejectsSelectorAmbiguity(t *testing.T) {
 	const ns = "agree-ns"
 	labels := map[string]string{"app": "vllm"}
 
-	// Two CacheBackends with identical selectors. "alpha" should win on
-	// both surfaces (lexicographically before "zebra"). The two helpers
-	// produce different shapes — readyCacheBackendForSweep includes
-	// status.endpoint (the webhook needs it to inject) and cbFixture is
-	// selector-only (the poller's attribution doesn't depend on endpoint).
 	cbAlphaWebhook := readyCacheBackendForSweep("alpha", ns, labels)
 	cbZebraWebhook := readyCacheBackendForSweep("zebra", ns, labels)
-
-	// Surface 1 — webhook: admit a fresh engine pod and read the
-	// injected-by annotation the handler stamps. The annotation records
-	// the CacheBackend the webhook actually wired the engine to.
-	annotated := runPodWebhookAndCaptureInjectedBy(t, ns,
-		cbAlphaWebhook, cbZebraWebhook, labels)
-	webhookChose, ok := parseInjectedByForSweep(annotated)
-	if !ok || webhookChose.Namespace != ns {
-		t.Fatalf("webhook annotation %q parsed to %+v; want namespace %q", annotated, webhookChose, ns)
+	resp := runPodWebhookForSweep(t, ns, cbAlphaWebhook, cbZebraWebhook, labels)
+	if resp.Allowed {
+		t.Fatalf("overlapping selectors admitted with patches %+v", resp.Patches)
 	}
-
-	// Surface 2 — poller: feed the SAME backends + a same-shaped engine
-	// pod into the poller, with the annotation stripped so attribution
-	// falls through the selector path (not the annotation shortcut). The
-	// snapshot is keyed by the sidecar-identity convention
-	// (replica_id = pod_name, tenant_id = pod_namespace). The fallback's
-	// winner is observable as the backend whose
-	// status.indexParticipation.prefixCount is non-zero after the refresh.
-	cbAlphaPoller := cbFixture("alpha", ns, labels)
-	cbZebraPoller := cbFixture("zebra", ns, labels)
-	const podName = "engine-a"
-	pollerPod := enginePod(podName, ns, labels) // no injected-by annotation
-	var mu sync.Mutex
-	served := controlplaneapi.Snapshot{
-		Replicas: []controlplaneapi.ReplicaSnapshot{
-			{ReplicaID: podName, Tenant: ns, PrefixCount: 7, LastEventAt: time.Unix(1_700_000_000, 0).UTC()},
-		},
-	}
-	p, cl, srv := buildPollerWithFixtures(t,
-		[]*cachev1alpha1.CacheBackend{cbAlphaPoller, cbZebraPoller},
-		[]*corev1.Pod{pollerPod},
-		&served, &mu)
-	defer srv.Close()
-	if err := p.refresh(context.Background()); err != nil {
-		t.Fatalf("poller refresh: %v", err)
-	}
-	pollerChose := pickAttributedBackend(t, cl, []string{"alpha", "zebra"}, ns)
-
-	// The actual cross-system agreement assertion: ONE rename on either
-	// surface (sort field, selector semantics, etc.) drives these apart.
-	if pollerChose.Name != webhookChose.Name || pollerChose.Namespace != webhookChose.Namespace {
-		t.Fatalf("webhook+poller fallback disagreement: webhook chose %s/%s, poller chose %s/%s",
-			webhookChose.Namespace, webhookChose.Name,
-			pollerChose.Namespace, pollerChose.Name)
-	}
-	// Both must converge on lex-first ("alpha"). A pivot to a different
-	// sort policy must be a deliberate joint change, with the doc
-	// comments on both surfaces updated.
-	if webhookChose.Name != "alpha" {
-		t.Fatalf("both surfaces should converge on 'alpha' (first by name); both chose %q", webhookChose.Name)
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "multiple CacheBackends") {
+		t.Fatalf("ambiguity denial = %+v, want explicit multiple-CacheBackend message", resp.Result)
 	}
 }
 
@@ -303,33 +244,19 @@ func TestRefreshSamePodNameAcrossTenantsIsFailSoft(t *testing.T) {
 
 // readyCacheBackendForSweep mirrors the unexported readyCacheBackend helper
 // in internal/webhook/pod (which we can't import across packages). The
-// webhook injects only when status.endpoint is populated, so the agreement
+// webhook injects only when the managed remote-storage endpoint is populated, so the agreement
 // test needs a CacheBackend that the webhook will pick up — not the
 // selector-only cbFixture form the poller tests use.
 func readyCacheBackendForSweep(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
-	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			UID:       types.UID("cb-" + namespace + "-" + name + "-uid"),
-		},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
-			},
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
-		},
-		Status: cachev1alpha1.CacheBackendStatus{
-			Endpoint: name + ".cache-ns.svc.cluster.local:65432",
-		},
+	backend := lmcacheBackend(name, namespace)
+	backend.UID = types.UID("cb-" + namespace + "-" + name + "-uid")
+	backend.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector}
+	backend.Status.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageStatus{
+		Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Endpoint: name + ".cache-ns.svc.cluster.local:6379",
+		Ready:    metav1.ConditionTrue,
 	}
+	return backend
 }
 
 // runPodWebhookAndCaptureInjectedBy admits an engine pod via the
@@ -338,8 +265,8 @@ func readyCacheBackendForSweep(name, namespace string, selector map[string]strin
 // would invoke Handle() at admission time without standing up a full
 // envtest — the agreement scenario doesn't need a real apiserver, just
 // the two surfaces' actual selection logic.
-func runPodWebhookAndCaptureInjectedBy(t *testing.T, namespace string,
-	cb1, cb2 *cachev1alpha1.CacheBackend, podLabels map[string]string) string {
+func runPodWebhookForSweep(t *testing.T, namespace string,
+	cb1, cb2 *cachev1alpha1.CacheBackend, podLabels map[string]string) admission.Response {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -377,69 +304,5 @@ func runPodWebhookAndCaptureInjectedBy(t *testing.T, namespace string,
 		},
 	}
 	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("webhook response not Allowed: %+v", resp.Result)
-	}
-	if len(resp.Patches) == 0 {
-		t.Fatal("expected JSON patches from webhook (overlapping selectors should produce a match)")
-	}
-	annotationEscaped := jsonPatchEscapeForSweep(podwebhook.AnnotationInjectedBy)
-	for _, p := range resp.Patches {
-		// The webhook can emit the annotation in two patch shapes:
-		// either an add of the whole annotations map, or an add of the
-		// single annotation key. Handle both rather than assuming one.
-		switch v := p.Value.(type) {
-		case map[string]any:
-			if s, ok := v[podwebhook.AnnotationInjectedBy].(string); ok && s != "" {
-				return s
-			}
-		case string:
-			if p.Path == "/metadata/annotations/"+annotationEscaped {
-				return v
-			}
-		}
-	}
-	t.Fatalf("webhook did not stamp %q annotation; patches = %+v",
-		podwebhook.AnnotationInjectedBy, resp.Patches)
-	return ""
-}
-
-// pickAttributedBackend returns the (namespace, name) of the single
-// CacheBackend in the supplied set whose status.indexParticipation is
-// populated with a non-zero prefixCount. Fails the test if zero or more
-// than one match — both surfaces must converge on exactly one winner.
-func pickAttributedBackend(t *testing.T, cl client.Client, names []string, namespace string) types.NamespacedName {
-	t.Helper()
-	var winners []types.NamespacedName
-	for _, n := range names {
-		cb := getBackendDirect(t, cl, n, namespace)
-		if cb.Status.IndexParticipation != nil && cb.Status.IndexParticipation.PrefixCount > 0 {
-			winners = append(winners, types.NamespacedName{Namespace: namespace, Name: n})
-		}
-	}
-	if len(winners) != 1 {
-		t.Fatalf("expected exactly one attributed backend; got %v", winners)
-	}
-	return winners[0]
-}
-
-// parseInjectedByForSweep splits a "namespace/name" injected-by annotation
-// into a NamespacedName. Returns ok=false on a malformed value so the
-// caller can produce a context-specific failure message.
-func parseInjectedByForSweep(value string) (types.NamespacedName, bool) {
-	ns, name, ok := strings.Cut(value, "/")
-	if !ok || ns == "" || name == "" {
-		return types.NamespacedName{}, false
-	}
-	return types.NamespacedName{Namespace: ns, Name: name}, true
-}
-
-// jsonPatchEscapeForSweep is the JSON-Pointer escaping for "/" and "~" in
-// JSON Patch paths (RFC 6901). Matches the helper of the same shape in
-// the webhook tests so the agreement test can identify the annotation
-// patch regardless of how controller-runtime renders it.
-func jsonPatchEscapeForSweep(s string) string {
-	s = strings.ReplaceAll(s, "~", "~0")
-	s = strings.ReplaceAll(s, "/", "~1")
-	return s
+	return resp
 }

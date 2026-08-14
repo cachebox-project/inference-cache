@@ -94,8 +94,8 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		}
 
 		cb := getBackend(t, r, "cache", ns)
-		if cb.Status.Endpoint != "" {
-			t.Fatalf("status.endpoint = %q, want empty (no provisioned server)", cb.Status.Endpoint)
+		if cb.Status.RemoteStorage != nil {
+			t.Fatalf("status.remoteStorage = %+v, want nil (no configured remote tier)", cb.Status.RemoteStorage)
 		}
 
 		// Before any KV event, with the default 5m firstEventTimeout still
@@ -136,8 +136,8 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		if deps, svcs := countOwnedWorkloads(t, k8s, "cache", ns); deps != 0 || svcs != 0 {
 			t.Fatalf("post-event owned workloads = %d/%d, want 0/0", deps, svcs)
 		}
-		if got.Status.Endpoint != "" {
-			t.Fatalf("post-event status.endpoint = %q, want empty", got.Status.Endpoint)
+		if got.Status.RemoteStorage != nil {
+			t.Fatalf("post-event status.remoteStorage = %+v, want nil", got.Status.RemoteStorage)
 		}
 		if c := findCondition(got.Status.Conditions, conditionTypeFunctionalProbeOK); c != nil {
 			t.Fatalf("post-event FunctionalProbeOK = %+v, want absent", c)
@@ -189,8 +189,8 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		if deps, svcs := countOwnedWorkloads(t, k8s, "cache", ns); deps != 0 || svcs != 0 {
 			t.Fatalf("post-timeout owned workloads = %d/%d, want 0/0 (events-only provisions nothing)", deps, svcs)
 		}
-		if got.Status.Endpoint != "" {
-			t.Fatalf("post-timeout status.endpoint = %q, want empty", got.Status.Endpoint)
+		if got.Status.RemoteStorage != nil {
+			t.Fatalf("post-timeout status.remoteStorage = %+v, want nil", got.Status.RemoteStorage)
 		}
 	})
 
@@ -200,21 +200,8 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		// reconcile (cleanupOwnedWorkload), end with empty status.endpoint, and
 		// drop the managed-only advisory conditions.
 		ns := freshNS(t, k8s)
-		cb := &cachev1alpha1.CacheBackend{
-			ObjectMeta: metav1.ObjectMeta{Name: "cache", Namespace: ns, Generation: 1},
-			Spec: cachev1alpha1.CacheBackendSpec{
-				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-				Type:    cachev1alpha1.CacheBackendTypeLMCache,
-				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-					Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-					Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-					LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
-				},
-				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-					Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
-				},
-			},
-		}
+		cb := lmcacheBackend("cache", ns)
+		delete(cb.Annotations, annotationRequireKVEvents)
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create Offload backend: %v", err)
 		}
@@ -266,6 +253,8 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		// LMCache, no autoscaling.)
 		live := getBackend(t, r, "cache", ns)
 		live.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
+		live.Spec.RemoteStorage = nil
+		live.Spec.LMCache = nil
 		if err := k8s.Update(ctx, live); err != nil {
 			t.Fatalf("update to EventsOnly: %v", err)
 		}
@@ -281,8 +270,8 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		}
 
 		got := getBackend(t, r, "cache", ns)
-		if got.Status.Endpoint != "" {
-			t.Fatalf("post-flip status.endpoint = %q, want empty", got.Status.Endpoint)
+		if got.Status.RemoteStorage != nil {
+			t.Fatalf("post-flip status.remoteStorage = %+v, want nil", got.Status.RemoteStorage)
 		}
 		if c := findCondition(got.Status.Conditions, conditionTypeFunctionalProbeOK); c != nil {
 			t.Fatalf("post-flip FunctionalProbeOK = %+v, want absent", c)
@@ -322,7 +311,11 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		live := getBackend(t, r, "cache", ns)
 		beforeSeed := live.DeepCopy()
 		stale := metav1.NewTime(time.Now().Add(-time.Hour))
-		live.Status.Endpoint = "cache." + ns + ".svc.cluster.local:8080"
+		live.Status.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageStatus{
+			Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+			Endpoint: "cache." + ns + ".svc.cluster.local:6379",
+			Ready:    metav1.ConditionTrue,
+		}
 		live.Status.FirstAvailableAt = &stale
 		meta.SetStatusCondition(&live.Status.Conditions, metav1.Condition{
 			Type: conditionTypeReady, Status: metav1.ConditionFalse,
@@ -360,8 +353,8 @@ func TestIntegrationEventsOnlyMode(t *testing.T) {
 		if got.Status.FirstAvailableAt == nil || got.Status.FirstAvailableAt.Time.Before(time.Now().Add(-time.Minute)) {
 			t.Fatalf("post-flip firstAvailableAt = %v, want re-anchored to ~now (stale Offload anchor reused)", got.Status.FirstAvailableAt)
 		}
-		if got.Status.Endpoint != "" {
-			t.Fatalf("post-flip status.endpoint = %q, want empty", got.Status.Endpoint)
+		if got.Status.RemoteStorage != nil {
+			t.Fatalf("post-flip status.remoteStorage = %+v, want nil", got.Status.RemoteStorage)
 		}
 	})
 }

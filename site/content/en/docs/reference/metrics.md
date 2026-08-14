@@ -6,10 +6,12 @@ description: >
   Every inferencecache_* series, its labels, and which binary emits it.
 ---
 
-Both binaries expose Prometheus metrics on their pod's `:8080/metrics`, all prefixed
+Both inference-cache binaries expose Prometheus metrics on their pod's `:8080/metrics`, all prefixed
 `inferencecache_*`. The two binaries use **separate registries** — the server's series cover
 the index and gRPC handlers; the controller's cover the reconcilers. Standard `go_*` and
-`process_*` collectors are also present but are not part of this schema.
+`process_*` collectors are also present but are not part of this schema. Successfully
+injected PodLocal LMCache sidecars expose their upstream `lmcache_mp_*` metrics separately;
+the observability overlay includes a cross-namespace PodMonitor for them.
 
 ## Server metrics (`inference-cache-server`)
 
@@ -56,7 +58,6 @@ alerts have no series to evaluate.
 |---|---|---|
 | `inferencecache_backend_probe_result_total` | `backend`, `stage` (`ingest`/`routing`/`t2`), `result` (`ok`/`failed`/`skipped`) | Functional-probe stage results — three increments per successful call. |
 | `inferencecache_backend_t2_query_tokens_total` | `backend` | Monotonic tier-2 activity signal (positive deltas only). |
-| `inferencecache_backend_server_restart_cascades_total` | `namespace`, `backend`, `reason` (`server_instance_changed`) | Cache-server restart cascades, rate-limited (~30s). |
 
 ## Endpoints
 
@@ -65,6 +66,7 @@ alerts have no series to evaluate.
 | Server | `:8080` (`--http-bind-address`) | `/healthz`, `/readyz` (unauth), `/metrics` |
 | Server | `:8081` (`--snapshot-bind-address`) | `/snapshot`, `/policy`, `/probe` (auth-gated) |
 | Controller | `:8080` (`--metrics-bind-address`) | `/metrics` (unauth by default; `--metrics-secure` to gate) |
+| Injected LMCache MP sidecar | `:8080` (`lmcache-http`) | `/healthcheck`, `/metrics` (unauthenticated on the Pod network) |
 
 ## Related pages
 

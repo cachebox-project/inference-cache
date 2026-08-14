@@ -13,7 +13,6 @@ import (
 	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"math"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	"sort"
 	"strconv"
 	"strings"
@@ -103,12 +102,6 @@ func validateSGLangHiCache(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 			"SGLangHiCache must select the engine Pods to inject",
 		))
 	}
-	if cb.Spec.Autoscaling != nil {
-		errs = append(errs, field.Forbidden(
-			field.NewPath("spec", "autoscaling"),
-			"SGLangHiCache is engine-local and has no backend workload to autoscale",
-		))
-	}
 	if cachev1alpha1.IntegrationMode(cb.Spec.Integration) != cachev1alpha1.CacheBackendIntegrationModeOffload {
 		errs = append(errs, field.NotSupported(
 			field.NewPath("spec", "integration", "mode"),
@@ -174,17 +167,15 @@ func validHiCacheMemoryLayout(value cachev1alpha1.SGLangHiCacheMemoryLayout) boo
 	}
 }
 
-// rejectUnsupportedSGLangRole rejects a non-ReadWrite spec.integration.role on a
-// (sglang, LMCache) backend. SGLang's --enable-lmcache integration has no
-// kv_role split equivalent to vLLM's LMCache connector — it always both stores
-// and retrieves — so a ReadOnly / WriteOnly role cannot be honored by the
-// engine. Rejecting at admission makes that loud rather than silently treating
-// the role as ReadWrite. Scoped to (sglang, LMCache): other engines map all
-// roles onto their connector (vLLM), and the rule must not fire on an
-// already-unsupported pair (e.g. sglang+External, which checkRuntimeAdapter
-// rejects on its own). If SGLang's LMCache integration gains a
-// producer/consumer split, lift this rule.
-func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList {
+// rejectUnsupportedLMCacheRole rejects a non-ReadWrite spec.integration.role
+// on every LMCache backend. SGLang's integration has no producer/consumer
+// split. vLLM accepts kv_consumer/kv_producer, but the validated LMCache 0.5.3
+// MP connector still stores as a consumer and retrieves as a producer. Until a
+// pinned connector enforces directionality and passes GPU validation, accepting
+// ReadOnly or WriteOnly would expose an API promise the data plane does not
+// honor. Keep the rule scoped to LMCache so other backend implementations can
+// define and validate their own role semantics independently.
+func rejectUnsupportedLMCacheRole(cb *cachev1alpha1.CacheBackend) field.ErrorList {
 	if cb.Spec.Integration == nil {
 		return nil
 	}
@@ -192,70 +183,19 @@ func rejectUnsupportedSGLangRole(cb *cachev1alpha1.CacheBackend) field.ErrorList
 	if role == "" || role == cachev1alpha1.CacheBackendIntegrationRoleReadWrite {
 		return nil // unset defaults to ReadWrite; ReadWrite is honored
 	}
-	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
-		cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
+	if cb.Spec.Type != cachev1alpha1.CacheBackendTypeLMCache {
 		return nil
 	}
 	return field.ErrorList{
 		field.Invalid(
 			field.NewPath("spec", "integration", "role"),
 			role,
-			fmt.Sprintf("the sglang engine's LMCache integration has no producer/consumer split, so only %q (the default) is honored today; %q / %q are not yet wired for SGLang",
+			fmt.Sprintf("LMCache integrations currently support only %q (the default); %q / %q are rejected until a validated connector enforces directional cache access",
 				cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
 				cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
 				cachev1alpha1.CacheBackendIntegrationRoleWriteOnly),
 		),
 	}
-}
-
-// rejectSGLangRedisL2ScaleOut hard-rejects a multi-replica or autoscaled
-// (sglang, LMCache) backend. That pair's managed cache-server is a single plain
-// Redis L2 store (the SGLang MP worker's --l2-adapter target), and a plain Redis is
-// not clustered: a second pod behind the one ClusterIP Service shards the keyspace
-// across independent instances, so a key stored via one is a miss via the other and
-// the L2 silently partitions. The failure looks like a healthy backend with a poor
-// hit rate, so reject at the door rather than warn — the same posture as
-// rejectMooncakeMasterScaleOut (a different singleton for a different reason).
-//
-// Scoped to (sglang, LMCache): vLLM's lm:// server is an ordinary pod-network
-// workload that scales, and other pairs are rejected on their own
-// (checkRuntimeAdapter). spec.replicas 0 (disabled) and 1 (the singleton) remain
-// valid, as is EventsOnly (which provisions no server at all — see the guard).
-// The reconciler's clampSingletonReplicas is the backstop for grandfathered
-// objects. If SGLang's shared tier gains a clustered store, lift this rule.
-func rejectSGLangRedisL2ScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	storage := cb.Spec.EffectiveRemoteStorage()
-	if adapterruntime.ResolveRuntimeID(cb) != adapterruntime.RuntimeSGLang ||
-		cb.Spec.EffectiveCacheType() != cachev1alpha1.CacheBackendTypeLMCache ||
-		storage == nil ||
-		storage.Provider != cachev1alpha1.CacheBackendRemoteStorageProviderRedis ||
-		storage.Ownership != cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
-		return nil
-	}
-	// EventsOnly provisions NO cache server at all (the reconciler sheds any owned
-	// workload and wires only the kvevent-subscriber sidecar), so there is no Redis
-	// L2 to partition and nothing this rule protects. Rejecting scale-out here would
-	// be both factually wrong — the message explains a Redis split that cannot happen
-	// — and gratuitously stricter than the otherwise-identical (vllm, LMCache)
-	// events-only backend. The rule applies to the Offload path, which is what
-	// renders the singleton Redis.
-	if cb.Spec.IsEventsOnly() {
-		return nil
-	}
-	var errs field.ErrorList
-	if cb.Spec.Replicas != nil && *cb.Spec.Replicas > 1 {
-		errs = append(errs, field.Invalid(
-			field.NewPath("spec", "replicas"), *cb.Spec.Replicas,
-			"the (sglang, LMCache) backend's Redis L2 store is a single non-clustered instance: a second replica behind the one Service shards the keyspace and silently partitions the cache. Set spec.replicas to 0 or 1.",
-		))
-	}
-	if cb.Spec.Autoscaling != nil {
-		errs = append(errs, field.Invalid(
-			field.NewPath("spec", "autoscaling"), cb.Spec.Autoscaling,
-			"spec.autoscaling is not supported for the (sglang, LMCache) backend: its Redis L2 store is a single non-clustered instance, so scaling it out partitions the cache across independent keyspaces. Remove spec.autoscaling.",
-		))
-	}
-	return errs
 }
 
 // rejectInvalidKernelCheckAnnotation rejects an unrecognized value for the
@@ -279,69 +219,6 @@ func rejectInvalidKernelCheckAnnotation(cb *cachev1alpha1.CacheBackend) field.Er
 				enginebinding.KernelCheckModeStrict, enginebinding.KernelCheckModeOff),
 		),
 	}
-}
-
-// mooncakeEngineHostNetworkWarning names the one thing that still stands between a
-// Mooncake CacheBackend and working KV transfer. The adapter provisions the master
-// correctly (hostNetwork behind a headless Service), but Mooncake's transfer engine
-// is a peer-to-peer mesh: the ENGINE pods must run with host networking too. That
-// move rewrites a pod the operator owns and hostNetwork is a privilege, so it is
-// opt-in via spec.integration.engineHostNetwork rather than injected by default.
-// Until the operator opts in, the backend reconciles Ready and moves zero KV — a
-// silent failure. Say so out loud at apply time, pointing at the exact field,
-// rather than letting them discover it from a flat cache-hit graph.
-//
-// The text stays within [maxWarningLen]: the API conventions ask for concise
-// warnings so clients render them reliably, and a truncated warning is exactly the
-// silent failure this exists to prevent. The field and its consequence live here;
-// the full rationale (the mesh, node ports, Pod Security ordering) lives in
-// docs/design/cachebackend-api.md.
-const mooncakeEngineHostNetworkWarning = "Mooncake: set spec.integration.engineHostNetwork=true or engine pods can't join the transfer mesh (Ready, no KV)"
-
-// maxWarningLen is the concise-warning budget from the Kubernetes API conventions.
-// Longer text risks truncation or being dropped by clients.
-const maxWarningLen = 120
-
-func warnMooncakeEngineHostNetwork(cb *cachev1alpha1.CacheBackend) admission.Warnings {
-	if !usesMooncakeStorage(cb) {
-		return nil
-	}
-	if enginebinding.EngineHostNetworkRequested(cb) {
-		// Opted in: the pod webhook moves engine pods onto the host network, so the
-		// data plane is complete and there is nothing left to warn about.
-		return nil
-	}
-	return admission.Warnings{mooncakeEngineHostNetworkWarning}
-}
-
-// rejectEngineHostNetworkOnBackendThatDoesNotNeedIt keeps
-// spec.integration.engineHostNetwork from sitting inert. Only Mooncake's
-// peer-to-peer transfer engine needs engine pods on the host network; on any other
-// backend the flag silently does nothing while leaving the operator convinced they
-// changed the pod's networking. hostNetwork is a privilege — a no-op that *looks*
-// like it granted one is worse than a rejection, so reject at the door.
-func rejectEngineHostNetworkOnBackendThatDoesNotNeedIt(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if !enginebinding.EngineHostNetworkRequested(cb) ||
-		usesMooncakeStorage(cb) {
-		return nil
-	}
-	provider := "none (host-only)"
-	if storage := cb.Spec.EffectiveRemoteStorage(); storage != nil {
-		provider = string(storage.Provider)
-	}
-	return field.ErrorList{field.Invalid(
-		field.NewPath("spec", "integration", "engineHostNetwork"), true,
-		fmt.Sprintf("spec.integration.engineHostNetwork is only meaningful when the effective remote storage provider is Mooncake, whose transfer engine dials engine pods "+
-			"on real node IPs; provider=%s does not need it and the flag would do nothing. Remove it.", provider),
-	)}
-}
-
-func usesMooncakeStorage(cb *cachev1alpha1.CacheBackend) bool {
-	if cb == nil {
-		return false
-	}
-	storage := cb.Spec.EffectiveRemoteStorage()
-	return storage != nil && storage.Provider == cachev1alpha1.CacheBackendRemoteStorageProviderMooncake
 }
 
 // checkRuntimeAdapter rejects a CacheBackend whose (runtime, type) pair no
@@ -452,8 +329,6 @@ func unsupportedPairMessage(engine adapterruntime.RuntimeID, backend cachev1alph
 //     kvevent-subscriber the routing tier needs.
 //   - spec.remoteStorage requests an offload provider that the controller
 //     deliberately removes in events-only mode.
-//   - spec.autoscaling has no workload to scale — the controller deploys
-//     nothing for an events-only backend.
 //
 // spec.remoteStorage.endpoint is already forbidden for managed ownership by
 // validateCacheHierarchy, so it needs no events-only-specific check.
@@ -475,88 +350,11 @@ func rejectEventsOnlyMisconfiguration(cb *cachev1alpha1.CacheBackend) field.Erro
 				cachev1alpha1.CacheBackendIntegrationModeEventsOnly, cachev1alpha1.CacheBackendTypeLMCache, cb.Spec.Type),
 		))
 	}
-	if cb.Spec.Autoscaling != nil {
-		errs = append(errs, field.Forbidden(
-			field.NewPath("spec", "autoscaling"),
-			fmt.Sprintf("events-only backends (spec.integration.mode=%q) provision no server workload, so there is nothing to autoscale",
-				cachev1alpha1.CacheBackendIntegrationModeEventsOnly),
-		))
-	}
 	if cb.Spec.RemoteStorage != nil {
 		errs = append(errs, field.Forbidden(
 			field.NewPath("spec", "remoteStorage"),
 			fmt.Sprintf("events-only backends (spec.integration.mode=%q) provision no remote-storage provider; remove spec.remoteStorage",
 				cachev1alpha1.CacheBackendIntegrationModeEventsOnly),
-		))
-	}
-	return errs
-}
-
-// requireExplicitMinReplicasOnScaleToZeroWithAutoscaling rejects the
-// combination spec.replicas=0 + spec.autoscaling != nil +
-// spec.autoscaling.minReplicas == nil. Without this rule the defaulter
-// declines to compute minReplicas (a 0 value would violate the schema's
-// Minimum=1), the apiserver accepts the CR with minReplicas left unset,
-// and the reconciler's HPA fallback silently picks defaultHPAMinReplicas
-// (=1) — so an operator who wrote "scale to zero" gets "scale 1-N" with
-// no notification. Forcing the operator to either set the floor
-// explicitly or remove the autoscaling block keeps the scale-to-zero
-// intent loud at write time.
-//
-// Bypassed when spec.replicas is nil: the apiserver applies the
-// `+kubebuilder:default=1` marker on spec.replicas before this rule
-// runs for a CR that came through admission, so a nil here means the
-// caller bypassed the apiserver (raw-struct unit-test invocation) and
-// the rule has no replicas value to interpret.
-func requireExplicitMinReplicasOnScaleToZeroWithAutoscaling(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	if cb.Spec.Replicas == nil || *cb.Spec.Replicas != 0 {
-		return nil
-	}
-	if cb.Spec.Autoscaling == nil || cb.Spec.Autoscaling.MinReplicas != nil {
-		return nil
-	}
-	return field.ErrorList{
-		field.Required(
-			field.NewPath("spec", "autoscaling", "minReplicas"),
-			"spec.replicas=0 with spec.autoscaling enabled requires spec.autoscaling.minReplicas to be set explicitly (must be >=1). "+
-				"Set minReplicas to make the autoscaling floor explicit, or remove spec.autoscaling to scale to zero unconditionally.",
-		),
-	}
-}
-
-// rejectMooncakeMasterScaleOut hard-rejects a multi-replica or autoscaled Mooncake
-// backend. The Mooncake master is a SINGLETON coordinator that the adapter runs on
-// the host network, so a second replica has no good outcome. Co-scheduled, it
-// cannot serve: it fails to bind ports the first master already holds on that node
-// (in practice the scheduler rejects it earlier still, because the API server
-// defaults hostPort=containerPort for hostNetwork pods and the NodePorts predicate
-// then trips). Scheduled elsewhere, it comes up as an INDEPENDENT master and
-// silently splits the store in two. Both failures land long after admission and
-// look like a healthy backend, so reject at the door rather than warn — the same
-// posture as the other cross-field invariants here.
-//
-// spec.replicas 0 (disabled) and 1 (the singleton) remain valid. type=LMCache is
-// unaffected: its lm:// server is an ordinary pod-network workload that scales.
-func rejectMooncakeMasterScaleOut(cb *cachev1alpha1.CacheBackend) field.ErrorList {
-	storage := cb.Spec.EffectiveRemoteStorage()
-	if storage == nil ||
-		storage.Provider != cachev1alpha1.CacheBackendRemoteStorageProviderMooncake ||
-		storage.Ownership != cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged {
-		return nil
-	}
-	var errs field.ErrorList
-	if cb.Spec.Replicas != nil && *cb.Spec.Replicas > 1 {
-		errs = append(errs, field.Invalid(
-			field.NewPath("spec", "replicas"), *cb.Spec.Replicas,
-			"the Mooncake master is a singleton on the host network: a second replica cannot bind the node ports the first already holds, "+
-				"and on a different node it becomes an independent master that silently splits the store. Set spec.replicas to 0 or 1.",
-		))
-	}
-	if cb.Spec.Autoscaling != nil {
-		errs = append(errs, field.Invalid(
-			field.NewPath("spec", "autoscaling"), cb.Spec.Autoscaling,
-			"spec.autoscaling is not supported for remoteStorage.provider=Mooncake: the master is a singleton on the host network, so scaling it out either cannot bind "+
-				"the node's ports or splits the store across independent masters. Remove spec.autoscaling.",
 		))
 	}
 	return errs

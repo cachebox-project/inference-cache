@@ -17,8 +17,7 @@ silently.
   the prefix from the `metricNamespace` constant in
   [`internal/server/metrics.go`](../../internal/server/metrics.go); controller-
   binary metrics declare it inline on each `prometheus.NewXVec`
-  declaration in `internal/controller/` (see
-  `backendServerRestartCascadesTotal` for the pattern) — the two
+  declaration in `internal/controller/` — the two
   processes use separate Prometheus registries, so no shared
   package-level constant is used to enforce the prefix today.
   Anything not matching that prefix is from a standard collector
@@ -84,7 +83,6 @@ Emitted by the `cmd/controller` binary, registered into the controller-runtime m
 | Metric | Labels | Meaning | Notes |
 |---|---|---|---|
 | `inferencecache_backend_probe_result_total` | `backend`, `stage`, `result` | One increment per stage per probe call the CacheBackend reconciler issues to the server's `/probe` endpoint. `backend` is the canonical `<namespace>/<name>`; `stage` ∈ `ingest` / `routing` / `t2`; `result` ∈ `ok` / `failed` / `skipped`. A successful probe call emits three increments (one per stage); an HTTP-level failure to reach `/probe` emits zero (no per-stage outcome was observed — the call itself failed). Skipped stages count too — the metric reflects "what the probe round-trip looked like," not "what was exercised." | `backend × stage × result` cardinality is bounded by the size of the CacheBackend fleet × 3 × 3, comfortably small. Probe rate (~once per backend per 30s) keeps total emission tame. Dashboards key off the `result="failed"` slice for the alerting signal — a steady rate means the cache plane has a known regression for that backend; the `stage` label points at which layer broke. See [`docs/design/cachebackend-api.md#functional-probe-gate`](../design/cachebackend-api.md#functional-probe-gate) for the semantics. The `ServerProbeFail` alert in `config/observability/{alerting-rules,prometheus-rules}.yaml` is wired off this metric. |
-| `inferencecache_backend_server_restart_cascades_total` | `namespace`, `backend`, `reason` | One increment per cascade-restart **decision** the `CacheBackend` reconciler emits when it observes a cache-server-pod replacement that warrants engine recovery. **The counter advances per cascade EVENT, not per Deployment patched** — a cascade that matches zero injected engine `Deployment`s today still counts as one event (the controller decided recovery was needed; the engine fleet may simply not be deployed yet, or `spec.engineSelector` is being rewired). The decision fires after the rate-limit window has elapsed and after the engine-Deployment annotates succeed — BEFORE the subsequent `status.observedServerInstance` patch. The metric reflects the cascade decision the moment it commits — any matched engine `Deployment`s have already been annotated and the rollout that drives the recovery is in flight — rather than lagging behind a transient status-write failure. A zero-match cascade (no engines injected yet, or `spec.engineSelector` is being rewired) still increments because the controller's "decided to recover" state is operator-actionable even when no engine rolled. Double-counting on retry is prevented by an in-process `(key, currentID)` ledger: a subsequent reconcile that re-enters the cascade branch with the same identifier does not advance the counter. | NOT a raw restart count: the cascade is rate-limited to at most once per ~30s per backend (see `DefaultMinServerRestartCascadeInterval`), so a crash-looping cache-server that restarts 10× inside one window still increments this counter once. For raw cache-server pod restart rate, scrape `kube_pod_container_status_restarts_total` from kube-state-metrics instead. Today `reason` is always `server_instance_changed`; future operator-initiated "force cascade" surfaces would add their own value. A series is created lazily on the first cascade — a backend that never cascades emits nothing. The cascade itself is the operator-side recovery for the upstream LMCache `LMServerConnector` EPIPE-on-restart bug ([LMCache/LMCache#3565](https://github.com/LMCache/LMCache/issues/3565)); see [`docs/design/cachebackend-api.md` `observedServerInstance`](../design/cachebackend-api.md). |
 | `inferencecache_backend_t2_query_tokens_total` | `backend` | **Monotonic** count of tier-2 (external offload) query tokens observed per CacheBackend — the **activity signal** for tier-2-degradation alerting: `rate(...)` separates an actively-queried backend (degraded when its hit-rate is `0`) from one that took a few cold misses and went idle. The CacheIndex poller accumulates only the **positive per-tick deltas** of the per-backend aggregate cumulative, so a drop from replica/tenant churn or an engine restart is clamped out and `rate()` never sees a phantom reset. | `backend` is the canonical `<namespace>/<name>` (Prometheus injects the install `namespace`); same present-when-exercised lifecycle + stale-series pruning as `inferencecache_backend_t2_hit_rate`. Intended for `rate(...) > 1000` tokens/sec activity gating in a tier-2-degradation alert (shipped separately in the observability bundle). |
 
 ---
@@ -140,12 +138,6 @@ with OTEL collectors) without bumping `v1alpha1`.
   registered into the controller-runtime metrics registry on `init()`.
   This is a separate `prometheus.Registry` from the server binary's per-
   Service registry.
-- **`backendServerRestartCascadesTotal` writer:** the `CacheBackend`
-  reconciler increments it once per cascade in
-  [`internal/controller/cachebackend_server_restart.go`](../../internal/controller/cachebackend_server_restart.go).
-  See the `reconcileServerInstance` godoc for when a cascade is and is
-  not emitted (rate-limit, strict-superset midpoints, converged
-  scale-ups, stale-while-unavailable).
 - **`inferencecache_backend_probe_result_total` writer:** the
   `CacheBackend` reconciler in
   [`internal/controller/cachebackend_probe.go`](../../internal/controller/cachebackend_probe.go)
@@ -266,9 +258,7 @@ Two binaries each expose their own `/metrics` endpoint — separate processes, s
      keeping the surface narrow makes it test-mockable.
    - **Controller binary (`cmd/controller`)**: declare a package-level
      `prometheus.NewCounterVec` / `NewGaugeVec` / etc. var in the
-     reconciler / webhook file that uses it (e.g.
-     `backendServerRestartCascadesTotal` in
-     `internal/controller/cachebackend_server_restart.go`); register it
+     reconciler / webhook file that uses it; register it
      into `sigs.k8s.io/controller-runtime/pkg/metrics.Registry` from
      an `init()` so it appears on the manager's `/metrics` endpoint
      without a separate plumbing path. Add a package-private
@@ -284,8 +274,7 @@ Two binaries each expose their own `/metrics` endpoint — separate processes, s
 4. **Wire test coverage.** Server-binary metrics: add an assertion in
    `internal/server/metrics_test.go`. Controller-binary metrics: add an
    assertion in a `_test.go` file alongside the reconciler that increments
-   them (e.g. `cachebackend_server_restart_test.go` — see the
-   `cascadeRestartsCount` helper for the pattern). In both cases verify
+   them. In both cases verify
    the metric appears in `/metrics` output with the expected name and
    labels.
 5. **Flag the schema impact in the PR description.** If the metric is a

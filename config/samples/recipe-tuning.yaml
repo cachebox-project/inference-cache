@@ -4,20 +4,17 @@
 
 # Recipe: Tuning — CPU dev shape plus a meaningful engineOverrides block.
 #
-# Scenario: the canonical LMCache injection works, but you want to tune an
-# adapter-injected knob (chunk size) and turn up LMCache logging for triage —
-# WITHOUT losing the rest of the integration the pod webhook injects.
+# Scenario: tune the MP server's typed chunk size and add an engine-side logging
+# environment value without losing the rest of the injected integration.
 #
 # `spec.integration.engineOverrides` amends the engine container on top of the
-# adapter's canonical injection. Two primitives are shown here:
-#   * UPSERT — `LMCACHE_CHUNK_SIZE` matches an adapter-owned env, so the override
-#     value (128) REPLACES the canonical default. Drop chunk size on nodes where
-#     the default eats too much per-replica memory.
-#   * APPEND — `LMCACHE_LOG_LEVEL` is not in the adapter's canonical set, so it
+# adapter's canonical injection. `LMCACHE_LOG_LEVEL` is not in the adapter's
+# canonical set, so it
 #     is added unchanged. Useful for reading the LMCache log stream during triage.
 #
 # IMPORTANT: overrides that overlap the adapter's RESERVED args/env
-# (--kv-transfer-config, LMCACHE_REMOTE_URL, VLLM_USE_V1, INFERENCECACHE_FAIL_OPEN)
+# (--kv-transfer-config, --disable-hybrid-kv-cache-manager, PYTHONHASHSEED,
+# INFERENCECACHE_FAIL_OPEN)
 # are HARD-REJECTED at admission with a field-scoped error — they are required
 # for the integration to function. engineOverrides tunes; it does not disable.
 # To skip injection entirely on a pod, use the `inferencecache.io/skip-inject`
@@ -39,27 +36,34 @@ metadata:
 spec:
   runtime: VLLM
   type: LMCache
-  replicas: 1
   integration:
     role: ReadWrite
     engineOverrides:
       env:
-        # Upsert: replaces the adapter's canonical chunk-size value.
-        - name: LMCACHE_CHUNK_SIZE
-          value: "128"
         # Append: adapter doesn't inject this, so it's added unchanged.
         - name: LMCACHE_LOG_LEVEL
           value: DEBUG
   engineSelector:
     matchLabels:
-      app: tuning-demo
+      inferencecache.io/cache-domain: tuning-demo
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 128
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 2Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 3Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
   observation:
     modelID: Qwen/Qwen2.5-0.5B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer:
-      image: lmcache/standalone:v0.4.7
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -76,6 +80,7 @@ spec:
     metadata:
       labels:
         app: tuning-demo
+        inferencecache.io/cache-domain: tuning-demo
     spec:
       nodeSelector:
         kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`

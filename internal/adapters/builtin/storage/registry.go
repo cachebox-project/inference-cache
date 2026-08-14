@@ -34,19 +34,6 @@ type externalProvider struct {
 	protocol backendadapter.Protocol
 }
 
-type options struct {
-	lmCacheServerImage string
-}
-
-// Option configures the shipping remote-storage provider adapters.
-type Option func(*options)
-
-// WithLMCacheServerImage sets the operator-selected fallback image for managed
-// LMCache servers. A per-CacheBackend image still takes precedence.
-func WithLMCacheServerImage(image string) Option {
-	return func(opts *options) { opts.lmCacheServerImage = image }
-}
-
 func (p externalProvider) Supports(storage *cachev1alpha1.CacheBackendRemoteStorageSpec) bool {
 	return storage != nil &&
 		storage.Provider == p.provider &&
@@ -62,12 +49,7 @@ func (p externalProvider) Render(cache *cachev1alpha1.CacheBackend) (*backendada
 
 // DefaultRegistry returns the shipping provider capabilities. Engine/runtime
 // compatibility is intentionally not encoded here.
-func DefaultRegistry(opts ...Option) *backendadapter.Registry {
-	var cfg options
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-
+func DefaultRegistry() *backendadapter.Registry {
 	registry := backendadapter.NewRegistry()
 	registry.Register(managedProvider{
 		provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
@@ -76,27 +58,7 @@ func DefaultRegistry(opts ...Option) *backendadapter.Registry {
 			return rendered(pod, service, backendadapter.ProtocolRESP, err)
 		},
 	})
-	registry.Register(managedProvider{
-		provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-		render: func(cache *cachev1alpha1.CacheBackend) (*backendadapter.RenderedStorage, error) {
-			pod, service, err := ResolveLMCacheServer(cache, cfg.lmCacheServerImage)
-			return rendered(pod, service, backendadapter.ProtocolLMCache, err)
-		},
-	})
-	registry.Register(managedProvider{
-		provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-		render: func(cache *cachev1alpha1.CacheBackend) (*backendadapter.RenderedStorage, error) {
-			pod, service, err := ResolveMooncakeServer(cache)
-			return rendered(pod, service, backendadapter.ProtocolMooncakeStore, err)
-		},
-	})
-	for _, provider := range []externalProvider{
-		{provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, protocol: backendadapter.ProtocolRESP},
-		{provider: cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer, protocol: backendadapter.ProtocolLMCache},
-		{provider: cachev1alpha1.CacheBackendRemoteStorageProviderMooncake, protocol: backendadapter.ProtocolMooncakeStore},
-	} {
-		registry.Register(provider)
-	}
+	registry.Register(externalProvider{provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, protocol: backendadapter.ProtocolRESP})
 	return registry
 }
 

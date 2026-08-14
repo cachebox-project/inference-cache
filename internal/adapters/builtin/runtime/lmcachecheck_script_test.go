@@ -114,9 +114,10 @@ func TestKernelCheckScriptLmcacheAbsentReportsFail(t *testing.T) {
 
 // makeHealthyLmcachePkg builds a synthetic PYTHONPATH root with a loadable
 // native c_ops*.so (compiled trivially — no Python init symbol, no CUDA deps)
-// plus a stub `torch` package so the detector's `import torch` succeeds. This
-// reproduces a HEALTHY engine for the detector: lmcache present, c_ops present,
-// dlopen-able. It is the regression guard for the OK path — with the previous
+// plus stub `torch` and current `vllm._C_stable_libtorch` packages so both
+// native compatibility checks succeed. This reproduces a HEALTHY engine for
+// the detector: LMCache present, c_ops dlopen-able, and the vLLM extension
+// importable. It is the regression guard for the OK path — with the previous
 // importlib.exec_module loader (which derives PyInit_<spec-name>), loading this
 // header-free .so would have FAILED; ctypes.CDLL loads it, so this asserts the
 // detector reports OK on a kernel that actually loads. Skips if no C compiler.
@@ -137,10 +138,18 @@ func makeHealthyLmcachePkg(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Join(root, "torch"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(root, "vllm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(pkg, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{filepath.Join(pkg, "__init__.py"), filepath.Join(root, "torch", "__init__.py")} {
+	for _, f := range []string{
+		filepath.Join(pkg, "__init__.py"),
+		filepath.Join(root, "torch", "__init__.py"),
+		filepath.Join(root, "vllm", "__init__.py"),
+		filepath.Join(root, "vllm", "_C_stable_libtorch.py"),
+	} {
 		if err := os.WriteFile(f, []byte("# stub\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -155,6 +164,37 @@ func makeHealthyLmcachePkg(t *testing.T) string {
 		t.Skipf("could not compile a trivial shared object (%v): %s", err, out)
 	}
 	return root
+}
+
+func TestKernelCheckScriptMissingVLLMNativeExtensionReportsFail(t *testing.T) {
+	root := makeHealthyLmcachePkg(t)
+	if err := os.Remove(filepath.Join(root, "vllm", "_C_stable_libtorch.py")); err != nil {
+		t.Fatal(err)
+	}
+	msg, code := runScript(t, root, false)
+	if code != 0 {
+		t.Errorf("report-only exit = %d, want 0", code)
+	}
+	if !strings.Contains(msg, "no supported vLLM native core extension") {
+		t.Errorf("message = %q, want missing native-core failure", msg)
+	}
+}
+
+func TestKernelCheckScriptLegacyVLLMNativeExtensionFallbackReportsOK(t *testing.T) {
+	root := makeHealthyLmcachePkg(t)
+	if err := os.Remove(filepath.Join(root, "vllm", "_C_stable_libtorch.py")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "vllm", "_C.py"), []byte("# legacy stub\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msg, code := runScript(t, root, false)
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	if strings.TrimSpace(msg) != enginebinding.KernelCheckMsgOK {
+		t.Errorf("message = %q, want %q for legacy fallback", msg, enginebinding.KernelCheckMsgOK)
+	}
 }
 
 func TestKernelCheckScriptHealthyExtensionReportsOK(t *testing.T) {

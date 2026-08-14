@@ -46,7 +46,8 @@
 # sidecar is auto-attached, which requires the controller to run with
 # --kvevent-subscriber-image set (empty by default). Without it the engines are
 # wired to their caches but report no KV events, so status.indexEntries stays
-# unset. CPU shape — runs without a GPU.
+# unset. The manifests are admission-valid without a GPU; the inference owner
+# must still supply an engine image containing the selected LMCache MP client.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -88,19 +89,29 @@ metadata:
 spec:
   runtime: VLLM
   type: LMCache
-  replicas: 1
   integration:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: tenant-engine
+      inferencecache.io/cache-domain: tenant-a-engine
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 2Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 3Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
   observation:
     modelID: Qwen/Qwen2.5-0.5B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer:
-      image: lmcache/standalone:v0.4.7
 ---
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
@@ -110,19 +121,29 @@ metadata:
 spec:
   runtime: VLLM
   type: LMCache
-  replicas: 1
   integration:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app: tenant-engine
+      inferencecache.io/cache-domain: tenant-b-engine
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 2Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 3Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
   observation:
     modelID: Qwen/Qwen2.5-0.5B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer:
-      image: lmcache/standalone:v0.4.7
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -140,6 +161,7 @@ spec:
     metadata:
       labels:
         app: tenant-engine
+        inferencecache.io/cache-domain: tenant-a-engine
     spec:
       nodeSelector:
         kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`
@@ -203,6 +225,7 @@ spec:
     metadata:
       labels:
         app: tenant-engine
+        inferencecache.io/cache-domain: tenant-b-engine
     spec:
       nodeSelector:
         kubernetes.io/arch: amd64    # arm64 hosts: change to `arm64`

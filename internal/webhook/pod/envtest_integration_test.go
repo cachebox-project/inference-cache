@@ -17,6 +17,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,10 +35,11 @@ import (
 // TestWebhookOnEnvtest_EndToEnd boots a real apiserver via envtest, installs
 // the controller's MutatingWebhookConfiguration, starts the controller-runtime
 // manager with the Pod admission handler registered, then creates a
-// CacheBackend whose status.endpoint is populated and a matching engine Pod.
+// typed CacheBackend whose managed Redis status endpoint is populated and a
+// matching engine Pod.
 // On admission the apiserver routes the CREATE through the webhook over the
-// local serving cert and asserts the persisted pod carries the LMCache env +
-// the kv-transfer-config arg the adapter writes.
+// local serving cert and asserts the persisted pod carries the typed MP
+// sidecar and kv-transfer-config the adapter writes.
 //
 // Skips when KUBEBUILDER_ASSETS is unset so default CI stays green.
 // Run locally via:
@@ -98,10 +100,12 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	// the registry with a subscriber image — the integration test exists
 	// to gate that end-to-end behaviour. Production operators do the same
 	// by passing --kvevent-subscriber-image to the controller.
+	registry := newVLLMRegistry(builtinruntime.SubscriberConfig{Image: testSubscriberImage})
+	registry.Register(builtinruntime.NewSGLangLMCacheAdapter(builtinruntime.SubscriberConfig{Image: testSubscriberImage}))
 	mgr.GetWebhookServer().Register(WebhookPath, &webhook.Admission{
 		Handler: &EngineInjector{
 			Reader:   mgr.GetAPIReader(),
-			Registry: newVLLMRegistry(builtinruntime.SubscriberConfig{Image: testSubscriberImage}),
+			Registry: registry,
 		},
 	})
 
@@ -138,10 +142,23 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+				PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+					Image:      "registry.example.com/lmcache@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+					Port:       65432,
+					L1Capacity: resource.MustParse("1Gi"),
+					MaxWorkers: 2,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+						Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+					},
+				}},
+			},
 			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
 				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
@@ -158,7 +175,10 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if err := mgr.GetClient().Create(ctx, cb); err != nil {
 		t.Fatalf("create CacheBackend: %v", err)
 	}
-	cb.Status.Endpoint = "envtest-cb.default.svc.cluster.local:65432"
+	cb.Status.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageStatus{
+		Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Endpoint: "envtest-cb.default.svc.cluster.local:6379",
+	}
 	if err := mgr.GetClient().Status().Update(ctx, cb); err != nil {
 		t.Fatalf("set CacheBackend status: %v", err)
 	}
@@ -186,8 +206,14 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 		t.Fatalf("get pod after create: %v", err)
 	}
 
-	mustHaveContainerEnv(t, &got, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
-	mustHaveContainerEnv(t, &got, testEnvVLLMUseV1, "1")
+	config := envtestArgValue(got.Spec.Containers[0].Args, "--kv-transfer-config")
+	if !strings.Contains(config, `"kv_connector":"LMCacheMPConnector"`) {
+		t.Fatalf("typed vLLM kv-transfer-config = %q", config)
+	}
+	server := envtestFindInitContainer(&got, "lmcache-mp-server")
+	if server == nil || !containsArgPair(server.Args, "--l2-adapter", `{"host":"envtest-cb.default.svc.cluster.local","port":6379,"type":"resp"}`) {
+		t.Fatalf("typed MP server does not carry managed Redis binding: %+v", server)
+	}
 	if got.Annotations[AnnotationInjectedBy] != ns+"/"+cb.Name {
 		t.Fatalf("annotation %s: got %q want %q",
 			AnnotationInjectedBy, got.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name)
@@ -200,6 +226,9 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if got.Annotations[AnnotationInjectedByUID] != string(cb.UID) {
 		t.Fatalf("annotation %s: got %q want %q (live CacheBackend UID)",
 			AnnotationInjectedByUID, got.Annotations[AnnotationInjectedByUID], string(cb.UID))
+	}
+	if got.Annotations[AnnotationInjectedGeneration] != "1" {
+		t.Fatalf("annotation %s: got %q want %q", AnnotationInjectedGeneration, got.Annotations[AnnotationInjectedGeneration], "1")
 	}
 	if !containsArgFlag(got.Spec.Containers[0].Args, "--kv-transfer-config") {
 		t.Fatalf("--kv-transfer-config flag not injected; args = %v", got.Spec.Containers[0].Args)
@@ -236,6 +265,7 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	// the apiserver would actually see it.
 	delete(pod2.Annotations, AnnotationInjectedBy)
 	delete(pod2.Annotations, AnnotationInjectedByUID)
+	delete(pod2.Annotations, AnnotationInjectedGeneration)
 	if err := mgr.GetClient().Create(ctx, pod2); err != nil {
 		t.Fatalf("create second Pod: %v", err)
 	}
@@ -243,7 +273,9 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: pod2.Name}, &got2); err != nil {
 		t.Fatalf("get second pod: %v", err)
 	}
-	mustHaveContainerEnv(t, &got2, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	if envtestFindInitContainer(&got2, "lmcache-mp-server") == nil {
+		t.Fatalf("second admitted Pod is missing typed MP sidecar: %+v", got2.Spec.InitContainers)
+	}
 
 	skipped := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -273,36 +305,232 @@ func TestWebhookOnEnvtest_EndToEnd(t *testing.T) {
 	if got := gotSkipped.Annotations[AnnotationInjectedBy]; got != "" {
 		t.Fatalf("annotation %s: got %q want absent on skipped pod", AnnotationInjectedBy, got)
 	}
-	if envtestHasContainerEnv(&gotSkipped, testEnvLMCacheRemoteURL) {
-		t.Fatalf("skipped pod unexpectedly has %s env; webhook must not inject engine wiring when %s=true",
-			testEnvLMCacheRemoteURL, AnnotationSkip)
+	if envtestFindInitContainer(&gotSkipped, "lmcache-mp-server") != nil ||
+		containsArgFlag(gotSkipped.Spec.Containers[0].Args, "--kv-transfer-config") {
+		t.Fatalf("skipped pod unexpectedly has typed MP wiring; webhook must not inject when %s=true", AnnotationSkip)
 	}
-}
 
-// mustHaveContainerEnv fails the test if the first container's env array
-// does not include name=value.
-func mustHaveContainerEnv(t *testing.T, pod *corev1.Pod, name, value string) {
-	t.Helper()
-	if len(pod.Spec.Containers) == 0 {
-		t.Fatalf("no containers on pod %s", pod.Name)
+	// Typed SGLang PodLocal smoke: this goes through a real apiserver so the
+	// native-sidecar restartPolicy, probes, ports, resource quantities, mounts,
+	// and SecretKeyRef-capable env shape are schema/defaulting checked rather
+	// than only compared as Go structs.
+	typedCB := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "sglang-mp", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{
+				"app": "sglang-mp-test",
+			}},
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+				PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+					Image:      "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					Port:       6500,
+					L1Capacity: resource.MustParse("1Gi"),
+					MaxWorkers: 2,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("3Gi")},
+					},
+				}},
+			},
+		},
 	}
-	for _, e := range pod.Spec.Containers[0].Env {
-		if e.Name == name {
-			if e.Value != value {
-				t.Fatalf("env %s on %s: got %q want %q", name, pod.Name, e.Value, value)
-			}
-			return
+	if err := mgr.GetClient().Create(ctx, typedCB); err != nil {
+		t.Fatalf("create typed SGLang CacheBackend: %v", err)
+	}
+	typedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sglang-mp-engine",
+			Namespace: ns,
+			Labels:    map[string]string{"app": "sglang-mp-test"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "sglang", Image: "sglang:connector-ready", Args: []string{"--page-size=1"},
+		}}},
+	}
+	if err := mgr.GetClient().Create(ctx, typedPod); err != nil {
+		t.Fatalf("create typed SGLang Pod: %v", err)
+	}
+	var gotTyped corev1.Pod
+	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: typedPod.Name}, &gotTyped); err != nil {
+		t.Fatalf("get typed SGLang Pod: %v", err)
+	}
+	var mpServer *corev1.Container
+	for i := range gotTyped.Spec.InitContainers {
+		if gotTyped.Spec.InitContainers[i].Name == "lmcache-mp-server" {
+			mpServer = &gotTyped.Spec.InitContainers[i]
+			break
 		}
 	}
-	t.Fatalf("env %s missing on %s; have %v", name, pod.Name, pod.Spec.Containers[0].Env)
+	if mpServer == nil {
+		t.Fatalf("typed native sidecar missing: %+v", gotTyped.Spec.InitContainers)
+	}
+	if mpServer.RestartPolicy == nil || *mpServer.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("native sidecar restartPolicy = %v, want Always", mpServer.RestartPolicy)
+	}
+	if mpServer.StartupProbe == nil || mpServer.ReadinessProbe == nil || mpServer.LivenessProbe == nil {
+		t.Fatalf("typed native sidecar probes missing: %+v", mpServer)
+	}
+	if got := gotTyped.Labels[LabelLMCacheMPMetrics]; got != LabelLMCacheMPMetricsEnabled {
+		t.Fatalf("typed native sidecar metrics label %s = %q, want %q",
+			LabelLMCacheMPMetrics, got, LabelLMCacheMPMetricsEnabled)
+	}
+
+	// Typed vLLM PodLocal smoke: prove the dedicated MP adapter, external
+	// connector module path, deterministic hash seed, and common native sidecar
+	// survive real apiserver admission/defaulting. This remains a control-plane
+	// test; envtest has no kubelet or GPU runtime.
+	vllmMPCB := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "vllm-mp", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{
+				"app": "vllm-mp-test",
+			}},
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+				PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+					Image:      "registry.example.com/lmcache@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+					Port:       6555,
+					L1Capacity: resource.MustParse("1Gi"),
+					MaxWorkers: 2,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("3Gi")},
+					},
+				}},
+			},
+		},
+	}
+	if err := mgr.GetClient().Create(ctx, vllmMPCB); err != nil {
+		t.Fatalf("create typed vLLM CacheBackend: %v", err)
+	}
+	vllmMPPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vllm-mp-engine",
+			Namespace: ns,
+			Labels:    map[string]string{"app": "vllm-mp-test"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "vllm", Image: "vllm:connector-ready", Args: []string{"--model", "model-a", "--tensor-parallel-size=2"},
+		}}},
+	}
+	if err := mgr.GetClient().Create(ctx, vllmMPPod); err != nil {
+		t.Fatalf("create typed vLLM Pod: %v", err)
+	}
+	var gotVLLMMP corev1.Pod
+	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: vllmMPPod.Name}, &gotVLLMMP); err != nil {
+		t.Fatalf("get typed vLLM Pod: %v", err)
+	}
+	var vllmMPServer *corev1.Container
+	for index := range gotVLLMMP.Spec.InitContainers {
+		if gotVLLMMP.Spec.InitContainers[index].Name == "lmcache-mp-server" {
+			vllmMPServer = &gotVLLMMP.Spec.InitContainers[index]
+			break
+		}
+	}
+	if vllmMPServer == nil || vllmMPServer.RestartPolicy == nil || *vllmMPServer.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("typed vLLM native sidecar = %+v", vllmMPServer)
+	}
+	vllmConfig := envtestArgValue(gotVLLMMP.Spec.Containers[0].Args, "--kv-transfer-config")
+	if !strings.Contains(vllmConfig, `"kv_connector":"LMCacheMPConnector"`) ||
+		!strings.Contains(vllmConfig, `"kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector"`) ||
+		!strings.Contains(vllmConfig, `"lmcache.mp.host":"tcp://127.0.0.1"`) {
+		t.Fatalf("typed vLLM kv-transfer-config = %q", vllmConfig)
+	}
+	if !envtestHasContainerEnvValue(&gotVLLMMP, "PYTHONHASHSEED", "0") {
+		t.Fatalf("typed vLLM Pod is missing PYTHONHASHSEED=0: %+v", gotVLLMMP.Spec.Containers[0].Env)
+	}
+
+	// Typed vLLM NodeLocal smoke: the real apiserver must preserve hostPath
+	// /dev/shm, preserved inference-owned placement, the Downward API node address, and
+	// the blocking ownership gate. No PodLocal native sidecar may be present.
+	nodeLocalCB := &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "vllm-node-mp", Namespace: ns},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
+			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{
+				"app": "vllm-node-mp-test",
+			}},
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyNodeLocal,
+				NodeLocal: &cachev1alpha1.LMCacheNodeLocalSpec{
+					Server: &cachev1alpha1.LMCacheNodeLocalServerSpec{
+						Image: "registry.example.com/lmcache@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+						Port:  16555, HTTPPort: 18080, L1Capacity: resource.MustParse("1Gi"), MaxGPUWorkers: 2, MaxCPUWorkers: 2,
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+							Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+						},
+					},
+					Scheduling: &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{},
+				},
+			},
+		},
+	}
+	if err := mgr.GetClient().Create(ctx, nodeLocalCB); err != nil {
+		t.Fatalf("create typed vLLM NodeLocal CacheBackend: %v", err)
+	}
+	nodeLocalPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "vllm-node-mp-engine", Namespace: ns, Labels: map[string]string{"app": "vllm-node-mp-test"}},
+		Spec: corev1.PodSpec{NodeSelector: map[string]string{"gpu-pool": "inference-owned"}, Containers: []corev1.Container{{
+			Name: "vllm", Image: "vllm:connector-ready", Args: []string{"--model", "model-a", "--tensor-parallel-size=1"},
+		}}},
+	}
+	if err := mgr.GetClient().Create(ctx, nodeLocalPod); err != nil {
+		t.Fatalf("create typed vLLM NodeLocal Pod: %v", err)
+	}
+	var gotNodeLocal corev1.Pod
+	if err := mgr.GetAPIReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: nodeLocalPod.Name}, &gotNodeLocal); err != nil {
+		t.Fatalf("get typed vLLM NodeLocal Pod: %v", err)
+	}
+	if envtestFindInitContainer(&gotNodeLocal, "lmcache-mp-server") != nil || envtestFindInitContainer(&gotNodeLocal, "lmcache-node-local-gate") == nil {
+		t.Fatalf("NodeLocal init containers = %+v", gotNodeLocal.Spec.InitContainers)
+	}
+	if len(gotNodeLocal.Spec.NodeSelector) != 1 || gotNodeLocal.Spec.NodeSelector["gpu-pool"] != "inference-owned" || gotNodeLocal.Spec.Affinity != nil {
+		t.Fatalf("NodeLocal mutated inference-owned placement: selector:%v affinity:%+v", gotNodeLocal.Spec.NodeSelector, gotNodeLocal.Spec.Affinity)
+	}
+	nodeConfig := envtestArgValue(gotNodeLocal.Spec.Containers[0].Args, "--kv-transfer-config")
+	if !strings.Contains(nodeConfig, `"lmcache.mp.host":"tcp://$(INFERENCECACHE_NODE_IP)"`) ||
+		!envtestContainerHasFieldRef(&gotNodeLocal, "INFERENCECACHE_NODE_IP", "status.hostIP") {
+		t.Fatalf("NodeLocal node-derived engine wire = config:%q env:%+v", nodeConfig, gotNodeLocal.Spec.Containers[0].Env)
+	}
 }
 
-func envtestHasContainerEnv(pod *corev1.Pod, name string) bool {
-	if len(pod.Spec.Containers) == 0 {
+func envtestArgValue(args []string, flag string) string {
+	for index, arg := range args {
+		if arg == flag && index+1 < len(args) {
+			return args[index+1]
+		}
+		if strings.HasPrefix(arg, flag+"=") {
+			return strings.TrimPrefix(arg, flag+"=")
+		}
+	}
+	return ""
+}
+
+func envtestHasContainerEnvValue(pod *corev1.Pod, name, value string) bool {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
 		return false
 	}
-	for _, e := range pod.Spec.Containers[0].Env {
-		if e.Name == name {
+	for _, entry := range pod.Spec.Containers[0].Env {
+		if entry.Name == name && entry.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func envtestContainerHasFieldRef(pod *corev1.Pod, name, path string) bool {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return false
+	}
+	for _, entry := range pod.Spec.Containers[0].Env {
+		if entry.Name == name && entry.ValueFrom != nil && entry.ValueFrom.FieldRef != nil && entry.ValueFrom.FieldRef.FieldPath == path {
 			return true
 		}
 	}
@@ -317,6 +545,15 @@ func envtestFindContainer(pod *corev1.Pod, name string) *corev1.Container {
 	for i := range pod.Spec.Containers {
 		if pod.Spec.Containers[i].Name == name {
 			return &pod.Spec.Containers[i]
+		}
+	}
+	return nil
+}
+
+func envtestFindInitContainer(pod *corev1.Pod, name string) *corev1.Container {
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == name {
+			return &pod.Spec.InitContainers[i]
 		}
 	}
 	return nil

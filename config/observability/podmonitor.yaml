@@ -5,18 +5,16 @@
 # PodMonitor for `inference-cache-controller-manager`. Without this, a
 # prometheus-operator install scrapes ONLY the server-binary metrics
 # (covered by servicemonitor.yaml) and silently misses every
-# controller-binary series — including
+# controller-binary series, including
 # `inferencecache_backend_probe_result_total` (which `ServerProbeFail`
-# in this same overlay depends on) and
-# `inferencecache_backend_server_restart_cascades_total` (no alert
-# reads it today; reserved for a future cascade-loop alert).
+# in this same overlay depends on).
 #
 # A PodMonitor (not a ServiceMonitor) is the right shape here because the
 # controller binary does not front its /metrics endpoint with a Service —
 # the manager pod listens on :8080 directly. Loaded by the same
 # `kubectl apply -k config/observability` as the PrometheusRule and the
-# server ServiceMonitor, so the alert bundle and BOTH scrape configs ship
-# together.
+# server ServiceMonitor and LMCache MP PodMonitor, so the alert bundle and all
+# scrape configs ship together.
 #
 # Selector matches the controller Deployment in config/manager/manager.yaml.
 # The endpoint binds by port-NAME (`metrics`), not number, so this stays

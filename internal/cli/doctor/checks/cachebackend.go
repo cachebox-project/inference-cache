@@ -187,21 +187,25 @@ func matchedEnginePodCount(ctx context.Context, c client.Client, cb *cachev1alph
 // unreachable) for a backend, returning ok=false when the endpoint is healthy
 // (or when no dialer is configured to prove unreachability).
 func endpointFinding(ctx context.Context, cb *cachev1alpha1.CacheBackend, ref string, dial TCPDialer) (doctor.Finding, bool) {
-	if cb.Status.Endpoint == "" {
+	endpoint := ""
+	if cb.Status.RemoteStorage != nil {
+		endpoint = cb.Status.RemoteStorage.Endpoint
+	}
+	if endpoint == "" {
 		return doctor.Finding{
 			Code: doctor.CodeBackendEndpointUnreachable, Status: doctor.StatusWarn,
 			Check: checkCacheBackendHealth, Resource: ref,
-			Message: "status.endpoint is empty — clients have no address to reach this backend yet",
+			Message: "status.remoteStorage.endpoint is empty — the remote tier has no published address",
 		}, true
 	}
 	if dial == nil {
 		return doctor.Finding{}, false
 	}
-	if err := dial(ctx, cb.Status.Endpoint); err != nil {
+	if err := dial(ctx, endpoint); err != nil {
 		return doctor.Finding{
 			Code: doctor.CodeBackendEndpointUnreachable, Status: doctor.StatusWarn,
 			Check: checkCacheBackendHealth, Resource: ref,
-			Message: fmt.Sprintf("status.endpoint %q is not reachable over TCP: %v", cb.Status.Endpoint, err),
+			Message: fmt.Sprintf("status.remoteStorage.endpoint %q is not reachable over TCP: %v", endpoint, err),
 		}, true
 	}
 	return doctor.Finding{}, false

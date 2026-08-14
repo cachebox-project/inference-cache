@@ -6,138 +6,33 @@ package v1alpha1
 
 import (
 	"context"
-	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
-	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
-	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
-	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
-	corev1 "k8s.io/api/core/v1"
+	"strings"
+	"testing"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"strings"
-	"testing"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	builtinruntime "github.com/cachebox-project/inference-cache/internal/adapters/builtin/runtime"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
+	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
+	adapterruntime "github.com/cachebox-project/inference-cache/pkg/adapters/runtime"
 )
-
-// newBackend returns a minimally-valid managed CacheBackend the test cases
-// derive from. Tests deep-copy and mutate the relevant fields rather than
-// re-declaring the whole spec each time.
-func newBackend() *cachev1alpha1.CacheBackend {
-	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "cb", Namespace: "team-a"},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-		},
-	}
-}
-
-func managedLMCacheServer(cb *cachev1alpha1.CacheBackend) *cachev1alpha1.LMCacheServerRemoteStorageSpec {
-	if cb.Spec.RemoteStorage == nil {
-		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{}
-	}
-	cb.Spec.RemoteStorage.Provider = cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer
-	cb.Spec.RemoteStorage.Ownership = cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged
-	if cb.Spec.RemoteStorage.LMCacheServer == nil {
-		cb.Spec.RemoteStorage.LMCacheServer = &cachev1alpha1.LMCacheServerRemoteStorageSpec{}
-	}
-	return cb.Spec.RemoteStorage.LMCacheServer
-}
 
 func i32p(v int32) *int32 { return &v }
 
-func defaultShippingRegistry() *adapterruntime.Registry {
-	registry := adapterruntime.NewRegistry()
-	registry.Register(builtinruntime.NewVLLMLMCacheAdapter(builtinruntime.SubscriberConfig{}))
-	registry.Register(builtinruntime.NewSGLangLMCacheAdapter(builtinruntime.SubscriberConfig{}))
-	registry.Register(builtinruntime.NewSGLangHiCacheAdapter(builtinruntime.SubscriberConfig{}))
-	return registry
-}
-
-func shippingValidator() *CacheBackendValidator {
-	return &CacheBackendValidator{Registry: defaultShippingRegistry()}
-}
-
-func newHiCacheBackend() *cachev1alpha1.CacheBackend {
-	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "hicache", Namespace: "team-a"},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
-			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "sglang"},
-			},
-			HiCache: &cachev1alpha1.SGLangHiCacheSpec{
-				Ratio:        "2.0",
-				WritePolicy:  cachev1alpha1.SGLangHiCacheWriteThroughSelective,
-				IOBackend:    cachev1alpha1.SGLangHiCacheIOKernel,
-				MemoryLayout: cachev1alpha1.SGLangHiCacheMemoryPageFirst,
-			},
-			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "model-a"},
-		},
+func newBackend() *cachev1alpha1.CacheBackend {
+	backend := validPodLocalMPBackend()
+	backend.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 	}
-}
-
-// requireInvalidWithCause runs v against cb and asserts the response is an
-// aggregated Invalid status whose causes contain the substring wantMsg on
-// field wantField. Centralising the assertion keeps the per-rule tests one
-// line and the error-shape contract pinned in one place.
-func requireInvalidWithCause(t *testing.T, v *CacheBackendValidator, cb *cachev1alpha1.CacheBackend, wantField, wantMsg string) {
-	t.Helper()
-	_, err := v.ValidateCreate(context.Background(), cb)
-	if err == nil {
-		t.Fatalf("expected validation error, got nil")
-	}
-	statusErr, ok := err.(*apierrors.StatusError)
-	if !ok {
-		t.Fatalf("expected *apierrors.StatusError, got %T: %v", err, err)
-	}
-	if !apierrors.IsInvalid(err) {
-		t.Fatalf("expected Invalid status, got %v", statusErr.Status())
-	}
-	if statusErr.Status().Details == nil {
-		t.Fatalf("Invalid status has no details: %v", statusErr.Status())
-	}
-	for _, c := range statusErr.Status().Details.Causes {
-		if c.Field == wantField && strings.Contains(c.Message, wantMsg) {
-			return
-		}
-	}
-	t.Fatalf("no cause on field %q containing %q; got causes: %+v",
-		wantField, wantMsg, statusErr.Status().Details.Causes)
-}
-
-// requireUpdateInvalidWithCause is the ValidateUpdate-equivalent of
-// requireInvalidWithCause. Asserts the (old, new) pair fails validation
-// with an Invalid status carrying the named field + message substring.
-func requireUpdateInvalidWithCause(t *testing.T, v *CacheBackendValidator, oldCB, newCB *cachev1alpha1.CacheBackend, wantField, wantMsg string) {
-	t.Helper()
-	_, err := v.ValidateUpdate(context.Background(), oldCB, newCB)
-	if err == nil {
-		t.Fatalf("expected validation error on update, got nil")
-	}
-	statusErr, ok := err.(*apierrors.StatusError)
-	if !ok {
-		t.Fatalf("expected *apierrors.StatusError, got %T: %v", err, err)
-	}
-	if !apierrors.IsInvalid(err) {
-		t.Fatalf("expected Invalid status, got %v", statusErr.Status())
-	}
-	if statusErr.Status().Details == nil {
-		t.Fatalf("Invalid status has no details: %v", statusErr.Status())
-	}
-	for _, c := range statusErr.Status().Details.Causes {
-		if c.Field == wantField && strings.Contains(c.Message, wantMsg) {
-			return
-		}
-	}
-	t.Fatalf("no cause on field %q containing %q; got causes: %+v",
-		wantField, wantMsg, statusErr.Status().Details.Causes)
+	return backend
 }
 
 func TestValidator_HappyPath_LMCacheAdmitted(t *testing.T) {
@@ -145,117 +40,6 @@ func TestValidator_HappyPath_LMCacheAdmitted(t *testing.T) {
 	cb := newBackend()
 	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
 		t.Fatalf("happy-path LMCache rejected: %v", err)
-	}
-}
-
-func mooncakeBackendWithEngineHostNetwork(optIn bool) *cachev1alpha1.CacheBackend {
-	cb := newBackend()
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-		EngineHostNetwork: optIn,
-	}
-	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-	}
-	return cb
-}
-
-func setCanonicalExternalStorage(cb *cachev1alpha1.CacheBackend, endpoint string) {
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
-	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
-		Endpoint:  endpoint,
-	}
-}
-
-func setCanonicalMooncakeStorage(cb *cachev1alpha1.CacheBackend) {
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
-	cb.Spec.Type = cachev1alpha1.CacheBackendTypeLMCache
-	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-	}
-}
-
-func TestValidator_WarningTextStaysConcise(t *testing.T) {
-	// The Kubernetes API conventions ask for warnings within a concise budget so
-	// clients render them reliably. A warning that gets truncated — or dropped — is
-	// exactly the silent failure this warning exists to prevent, so guard the budget
-	// here rather than trusting review to catch a future edit that pads it out.
-	for _, w := range []string{mooncakeEngineHostNetworkWarning} {
-		if got := len(w); got > maxWarningLen {
-			t.Fatalf("warning is %d chars, want <= %d — put the detail in the docs, not the warning:\n%q",
-				got, maxWarningLen, w)
-		}
-	}
-}
-
-func sglangLMCacheBackend() *cachev1alpha1.CacheBackend {
-	cb := newBackend() // Type=LMCache
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
-	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
-		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
-	}
-	return cb
-}
-
-func TestValidator_SameNamespaceEndpointAdmitted(t *testing.T) {
-	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
-	cb := newBackend()
-	setCanonicalExternalStorage(cb, "team-a-cache.team-a.svc.cluster.local:9000")
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
-	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-		t.Fatalf("same-namespace endpoint rejected: %v", err)
-	}
-}
-
-func TestValidator_ExternalHostnamePassesThrough(t *testing.T) {
-	// External hostnames are not in-cluster Service DNS — the cross-namespace
-	// rule has no namespace to compare against and must let them through.
-	// Use a bare host:port (the canonical External shape; the LMCache
-	// adapter prepends the lm:// scheme on injection).
-	v := &CacheBackendValidator{Registry: stubRegistryWithExternal()}
-	cb := newBackend()
-	setCanonicalExternalStorage(cb, "cache.example.com:8200")
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeVLLM
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{}
-	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-		t.Fatalf("external hostname rejected: %v", err)
-	}
-}
-
-func TestValidator_AggregatesMultipleViolations(t *testing.T) {
-	// Two independent violations on a single CR must both appear in the
-	// rejection's status.details.causes, so kubectl prints them together.
-	// Here: non-positive host memory plus scale-to-zero with autoscaling and no
-	// explicit minReplicas. Both rules should fire on
-	// the same spec.
-	v := shippingValidator()
-	cb := newBackend()
-	zeroQuantity := resource.MustParse("0")
-	cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
-		HostMemory: &cachev1alpha1.CacheBackendHostMemorySpec{Capacity: &zeroQuantity},
-	}
-	zero := int32(0)
-	cb.Spec.Replicas = &zero
-	cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-
-	_, err := v.ValidateCreate(context.Background(), cb)
-	statusErr, ok := err.(*apierrors.StatusError)
-	if !ok {
-		t.Fatalf("expected *apierrors.StatusError, got %T: %v", err, err)
-	}
-	if statusErr.Status().Details == nil || len(statusErr.Status().Details.Causes) < 2 {
-		t.Fatalf("expected >=2 causes, got %+v", statusErr.Status().Details)
 	}
 }
 
@@ -295,124 +79,298 @@ func TestValidator_PluggableRuleAppendable(t *testing.T) {
 	requireInvalidWithCause(t, v, cb, "spec", "synthetic")
 }
 
-// stubVLLMLMCacheAdapter is a hermetic stand-in for the production
-// vLLM+LMCache adapter that exercises the validator without dragging in the
-// reference-stack adapter wiring. It supports exactly the vLLM/LMCache pair
-// and exposes it via PairLister so the registry surfaces the same option to
-// admission error messages.
-type stubVLLMLMCacheAdapter struct{}
-
-func (stubVLLMLMCacheAdapter) Supports(rt adapterruntime.RuntimeID, cb *cachev1alpha1.CacheBackend) bool {
-	if cb == nil {
-		return false
-	}
-	return rt == adapterruntime.RuntimeVLLM && cb.Spec.Type == cachev1alpha1.CacheBackendTypeLMCache
-}
-
-func (stubVLLMLMCacheAdapter) SupportsBinding(binding *backendadapter.Binding) bool {
-	return binding == nil ||
-		binding.Protocol == backendadapter.ProtocolLMCache ||
-		binding.Protocol == backendadapter.ProtocolMooncakeStore
-}
-
-func (stubVLLMLMCacheAdapter) ResolveCacheServer(*cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
-	return nil, nil, nil
-}
-func (stubVLLMLMCacheAdapter) InjectEngineConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
-	return nil
-}
-func (stubVLLMLMCacheAdapter) InjectRouterConfig(*corev1.PodSpec, *backendadapter.Binding, *cachev1alpha1.CacheBackend) error {
-	return nil
-}
-func (stubVLLMLMCacheAdapter) ObservationSidecar(*cachev1alpha1.CacheBackend, *corev1.Pod) (*corev1.Container, error) {
-	return nil, nil
-}
-func (stubVLLMLMCacheAdapter) SupportedPairs() []adapterruntime.SupportedPair {
-	return []adapterruntime.SupportedPair{{
-		Runtime: adapterruntime.RuntimeVLLM,
-		Backend: cachev1alpha1.CacheBackendTypeLMCache,
-	}}
-}
-func (stubVLLMLMCacheAdapter) ReservedArgs() []string {
-	return []string{"--kv-transfer-config"}
-}
-func (stubVLLMLMCacheAdapter) ReservedEnv() []string {
-	return []string{"VLLM_USE_V1", "LMCACHE_REMOTE_URL", "INFERENCECACHE_FAIL_OPEN", "PYTHONHASHSEED"}
-}
-func (stubVLLMLMCacheAdapter) EngineContainerName() string { return "vllm" }
-
-// stubRegistry returns a Registry with the stub vLLM+LMCache adapter
-// installed. Hermetic — tests don't depend on the in-tree
-// builtin adapter composition, so they keep passing if a future adapter joins
-// or leaves the default set. External ownership uses this same runtime adapter;
-// it is a remote-storage binding property, not a separate cache type.
-func stubRegistry() *adapterruntime.Registry {
-	r := adapterruntime.NewRegistry()
-	r.Register(builtinruntime.NewVLLMLMCacheAdapter(builtinruntime.SubscriberConfig{}))
-	return r
-}
-
-// stubRegistryWithExternal uses the same LMCache runtime adapter because
-// external ownership is a remote-storage property, not a cache type.
-func stubRegistryWithExternal() *adapterruntime.Registry {
-	return stubRegistry()
-}
-
 func TestSetupCacheBackendWebhookRequiresRegistry(t *testing.T) {
 	if err := SetupCacheBackendWebhookWithManager(nil, nil); err == nil || !strings.Contains(err.Error(), "registry is required") {
 		t.Fatalf("SetupCacheBackendWebhookWithManager error = %v, want missing-registry error", err)
 	}
 }
 
-// withVLLMOverrides returns a fresh stub-LMCache backend whose integration
-// declares vLLM and carries the supplied EngineInjectionOverrides — the
-// admission-test backing for the engine-overrides rule.
-func withVLLMOverrides(o cachev1alpha1.EngineInjectionOverrides) *cachev1alpha1.CacheBackend {
-	cb := newBackend()
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		EngineOverrides: &o,
+func TestValidatorRejectsOverlappingEngineSelectorsInNamespace(t *testing.T) {
+	existing := newBackend()
+	existing.Name = "broad"
+	existing.Namespace = "team-a"
+	existing.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+
+	tests := []struct {
+		name     string
+		selector map[string]string
+		wantErr  bool
+	}{
+		{name: "same domain", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}, wantErr: true},
+		{name: "different domain is disjoint", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "sglang"}},
 	}
-	return cb
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := newBackend()
+			candidate.Name = "candidate"
+			candidate.Namespace = "team-a"
+			candidate.Spec.EngineSelector.MatchLabels = tc.selector
+			_, err := selectorValidator(t, existing).ValidateCreate(context.Background(), candidate)
+			if tc.wantErr {
+				if err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "already owned") {
+					t.Fatalf("ValidateCreate error = %v, want overlapping-selector Invalid", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ValidateCreate rejected disjoint selector: %v", err)
+			}
+		})
+	}
 }
 
-// withSGLangOverrides builds a (sglang, LMCache) CacheBackend carrying the
-// given engineOverrides. The SGLang override tests use the real
-// defaultShippingRegistry (not stubRegistry) so the SGLang adapter is the one
-// the reserved-args/env check consults — proving the check is keyed on the
-// SELECTED adapter, not a hardcoded vLLM list.
-func withSGLangOverrides(o cachev1alpha1.EngineInjectionOverrides) *cachev1alpha1.CacheBackend {
-	cb := newBackend() // type=LMCache
-	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
-	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
-		EngineOverrides: &o,
+func TestValidatorEngineSelectorOverlapIsNamespaceScoped(t *testing.T) {
+	existing := newBackend()
+	existing.Name = "other-namespace"
+	existing.Namespace = "team-b"
+	existing.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	candidate := newBackend()
+	candidate.Name = "candidate"
+	candidate.Namespace = "team-a"
+	candidate.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	if _, err := selectorValidator(t, existing).ValidateCreate(context.Background(), candidate); err != nil {
+		t.Fatalf("same selector in another namespace rejected: %v", err)
 	}
-	return cb
 }
 
-func TestValidator_VLLMRoleReadOnlyStillAdmitted(t *testing.T) {
-	// The SGLang role rule must not bleed onto vLLM: vLLM maps ReadOnly onto
-	// its connector (kv_consumer), so a (vllm, LMCache) backend with ReadOnly
-	// must still admit.
+func TestValidatorRejectsUpdateThatIntroducesSelectorOverlap(t *testing.T) {
+	existing := newBackend()
+	existing.Name = "existing"
+	existing.Namespace = "team-a"
+	existing.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	oldCB := newBackend()
+	oldCB.Name = "candidate"
+	oldCB.Namespace = "team-a"
+	oldCB.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "sglang"}
+	newCB := oldCB.DeepCopy()
+	newCB.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+
+	_, err := selectorValidator(t, existing).ValidateUpdate(context.Background(), oldCB, newCB)
+	if err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("ValidateUpdate error = %v, want newly-overlapping selector Invalid", err)
+	}
+}
+
+func TestValidatorRejectsUnrelatedUpdateWhileSelectorOverlapExists(t *testing.T) {
+	existing := newBackend()
+	existing.Name = "existing"
+	existing.Namespace = "team-a"
+	existing.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	oldCB := newBackend()
+	oldCB.Name = "candidate"
+	oldCB.Namespace = "team-a"
+	oldCB.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}
+	newCB := oldCB.DeepCopy()
+	newCB.Labels = map[string]string{"maintenance": "requested"}
+
+	_, err := selectorValidator(t, existing).ValidateUpdate(context.Background(), oldCB, newCB)
+	if err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("unrelated update error = %v, want existing overlap to remain blocked", err)
+	}
+}
+
+func TestValidatorRequiresSoleCacheDomainSelector(t *testing.T) {
+	tests := []struct {
+		name     string
+		selector map[string]string
+		want     string
+	}{
+		{name: "app selector is not an ownership domain", selector: map[string]string{"app": "vllm"}, want: cachev1alpha1.CacheBackendDomainLabel},
+		{name: "extra ownership key", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm", "app": "vllm"}, want: "must contain only"},
+		{name: "invalid domain value", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "Qwen/Qwen"}, want: "Invalid value"},
+		{name: "canonical domain", selector: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "vllm"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cb := newBackend()
+			cb.Spec.EngineSelector.MatchLabels = tc.selector
+			_, err := shippingValidator().ValidateCreate(context.Background(), cb)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("canonical selector rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateCreate error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidatorRejectsNonCanonicalSelectorOnEveryUpdate(t *testing.T) {
+	oldCB := newBackend()
+	oldCB.Spec.EngineSelector.MatchLabels = map[string]string{"app": "legacy"}
+
+	unrelated := oldCB.DeepCopy()
+	unrelated.Labels = map[string]string{"maintenance": "requested"}
+	if _, err := shippingValidator().ValidateUpdate(context.Background(), oldCB, unrelated); err == nil || !strings.Contains(err.Error(), cachev1alpha1.CacheBackendDomainLabel) {
+		t.Fatalf("non-canonical selector update error = %v, want strict domain requirement", err)
+	}
+
+	canonical := oldCB.DeepCopy()
+	canonical.Spec.EngineSelector.MatchLabels = map[string]string{cachev1alpha1.CacheBackendDomainLabel: "canonical"}
+	if _, err := shippingValidator().ValidateUpdate(context.Background(), oldCB, canonical); err != nil {
+		t.Fatalf("canonical selector update rejected: %v", err)
+	}
+}
+
+func TestValidator_VLLMRoleReadOnlyRejected(t *testing.T) {
+	// vLLM renders ReadOnly as kv_consumer, but LMCache 0.5.3 does not enforce
+	// that directionality. Admission must reject the unsupported API promise.
 	v := &CacheBackendValidator{Registry: defaultShippingRegistry()}
 	cb := newBackend()
 	cb.Spec.Integration = &cachev1alpha1.CacheBackendIntegrationSpec{
 		Role: cachev1alpha1.CacheBackendIntegrationRoleReadOnly,
 	}
-	if _, err := v.ValidateCreate(context.Background(), cb); err != nil {
-		t.Fatalf("vllm role=ReadOnly rejected by the sglang role rule: %v", err)
+	requireInvalidWithCause(t, v, cb, "spec.integration.role", "directional cache access")
+}
+
+func defaultShippingRegistry() *adapterruntime.Registry {
+	registry := adapterruntime.NewRegistry()
+	registry.Register(builtinruntime.NewVLLMLMCacheMPAdapter(builtinruntime.SubscriberConfig{}))
+	registry.Register(builtinruntime.NewSGLangLMCacheAdapter(builtinruntime.SubscriberConfig{}))
+	registry.Register(builtinruntime.NewSGLangHiCacheAdapter(builtinruntime.SubscriberConfig{}))
+	return registry
+}
+
+func shippingValidator() *CacheBackendValidator {
+	return &CacheBackendValidator{Registry: defaultShippingRegistry()}
+}
+
+func selectorValidator(t *testing.T, existing ...*cachev1alpha1.CacheBackend) *CacheBackendValidator {
+	t.Helper()
+	objects := make([]runtime.Object, len(existing))
+	for i := range existing {
+		objects[i] = existing[i]
+	}
+	return &CacheBackendValidator{
+		Registry: defaultShippingRegistry(),
+		Reader:   fake.NewClientBuilder().WithScheme(newCacheScheme(t)).WithRuntimeObjects(objects...).Build(),
 	}
 }
 
-// eventsOnlyIntegration returns an integration spec wired for the events-only
-// (tier-1 routing) mode. Centralised so the events-only tests set the mode the
-// one way the implementation reads it (via spec.integration.mode).
-func eventsOnlyIntegration() *cachev1alpha1.CacheBackendIntegrationSpec {
-	return &cachev1alpha1.CacheBackendIntegrationSpec{
-		Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
+type rejectingBindingAdapter struct {
+	adapterruntime.KVCacheRuntimeAdapter
+}
+
+func (rejectingBindingAdapter) SupportsBinding(*backendadapter.Binding) bool { return false }
+
+func TestValidatorTypedLMCacheChecksRuntimeBindingCapability(t *testing.T) {
+	cb := newBackend()
+	registry := adapterruntime.NewRegistry()
+	registry.Register(rejectingBindingAdapter{
+		KVCacheRuntimeAdapter: builtinruntime.NewVLLMLMCacheMPAdapter(builtinruntime.SubscriberConfig{}),
+	})
+
+	requireInvalidWithCause(t, &CacheBackendValidator{Registry: registry}, cb,
+		"spec.remoteStorage.provider", "does not accept remote-storage protocol")
+}
+
+func newHiCacheBackend() *cachev1alpha1.CacheBackend {
+	return &cachev1alpha1.CacheBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "hicache", Namespace: "team-a"},
+		Spec: cachev1alpha1.CacheBackendSpec{
+			Runtime: cachev1alpha1.CacheBackendRuntimeSGLang,
+			Type:    cachev1alpha1.CacheBackendTypeSGLangHiCache,
+			HiCache: &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"},
+			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
+				Mode: cachev1alpha1.CacheBackendIntegrationModeOffload,
+				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
+			},
+			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{cachev1alpha1.CacheBackendDomainLabel: "sglang"}},
+		},
 	}
 }
 
-// Sanity check on the package-level wiring: SetupCacheBackendWebhookWithManager
-// is exercised by manager start-up; the runtime.Object interface is the only
-// thing we can sanity-check here without a controller manager.
-var _ runtime.Object = (*cachev1alpha1.CacheBackend)(nil)
+func requireInvalidWithCause(t *testing.T, validator *CacheBackendValidator, cb *cachev1alpha1.CacheBackend, wantField, wantMsg string) {
+	t.Helper()
+	_, err := validator.ValidateCreate(context.Background(), cb)
+	if err == nil || !apierrors.IsInvalid(err) {
+		t.Fatalf("ValidateCreate() error = %v, want Invalid", err)
+	}
+	statusErr := err.(*apierrors.StatusError)
+	for _, cause := range statusErr.Status().Details.Causes {
+		if cause.Field == wantField && strings.Contains(cause.Message, wantMsg) {
+			return
+		}
+	}
+	t.Fatalf("no cause on field %q containing %q: %+v", wantField, wantMsg, statusErr.Status().Details.Causes)
+}
+
+func requireUpdateInvalidWithCause(t *testing.T, validator *CacheBackendValidator, oldCB, newCB *cachev1alpha1.CacheBackend, wantField, wantMsg string) {
+	t.Helper()
+	_, err := validator.ValidateUpdate(context.Background(), oldCB, newCB)
+	if err == nil || !apierrors.IsInvalid(err) {
+		t.Fatalf("ValidateUpdate() error = %v, want Invalid", err)
+	}
+	statusErr := err.(*apierrors.StatusError)
+	for _, cause := range statusErr.Status().Details.Causes {
+		if cause.Field == wantField && strings.Contains(cause.Message, wantMsg) {
+			return
+		}
+	}
+	t.Fatalf("no cause on field %q containing %q: %+v", wantField, wantMsg, statusErr.Status().Details.Causes)
+}
+
+func TestValidatorAdmitsTypedPodLocal(t *testing.T) {
+	cb := validPodLocalMPBackend()
+	cb.Spec.LMCache.PodLocal.Server.L1Capacity = resource.MustParse("4Gi")
+	if _, err := shippingValidator().ValidateCreate(context.Background(), cb); err != nil {
+		t.Fatalf("typed PodLocal rejected: %v", err)
+	}
+}
+
+func TestValidatorRejectsTopologyLessLMCache(t *testing.T) {
+	cb := validPodLocalMPBackend()
+	cb.Spec.LMCache.Topology = ""
+	requireInvalidWithCause(t, shippingValidator(), cb, "spec.lmCache.topology", "required")
+}
+
+func TestValidatorSGLangHiCacheCurrentContract(t *testing.T) {
+	t.Run("accepted", func(t *testing.T) {
+		if _, err := shippingValidator().ValidateCreate(context.Background(), newHiCacheBackend()); err != nil {
+			t.Fatalf("valid SGLangHiCache rejected: %v", err)
+		}
+	})
+
+	t.Run("remote storage rejected", func(t *testing.T) {
+		cb := newHiCacheBackend()
+		cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+			Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+			Redis: &cachev1alpha1.RedisRemoteStorageSpec{},
+		}
+		requireInvalidWithCause(t, shippingValidator(), cb, "spec.remoteStorage.provider", "does not accept")
+	})
+
+	t.Run("hiCache block rejected for LMCache", func(t *testing.T) {
+		cb := validPodLocalMPBackend()
+		cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
+		requireInvalidWithCause(t, shippingValidator(), cb, "spec.hiCache", "only valid")
+	})
+
+	t.Run("invalid ratio rejected", func(t *testing.T) {
+		cb := newHiCacheBackend()
+		cb.Spec.HiCache.Ratio = "NaN"
+		requireInvalidWithCause(t, shippingValidator(), cb, "spec.hiCache.ratio", "finite number")
+	})
+}
+
+func TestValidatorRejectsInvalidKernelCheckAnnotation(t *testing.T) {
+	cb := validPodLocalMPBackend()
+	cb.Annotations = map[string]string{enginebinding.AnnotationLMCacheKernelCheck: "strcit"}
+	requireInvalidWithCause(t, shippingValidator(), cb,
+		"metadata.annotations[inferencecache.io/lmcache-kernel-check]", "must be one of")
+}
+
+func TestValidatorRejectsEventsOnlyRemoteStorage(t *testing.T) {
+	cb := newBackend()
+	cb.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
+	requireInvalidWithCause(t, shippingValidator(), cb, "spec.remoteStorage", "remove spec.remoteStorage")
+}
+
+func TestValidatorRejectsUnknownRuntime(t *testing.T) {
+	cb := validPodLocalMPBackend()
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime("UnknownRuntime")
+	requireInvalidWithCause(t, shippingValidator(), cb, "spec.runtime", "no runtime adapter supports")
+}

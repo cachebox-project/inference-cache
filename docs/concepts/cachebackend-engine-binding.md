@@ -1,120 +1,154 @@
-# CacheBackend ↔ engine-pod binding
+# CacheBackend ↔ engine-Pod binding
 
-CacheBackend uses Kubernetes label selectors to find the engine pods it injects cache wiring into. This page explains the model, the lifecycle, and the common ways it goes wrong.
+CacheBackend uses a namespaced label selector to find the inference-engine Pods
+whose cache integration it should inject. The inference system owns the engine
+Deployment and image; CacheBackend owns only the cache components and
+engine-specific connector wire it adds.
 
-## How it works
+## Current LMCache flow
 
-Three actors participate in the binding:
+For `spec.type: LMCache`, current manifests declare a typed PodLocal or
+NodeLocal topology. At Pod CREATE, the webhook:
 
-- **CacheBackend** — the namespaced CR you create. Its `spec.engineSelector.matchLabels` is a label selector over pods in the same namespace, with the same semantics as `Service.spec.selector`.
-- **Engine pod** — a vLLM (or other supported runtime) pod, typically owned by a user-managed Deployment. Its `template.metadata.labels` are what the selector matches against.
-- **Mutating Pod webhook** — the controller's admission webhook intercepts pod CREATE and stamps the matched engine pod with the LMCache engine wiring (env vars + CLI args). The kvevent-subscriber observation sidecar is appended in addition only when the controller is started with `--kvevent-subscriber-image` set; lifecycle step 3 below has the full conditions.
+1. finds the one matching CacheBackend in the Pod's namespace;
+2. selects the runtime-specific MP adapter;
+3. injects the vLLM or SGLang connector launch surface plus either a PodLocal
+   native sidecar or a NodeLocal same-node startup gate and the backend UID's
+   host SHM directory mounted as `/dev/shm`;
+4. optionally binds the MP server to a Redis L3; and
+5. stamps `inferencecache.io/injected-by` and
+   `inferencecache.io/injected-by-uid`.
+
+The engine image is never replaced or inspected. Normal engine initialization
+is the authoritative compatibility check for the required connector/package.
+PodLocal native sidecars require Kubernetes 1.29 or newer.
+
+NodeLocal is engine-first. CacheBackend creation alone creates no server. After
+the inference system schedules an injected engine Pod, the controller creates
+one CacheBackend-owned server Pod for each distinct active engine node. The
+server uses exact node-name affinity, so Kubernetes still evaluates taints,
+resources, and declared host-port conflicts. The Downward API supplies the
+engine's `status.hostIP`; no ClusterIP participates. The init gate blocks normal
+engine startup until `/config` and `/healthcheck` verify the same
+name/UID/generation and live server configuration. Each CacheBackend UID also
+derives an explicit `lmcache_l1_pool_inferencecache_<uid>` POSIX SHM name; the
+gate verifies both the declared and effective live name before starting the
+engine. The server and engines mount only
+`/dev/shm/inference-cache/<cacheBackendUID>` from the host as their container
+`/dev/shm`, so normally behaving co-located pools do not see one another's SHM
+objects. This remains ownership isolation rather than cryptographic
+authentication: host root, privileged Pods, or processes mounting the parent
+directory can bypass it, so the host-network/server pool still requires one
+trusted tenant domain.
+When the final selected engine leaves a node, the server enters the configured
+`idleRetentionSeconds` window instead of being coupled to that engine Pod's
+restart. Demand returning during the window clears the idle marker and reuses
+the same server and L1; expiry removes the server. The default is 300 seconds,
+and zero requests immediate deletion.
+
+Every new non-empty `engineSelector` contains exactly one label:
+`inferencecache.io/cache-domain`. Its value is unique within the namespace and
+identifies one runtime/model/KV-layout/trust compatibility domain. Engine Pods
+may carry any other application, scheduling, and observability labels, but
+those labels do not participate in CacheBackend ownership. CREATE and UPDATE
+both enforce this shape. As a runtime backstop for concurrent CREATE admission,
+the Pod webhook denies a Pod matching more than one CacheBackend; it never
+chooses one by name.
 
 ```text
-                                       +-----------------------+
-                                       | CacheBackend (CR)     |
-                                       |   spec.engineSelector |
-                                       +-----------+-----------+
-                                                   | label-selector match (at pod CREATE)
-                                                   v
-+-----------------+    pod CREATE     +------------+-----------+
-| Engine          | -----------+----> | Mutating Pod webhook   |
-| Deployment      |            |      | (matches selector;     |
-| template:       |            |      |  injects engine config;|
-|   labels: {...} |            |      |  +subscriber sidecar*) |
-+-----------------+            |      +------------+-----------+
-                               |                   |
-                               |                   v
-                               |        +----------+--------------+
-                               |        | Engine pod              |
-                               |        |  env: LMCACHE_*         |
-                               |        |  args: --kv-...         |
-                               |        |  sidecar: subscriber*   |
-                               |        +----------+--------------+
-                               |                   |
-                               |                   v subscriber publishes
-                               |        +----------+-----------+
-                               |        | lmcache-server pod   |
-                               +------> | (managed by the CR;  |
-                                        |  endpoint published  |
-                                        |  in status.endpoint) |
-                                        +----------------------+
+CacheBackend selector ──matches at Pod CREATE──▶ mutating webhook
+                                                   │
+                           PodLocal: native sidecar │ NodeLocal: startup gate
+                                                   ▼
+                                    inference system schedules engine
+                                                   │
+                         NodeLocal controller observes spec.nodeName
+                                                   ▼
+                              one same-node server Pod per active node
 ```
 
-The match is evaluated **once at pod CREATE** by the mutating webhook. The wiring is sticky to the life of the pod; relabeling an existing pod does not re-evaluate it. To opt a pod out regardless of label match, set `inferencecache.io/skip-inject: "true"` on the pod template. Skipped pods are stamped with `inferencecache.io/inject-skipped: "skip-inject-annotation"` and receive a `SkippedByOperator` Event, so an intentional opt-out is distinguishable from selector drift.
-
-`*` The kvevent-subscriber sidecar is opt-in. It is appended only when the controller is started with `--kvevent-subscriber-image` set (empty by default) AND the matched CacheBackend has `spec.observation.modelID` configured; otherwise the engine is wired without it. The default install does not auto-attach the sidecar.
-
-> **Native SGLang HiCache exception.** `type: SGLangHiCache` is engine-local:
-> the controller creates no backend workload or endpoint, and the webhook does
-> not wait for `status.endpoint`. It injects the typed `spec.hiCache` launch
-> flags directly into matching SGLang Pods. The LMCache lifecycle below remains
-> the endpoint-bearing path.
+Host-only PodLocal and NodeLocal objects publish no endpoint. With external Redis, the
+webhook uses `spec.remoteStorage.endpoint`; with managed Redis, it uses the
+controller-resolved endpoint. Connector readiness and remote-storage readiness
+are reported independently.
 
 ## Lifecycle
 
-1. **Apply the CacheBackend.** `kubectl apply -f cachebackend.yaml`. The reconciler creates the managed lmcache-server Deployment + Service and publishes the resolved address in `status.endpoint`.
-2. **Deploy the engine.** Apply an engine Deployment whose pod template labels include every key/value in `spec.engineSelector.matchLabels`. New pods from that Deployment hit the mutating webhook at admission time.
-3. **The webhook claims matching pods (precondition: status.endpoint published).** When the matched CacheBackend has `status.endpoint` populated by the time admission runs, the webhook injects LMCache env vars, the `--kv-transfer-config` CLI arg, and stamps TWO annotations: `inferencecache.io/injected-by: <ns>/<name>` (operator-readable identity, visible in `kubectl describe pod`) and `inferencecache.io/injected-by-uid: <cache.UID>` (the matched CR's `metadata.uid` — an apiserver-assigned identifier that the events controller cross-checks against the live CR's UID before emitting. The check catches casual copy-paste of an injected pod's annotations into a fresh template, but it isn't a security boundary: UIDs are readable metadata, so a pod creator with `get` RBAC on CacheBackends can stamp the pair correctly). When the controller is started with `--kvevent-subscriber-image` set (empty by default) AND the matched CacheBackend has a model id configured, the kvevent-subscriber sidecar is also appended; otherwise the engine is wired without the sidecar. A controller watching pods then validates the UID annotation against the live CR's UID and records a `Normal InjectedByCacheBackend` event on the now-persisted pod, visible in `kubectl describe pod`. (The event is emitted from a controller rather than the webhook because the apiserver does not assign `metadata.uid` until after mutating admission — an event recorded from the webhook would have `involvedObject.uid=""` and would not surface under describe. The UID annotation is what lets the controller distinguish a real webhook injection from a user-supplied `injected-by` annotation when the webhook is unreachable under `failurePolicy=Ignore`.) **If the CacheBackend's `status.endpoint` is empty at admission time** (the operator applied the engine Deployment before the reconciler had a chance to publish it), the webhook fail-opens — the pod is admitted unwired, no annotations are stamped, no Event is emitted. Because admission is CREATE-only, this is permanent for that pod; recovery is `kubectl rollout restart deploy/<engine>` so new pods re-enter admission. Note that `status.matchedEnginePods` still counts the unwired pod (the selector matches its labels), so `Matched > 0` does **not** guarantee the pod was injected — the per-pod annotations and Event are the authoritative wiring signals.
-4. **KV events flow (when the sidecar is configured).** When the subscriber sidecar is present, it streams the engine's KV-cache events to the policy server's index, which surfaces them in `CacheBackend.status` (the index-participation status fields). Without the sidecar, the binding is still observable — `status.matchedEnginePods` and the per-pod annotation/Event still materialize from step 3 — but no KV events flow and the index-participation fields stay unset.
-5. **Observe and debug.** `kubectl get cachebackend` shows the `Matched` column — the snapshot count of pods whose labels currently match. `kubectl describe pod <engine-pod>` shows which CacheBackend (if any) claimed it.
+1. Apply the CacheBackend before creating engine Pods.
+2. Create an engine Deployment whose Pod-template labels include every
+   `spec.engineSelector.matchLabels` entry.
+3. Admission injects the complete MP wire atomically. Ordinary lookup or
+   adapter failures fail open without a partial mutation; selector ambiguity
+   is denied because choosing a cache trust domain is unsafe. Inspect Pod
+   annotations, Events, and engine startup logs.
+4. If `--kvevent-subscriber-image` is configured and
+   `spec.observation.modelID` is set, the webhook also adds the observation
+   sidecar. The subscriber reports metadata-only KV events to the policy index.
+5. Recreate Pods after changing a CacheBackend. Injection is evaluated only at
+   Pod CREATE; relabeling or editing a running Pod does not re-run admission.
 
 ## Annotated example
-
-A single CacheBackend with a matching engine Deployment. The label `app: qwen-demo` appears in two places — that's what binds them:
 
 ```yaml
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
-  name: qwen-demo-cache       # <-- CR name; deliberately distinct from the engine Deployment name (see note below)
+  name: qwen-demo-cache
 spec:
   runtime: VLLM
   type: LMCache
-  integration:
-    role: ReadWrite
   engineSelector:
     matchLabels:
-      app: qwen-demo          # <-- selector key/value (1 of 2; binding is by label, not by resource name)
-  observation:
-    modelID: Qwen/Qwen2.5-0.5B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer: {}
+      inferencecache.io/cache-domain: qwen-demo
+  lmCache:
+    topology: PodLocal
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: qwen-engine           # <-- engine Deployment name; must differ from the CR name above (the controller reconciles the CR into an lmcache-server Deployment whose name equals the CR's name, so sharing names would collide on Create)
+  name: qwen-engine
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: qwen-demo
   template:
     metadata:
       labels:
-        app: qwen-demo        # <-- selector key/value (2 of 2; this is what the webhook sees)
+        app: qwen-demo
+        inferencecache.io/cache-domain: qwen-demo
     spec:
       containers:
         - name: vllm
-          # Arch-tagged: swap to `:latest-arm64` on Apple Silicon hosts.
-          image: vllm/vllm-openai-cpu:latest-x86_64
-          args: ["--model", "Qwen/Qwen2.5-0.5B-Instruct"]
+          image: example.invalid/runtime-owned-vllm-lmcache@sha256:0000000000000000000000000000000000000000000000000000000000000000
 ```
 
-A copy-pasteable version of this pair ships at [`config/samples/cachebackend-with-engine.yaml`](../../config/samples/cachebackend-with-engine.yaml).
+A fuller paired sample is
+[`config/samples/cachebackend-with-engine.yaml`](../../config/samples/cachebackend-with-engine.yaml).
 
 ## Common failure modes
 
-| Symptom | Cause | How to detect | Fix |
-|---|---|---|---|
-| Engine pod runs uncached; no LMCache env on its container | Selector and pod labels don't overlap (typo, drift after a Deployment rename, etc.) | `kubectl describe pod <engine-pod>` shows no `InjectedByCacheBackend` or `SkippedByOperator` event and neither `inferencecache.io/injected-by` nor `inferencecache.io/inject-skipped`; `kubectl get cachebackend` shows `Matched: 0`; `kubectl get cachebackend <name> -o jsonpath='{.status.engineSelectorMessage}'` echoes the selector that matched no pods; `kubectl describe cachebackend <name>` shows a Normal `EngineSelectorUnmatched` Event when the CR first observes zero matches or transitions from matched to zero | Reconcile the label sets: either fix `engineSelector.matchLabels` on the CR or fix the Deployment's pod template labels |
-| Multiple CacheBackends overlap on the same pod | Two CacheBackends in the namespace have selectors that both match | The webhook picks the lexicographically-first match by `metadata.name` (sort is deterministic so the picked CR is reproducible across re-admissions) and stamps `inferencecache.io/injected-by` on the pod — `kubectl describe pod` and that annotation name the CR that actually injected. There is no admission validator for selector overlap today; multi-match is a misconfiguration the operator must avoid by hand | Pick one CR for the pod; delete or narrow the other so each engine pod's labels match exactly one CacheBackend |
-| Engine pod was labeled after creation but still uncached | Label match is evaluated once at pod CREATE; relabeling later has no effect | `kubectl describe pod <engine-pod>` shows no `InjectedByCacheBackend` event | Delete the pod (`kubectl delete pod <engine-pod>`); the Deployment will recreate it and the new pod will re-enter admission |
-| CacheBackend was deleted, but engine pods are still running with the old wiring | Wiring is sticky to the pod's lifetime; deleting the CR does not retract env vars from already-admitted pods | Engine logs show LMCache connect failures to a no-longer-existing Service | Rolling-restart the engine Deployment to admit fresh pods (which will match no CR and run uncached) |
-| Engine pod intentionally runs uncached | The pod template has `inferencecache.io/skip-inject` set to a truthy value | `kubectl get pod <pod> -o jsonpath='{.metadata.annotations.inferencecache\.io/inject-skipped}'` returns `skip-inject-annotation`, and `kubectl describe pod <pod>` shows a Normal `SkippedByOperator` Event | No fix needed if the opt-out was intentional; remove the skip annotation from the pod template and restart if the pod should be wired |
-| Pod that should be skipped still gets wiring | The `inferencecache.io/skip-inject: "true"` annotation was missing or set on the Deployment, not the pod template | `kubectl get pod <pod> -o yaml` shows no `inferencecache.io/skip-inject` annotation | Add the annotation under `spec.template.metadata.annotations` of the Deployment and restart |
+| Symptom | Cause | Fix |
+|---|---|---|
+| `MATCHED: 0` and no injection annotation | Selector and Pod labels differ. | Align the labels and recreate the Pod. |
+| A matching Pod has no injection annotation | Admission failed open because of an invalid/colliding Pod shape or an unavailable managed Redis endpoint. | Read webhook logs and Pod Events, fix the reported shape, then recreate the Pod. |
+| Engine crashes after successful injection | The runtime-owned image lacks a compatible LMCache client/API, or another engine startup requirement failed. | Inspect engine logs and use a compatible pinned image; CacheBackend does not replace it. |
+| Multiple CacheBackends could match one Pod | A cache-domain value was reused by concurrent creates. CacheBackend admission normally rejects the duplicate; the Pod webhook also denies an ambiguous live match rather than choosing a backend. | Give every CacheBackend a unique namespace-scoped `inferencecache.io/cache-domain` value and put that value on only the intended engine Pod templates. |
+| NodeLocal engine stays in `lmcache-node-local-gate` | Its on-demand same-node server is not healthy, the host ports conflict, the effective UID-scoped SHM pool is unavailable/mismatched, or live config belongs to another backend. | Inspect the server Pod args, `/config`, scheduler events, and `status.connector.enginePodCoverage`; fix ports, host `/dev/shm` capacity, resources, or runtime configuration and recreate or reschedule. |
+| Pod was relabeled after creation | Admission is CREATE-only. | Recreate the Pod. |
+| Pod intentionally needs no cache injection | No explicit opt-out was set. | Put `inferencecache.io/skip-inject: "true"` on the Pod template and recreate it. |
 
-The `inferencecache.io/skip-inject` annotation is the explicit escape hatch: any non-empty value other than the falsey set opts the pod out. The falsey set is what Go's `strconv.ParseBool` accepts as false (`false`/`FALSE`/`False`/`f`/`F`/`0`) plus the case-insensitive synonyms `no`/`off`/`disable`/`disabled`. Use the annotation for pods you've already pre-wired or that should run vanilla for a debugging experiment. A skipped pod keeps the original `skip-inject` annotation, gets `inferencecache.io/inject-skipped: "skip-inject-annotation"`, and does not get `inferencecache.io/injected-by`.
+Legacy topology-less vLLM/IP binding exists only as negative search/schema
+assertions. No production adapter implements it.

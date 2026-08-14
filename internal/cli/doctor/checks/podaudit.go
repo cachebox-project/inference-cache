@@ -23,12 +23,13 @@ const (
 	checkOrphanPods         = "OrphanPodCheck"
 )
 
-// EnginePodInjectionAudit finds pods that match some CacheBackend's
+// EnginePodInjectionAudit finds pods that match a CacheBackend's
 // engineSelector and verifies each carries an InjectedByCacheBackend Event —
 // the controller's proof that the mutating Pod webhook actually wired the pod.
 // A matched pod with no such Event is serving uncached (it likely lost the
 // admission race against the reconciler, or was created before the backend
-// existed) and gets a WARN.
+// existed) and gets a WARN. A pod matching multiple backends is also WARNed:
+// there is no safe owner to audit, and fresh Pod admission would deny it.
 func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []doctor.Finding {
 	var backends cachev1alpha1.CacheBackendList
 	if err := c.List(ctx, &backends, client.InNamespace(ns)); err != nil {
@@ -51,10 +52,8 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 		}
 		byNamespace[cb.Namespace] = append(byNamespace[cb.Namespace], sel{backend: cb.Name, uid: string(cb.UID), labels: cb.Spec.EngineSelector.MatchLabels})
 	}
-	// Match the pod webhook's documented tie-break for overlapping selectors:
-	// the lexicographically-smallest CacheBackend name wins. Sorting here makes
-	// the audit's "first match" agree with the backend that actually injected
-	// the pod, rather than depending on List order.
+	// Sort for deterministic ambiguity messages. Unlike the historical status
+	// attribution fallback, doctor never chooses a winner for an invalid overlap.
 	for ns := range byNamespace {
 		sort.Slice(byNamespace[ns], func(i, j int) bool { return byNamespace[ns][i].backend < byNamespace[ns][j].backend })
 	}
@@ -89,17 +88,31 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 	var findings []doctor.Finding
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		var matched *sel
+		var matched []sel
 		for j := range byNamespace[pod.Namespace] {
 			if selectorMatches(byNamespace[pod.Namespace][j].labels, pod.Labels) {
-				matched = &byNamespace[pod.Namespace][j]
-				break
+				matched = append(matched, byNamespace[pod.Namespace][j])
 			}
 		}
-		if matched == nil {
+		if len(matched) == 0 {
 			continue
 		}
 		ref := resourceRef("Pod", pod.Namespace, pod.Name)
+		if len(matched) > 1 {
+			names := make([]string, 0, len(matched))
+			for _, candidate := range matched {
+				names = append(names, candidate.backend)
+			}
+			findings = append(findings, doctor.Finding{
+				Code:     doctor.CodeEngineSelectorAmbiguous,
+				Status:   doctor.StatusWarn,
+				Check:    checkEnginePodInjection,
+				Resource: ref,
+				Message:  fmt.Sprintf("engine pod matches multiple CacheBackends %q in namespace %q; no backend is selected implicitly, and fresh Pod admission would deny this ambiguity — make the engineSelectors disjoint", names, pod.Namespace),
+			})
+			continue
+		}
+		selected := matched[0]
 
 		// Trust the durable inferencecache.io/injected-by annotation only when it
 		// both NAMES the matched backend and carries an injected-by-uid matching
@@ -107,8 +120,8 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 		// which rejects a forged, stale, or internally-inconsistent annotation
 		// pair. This outlives the GC-able Event.
 		if owner := pod.Annotations[annotationInjectedBy]; owner != "" &&
-			owner == pod.Namespace+"/"+matched.backend &&
-			matched.uid != "" && pod.Annotations[annotationInjectedByUID] == matched.uid {
+			owner == pod.Namespace+"/"+selected.backend &&
+			selected.uid != "" && pod.Annotations[annotationInjectedByUID] == selected.uid {
 			findings = append(findings, doctor.Finding{
 				Code:     doctor.CodeEnginePodInjected,
 				Status:   doctor.StatusOK,
@@ -135,7 +148,7 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 				Status:   doctor.StatusOK,
 				Check:    checkEnginePodInjection,
 				Resource: ref,
-				Message:  fmt.Sprintf("engine pod matches CacheBackend %q (engineSelector) and carries an InjectedByCacheBackend Event for its current UID — it was injected by the cache plane (the Event does not record which backend; the inferencecache.io/injected-by annotation is the authoritative per-backend signal and is absent or unvalidated here)", matched.backend),
+				Message:  fmt.Sprintf("engine pod matches CacheBackend %q (engineSelector) and carries an InjectedByCacheBackend Event for its current UID — it was injected by the cache plane (the Event does not record which backend; the inferencecache.io/injected-by annotation is the authoritative per-backend signal and is absent or unvalidated here)", selected.backend),
 			})
 		} else {
 			findings = append(findings, doctor.Finding{
@@ -143,7 +156,7 @@ func EnginePodInjectionAudit(ctx context.Context, c client.Client, ns string) []
 				Status:   doctor.StatusWarn,
 				Check:    checkEnginePodInjection,
 				Resource: ref,
-				Message:  fmt.Sprintf("engine pod matches CacheBackend %q (engineSelector) but has no injection marker (no validated inferencecache.io/injected-by annotation and no InjectedByCacheBackend Event for its UID) — it may be running uncached; recreate it (e.g. kubectl rollout restart) so the mutating webhook re-evaluates", matched.backend),
+				Message:  fmt.Sprintf("engine pod matches CacheBackend %q (engineSelector) but has no injection marker (no validated inferencecache.io/injected-by annotation and no InjectedByCacheBackend Event for its UID) — it may be running uncached; recreate it (e.g. kubectl rollout restart) so the mutating webhook re-evaluates", selected.backend),
 			})
 		}
 	}

@@ -27,12 +27,28 @@ spec:
   engineSelector:
     matchLabels:
       app: my-engine            # must match your engine pods' labels
+  lmCache:
+    topology: PodLocal
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
   observation:
     modelID: Qwen/Qwen2.5-0.5B-Instruct
 ```
 
-Everything else is defaulted: `spec.replicas` becomes `1`, the readiness gate's
-`observation.firstEventTimeout` becomes `5m`, and `integration.failOpen` is treated as `true`.
+Omitting `remoteStorage` intentionally selects host-only PodLocal MP. The
+readiness gate's `observation.firstEventTimeout` defaults to `5m`, and
+`integration.failOpen` is treated as `true`.
 
 {{% alert title="One label does the binding" color="warning" %}}
 The value under `engineSelector.matchLabels` must also appear on your engine pods' template
@@ -43,19 +59,18 @@ shows `MATCHED: 0`.
 
 ## 2. Add engine pods (copy a recipe)
 
-The `CacheBackend` on its own provisions the managed cache server. For a working end-to-end
-setup you also need engine pods carrying that label and publishing KV events. The fastest
-path is the CPU dev recipe, which needs no GPU:
+The CacheBackend injects an MP server into matching Pods but does not replace
+the engine image. For a working end-to-end setup, supply a connector-compatible
+image and publish KV events. A paired repository shape is:
 
 ```bash
 kubectl apply -f \
-  https://raw.githubusercontent.com/cachebox-project/inference-cache/main/config/samples/recipe-cpu-dev.yaml
+  https://raw.githubusercontent.com/cachebox-project/inference-cache/main/config/samples/cachebackend-with-engine.yaml
 ```
 
-That single file ships the `CacheBackend` above plus a matching tiny-model vLLM engine
-Deployment, with the engine wired to the cache. Acting on the resulting `LookupRoute` hints
-to route requests is the gateway's job (which integrates separately) — so this recipe is the
-cache half, not a full gateway round-trip.
+That file ships a typed host-only CacheBackend plus a matching vLLM Deployment.
+Normal engine startup is the authoritative connector/package compatibility
+check. Acting on `LookupRoute` hints remains the gateway's job.
 
 The recipe catalog under `config/samples/` includes CPU dev, GPU production, external cache,
 multi-tenant, and engine-tuning scenarios.
@@ -79,15 +94,15 @@ The Pod webhook runs only on CREATE. If the engine Deployment already exists, re
 pods after the controller rollout:
 
 ```bash
-kubectl rollout restart deployment/cpu-dev-engine
-kubectl rollout status deployment/cpu-dev-engine
+kubectl rollout restart deployment/qwen-engine
+kubectl rollout status deployment/qwen-engine
 ```
 
 Finally, send one request so vLLM publishes the first KV event. Keep the port-forward running
 in one terminal:
 
 ```bash
-kubectl port-forward deployment/cpu-dev-engine 8000:8000
+kubectl port-forward deployment/qwen-engine 8000:8000
 ```
 
 Then call the engine from another:
@@ -107,8 +122,8 @@ External backends are exempt from this gate.
 
 ```
 $ kubectl get cachebackend
-NAME       TYPE      READY   MATCHED   ENDPOINT              PREFIXES   LASTEVENT   AGE
-my-cache   LMCache   True    1         my-cache.default...   128        12s         3m
+NAME       TYPE      READY   MATCHED   ENDPOINT   PREFIXES   LASTEVENT   AGE
+my-cache   LMCache   True    1         <none>     128        12s         3m
 ```
 
 - `MATCHED` — the number of engine pods the selector binds.
@@ -138,8 +153,8 @@ Once the backend is Ready and engine pods are bound, three things are live:
 
 - **Cache-aware routing** — the server answers `LookupRoute` with which replicas hold which
   prefixes warm, so a gateway can route for a prefix cache hit.
-- **KV reuse** — matched engine pods get the LMCache wiring injected automatically, so their
-  KV cache is offloaded to and reused from the managed backend.
+- **KV reuse** — matched engine Pods get the typed MP wiring injected
+  automatically; host-only L1 is per Pod, and Redis L3 is optional.
 - **Observability** — `kubectl get cachebackend` and the cluster-wide `CacheIndex` surface
   live state.
 

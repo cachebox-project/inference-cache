@@ -1117,13 +1117,13 @@ func TestRefreshScrapeFailureDoesNotClearParticipation(t *testing.T) {
 	}
 }
 
-// TestRefreshOverlappingSelectorsFirstNameWins: two CacheBackends with
-// overlapping EngineSelector that both match the same engine pod — the
-// poller must attribute only to the deterministic "first by name" backend,
-// mirroring the webhook's one-pod-one-backend wiring rule. Attributing to
-// both would tell operators a backend is contributing when its engine was
-// actually wired to the other backend's endpoint.
-func TestRefreshOverlappingSelectorsFirstNameWins(t *testing.T) {
+// TestRefreshManualOverlappingSelectorsFallbackIsDeterministic covers
+// manually created state that bypassed admission. Without an authoritative
+// injected-by annotation, the poller
+// attributes to the deterministic first backend by name rather than claiming
+// both backends. Fresh CacheBackend and Pod admission cannot create this
+// ambiguous state.
+func TestRefreshManualOverlappingSelectorsFallbackIsDeterministic(t *testing.T) {
 	cbAlpha := cbFixture("alpha", "default", map[string]string{"app": "vllm"})
 	cbBeta := cbFixture("beta", "default", map[string]string{"app": "vllm", "model": "llama"})
 	podMatch := enginePod("vllm-0", "default", map[string]string{"app": "vllm", "model": "llama"})

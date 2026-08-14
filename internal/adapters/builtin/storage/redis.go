@@ -17,14 +17,9 @@ import (
 //
 // SGLang drives LMCache in multiprocess (MP) mode: the engine attaches to a
 // node-local MP worker, and the worker offloads its shared/cross-node tier to an
-// `--l2-adapter`. Unlike the vLLM `lm://` path, `lm://` is not a valid MP
-// `--l2-adapter` type, so the SGLang pair cannot reuse [ResolveLMCacheServer].
-// Redis (the `resp` adapter) is the shared L2: a network-addressable store that
-// fits the one-Service, engines-anywhere model exactly (a ClusterIP Service, no
-// hostNetwork/mesh — the opposite of Mooncake), it maps onto one Deployment +
-// Service, and it is proven end-to-end. The heavier tiers (`s3`, `mooncake_store`)
-// are future provider bindings, not the simple default. See
-// docs/design/sglang-lmcache-mp-mode.md.
+// `--l2-adapter`. Redis (the `resp` adapter) is the shared L2: a
+// network-addressable store that fits the one-Service, engines-anywhere model
+// exactly. It maps onto one Deployment and Service and is proven end-to-end.
 //
 // This render is the shared-store half of the MP data plane; the engine-side wire
 // (config-file + MP-worker sidecar pointed at this Redis) is injected by the
@@ -53,11 +48,12 @@ const (
 	// It matches the provider's 8Gi memory default.
 	redisMaxmemoryDefaultBytes = int64(8) * 1024 * 1024 * 1024 // 8Gi
 
+	redisPasswordEnv = "REDIS_PASSWORD"
+	redisCLIAuthEnv  = "REDISCLI_AUTH"
 )
 
 // ResolveRedisL2Server renders the managed Redis L2 store's container set and the
-// Service's port set for the SGLang LMCache MP-mode data plane, mirroring the seam
-// [ResolveLMCacheServer] uses: the reconciler owns ObjectMeta, the Service
+// Service's port set for the SGLang LMCache MP-mode data plane. The reconciler owns ObjectMeta, the Service
 // Selector, the workload kind, and owner references (all CacheBackend-identity
 // dependent), so this returns only PodSpec.Containers and Service.Spec
 // Ports/Type.
@@ -70,11 +66,13 @@ const (
 // CacheBackend), added alongside the wiring that consumes this render — before it
 // provisions anything.
 //
-// Security posture matches the lm:// lmcache-server this replaces: an
-// unauthenticated, non-TLS ClusterIP holding KV blocks, trusted to the in-cluster
-// network — any pod that can reach the Service can read, overwrite, or flush
-// cached KV. Hardening (a NetworkPolicy scoping access to engine pods, Redis AUTH,
-// or TLS) is a follow-up carried at the same posture as the existing server.
+// Security posture is explicit: without an authentication binding this is an
+// unauthenticated, non-TLS ClusterIP holding KV blocks, so any pod that can
+// reach the Service can read, overwrite, or flush cached KV. Secret-backed
+// password authentication is supported below and configures both Redis and the
+// LMCache RESP client. TLS remains rejected because the pinned LMCache 0.5.3
+// RESP adapter does not implement it; NetworkPolicy scoping is still required
+// for production defense in depth.
 func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *corev1.Service, error) {
 	if cache == nil {
 		return nil, nil, fmt.Errorf("resolve redis L2: cache is nil")
@@ -123,10 +121,40 @@ func ResolveRedisL2Server(cache *cachev1alpha1.CacheBackend) (*corev1.PodSpec, *
 			PeriodSeconds:       10,
 			FailureThreshold:    6,
 		},
-		// Reuse the shared provider-resources helper plus the autoscaling CPU
-		// request fallback. The memory limit here is also what --maxmemory is
+		// Reuse the shared provider-resources helper. The memory limit here is also what --maxmemory is
 		// derived from, so the two stay consistent.
 		Resources: defaultServerResources(cache),
+	}
+
+	// Managed authentication configures BOTH ends of the binding: this Redis
+	// process requires the Secret-backed password, while the MP renderer maps
+	// the same selector to LMCACHE_RESP_PASSWORD. The secret value never enters
+	// the PodSpec or CacheBackend status. Kubelet expands the environment
+	// reference in Args before invoking the image's own entrypoint, so managed
+	// authentication does not depend on the official Redis image's private
+	// docker-entrypoint.sh path.
+	if storage := cache.Spec.EffectiveRemoteStorage(); storage != nil && storage.Redis != nil && storage.Redis.Authentication != nil {
+		redis := storage.Redis
+		auth := redis.Authentication
+		if auth.Username != nil {
+			return nil, nil, fmt.Errorf("resolve redis L2: managed Redis supports password authentication with the default user only")
+		}
+		passwordRef := auth.Password.DeepCopy()
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: redisPasswordEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: passwordRef}},
+			corev1.EnvVar{Name: redisCLIAuthEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: auth.Password.DeepCopy()}},
+		)
+		container.Args = append(container.Args, "--requirepass", "$("+redisPasswordEnv+")")
+		// REDISCLI_AUTH lets redis-cli authenticate without placing the password
+		// in the probe command. A TCP-only probe would declare a server Ready even
+		// if AUTH setup were unusable.
+		container.ReadinessProbe = &corev1.Probe{
+			ProbeHandler:        corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"redis-cli", "ping"}}},
+			InitialDelaySeconds: 3,
+			PeriodSeconds:       10,
+			FailureThreshold:    6,
+			TimeoutSeconds:      2,
+		}
 	}
 
 	pod := &corev1.PodSpec{

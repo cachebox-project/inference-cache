@@ -6,6 +6,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -20,25 +21,19 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
+	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
 
 // gatedLMCacheBackend is a managed LMCache backend WITH the KV-event readiness
 // gate enabled (no opt-out annotation), used by the KV-event gate tests. The
 // shared lmcacheBackend fixture opts out, so gate tests use this instead.
 func gatedLMCacheBackend(name, ns string) *cachev1alpha1.CacheBackend {
-	return &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Generation: 1},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime:  cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:     cachev1alpha1.CacheBackendTypeLMCache,
-			Replicas: ptrInt32(1),
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
-			},
-		},
-	}
+	cb := lmcacheBackend(name, ns)
+	delete(cb.Annotations, annotationRequireKVEvents)
+	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{
+		cachev1alpha1.CacheBackendDomainLabel: name,
+	}}
+	return cb
 }
 
 // setFirstAvailableAt patches the backend's write-once timeout anchor
@@ -67,6 +62,7 @@ func setFirstAvailableAt(t *testing.T, cl client.Client, name, ns string, at tim
 // condition.
 func setDeploymentHTTPReady(t *testing.T, cl client.Client, name, ns string, availableSince time.Time) {
 	t.Helper()
+	setPodLocalConnectorReady(t, cl, name, ns)
 	var dep appsv1.Deployment
 	if err := cl.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, &dep); err != nil {
 		t.Fatalf("get deployment %s/%s: %v", ns, name, err)
@@ -89,6 +85,79 @@ func setDeploymentHTTPReady(t *testing.T, cl client.Client, name, ns string, ava
 	if err := cl.Status().Update(context.Background(), &dep); err != nil {
 		t.Fatalf("update deployment status %s/%s: %v", ns, name, err)
 	}
+}
+
+// setPodLocalConnectorReady creates the engine-side state that typed MP
+// readiness requires. Envtest has no inference owner, mutating webhook, or
+// kubelet, so the fixture must explicitly model their persisted output: a
+// selected Pod with ownership stamps, a running native sidecar, and PodReady.
+func setPodLocalConnectorReady(t *testing.T, cl client.Client, name, ns string) {
+	t.Helper()
+	ctx := context.Background()
+	var backend cachev1alpha1.CacheBackend
+	if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &backend); err != nil {
+		t.Fatalf("get CacheBackend %s/%s for connector fixture: %v", ns, name, err)
+	}
+	if !isTypedLMCachePodLocal(&backend) || backend.Spec.EngineSelector == nil || len(backend.Spec.EngineSelector.MatchLabels) == 0 {
+		return
+	}
+
+	key := types.NamespacedName{Name: name + "-ready-engine", Namespace: ns}
+	pod := &corev1.Pod{}
+	err := cl.Get(ctx, key, pod)
+	if client.IgnoreNotFound(err) != nil {
+		t.Fatalf("get connector fixture Pod %s/%s: %v", ns, key.Name, err)
+	}
+	if err != nil {
+		pod = &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: key.Name, Namespace: ns,
+				Labels: backend.Spec.EngineSelector.MatchLabels,
+				Annotations: map[string]string{
+					enginebinding.AnnotationInjectedBy:         ns + "/" + name,
+					enginebinding.AnnotationInjectedByUID:      string(backend.UID),
+					enginebinding.AnnotationInjectedGeneration: strconv.FormatInt(backend.Generation, 10),
+				},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "vllm", Image: "registry.example.com/vllm:test"}}},
+		}
+		if err := cl.Create(ctx, pod); err != nil {
+			t.Fatalf("create connector fixture Pod %s/%s: %v", ns, key.Name, err)
+		}
+	} else {
+		before := pod.DeepCopy()
+		pod.Labels = backend.Spec.EngineSelector.MatchLabels
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
+		}
+		pod.Annotations[enginebinding.AnnotationInjectedBy] = ns + "/" + name
+		pod.Annotations[enginebinding.AnnotationInjectedByUID] = string(backend.UID)
+		pod.Annotations[enginebinding.AnnotationInjectedGeneration] = strconv.FormatInt(backend.Generation, 10)
+		if err := cl.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
+			t.Fatalf("patch connector fixture Pod %s/%s metadata: %v", ns, key.Name, err)
+		}
+	}
+
+	before := pod.DeepCopy()
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: lmCacheMPServerStatusContainerName, Ready: true,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}}
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := cl.Status().Patch(ctx, pod, client.MergeFrom(before)); err != nil {
+		t.Fatalf("patch connector fixture Pod %s/%s status: %v", ns, key.Name, err)
+	}
+
+	// Seed the production connector projection before the next full reconcile.
+	// The reconciler deliberately refreshes this independent status writer after
+	// readiness aggregation, so a single-shot envtest otherwise observes the
+	// previous connector verdict for one cycle.
+	if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &backend); err != nil {
+		t.Fatalf("refresh CacheBackend %s/%s for connector projection: %v", ns, name, err)
+	}
+	fixtureReconciler := &CacheBackendReconciler{Client: cl, APIReader: cl}
+	fixtureReconciler.refreshLMCacheMPConnectorStatus(ctx, &backend)
 }
 
 // patchLastEventAt simulates the CacheIndex poller writing a fresh KV-event
@@ -278,6 +347,10 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		if err := k8s.Update(ctx, live); err != nil {
 			t.Fatalf("update firstEventTimeout: %v", err)
 		}
+		// Model the engine rollout/reinjection that authenticates the Pod for
+		// the new CacheBackend generation; this test is about the sticky
+		// KV-event verdict, not connector rollout behavior.
+		setPodLocalConnectorReady(t, k8s, "cache", ns)
 		reconcile(t, r, "cache", ns)
 
 		got := getBackend(t, r, "cache", ns)
@@ -325,31 +398,36 @@ func TestIntegrationKVEventReadinessGate(t *testing.T) {
 		}
 	})
 
-	t.Run("ExternalBypassesGateEntirely", func(t *testing.T) {
+	t.Run("ExternalRemoteStorageBypassesKVEventGate", func(t *testing.T) {
 		ns := freshNS(t, k8s)
 		cb := &cachev1alpha1.CacheBackend{
 			ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
 			Spec: cachev1alpha1.CacheBackendSpec{
 				Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
 				Type:          cachev1alpha1.CacheBackendTypeLMCache,
-				RemoteStorage: externalLMCacheStorage("external.example.svc:6379"),
+				LMCache:       lmcacheBackend("fixture", ns).Spec.LMCache.DeepCopy(),
+				RemoteStorage: externalRedisStorage("external.example.svc:6379"),
+				Integration:   &cachev1alpha1.CacheBackendIntegrationSpec{Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite},
+				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: map[string]string{
+					cachev1alpha1.CacheBackendDomainLabel: "ext",
+				}},
 			},
 		}
 		if err := k8s.Create(ctx, cb); err != nil {
 			t.Fatalf("create: %v", err)
 		}
+		setPodLocalConnectorReady(t, k8s, "ext", ns)
 		reconcile(t, r, "ext", ns)
 
 		got := getBackend(t, r, "ext", ns)
-		if got.Status.Endpoint != "external.example.svc:6379" {
-			t.Fatalf("endpoint = %q, want mirrored external endpoint", got.Status.Endpoint)
+		if got.Status.RemoteStorage == nil || got.Status.RemoteStorage.Endpoint != "external.example.svc:6379" {
+			t.Fatalf("remoteStorage status = %+v, want mirrored external endpoint", got.Status.RemoteStorage)
 		}
-		// External never enters the KV-event gate: readiness comes from
-		// admission accepting the endpoint (reason ExternalEndpointAccepted),
-		// not from a KV event. The gate's reasons and latch must never appear.
+		// External Redis never enters the KV-event gate. The required local MP
+		// connector still gates readiness independently of the remote tier.
 		ready := findCondition(got.Status.Conditions, conditionTypeReady)
-		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != "ExternalEndpointAccepted" {
-			t.Fatalf("Ready = %+v, want True/ExternalEndpointAccepted (endpoint-driven, not gated)", ready)
+		if ready == nil || ready.Status != metav1.ConditionTrue || ready.Reason != reasonConnectorReady {
+			t.Fatalf("Ready = %+v, want True/%s (connector-ready, not KV-event-gated)", ready, reasonConnectorReady)
 		}
 		if deg := findCondition(got.Status.Conditions, conditionTypeDegraded); deg != nil {
 			t.Fatalf("Degraded = %+v, want absent for External", deg)
@@ -438,7 +516,7 @@ func TestIntegrationKVEventGateAutoReconcileOnPollerWrite(t *testing.T) {
 // recorder so it runs without envtest.
 func TestKVEventGateEmitsTransitionEvents(t *testing.T) {
 	cb := gatedLMCacheBackend("cache", "ns1")
-	r, rec := newReconcilerWithRecorder(t, cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 
 	// Cold start: deployment not ready → no gate event yet.
 	reconcile(t, r, "cache", "ns1")
@@ -465,7 +543,7 @@ func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
 	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{
 		FirstEventTimeout: &metav1.Duration{Duration: time.Second},
 	}
-	r, rec := newReconcilerWithRecorder(t, cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 	reconcile(t, r, "cache", "ns1")
 
 	// Deployment Ready (managedReadiness keys on replica counts), and the latched
@@ -487,7 +565,7 @@ func TestKVEventGateEmitsNoKVEventsObservedOnTimeout(t *testing.T) {
 // Ready must NOT re-emit "first KV event observed".
 func TestKVEventGateKVEventsObservedFiresOnceAcrossRollout(t *testing.T) {
 	cb := gatedLMCacheBackend("cache", "ns1")
-	r, rec := newReconcilerWithRecorder(t, cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 	reconcile(t, r, "cache", "ns1")
 
 	// First event → KVEventsObserved fires once.
@@ -526,7 +604,8 @@ func TestKVEventGateKVEventsObservedFiresOnceAcrossRollout(t *testing.T) {
 // NOT a misleading second KVEventsObserved (events never stopped flowing).
 func TestKVEventGateDeploymentRecoveryIsBackendRecovered(t *testing.T) {
 	cb := gatedLMCacheBackend("cache", "ns1")
-	r, rec := newReconcilerWithRecorder(t, cb)
+	requireRemoteStorageForReadiness(cb)
+	r, rec := newReconcilerWithRecorderOptions(t, true, cb)
 	reconcile(t, r, "cache", "ns1")
 
 	// Become Ready with events flowing.
@@ -541,13 +620,13 @@ func TestKVEventGateDeploymentRecoveryIsBackendRecovered(t *testing.T) {
 	// Lose replicas → Degraded (deployment cause, not KV).
 	markDeploymentDegraded(t, r, "cache", "ns1", 1)
 	reconcile(t, r, "cache", "ns1")
-	expectEvent(t, drainEvents(rec), eventReasonBackendDegraded)
+	expectEvent(t, drainEvents(rec), reasonRemoteStorageUnavailable)
 
 	// Replicas recover; lastEventAt is still set (events never lost).
 	markDeploymentReady(t, r, "cache", "ns1", 1)
 	reconcile(t, r, "cache", "ns1")
 	evs := drainEvents(rec)
-	expectEvent(t, evs, eventReasonBackendRecovered)
+	expectEvent(t, evs, reasonRemoteStorageReady)
 	expectNoEvent(t, evs, reasonKVEventsObserved)
 }
 
@@ -562,7 +641,7 @@ func TestKVEventGateRequeueDoesNotStarveMatchedPodsRefresh(t *testing.T) {
 	cb.Spec.EngineSelector = &cachev1alpha1.CacheBackendEngineSelector{
 		MatchLabels: map[string]string{"app": "vllm"},
 	}
-	r, _ := newReconcilerWithRecorder(t, cb)
+	r, _ := newReconcilerWithRecorderOptions(t, false, cb)
 	r.MatchedEnginePodsRequeueInterval = 7 * time.Second
 
 	reconcile(t, r, "cache", "ns1")
@@ -576,8 +655,8 @@ func TestKVEventGateRequeueDoesNotStarveMatchedPodsRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if rd := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); rd == nil || rd.Status != metav1.ConditionFalse || rd.Reason != reasonAwaitingFirstKVEvent {
-		t.Fatalf("Ready = %+v, want False/AwaitingFirstKVEvent (precondition)", rd)
+	if rd := findCondition(getBackend(t, r, "cache", "ns1").Status.Conditions, conditionTypeReady); rd == nil || rd.Status != metav1.ConditionFalse || rd.Reason != reasonNoEnginePods {
+		t.Fatalf("Ready = %+v, want False/NoEnginePods (connector observation wins before the KV-event gate)", rd)
 	}
 	if res.RequeueAfter != 7*time.Second {
 		t.Fatalf("RequeueAfter = %s, want 7s (matched-pods cadence must win over the gate's firstEventTimeout window)", res.RequeueAfter)

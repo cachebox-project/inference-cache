@@ -40,7 +40,7 @@ import (
 const (
 	testVLLMEngineContainerName = "vllm"
 	testSubscriberImage         = "subscriber:test"
-	testEnvLMCacheRemoteURL     = "LMCACHE_REMOTE_URL"
+	testRetiredLMCacheRemoteURL = "LMCACHE_REMOTE_URL"
 	testEnvLMCacheChunkSize     = "LMCACHE_CHUNK_SIZE"
 	testEnvVLLMUseV1            = "VLLM_USE_V1"
 	testEnvPythonHashSeed       = "PYTHONHASHSEED"
@@ -54,7 +54,7 @@ func newVLLMRegistry(configs ...builtinruntime.SubscriberConfig) *adapterruntime
 		config = configs[0]
 	}
 	registry := adapterruntime.NewRegistry()
-	registry.Register(builtinruntime.NewVLLMLMCacheAdapter(config))
+	registry.Register(builtinruntime.NewVLLMLMCacheMPAdapter(config))
 	return registry
 }
 
@@ -102,11 +102,12 @@ func referenceUpsertEnv(env []corev1.EnvVar, want corev1.EnvVar) []corev1.EnvVar
 	return append(env, want)
 }
 
-func externalLMCacheStorage(endpoint string) *cachev1alpha1.CacheBackendRemoteStorageSpec {
+func externalRedisStorage(endpoint string) *cachev1alpha1.CacheBackendRemoteStorageSpec {
 	return &cachev1alpha1.CacheBackendRemoteStorageSpec{
-		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
 		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
 		Endpoint:  endpoint,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 	}
 }
 
@@ -219,14 +220,14 @@ func sglangEnginePod(name string, labels map[string]string) *corev1.Pod {
 				Env: []corev1.EnvVar{
 					{Name: "USER_FLAG", Value: "preserved"},
 				},
-				Args: []string{"--model-path", "Qwen/Qwen2.5-0.5B-Instruct"},
+				Args: []string{"--model-path", "Qwen/Qwen2.5-0.5B-Instruct", "--page-size", "64"},
 			}},
 		},
 	}
 }
 
-// readyCacheBackend returns a CacheBackend with status.endpoint published,
-// a vLLM integration, and an EngineSelector keyed on a single label.
+// readyCacheBackend returns a typed host-only CacheBackend with a vLLM
+// integration and an EngineSelector keyed on a single label.
 // The metadata.uid is set to a stable fake so the webhook's
 // AnnotationInjectedByUID stamp has a value to compare against in tests
 // that assert the annotation contents (a real apiserver would assign one
@@ -241,10 +242,21 @@ func readyCacheBackend(name, namespace string, selector map[string]string) *cach
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
 			Type:    cachev1alpha1.CacheBackendTypeLMCache,
+			LMCache: &cachev1alpha1.LMCacheEngineSpec{
+				Topology: cachev1alpha1.LMCacheTopologyPodLocal,
+				PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+					Image: "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					Port:  6500, L1Capacity: resource.MustParse("4Gi"), MaxWorkers: 2,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+						Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("6Gi")},
+					},
+				}},
+			},
 			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:      cachev1alpha1.CacheBackendRemoteStorageProviderLMCacheServer,
-				Ownership:     cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				LMCacheServer: &cachev1alpha1.LMCacheServerRemoteStorageSpec{},
+				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+				Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 			},
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
 				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
@@ -252,7 +264,11 @@ func readyCacheBackend(name, namespace string, selector map[string]string) *cach
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
 		},
 		Status: cachev1alpha1.CacheBackendStatus{
-			Endpoint: name + ".cache-ns.svc.cluster.local:65432",
+			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageStatus{
+				Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+				Endpoint: name + "." + namespace + ".svc.cluster.local:6379",
+				Ready:    metav1.ConditionTrue,
+			},
 		},
 	}
 }
@@ -285,38 +301,153 @@ func newHandlerWithSubscriber(t *testing.T, objs ...client.Object) *EngineInject
 	}
 }
 
-func TestHandle_MatchAndInject(t *testing.T) {
+func typedVLLMPodLocalBackend(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
+	cb := readyCacheBackend(name, namespace, selector)
+	chunkSize := int32(256)
+	cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
+		Topology:        cachev1alpha1.LMCacheTopologyPodLocal,
+		ChunkSizeTokens: &chunkSize,
+		PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+			Image:      "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Port:       6500,
+			L1Capacity: resource.MustParse("4Gi"),
+			MaxWorkers: 2,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("6Gi")},
+			},
+		}},
+	}
+	cb.Spec.RemoteStorage = nil
+	cb.Status.RemoteStorage = nil
+	return cb
+}
+
+func typedVLLMNodeLocalBackend(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
+	cb := typedVLLMPodLocalBackend(name, namespace, selector)
+	cb.Generation = 3
+	cb.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyNodeLocal
+	cb.Spec.LMCache.PodLocal = nil
+	cb.Spec.LMCache.NodeLocal = &cachev1alpha1.LMCacheNodeLocalSpec{
+		Server: &cachev1alpha1.LMCacheNodeLocalServerSpec{
+			Image: "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Port:  6555, HTTPPort: 18080,
+			L1Capacity: resource.MustParse("8Gi"), MaxGPUWorkers: 4, MaxCPUWorkers: 4,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("9Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("9Gi")},
+			},
+		},
+		Scheduling: &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{},
+	}
+	return cb
+}
+
+func TestHandle_TypedVLLMWithoutCapabilityAnnotationsUsesDedicatedMPAdapter(t *testing.T) {
 	const ns = "engines"
-	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb := typedVLLMPodLocalBackend("primary", ns, map[string]string{"app": "vllm"})
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
 
 	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("typed MP pod should be injected without capability annotations: allowed=%v patches=%d result=%+v",
+			resp.Allowed, len(resp.Patches), resp.Result)
 	}
-	if len(resp.Patches) == 0 {
-		t.Fatalf("expected JSON patches, got none")
+}
+
+func TestHandle_TypedNodeLocalVLLMGatesOnOwnershipVerifiedSameNodeServer(t *testing.T) {
+	const ns = "engines"
+	cb := typedVLLMNodeLocalBackend("node-cache", ns, map[string]string{"app": "vllm-node"})
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-node", map[string]string{"app": "vllm-node"})
+	pod.Spec.NodeSelector = map[string]string{"inference-system.io/pool": "owned"}
+	pod.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{Weight: 1}}}}
+	wantNodeSelector := map[string]string{"inference-system.io/pool": "owned"}
+	wantAffinity := pod.Spec.Affinity.DeepCopy()
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("NodeLocal injection: Allowed=%v patches=%d result=%+v", resp.Allowed, len(resp.Patches), resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-server") != nil {
+		t.Fatalf("NodeLocal engine received PodLocal server: %+v", mutated.Spec.InitContainers)
+	}
+	gate := findInitContainerByName(mutated.Spec.InitContainers, "lmcache-node-local-gate")
+	if gate == nil || !strings.Contains(strings.Join(gate.Args, " "), "/healthcheck") || !strings.Contains(strings.Join(gate.Args, " "), "/config") {
+		t.Fatalf("ownership-verifying NodeLocal gate = %+v", gate)
+	}
+	config := testArgValue(mutated.Spec.Containers[0].Args, "--kv-transfer-config")
+	if !strings.Contains(config, `tcp://$(INFERENCECACHE_NODE_IP)`) {
+		t.Fatalf("node-derived vLLM config = %q", config)
+	}
+	if mutated.Spec.HostNetwork || mutated.Spec.HostIPC {
+		t.Fatalf("engine entered host namespace: hostNetwork=%v hostIPC=%v", mutated.Spec.HostNetwork, mutated.Spec.HostIPC)
+	}
+	if !reflect.DeepEqual(mutated.Spec.NodeSelector, wantNodeSelector) || !reflect.DeepEqual(mutated.Spec.Affinity, wantAffinity) {
+		t.Fatalf("NodeLocal mutated inference-owned placement: selector=%v affinity=%+v", mutated.Spec.NodeSelector, mutated.Spec.Affinity)
+	}
+	if got := mutated.Annotations[AnnotationInjectedByUID]; got != string(cb.UID) {
+		t.Fatalf("injected backend UID = %q", got)
+	}
+	if got := mutated.Labels[LabelLMCacheMPMetrics]; got != "" {
+		t.Fatalf("NodeLocal engine must not advertise a PodLocal metrics sidecar: %s=%q", LabelLMCacheMPMetrics, got)
+	}
+}
+
+func TestHandle_TypedPodLocalVLLMUsesDedicatedMPAdapter(t *testing.T) {
+	const ns = "engines"
+	cb := typedVLLMPodLocalBackend("vllm-typed", ns, map[string]string{"app": "vllm-mp"})
+	h := newHandler(t, cb)
+	pod := vllmEnginePod("engine-mp", map[string]string{"app": "vllm-mp"})
+	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--tensor-parallel-size=2")
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("typed vLLM MP injection: Allowed=%v patches=%d result=%+v", resp.Allowed, len(resp.Patches), resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	server := findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-server")
+	if server == nil || server.Image != cb.Spec.LMCache.PodLocal.Server.Image {
+		t.Fatalf("typed MP server = %+v", server)
+	}
+	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-worker") != nil {
+		t.Fatalf("typed vLLM wire fell through to legacy worker: %+v", mutated.Spec.InitContainers)
+	}
+	mustHaveArgFlag(t, mutated, "--disable-hybrid-kv-cache-manager")
+	config := testArgValue(mutated.Spec.Containers[0].Args, "--kv-transfer-config")
+	for _, want := range []string{
+		`"kv_connector":"LMCacheMPConnector"`,
+		`"kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector"`,
+		`"kv_role":"kv_both"`,
+		`"lmcache.mp.host":"tcp://127.0.0.1"`,
+		`"lmcache.mp.port":"6500"`,
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("kv-transfer-config %q missing %q", config, want)
+		}
+	}
+	mustHaveEnv(t, mutated, testEnvPythonHashSeed, "0")
+	if got := mutated.Labels[LabelLMCacheMPMetrics]; got != LabelLMCacheMPMetricsEnabled {
+		t.Fatalf("label %s = %q", LabelLMCacheMPMetrics, got)
 	}
 
-	mutated := applyPatches(t, req.Object.Raw, resp)
-	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL,
-		"lm://"+cb.Status.Endpoint)
-	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
-	if got, want := mutated.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name; got != want {
-		t.Fatalf("annotation %s: got %q, want %q", AnnotationInjectedBy, got, want)
+	incompatible := vllmEnginePod("engine-pp", map[string]string{"app": "vllm-mp"})
+	incompatible.Annotations = pod.Annotations
+	incompatible.Spec.Containers[0].Args = append(incompatible.Spec.Containers[0].Args, "--pipeline-parallel-size=2")
+	incompatibleReq := newRequest(t, incompatible, ns)
+	incompatibleResp := h.Handle(context.Background(), incompatibleReq)
+	if !incompatibleResp.Allowed || len(incompatibleResp.Patches) != 0 {
+		t.Fatalf("unsupported PP must admit unchanged: Allowed=%v patches=%d result=%+v",
+			incompatibleResp.Allowed, len(incompatibleResp.Patches), incompatibleResp.Result)
 	}
-	// Pin the webhook-only proof-of-injection annotation against the
-	// matched CR's UID. The engine-pod-events controller skips emission
-	// when this doesn't match; a regression in the success-path stamp
-	// would break the binding signal end-to-end.
-	if got, want := mutated.Annotations[AnnotationInjectedByUID], string(cb.UID); got != want {
-		t.Fatalf("annotation %s: got %q, want %q (matched CR UID)", AnnotationInjectedByUID, got, want)
+	if incompatibleResp.Result == nil || !strings.Contains(incompatibleResp.Result.Message, "pipeline parallel size 2") {
+		t.Fatalf("unsupported PP diagnostic = %+v", incompatibleResp.Result)
 	}
-	mustHaveArgPair(t, mutated, "--model", "Qwen/Qwen2.5-0.5B-Instruct")
-	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
 func TestHandle_MatchAndInject_SGLang(t *testing.T) {
@@ -356,8 +487,7 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 	mustHaveEnv(t, mutated, "LMCACHE_USE_EXPERIMENTAL", "True")
 
 	// Proof it went through the SGLang MP path: the vLLM-only connector arg/env
-	// must be absent, the old lm:// env must NOT be injected, and the MP-worker
-	// native sidecar must be present.
+	// must be absent and the common MP server native sidecar must be present.
 	for _, c := range mutated.Spec.Containers {
 		if c.Name != "sglang" {
 			continue
@@ -371,19 +501,89 @@ func TestHandle_MatchAndInject_SGLang(t *testing.T) {
 			if e.Name == testEnvVLLMUseV1 || e.Name == testEnvPythonHashSeed {
 				t.Fatalf("SGLang pod got vLLM-only env %q (SGLang injects neither)", e.Name)
 			}
-			if e.Name == testEnvLMCacheRemoteURL {
-				t.Fatalf("SGLang MP wire must not inject %s", testEnvLMCacheRemoteURL)
+			if e.Name == testRetiredLMCacheRemoteURL {
+				t.Fatalf("SGLang MP wire must not inject retired %s", testRetiredLMCacheRemoteURL)
 			}
 		}
 	}
-	hasWorker := false
-	for _, ic := range mutated.Spec.InitContainers {
-		if ic.Name == "lmcache-mp-worker" {
-			hasWorker = true
-		}
+	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-server") == nil {
+		t.Fatalf("MP server sidecar not injected; initContainers = %+v", mutated.Spec.InitContainers)
 	}
-	if !hasWorker {
-		t.Fatalf("MP-worker sidecar not injected; initContainers = %+v", mutated.Spec.InitContainers)
+	if got := mutated.Labels[LabelLMCacheMPMetrics]; got != "true" {
+		t.Fatalf("typed SGLang pod label %s=%q, want true", LabelLMCacheMPMetrics, got)
+	}
+}
+
+func TestHandle_TypedPodLocalSGLangUsesCommonMPServer(t *testing.T) {
+	const ns = "engines"
+	cb := readyCacheBackend("sg-typed", ns, map[string]string{"app": "sglang"})
+	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+	}
+	chunkSize := int32(256)
+	cb.Spec.LMCache = &cachev1alpha1.LMCacheEngineSpec{
+		Topology:        cachev1alpha1.LMCacheTopologyPodLocal,
+		ChunkSizeTokens: &chunkSize,
+		PodLocal: &cachev1alpha1.LMCachePodLocalSpec{Server: &cachev1alpha1.LMCachePodLocalServerSpec{
+			Image:      "registry.example.com/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Port:       6500,
+			L1Capacity: resource.MustParse("4Gi"),
+			MaxWorkers: 2,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("5Gi")},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("6Gi")},
+			},
+		}},
+	}
+	h := newHandler(t, cb)
+	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
+	req := newRequest(t, pod, ns)
+
+	resp := h.Handle(context.Background(), req)
+	if !resp.Allowed || len(resp.Patches) == 0 {
+		t.Fatalf("typed SGLang injection: Allowed=%v patches=%d result=%+v", resp.Allowed, len(resp.Patches), resp.Result)
+	}
+	mutated := applyPatches(t, req.Object.Raw, resp)
+	mustHaveArgFlag(t, mutated, "--enable-lmcache")
+	mustHaveArgPair(t, mutated, "--lmcache-config-file", "/var/run/inference-cache/lmcache/client.yaml")
+	server := findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-server")
+	if server == nil {
+		t.Fatalf("typed MP server missing: %+v", mutated.Spec.InitContainers)
+	}
+	if server.Image != cb.Spec.LMCache.PodLocal.Server.Image || server.Image == mutated.Spec.Containers[0].Image {
+		t.Fatalf("server image = %q, engine image = %q", server.Image, mutated.Spec.Containers[0].Image)
+	}
+	joined := strings.Join(append(server.Command, server.Args...), " ")
+	if !strings.Contains(joined, "lmcache server") || !strings.Contains(joined, "--http-port 8080") || strings.Contains(joined, "python3 -m") {
+		t.Fatalf("typed server command = %s", joined)
+	}
+	if server.StartupProbe == nil || server.ReadinessProbe == nil || server.LivenessProbe == nil {
+		t.Fatalf("typed server probes missing: %+v", server)
+	}
+	if got := mutated.Labels[LabelLMCacheMPMetrics]; got != LabelLMCacheMPMetricsEnabled {
+		t.Fatalf("label %s = %q, want %q", LabelLMCacheMPMetrics, got, LabelLMCacheMPMetricsEnabled)
+	}
+	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-worker") != nil {
+		t.Fatalf("typed wire fell through to legacy worker: %+v", mutated.Spec.InitContainers)
+	}
+
+	// The compatibility guard must fail open atomically: an incompatible page
+	// size admits the inference Pod but renders neither the server nor half of
+	// the engine wire. The response message is the actionable admission trace;
+	// controller status subsequently counts the Pod as uncovered.
+	incompatible := sglangEnginePod("sg-engine-incompatible", map[string]string{"app": "sglang"})
+	incompatible.Spec.Containers[0].Args = []string{"--model-path", "Qwen/Qwen2.5-0.5B-Instruct", "--page-size=96"}
+	incompatibleReq := newRequest(t, incompatible, ns)
+	incompatibleResp := h.Handle(context.Background(), incompatibleReq)
+	if !incompatibleResp.Allowed || len(incompatibleResp.Patches) != 0 {
+		t.Fatalf("incompatible page size must admit unchanged: Allowed=%v patches=%d result=%+v",
+			incompatibleResp.Allowed, len(incompatibleResp.Patches), incompatibleResp.Result)
+	}
+	if incompatibleResp.Result == nil || !strings.Contains(incompatibleResp.Result.Message, "chunk size 256 must be a multiple") {
+		t.Fatalf("incompatible page-size diagnostic = %+v", incompatibleResp.Result)
 	}
 }
 
@@ -392,6 +592,7 @@ func TestHandle_MatchAndInject_SGLangHiCacheWithoutEndpoint(t *testing.T) {
 	cb := readyCacheBackend("hicache", ns, map[string]string{"app": "sglang"})
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	cb.Spec.LMCache = nil
 	cb.Spec.RemoteStorage = nil
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{
@@ -400,7 +601,7 @@ func TestHandle_MatchAndInject_SGLangHiCacheWithoutEndpoint(t *testing.T) {
 		IOBackend:    cachev1alpha1.SGLangHiCacheIOKernel,
 		MemoryLayout: cachev1alpha1.SGLangHiCacheMemoryPageFirst,
 	}
-	cb.Status.Endpoint = ""
+	cb.Status.RemoteStorage = nil
 
 	h := newHandler(t, cb)
 	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
@@ -435,6 +636,7 @@ func TestHandle_CanonicalSGLangHiCacheWithRemoteStorageFailsOpen(t *testing.T) {
 	cb := readyCacheBackend("hicache-remote", ns, map[string]string{"app": "sglang"})
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	cb.Spec.LMCache = nil
 	cb.Spec.Runtime = ""
 	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{Ratio: "2"}
 	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
@@ -459,13 +661,14 @@ func TestHandle_SGLangHiCacheConflictFailsOpenWithoutPartialInjection(t *testing
 	cb := readyCacheBackend("hicache", ns, map[string]string{"app": "sglang"})
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+	cb.Spec.LMCache = nil
 	cb.Spec.RemoteStorage = nil
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
 	cb.Spec.HiCache = &cachev1alpha1.SGLangHiCacheSpec{
 		Ratio:       "2",
 		WritePolicy: cachev1alpha1.SGLangHiCacheWriteThrough,
 	}
-	cb.Status.Endpoint = ""
+	cb.Status.RemoteStorage = nil
 
 	pod := sglangEnginePod("sg-engine-a", map[string]string{"app": "sglang"})
 	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--hicache-ratio=3")
@@ -479,232 +682,11 @@ func TestHandle_SGLangHiCacheConflictFailsOpenWithoutPartialInjection(t *testing
 	}
 }
 
-func TestHandle_MooncakeBackend_InjectsMooncakeStoreEndpoint(t *testing.T) {
-	// End-to-end pod-webhook path for a managed Mooncake backend: the handler
-	// lists the CacheBackend, the built-in shipping registry selects the
-	// vLLM+LMCache adapter with a Mooncake binding, and the engine container is wired to the
-	// Mooncake master via the LMCache connector with the mooncakestore://
-	// scheme (the lm:// analog) — plus the kvevent-subscriber sidecar. This is
-	// the advertised integration path; the adapter-level tests don't exercise
-	// the webhook's registry selection + injection together.
-	const ns = "engines"
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "mc",
-			Namespace: ns,
-			UID:       types.UID("cb-mc-uid"),
-		},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-			},
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "vllm"},
-			},
-			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"},
-		},
-		// Mooncake status.endpoint is the master's RPC host:port (the
-		// reconciler publishes the Service's first port, 50051).
-		Status: cachev1alpha1.CacheBackendStatus{
-			Endpoint: "mc.engines.svc.cluster.local:50051",
-		},
-	}
-	h := newHandlerWithSubscriber(t, cb)
-	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
-	req := newRequest(t, pod, ns)
-
-	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed || len(resp.Patches) == 0 {
-		t.Fatalf("expected Allowed with patches; Allowed=%v patches=%d result=%+v", resp.Allowed, len(resp.Patches), resp.Result)
-	}
-	mutated := applyPatches(t, req.Object.Raw, resp)
-
-	// The defining difference from the LMCache path: the remote URL carries
-	// the mooncakestore:// scheme, pointed at the master RPC endpoint.
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "mooncakestore://"+cb.Status.Endpoint)
-	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
-	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
-	// User-set engine arg survives the merge (merge, not clobber).
-	mustHaveArgPair(t, mutated, "--model", "Qwen/Qwen2.5-0.5B-Instruct")
-	if got, want := mutated.Annotations[AnnotationInjectedBy], ns+"/"+cb.Name; got != want {
-		t.Fatalf("annotation %s: got %q, want %q", AnnotationInjectedBy, got, want)
-	}
-
-	// The kvevent-subscriber sidecar is appended on the Mooncake path too
-	// (same shared builder; vLLM's KV-event stream is store-independent).
-	sub := findContainer(mutated, enginebinding.SubscriberContainerName)
-	if sub == nil {
-		t.Fatalf("subscriber sidecar missing on Mooncake path; containers = %v", containerNames(mutated))
-	}
-	if !argPresent(sub.Args, "--hash-scheme=vllm") {
-		t.Fatalf("subscriber must tag events hash-scheme=vllm; args = %v", sub.Args)
-	}
-	if !argPresent(sub.Args, "--engine-metrics-url=http://127.0.0.1:8000/metrics") {
-		t.Fatalf("vLLM subscriber must scrape :8000/metrics; args = %v", sub.Args)
-	}
-	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
-		t.Fatalf("subscriber --model-id derived from observation.modelID missing; args = %v", sub.Args)
-	}
-}
-
-func TestHandle_MooncakeBackend_EngineHostNetworkIsOptIn(t *testing.T) {
-	// Mooncake's mesh is dialed FROM the engine at a node IP on a negotiated
-	// port, so an overlay engine pod transfers zero KV while the backend reports
-	// Ready. spec.integration.engineHostNetwork moves matched engine pods onto
-	// the host network — but only when the operator asks for it: hostNetwork is
-	// a privilege, and mutating webhooks run BEFORE Pod Security validation, so
-	// injecting it unasked would turn a working pod into one a "restricted"
-	// namespace rejects, blaming Pod Security rather than this controller.
-	//
-	// The adapter unit test pins InjectEngineConfig; this pins the whole
-	// admission path, which is the surface the operator's pod actually crosses.
-	const ns = "engines"
-	backend := func(optIn bool) *cachev1alpha1.CacheBackend {
-		return &cachev1alpha1.CacheBackend{
-			ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns, UID: types.UID("cb-mc-uid")},
-			Spec: cachev1alpha1.CacheBackendSpec{
-				Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-				Type:    cachev1alpha1.CacheBackendTypeLMCache,
-				Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-					Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-					EngineHostNetwork: optIn,
-				},
-				RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-					Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-					Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-				},
-				EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-					MatchLabels: map[string]string{"app": "vllm"},
-				},
-			},
-			Status: cachev1alpha1.CacheBackendStatus{Endpoint: "mc.engines.svc.cluster.local:50051"},
-		}
-	}
-
-	t.Run("NotInjectedByDefault", func(t *testing.T) {
-		h := newHandlerWithSubscriber(t, backend(false))
-		req := newRequest(t, vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns)
-
-		resp := h.Handle(context.Background(), req)
-		if !resp.Allowed {
-			t.Fatalf("expected Allowed; result=%+v", resp.Result)
-		}
-		mutated := applyPatches(t, req.Object.Raw, resp)
-
-		if mutated.Spec.HostNetwork {
-			t.Fatal("webhook moved an engine pod onto the host network without spec.integration.engineHostNetwork; " +
-				"that silently escalates the pod's privileges and Pod Security would reject it downstream")
-		}
-		if mutated.Spec.DNSPolicy != "" {
-			t.Fatalf("dnsPolicy rewritten to %q without the opt-in; want it left to the cluster default", mutated.Spec.DNSPolicy)
-		}
-		// The rest of the Mooncake wiring still lands — the opt-in gates the
-		// networking rewrite only, never the connector env.
-		mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "mooncakestore://mc.engines.svc.cluster.local:50051")
-	})
-
-	t.Run("InjectedWhenOperatorOptsIn", func(t *testing.T) {
-		h := newHandlerWithSubscriber(t, backend(true))
-		req := newRequest(t, vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns)
-
-		resp := h.Handle(context.Background(), req)
-		if !resp.Allowed {
-			t.Fatalf("expected Allowed; result=%+v", resp.Result)
-		}
-		mutated := applyPatches(t, req.Object.Raw, resp)
-
-		if !mutated.Spec.HostNetwork {
-			t.Fatal("engineHostNetwork=true but the pod stayed on the overlay; the engine cannot reach the Mooncake mesh")
-		}
-		// Without this the pod loses cluster DNS, and status.endpoint is a
-		// Service DNS name — the engine would fail to resolve the master.
-		if got, want := mutated.Spec.DNSPolicy, corev1.DNSClusterFirstWithHostNet; got != want {
-			t.Fatalf("dnsPolicy: got %q, want %q (hostNetwork pods lose cluster DNS without it, and status.endpoint is a DNS name)", got, want)
-		}
-		mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "mooncakestore://mc.engines.svc.cluster.local:50051")
-	})
-}
-
-func TestHandle_MooncakeBackend_HostNetworkNeverGrantedToAnUnwiredPod(t *testing.T) {
-	// The host-network mutation lives INSIDE InjectEngineConfig, behind the same
-	// endpoint gate as the KV connector. So when the reconciler has not yet
-	// published status.endpoint, the pod admits fail-open with neither the
-	// connector nor hostNetwork — the two always travel together.
-	//
-	// That coupling is deliberate, and this test exists to keep it. Hoisting the
-	// hostNetwork mutation above the endpoint gate would grant a pod a privilege
-	// (host networking, which Pod Security gates) while giving it nothing to use
-	// the privilege for: without LMCACHE_REMOTE_URL the engine never dials the
-	// Mooncake mesh. The pod must be rolled once the backend reports Ready
-	// regardless — pods are immutable, and it needs the connector env either way.
-	const ns = "engines"
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "mc", Namespace: ns, UID: types.UID("cb-mc-uid")},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role:              cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-				EngineHostNetwork: true,
-			},
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "vllm"},
-			},
-		},
-		// The reconciler has not published the master's RPC address yet.
-		Status: cachev1alpha1.CacheBackendStatus{Endpoint: ""},
-	}
-	h := newHandlerWithSubscriber(t, cb)
-	req := newRequest(t, vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns)
-
-	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("endpoint-not-ready must fail open, not reject the pod; result=%+v", resp.Result)
-	}
-	mutated := applyPatches(t, req.Object.Raw, resp)
-
-	if mutated.Spec.HostNetwork {
-		t.Fatal("pod was granted hostNetwork while the backend had no endpoint — a Pod-Security-gated privilege " +
-			"handed to a pod with no KV connector to use it")
-	}
-	for _, c := range mutated.Spec.Containers {
-		for _, e := range c.Env {
-			if e.Name == testEnvLMCacheRemoteURL {
-				t.Fatalf("connector env %s injected without an endpoint", e.Name)
-			}
-		}
-	}
-}
-
 func TestHandle_LMCacheBackend_NeverMovesEnginePodOntoHostNetwork(t *testing.T) {
-	// The default path must stay on the overlay. hostNetwork is Mooncake's
-	// carve-out; a regression that leaked it into the LMCache adapter would
-	// break every "restricted"-PSA namespace running the shipping default.
+	// The typed MP path must stay on the overlay; moving the engine to the host
+	// network would break restricted Pod Security namespaces.
 	const ns = "engines"
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "lm", Namespace: ns, UID: types.UID("cb-lm-uid")},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "vllm"},
-			},
-		},
-		Status: cachev1alpha1.CacheBackendStatus{Endpoint: "lm.engines.svc.cluster.local:8000"},
-	}
+	cb := readyCacheBackend("lm", ns, map[string]string{"app": "vllm"})
 	h := newHandlerWithSubscriber(t, cb)
 	req := newRequest(t, vllmEnginePod("engine-a", map[string]string{"app": "vllm"}), ns)
 
@@ -757,9 +739,14 @@ func TestHandle_AppendsObservationSidecar(t *testing.T) {
 	if !argPresent(sub.Args, "--tenant-id=$(POD_NAMESPACE)") {
 		t.Fatalf("--tenant-id MUST use downward-API POD_NAMESPACE; args = %v", sub.Args)
 	}
-	// The engine container is still wired with LMCache env — appending the
-	// sidecar must not regress the engine-side injection.
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	if !argPresent(sub.Args, "--engine-metrics-url=http://127.0.0.1:8000/metrics") {
+		t.Fatalf("vLLM subscriber must scrape :8000/metrics; args = %v", sub.Args)
+	}
+	// Appending the observation sidecar must not regress typed MP injection.
+	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
+	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-server") == nil {
+		t.Fatal("LMCache MP server missing after subscriber injection")
+	}
 }
 
 func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
@@ -806,7 +793,7 @@ func TestHandle_AppendsObservationSidecar_SGLang(t *testing.T) {
 		t.Fatalf("SGLang subscriber MUST tag --hash-scheme=sglang; args = %v", sub.Args)
 	}
 	if !argPresent(sub.Args, "--engine-metrics-url=http://127.0.0.1:30000/metrics") {
-		t.Fatalf("SGLang subscriber must scrape :30000/metrics (not vLLM's :8000); args = %v", sub.Args)
+		t.Fatalf("SGLang subscriber must scrape :30000/metrics; args = %v", sub.Args)
 	}
 	if !argPresent(sub.Args, "--model-id=Qwen/Qwen2.5-0.5B-Instruct") {
 		t.Fatalf("--model-id derived from cb.spec.observation.modelID missing; args = %v", sub.Args)
@@ -842,9 +829,9 @@ func TestHandle_SidecarAppendIsIdempotent(t *testing.T) {
 
 // eventsOnlyCacheBackend returns an events-only (tier-1 routing) LMCache
 // CacheBackend: type=LMCache, spec.integration.mode=EventsOnly, a served model
-// id (so ObservationSidecar emits a container), an engineSelector, and NO
-// status.endpoint. It provisions no server, so the absent endpoint is the
-// expected steady state — not a not-yet-reconciled race.
+// id (so ObservationSidecar emits a container), an engineSelector, and no
+// remote storage. The absent endpoint is the expected steady state, not a
+// not-yet-reconciled race.
 func eventsOnlyCacheBackend(name, namespace string, selector map[string]string) *cachev1alpha1.CacheBackend {
 	return &cachev1alpha1.CacheBackend{
 		ObjectMeta: metav1.ObjectMeta{
@@ -862,13 +849,12 @@ func eventsOnlyCacheBackend(name, namespace string, selector map[string]string) 
 			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{MatchLabels: selector},
 			Observation:    &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"},
 		},
-		// No Status.Endpoint — events-only provisions no server, so the
-		// reconciler leaves it empty. The webhook MUST inject anyway.
+		// No remote-storage status: the webhook must inject the subscriber anyway.
 	}
 }
 
 func TestHandle_EventsOnly_EmptyEndpoint_InjectsSubscriberWithoutConnector(t *testing.T) {
-	// An events-only backend has an EMPTY status.endpoint by design (no
+	// An events-only backend has no status.remoteStorage by design (no
 	// provisioned server), but it must NOT fail-open the way a managed backend
 	// with a not-yet-published endpoint does. The webhook injects: the pod is
 	// patched, the kvevent-subscriber sidecar is appended, the injected-by
@@ -885,7 +871,7 @@ func TestHandle_EventsOnly_EmptyEndpoint_InjectsSubscriberWithoutConnector(t *te
 		t.Fatalf("expected Allowed, got: %+v", resp.Result)
 	}
 	if len(resp.Patches) == 0 {
-		t.Fatalf("events-only backend with empty status.endpoint must INJECT, not fail-open; got no patches")
+		t.Fatalf("events-only backend with no remote-storage endpoint must inject, not fail open; got no patches")
 	}
 
 	mutated := applyPatches(t, req.Object.Raw, resp)
@@ -938,15 +924,20 @@ func TestHandle_EventsOnly_EmptyEndpoint_InjectsSubscriberWithoutConnector(t *te
 
 func TestHandle_OffloadManagedBackend_EmptyEndpoint_FailsOpen(t *testing.T) {
 	// Contrast with the events-only case above: an Offload (default-mode)
-	// managed backend whose status.endpoint is not yet published MUST fail-open
+	// managed backend whose status.remoteStorage.endpoint is not yet published must fail open
 	// — admit unmodified, no subscriber sidecar, no injected-by annotation —
 	// because the connector it would wire needs a real dial target. This pins
 	// that the events-only inject path is mode-gated, not a blanket
 	// "inject on empty endpoint".
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
+	}
 	cb.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"}
-	cb.Status.Endpoint = "" // Offload mode, reconciler hasn't published yet.
+	cb.Status.RemoteStorage = nil
 	h := newHandlerWithSubscriber(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
@@ -956,7 +947,7 @@ func TestHandle_OffloadManagedBackend_EmptyEndpoint_FailsOpen(t *testing.T) {
 		t.Fatalf("expected Allowed (fail-open), got: %+v", resp.Result)
 	}
 	if len(resp.Patches) != 0 {
-		t.Fatalf("Offload managed backend with empty status.endpoint must fail-open (no patches), got %d: %+v",
+		t.Fatalf("Offload managed backend with empty status.remoteStorage.endpoint must fail open (no patches), got %d: %+v",
 			len(resp.Patches), resp.Patches)
 	}
 	// Fail-open never stamps injected-by; the inbound pod carried none, so a
@@ -1027,8 +1018,9 @@ func TestHandle_EventsOnly_NoSubscriber_StripsForgedInjectedBy(t *testing.T) {
 	h := newHandler(t, cb) // no subscriber image → nothing to wire
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Annotations = map[string]string{
-		AnnotationInjectedBy:    ns + "/routing-only",
-		AnnotationInjectedByUID: string(cb.UID),
+		AnnotationInjectedBy:         ns + "/routing-only",
+		AnnotationInjectedByUID:      string(cb.UID),
+		AnnotationInjectedGeneration: fmt.Sprint(cb.Generation),
 	}
 	req := newRequest(t, pod, ns)
 
@@ -1042,6 +1034,9 @@ func TestHandle_EventsOnly_NoSubscriber_StripsForgedInjectedBy(t *testing.T) {
 	}
 	if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
 		t.Fatalf("forged %s must be stripped on no-wiring fail-open; got %q", AnnotationInjectedByUID, got)
+	}
+	if got := mutated.Annotations[AnnotationInjectedGeneration]; got != "" {
+		t.Fatalf("forged %s must be stripped on no-wiring fail-open; got %q", AnnotationInjectedGeneration, got)
 	}
 }
 
@@ -1154,351 +1149,21 @@ func TestHandle_EventsOnly_EngineOverrides_DoNotTouchEngineContainer(t *testing.
 	}
 }
 
-func TestHandle_ExternalBackend_InjectsOperatorEndpoint(t *testing.T) {
-	// A pod that matches an externally owned CR's engine selector must come out
-	// of admission wired to the operator-supplied endpoint via the
-	// LMCache engine wire format — the controller doesn't render a
-	// Service for the cache, so the only source of truth for the
-	// address is spec.remoteStorage.endpoint (mirrored to status.endpoint by
-	// reconcileExternal).
-	const (
-		ns       = "engines"
-		endpoint = "external-cache.example:8200"
-	)
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:          cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: externalLMCacheStorage(endpoint),
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "vllm"},
-			},
-		},
-		Status: cachev1alpha1.CacheBackendStatus{Endpoint: endpoint},
-	}
-
-	s := newScheme(t)
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := newVLLMRegistry()
-	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
-
-	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
-	req := newRequest(t, pod, ns)
-
-	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("expected Allowed, got %+v", resp.Result)
-	}
-	mutated := applyPatches(t, req.Object.Raw, resp)
-
-	// LMCACHE_REMOTE_URL must be the operator-supplied endpoint with the
-	// lm:// scheme prepended, identical to what the managed adapter
-	// would write for the same endpoint.
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+endpoint)
-	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
-	// User --model arg survives the merge — the adapter only adds; it
-	// never clobbers user-set args.
-	if !containsArgPairLocal(mutated.Spec.Containers[0].Args, "--model", "Qwen/Qwen2.5-0.5B-Instruct") {
-		t.Fatalf("user --model arg was lost; args = %v", mutated.Spec.Containers[0].Args)
-	}
-	// The external-ownership path attaches no observation sidecar — the
-	// controller has no observability seam into an operator-managed cache.
-	if c := findContainer(mutated, enginebinding.SubscriberContainerName); c != nil {
-		t.Fatalf("External backend must NOT get a subscriber sidecar; found %+v", c)
-	}
-	if mutated.Annotations[AnnotationInjectedBy] != ns+"/ext" {
-		t.Fatalf("annotation %s = %q, want %q",
-			AnnotationInjectedBy, mutated.Annotations[AnnotationInjectedBy], ns+"/ext")
-	}
-}
-
-func TestHandle_ExternalBackend_InvalidSpecEndpoint_FailsOpen(t *testing.T) {
-	// An externally owned CR carrying a malformed spec.remoteStorage.endpoint
-	// must not be wired —
-	// injecting LMCACHE_REMOTE_URL=lm://https://... or lm://2001:db8::1
-	// would crash the engine at startup. effectiveEndpoint applies the
-	// same shape check the admission webhook uses and returns "" for
-	// invalid values, so the existing fail-open branch admits the pod
-	// un-wired and the operator sees the shape error in the response
-	// reason instead of an engine-pod crash log.
-	const ns = "engines"
-	for _, tc := range []struct {
-		name, endpoint string
-	}{
-		{"bad-scheme", "https://cache.example.com:443/api"},
-		{"portless-host", "cache.example.com"},
-		{"non-numeric-port", "cache.example.com:not-a-port"},
-		{"zero-port", "cache.example.com:0"},
-		{"out-of-range-port", "cache.example.com:70000"},
-		{"embedded-whitespace", "cache example:8200"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cb := &cachev1alpha1.CacheBackend{
-				ObjectMeta: metav1.ObjectMeta{Name: "ext-bad", Namespace: ns},
-				Spec: cachev1alpha1.CacheBackendSpec{
-					Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
-					Type:          cachev1alpha1.CacheBackendTypeLMCache,
-					RemoteStorage: externalLMCacheStorage(tc.endpoint),
-					Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-						Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-					},
-					EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-						MatchLabels: map[string]string{"app": "vllm"},
-					},
-				},
-			}
-			s := newScheme(t)
-			c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-			reg := newVLLMRegistry()
-			h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
-
-			pod := vllmEnginePod("engine", map[string]string{"app": "vllm"})
-			req := newRequest(t, pod, ns)
-			resp := h.Handle(context.Background(), req)
-			if !resp.Allowed {
-				t.Fatalf("expected Allowed (fail-open), got %+v", resp.Result)
-			}
-			// Zero patches — no injection happened.
-			if len(resp.Patches) != 0 {
-				t.Fatalf("expected no patches on invalid endpoint; got %d: %v", len(resp.Patches), resp.Patches)
-			}
-			// Response message must name the canonical spec field, not status.endpoint.
-			if msg := resp.Result.Message; !strings.Contains(msg, "spec.remoteStorage.endpoint") {
-				t.Fatalf("fail-open reason should mention spec.remoteStorage.endpoint for External; got %q", msg)
-			}
-		})
-	}
-}
-
-func TestEffectiveEndpointCanonicalExternalUsesProviderProtocol(t *testing.T) {
-	cache := &cachev1alpha1.CacheBackend{
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime: cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:    cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: &cachev1alpha1.CacheBackendRemoteStorageSpec{
-				Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderMooncake,
-				Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
-				Endpoint:  "mooncakestore://cache.example:50051",
-			},
-		},
-	}
-	if got := effectiveEndpoint(cache); got != cache.Spec.RemoteStorage.Endpoint {
-		t.Fatalf("effectiveEndpoint(Mooncake) = %q, want %q", got, cache.Spec.RemoteStorage.Endpoint)
-	}
-
-	cache.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
-	cache.Spec.RemoteStorage.Provider = cachev1alpha1.CacheBackendRemoteStorageProviderRedis
-	cache.Spec.RemoteStorage.Endpoint = "lm://redis.example:6379"
-	if got := effectiveEndpoint(cache); got != "" {
-		t.Fatalf("effectiveEndpoint(Redis with lm scheme) = %q, want empty fail-open endpoint", got)
-	}
-}
-
-func TestHandle_ExternalBackend_StatusEmpty_UsesSpecDirectly(t *testing.T) {
-	// Pod admission is CREATE-only — if an engine pod admits before the
-	// controller has mirrored spec.remoteStorage.endpoint into status.endpoint,
-	// the webhook would fail-open and leave the pod unwired *forever* (no
-	// re-admission on subsequent status updates). For externally owned CRs the
-	// webhook sources the endpoint from spec.remoteStorage.endpoint directly
-	// (NOT "falling back" — effectiveEndpoint ownership-scopes the source so
-	// external ownership never reads status.endpoint, preventing wiring against a
-	// stale mirror during an endpoint update). Without this, applying
-	// the externally owned CacheBackend and the engine Deployment in the same
-	// kubectl apply silently produces unwired engine pods.
-	const (
-		ns       = "engines"
-		endpoint = "external-cache.example:8200"
-	)
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:          cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: externalLMCacheStorage(endpoint),
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "vllm"},
-			},
-		},
-		// Deliberately no Status: simulates the race where pod admission
-		// fires before reconcileExternal has patched status.endpoint.
-	}
-
-	s := newScheme(t)
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := newVLLMRegistry()
-	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
-
-	pod := vllmEnginePod("engine-race", map[string]string{"app": "vllm"})
-	req := newRequest(t, pod, ns)
-
-	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("expected Allowed, got %+v", resp.Result)
-	}
-	mutated := applyPatches(t, req.Object.Raw, resp)
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+endpoint)
-}
-
-func TestHandle_ExternalBackend_PrefersSpecOverStaleStatus(t *testing.T) {
-	// When the operator updates spec.remoteStorage.endpoint for an externally
-	// owned CR but a new engine pod admits before the reconciler patches status,
-	// the
-	// pod must be wired to the NEW spec.remoteStorage.endpoint — not the stale
-	// status.endpoint. Pod admission is CREATE-only, so a pod wired to
-	// the old address on admission stays misrouted forever.
-	const (
-		ns          = "engines"
-		freshSpec   = "new-cache.example:8200"
-		staleStatus = "old-cache.example:8200"
-	)
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "ext", Namespace: ns},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:          cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: externalLMCacheStorage(freshSpec),
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "vllm"},
-			},
-		},
-		Status: cachev1alpha1.CacheBackendStatus{Endpoint: staleStatus},
-	}
-
-	s := newScheme(t)
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := newVLLMRegistry()
-	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
-
-	pod := vllmEnginePod("engine-stale", map[string]string{"app": "vllm"})
-	req := newRequest(t, pod, ns)
-
-	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("expected Allowed, got %+v", resp.Result)
-	}
-	mutated := applyPatches(t, req.Object.Raw, resp)
-	// Must use spec.remoteStorage.endpoint, NOT the stale status.endpoint.
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+freshSpec)
-	for _, e := range mutated.Spec.Containers[0].Env {
-		if e.Name == testEnvLMCacheRemoteURL && e.Value == "lm://"+staleStatus {
-			t.Fatalf("pod wired to stale status.endpoint %q; should be spec.remoteStorage.endpoint %q", staleStatus, freshSpec)
-		}
-	}
-}
-
-func TestHandle_ExternalBackend_UpperCaseSchemeNormalised(t *testing.T) {
-	// Admission lowercases the scheme during shape validation, so
-	// `LM://cache.example:8200` admits. The pod webhook must then
-	// normalise to lower-case `lm://` at injection — passing the
-	// operator-typed value through verbatim would produce
-	// `LMCACHE_REMOTE_URL=lm://LM://cache.example:8200`, a double-
-	// prefix the engine connector rejects.
-	const (
-		ns            = "engines"
-		operatorTyped = "LM://cache.example.com:8200"
-	)
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "ext-up", Namespace: ns},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
-			Type:          cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: externalLMCacheStorage(operatorTyped),
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "vllm"},
-			},
-		},
-	}
-
-	s := newScheme(t)
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
-	reg := newVLLMRegistry()
-	h := &EngineInjector{Reader: c, Registry: reg, Log: logr.Discard()}
-
-	pod := vllmEnginePod("engine-up", map[string]string{"app": "vllm"})
-	req := newRequest(t, pod, ns)
-
-	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("expected Allowed, got %+v", resp.Result)
-	}
-	mutated := applyPatches(t, req.Object.Raw, resp)
-	// Must be the canonical lower-case scheme, with the original
-	// host portion preserved verbatim.
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://cache.example.com:8200")
-}
-
-func TestHandle_WhitespaceStatusEndpointFailsOpen(t *testing.T) {
-	// A CR that predates the trim-in-reconciler change could carry a
-	// whitespace-only status.endpoint. The webhook MUST treat that as
-	// missing rather than injecting `LMCACHE_REMOTE_URL=lm://   ` which
-	// the engine connector would reject at runtime. The defensive trim
-	// applies to whichever field effectiveEndpoint reads for the CR's
-	// ownership — spec.remoteStorage.endpoint for external ownership (which
-	// never reads status), and status.endpoint for managed ownership.
-	const ns = "engines"
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "managed-ws", Namespace: ns},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "vllm"},
-			},
-		},
-		Status: cachev1alpha1.CacheBackendStatus{Endpoint: "   "},
-	}
-
-	h := newHandler(t, cb)
-	pod := vllmEnginePod("engine-ws", map[string]string{"app": "vllm"})
-	req := newRequest(t, pod, ns)
-
-	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("expected Allowed, got %+v", resp.Result)
-	}
-	mutated := applyPatches(t, req.Object.Raw, resp)
-	for _, e := range mutated.Spec.Containers[0].Env {
-		if e.Name == testEnvLMCacheRemoteURL {
-			t.Fatalf("whitespace status.endpoint must not become injected env; got %s=%q", e.Name, e.Value)
-		}
-	}
-}
-
 func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
 	// Counterpart to the external-ownership path: managed backends MUST wait
-	// for status.endpoint (the reconciler builds it from the rendered
+	// for status.remoteStorage.endpoint (the reconciler builds it from the rendered
 	// Service). spec.remoteStorage.endpoint is admission-rejected for managed
 	// ownership, so there's nothing else to fall back on — the webhook must
 	// fail-open without injecting until status catches up.
 	const ns = "engines"
-	cb := &cachev1alpha1.CacheBackend{
-		ObjectMeta: metav1.ObjectMeta{Name: "managed", Namespace: ns},
-		Spec: cachev1alpha1.CacheBackendSpec{
-			Type: cachev1alpha1.CacheBackendTypeLMCache,
-			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
-				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
-			},
-			EngineSelector: &cachev1alpha1.CacheBackendEngineSelector{
-				MatchLabels: map[string]string{"app": "vllm"},
-			},
-		},
-		// No Status.Endpoint published yet.
+	cb := readyCacheBackend("managed", ns, map[string]string{"app": "vllm"})
+	cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+		Provider:  cachev1alpha1.CacheBackendRemoteStorageProviderRedis,
+		Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipManaged,
+		Redis:     &cachev1alpha1.RedisRemoteStorageSpec{},
 	}
+	cb.Status.RemoteStorage = nil
+	// No status.remoteStorage.endpoint has been published yet.
 
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-managed", map[string]string{"app": "vllm"})
@@ -1508,29 +1173,12 @@ func TestHandle_ManagedBackend_StatusEmpty_FailsOpen(t *testing.T) {
 	if !resp.Allowed {
 		t.Fatalf("expected Allowed, got %+v", resp.Result)
 	}
-	// The pod must NOT have LMCACHE_REMOTE_URL because there's no
-	// endpoint to wire it to — the fallback is External-only.
+	// The pod must remain entirely unmodified because the managed endpoint has
+	// not been observed yet.
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	if len(mutated.Spec.Containers) == 0 {
-		t.Fatalf("pod has no containers after admission")
+	if findInitContainerByName(mutated.Spec.InitContainers, "lmcache-mp-server") != nil || containsArgFlag(mutated.Spec.Containers[0].Args, "--kv-transfer-config") {
+		t.Fatalf("managed CR with no status.remoteStorage.endpoint unexpectedly injected MP wiring: %+v", mutated.Spec)
 	}
-	for _, e := range mutated.Spec.Containers[0].Env {
-		if e.Name == testEnvLMCacheRemoteURL {
-			t.Fatalf("managed CR with no status.endpoint must NOT trigger injection; got %s=%q", e.Name, e.Value)
-		}
-	}
-}
-
-// containsArgPairLocal mirrors the helper in envtest_integration_test.go;
-// the two test files don't share state (envtest skips without
-// KUBEBUILDER_ASSETS) so each file has its own copy.
-func containsArgPairLocal(args []string, flag, value string) bool {
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == flag && args[i+1] == value {
-			return true
-		}
-	}
-	return false
 }
 
 func TestHandle_ExternalBackend_NoSidecar(t *testing.T) {
@@ -1541,6 +1189,9 @@ func TestHandle_ExternalBackend_NoSidecar(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime(testRuntimeReference)
+	cb.Spec.Type = cachev1alpha1.CacheBackendType("reference")
+	cb.Spec.LMCache = nil
+	cb.Spec.RemoteStorage = externalRedisStorage("redis.example:6379")
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	reg := adapterruntime.NewRegistry()
@@ -1580,7 +1231,7 @@ func TestHandle_SidecarOptInDefaultsToNoSidecar(t *testing.T) {
 	if c := findContainer(mutated, enginebinding.SubscriberContainerName); c != nil {
 		t.Fatalf("default install must NOT auto-attach the sidecar; got %+v", c)
 	}
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
 func TestHandle_SidecarSkippedWithoutModel(t *testing.T) {
@@ -1601,7 +1252,7 @@ func TestHandle_SidecarSkippedWithoutModel(t *testing.T) {
 	if c := findContainer(mutated, enginebinding.SubscriberContainerName); c != nil {
 		t.Fatalf("sidecar must be skipped without a model id; got %+v", c)
 	}
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
 func TestHandle_SidecarErrorIsFailOpen(t *testing.T) {
@@ -1612,6 +1263,9 @@ func TestHandle_SidecarErrorIsFailOpen(t *testing.T) {
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.Runtime = ""
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime("stub-fail")
+	cb.Spec.Type = cachev1alpha1.CacheBackendType("reference")
+	cb.Spec.LMCache = nil
+	cb.Spec.RemoteStorage = externalRedisStorage("redis.example:6379")
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	reg := adapterruntime.NewRegistry()
@@ -1703,6 +1357,15 @@ func findContainer(pod *corev1.Pod, name string) *corev1.Container {
 	return nil
 }
 
+func findInitContainerByName(containers []corev1.Container, name string) *corev1.Container {
+	for i := range containers {
+		if containers[i].Name == name {
+			return &containers[i]
+		}
+	}
+	return nil
+}
+
 func containerNames(pod *corev1.Pod) []string {
 	out := make([]string, len(pod.Spec.Containers))
 	for i, c := range pod.Spec.Containers {
@@ -1765,39 +1428,10 @@ func TestHandle_FullyInjected_NoOpPatch(t *testing.T) {
 	}
 }
 
-func TestHandle_PartialEnvOnly_StillConverges(t *testing.T) {
-	// Regression for the round-5 Codex finding: a pod that already carries
-	// LMCACHE_REMOTE_URL but is missing the rest of the contract (no
-	// VLLM_USE_V1, no --kv-transfer-config arg) MUST still get the
-	// remaining wiring filled in. A lenient env-presence short-circuit
-	// would leave the pod permanently misconfigured; the adapter is the
-	// source of truth and we always call it.
-	const ns = "engines"
-	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	h := newHandler(t, cb)
-	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
-	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
-		Name:  testEnvLMCacheRemoteURL,
-		Value: "lm://stale.example:65432",
-	})
-	req := newRequest(t, pod, ns)
-
-	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed || len(resp.Patches) == 0 {
-		t.Fatalf("partial-wired pod must still get the missing fields; Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
-	}
-	mutated := applyPatches(t, req.Object.Raw, resp)
-	// The stale URL is overwritten with the canonical one for the matched
-	// backend, and the missing pieces are added.
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
-	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
-	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
-}
-
 func TestHandle_EndpointNotPublished_FailOpen(t *testing.T) {
 	const ns = "engines"
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-	cb.Status.Endpoint = ""
+	cb.Status.RemoteStorage = nil
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	req := newRequest(t, pod, ns)
@@ -1849,61 +1483,22 @@ func TestHandle_EmptyEngineSelector_Skipped(t *testing.T) {
 	}
 }
 
-// TestHandle_OverlappingSelectors_FirstNameWins exercises the shared
-// attribution rule between the pod webhook and the CacheIndex poller:
-// when two CacheBackends in the same namespace have overlapping
-// EngineSelectors that both match the engine pod, BOTH surfaces must
-// pick the same backend — the one sorted first by metadata.name —
-// otherwise the engine is wired to one backend's endpoint while
-// status.indexParticipation reports the other as the owner.
-//
-// The matching poller-side assertion lives in
-// TestRefreshOverlappingSelectorsFirstNameWins
-// (internal/controller/cacheindex_controller_test.go).
-func TestHandle_OverlappingSelectors_FirstNameWins(t *testing.T) {
+func TestHandle_OverlappingSelectors_Rejected(t *testing.T) {
 	const ns = "engines"
-	// Create the backends in non-alphabetical order so a name-sort is
-	// observably different from raw List order.
 	cbZebra := readyCacheBackend("zebra", ns, map[string]string{"app": "vllm"})
-	cbAlpha := readyCacheBackend("alpha", ns, map[string]string{"app": "vllm"})
+	cbAlpha := readyCacheBackend("alpha", ns, map[string]string{"app": "vllm", "model": "qwen"})
 	h := newHandler(t, cbZebra, cbAlpha)
-	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
+	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm", "model": "qwen"})
 	req := newRequest(t, pod, ns)
 
 	resp := h.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("expected Allowed, got: %+v", resp.Result)
+	if resp.Allowed {
+		t.Fatalf("expected overlapping selectors to deny Pod admission, got Allowed with patches %+v", resp.Patches)
 	}
-	if len(resp.Patches) == 0 {
-		t.Fatal("expected injection patches when at least one backend matches")
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "multiple CacheBackends") ||
+		!strings.Contains(resp.Result.Message, "alpha, zebra") {
+		t.Fatalf("denial message = %+v, want deterministic conflicting backend names", resp.Result)
 	}
-	// The `inferencecache.io/injected-by` annotation records who claimed
-	// the pod. Sorted-by-name "alpha" must win over "zebra".
-	want := ns + "/alpha"
-	var got string
-	for _, p := range resp.Patches {
-		if p.Path == "/metadata/annotations" || p.Path == "/metadata/annotations/"+jsonPatchEscape(AnnotationInjectedBy) {
-			if anno, ok := p.Value.(map[string]any); ok {
-				if v, ok := anno[AnnotationInjectedBy].(string); ok {
-					got = v
-				}
-			} else if s, ok := p.Value.(string); ok {
-				got = s
-			}
-		}
-	}
-	if got != want {
-		t.Fatalf("injected-by annotation = %q, want %q (deterministic name-sort: alpha < zebra)", got, want)
-	}
-}
-
-// jsonPatchEscape is the JSON-Pointer escaping for "/" and "~" in JSON
-// Patch paths (RFC 6901). Used here only to match the annotation path
-// regardless of how the controller-runtime patch emitter renders it.
-func jsonPatchEscape(s string) string {
-	s = strings.ReplaceAll(s, "~", "~0")
-	s = strings.ReplaceAll(s, "/", "~1")
-	return s
 }
 
 func TestHandle_ListError_FailOpen(t *testing.T) {
@@ -2017,6 +1612,9 @@ func TestHandle_RegistryOverride_UsedInsteadOfDefault(t *testing.T) {
 	cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
 	cb.Spec.Runtime = ""
 	cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntime(testRuntimeReference)
+	cb.Spec.Type = cachev1alpha1.CacheBackendType("reference")
+	cb.Spec.LMCache = nil
+	cb.Spec.RemoteStorage = externalRedisStorage("redis.example:6379")
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cb).Build()
 	reg := adapterruntime.NewRegistry()
@@ -2030,7 +1628,7 @@ func TestHandle_RegistryOverride_UsedInsteadOfDefault(t *testing.T) {
 		t.Fatalf("expected Allowed with patches; got Allowed=%v patches=%d", resp.Allowed, len(resp.Patches))
 	}
 	mutated := applyPatches(t, req.Object.Raw, resp)
-	mustHaveEnv(t, mutated, testReferenceCacheEndpoint, cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, testReferenceCacheEndpoint, cb.Spec.RemoteStorage.Endpoint)
 }
 
 func TestHandle_PodNamespaceDefaultedFromRequest(t *testing.T) {
@@ -2120,9 +1718,10 @@ func TestHandle_SkipAnnotationStampsSkippedReasonAndClearsInjectedBy(t *testing.
 	h := newHandler(t, cb)
 	pod := vllmEnginePod("engine-a", map[string]string{"app": "vllm"})
 	pod.Annotations = map[string]string{
-		AnnotationSkip:          "true",
-		AnnotationInjectedBy:    ns + "/" + cb.Name,
-		AnnotationInjectedByUID: string(cb.UID),
+		AnnotationSkip:               "true",
+		AnnotationInjectedBy:         ns + "/" + cb.Name,
+		AnnotationInjectedByUID:      string(cb.UID),
+		AnnotationInjectedGeneration: fmt.Sprint(cb.Generation),
 	}
 	req := newRequest(t, pod, ns)
 
@@ -2139,6 +1738,9 @@ func TestHandle_SkipAnnotationStampsSkippedReasonAndClearsInjectedBy(t *testing.
 	}
 	if got := mutated.Annotations[AnnotationInjectedByUID]; got != "" {
 		t.Fatalf("annotation %s = %q, want cleared on skip path", AnnotationInjectedByUID, got)
+	}
+	if got := mutated.Annotations[AnnotationInjectedGeneration]; got != "" {
+		t.Fatalf("annotation %s = %q, want cleared on skip path", AnnotationInjectedGeneration, got)
 	}
 }
 
@@ -2170,6 +1772,18 @@ func mustHaveArgPair(t *testing.T, pod *corev1.Pod, flag, value string) {
 	t.Fatalf("arg pair %s %s missing; args = %v", flag, value, args)
 }
 
+func testArgValue(args []string, flag string) string {
+	for index, arg := range args {
+		if arg == flag && index+1 < len(args) {
+			return args[index+1]
+		}
+		if strings.HasPrefix(arg, flag+"=") {
+			return strings.TrimPrefix(arg, flag+"=")
+		}
+	}
+	return ""
+}
+
 func mustHaveArgFlag(t *testing.T, pod *corev1.Pod, flag string) {
 	t.Helper()
 	for _, a := range pod.Spec.Containers[0].Args {
@@ -2192,9 +1806,7 @@ func TestHandle_EngineOverrides_EnvUpsertAndArgAppend(t *testing.T) {
 		Args: []string{"--max-model-len", "8192"},
 		Env: []corev1.EnvVar{
 			{Name: "FOO", Value: "bar"},
-			// Override a tunable canonical env value, which is allowed
-			// because LMCACHE_CHUNK_SIZE is NOT reserved.
-			{Name: testEnvLMCacheChunkSize, Value: "512"},
+			{Name: "EXTRA_TUNABLE", Value: "512"},
 		},
 	}
 	h := newHandler(t, cb)
@@ -2209,12 +1821,9 @@ func TestHandle_EngineOverrides_EnvUpsertAndArgAppend(t *testing.T) {
 
 	// New env appended.
 	mustHaveEnv(t, mutated, "FOO", "bar")
-	// Override wins for the tunable name (LMCACHE_CHUNK_SIZE is an
-	// adapter-owned canonical entry — the override surface can touch it).
-	mustHaveEnv(t, mutated, testEnvLMCacheChunkSize, "512")
-	// Canonical reserved env still landed unchanged.
-	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	mustHaveEnv(t, mutated, "EXTRA_TUNABLE", "512")
+	// Canonical typed-MP env still lands unchanged.
+	mustHaveEnv(t, mutated, testEnvPythonHashSeed, "0")
 	// User-template env preserved.
 	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
 
@@ -2259,7 +1868,7 @@ func TestHandle_EngineOverrides_DoNotMutateUserTemplate(t *testing.T) {
 	// User-owned env untouched by the CR-driven override + suppress.
 	mustHaveEnv(t, mutated, "USER_FLAG", "preserved")
 	// Canonical injection still landed.
-	mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
+	mustHaveEnv(t, mutated, testEnvPythonHashSeed, "0")
 	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
@@ -2297,8 +1906,7 @@ func TestHandle_EngineOverrides_NoOverride_ByteIdenticalToBaseline(t *testing.T)
 		mutated := applyPatches(t, req.Object.Raw, resp)
 		// Sanity: canonical injection lands as expected — so a green test
 		// is meaningful (not green by producing an empty patch set).
-		mustHaveEnv(t, mutated, testEnvVLLMUseV1, "1")
-		mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+		mustHaveEnv(t, mutated, testEnvPythonHashSeed, "0")
 		mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 
 		raw, err := json.Marshal(mutated)
@@ -2338,7 +1946,7 @@ func TestHandle_FailOpenClearsForgedInjectedByAnnotation(t *testing.T) {
 			var h *EngineInjector
 			if tc.seedCB {
 				cb := readyCacheBackend("primary", ns, map[string]string{"app": "vllm"})
-				cb.Status.Endpoint = "" // force the endpoint-not-published fail-open path
+				cb.Status.RemoteStorage = nil // exercise fail-open while optional Redis is unavailable
 				h = newHandler(t, cb)
 			} else {
 				h = newHandler(t)
@@ -2422,8 +2030,8 @@ func TestHandle_KernelCheckInitContainer_AppendedOnGPUPod(t *testing.T) {
 		t.Fatalf("kernel-check init container %q missing from Spec.InitContainers; got: %v",
 			enginebinding.LMCacheKernelCheckContainerName, initContainerNames(mutated))
 	}
-	// Engine-side injection must still have landed.
-	mustHaveEnv(t, mutated, testEnvLMCacheRemoteURL, "lm://"+cb.Status.Endpoint)
+	// Engine-side typed MP injection must still have landed.
+	mustHaveArgFlag(t, mutated, "--kv-transfer-config")
 }
 
 // TestHandle_KernelCheckInitContainer_Idempotent verifies that a second
@@ -2721,7 +2329,7 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 		Spec: cachev1alpha1.CacheBackendSpec{
 			Runtime:       cachev1alpha1.CacheBackendRuntimeVLLM,
 			Type:          cachev1alpha1.CacheBackendTypeLMCache,
-			RemoteStorage: externalLMCacheStorage(endpoint),
+			RemoteStorage: externalRedisStorage(endpoint),
 			Integration: &cachev1alpha1.CacheBackendIntegrationSpec{
 				Mode: cachev1alpha1.CacheBackendIntegrationModeEventsOnly,
 				Role: cachev1alpha1.CacheBackendIntegrationRoleReadWrite,
@@ -2731,7 +2339,6 @@ func TestHandle_EventsOnlyExternal_NoConnectorWiring(t *testing.T) {
 			},
 			Observation: &cachev1alpha1.CacheBackendObservationSpec{ModelID: "Qwen/Qwen2.5-0.5B-Instruct"},
 		},
-		Status: cachev1alpha1.CacheBackendStatus{Endpoint: endpoint},
 	}
 
 	s := newScheme(t)

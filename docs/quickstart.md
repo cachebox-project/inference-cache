@@ -20,50 +20,73 @@ spec:
   type: LMCache                # engine-local cache integration
   engineSelector:
     matchLabels:
-      app: my-engine            # must match your engine pods' labels
+      inferencecache.io/cache-domain: my-engine-cache
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
   observation:
     modelID: Qwen/Qwen2.5-0.5B-Instruct
-  remoteStorage:
-    provider: LMCacheServer
-    ownership: Managed
-    lmCacheServer: {}
 ```
 
-That is the whole CacheBackend. The runtime/cache pair, matching labels, model
-identity, and remote provider are explicit; `spec.replicas` defaults to `1`,
-the readiness gate's `firstEventTimeout` defaults to `5m`, and
-`integration.failOpen` defaults to `true`.
+That is the whole CacheBackend. The runtime/cache pair, ownership domain, model
+identity, and MP server contract are explicit; `integration.role` defaults to
+`ReadWrite`, the readiness gate's `firstEventTimeout` defaults to `5m`, and
+`integration.failOpen` defaults to `true`. Omitting `remoteStorage` selects
+host-only MP: L1 is per engine Pod and there is no cross-Pod sharing. Add an
+explicit Redis L3 when sharing is required.
 
-For a managed LMCache provider, the server image resolves from
-`spec.remoteStorage.lmCacheServer.image` first and the controller's
-`--lmcache-server-image` flag second. The shipped Kustomize install sets that
-flag to the documented `lmcache/standalone:v0.4.7` baseline; operators should
-replace it with a digest compatible with the lmcache client in their engine
-image.
+To share one MP L1 across several engine Pods on each GPU node, use the
+focused NodeLocal samples for
+[vLLM](../config/samples/cachebackend-vllm-nodelocal-host-only.yaml) or
+[SGLang](../config/samples/cachebackend-sglang-nodelocal-host-only.yaml).
+NodeLocal is an advanced host-bound topology. The inference system schedules
+each engine without CacheBackend changing its placement; the controller then
+creates one shared server Pod on every node that actually has an active
+selected engine. The server and engine mount only the backend's
+`/dev/shm/inference-cache/<uid>` host directory as `/dev/shm` and declare MP
+and HTTP host ports. Engines are held in an init gate until their own node's
+server reports
+the exact CacheBackend name/UID/generation and healthy config. Co-schedule only
+mutually trusted engines and enforce host-port access with node firewalls;
+hostNetwork bypasses Kubernetes NetworkPolicy. L1 capacity is per node, and
+`maxGPUWorkers` must cover the maximum engine instances on that node. The
+focused samples retain an idle per-node server and its L1 for 300 seconds so an
+engine restart can reuse them; set `idleRetentionSeconds: 0` for immediate
+cleanup.
 
-> **One label does the binding.** The value under
-> `engineSelector.matchLabels` must also appear on your engine pods'
-> template labels. That label match is what lets the mutating Pod webhook
+> **One label does the binding.** Every non-empty selector contains only
+> `inferencecache.io/cache-domain`; its namespace-scoped value must also appear
+> on your engine pods' template labels. Other Pod labels do not participate in
+> CacheBackend ownership. That domain match lets the mutating Pod webhook
 > inject the cache wiring at pod CREATE. Drift them apart and the engine runs
 > uncached — `kubectl get cachebackend` then shows `MATCHED: 0`.
 
-The CacheBackend on its own provisions the managed cache server. To get a
-**working end-to-end setup** you also need engine pods carrying that label and
-publishing KV events. Rather than hand-assemble that here, copy a runnable
-recipe — the fastest is the CPU dev path, which needs no GPU:
+The CacheBackend injects the MP server into matching engine Pods; it does not
+own or replace their image. To get a **working end-to-end setup** you need an
+engine image containing a compatible LMCache client plus Pods carrying that
+label and publishing KV events. A paired shape is available at:
 
 ```bash
-kubectl apply -f config/samples/recipe-cpu-dev.yaml
+kubectl apply -f config/samples/cachebackend-with-engine.yaml
 ```
 
-That single file ships the CacheBackend above plus a matching tiny-model vLLM
-engine Deployment, with the engine wired to the cache (KV offload/reuse) and the
-backend producing `LookupRoute` hints. Acting on those hints to actually route
-requests is the gateway's job, which integrates separately — so this recipe is
-the cache half, not a full gateway round-trip. (On a cold cluster the first
-engine pod can race ahead of the cache server's endpoint being published; if so,
-wait for the endpoint and `kubectl rollout restart` the engine — see the comment
-at the top of the recipe.)
+That file ships the typed host-only CacheBackend plus a matching vLLM
+Deployment. Repository admission validation does not prove the supplied engine
+image contains the connector; normal engine startup is the authoritative check.
+Acting on `LookupRoute` hints remains the gateway's responsibility.
 
 > **One install-time prerequisite for observability.** The piece that publishes
 > KV events — the `kvevent-subscriber` sidecar — is only auto-attached when the
@@ -105,18 +128,18 @@ Once the backend is Ready and engine pods are bound, three things are live:
   lower time-to-first-token, less recompute. (inference-cache provides the
   hint; the gateway owns the routing decision.)
 - **KV reuse.** Matched engine pods get the LMCache wiring injected
-  automatically, so their KV cache is offloaded to and reused from the managed
-  cache backend instead of being recomputed per request.
+  automatically, so their KV cache is offloaded to the per-Pod MP server and
+  reused instead of being recomputed per request.
 - **Observability.** `kubectl get cachebackend` surfaces the live state:
 
   ```
   $ kubectl get cachebackend
-  NAME            TYPE      READY   MATCHED   ENDPOINT              PREFIXES   LASTEVENT   AGE
-  my-cache        LMCache   True    1         my-cache.default...   128        12s         3m
+  NAME            TYPE      READY   MATCHED   ENDPOINT   PREFIXES   LASTEVENT   AGE
+  my-cache        LMCache   True    1         <none>     128        12s         3m
   ```
 
-  `READY` flips to `True` only after the managed-readiness baseline
-  (pods Up, Service endpoints) **and** the KV-event gate (a real
+  `READY` flips to `True` only after the MP connector/server coverage baseline
+  **and** the KV-event gate (a real
   event observed, not merely the pod being reachable). When functional
   probing is enabled and not bypassed, a per-stage *failed* probe
   outcome additionally downgrades `Ready=False`. On a `/probe`
@@ -140,7 +163,9 @@ Once the backend is Ready and engine pods are bound, three things are live:
   annotation. Any active gate that reports a per-stage failure can
   hold the backend at `Ready=False` with a stage-specific reason on
   `.status.conditions[]` — see [Troubleshooting](#troubleshooting).
-  `MATCHED` is the engine-pod count the selector binds, and
+  `ENDPOINT` is empty for host-only PodLocal or NodeLocal MP and contains only a
+  configured remote L3 endpoint, never a local MP connector address. `MATCHED` is the
+  engine-pod count the selector binds, and
   `PREFIXES` / `LASTEVENT` show the cache actually receiving state.
 
 ## Next steps
@@ -251,7 +276,6 @@ install:
 - **The CR uses `spec.remoteStorage.ownership: External`.** Externally owned backends are wholly
   exempt from the probe gate — the controller never drives a
   round-trip against a cache it does not manage.
-- **The CR is on an Unmanaged path** (unsupported runtime, deferred
-  `deploymentKind: StatefulSet`, or other reconcile branch that sheds
-  the managed workload). The probe gate is exempt from these paths
+- **The CR is on an Unmanaged path** (for example, an unsupported runtime or
+  provider binding that bypassed admission). The probe gate is exempt from these paths
   and any prior `FunctionalProbeOK` condition is removed on transition.

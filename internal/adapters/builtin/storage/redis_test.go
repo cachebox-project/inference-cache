@@ -6,6 +6,7 @@ package storage
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -141,8 +142,7 @@ func TestResolveRedisL2Server(t *testing.T) {
 func TestResolveRedisL2ServerResourceContract(t *testing.T) {
 	// The renderer's resource contract, asserted on the surface its consumer uses
 	// (the rendered container) rather than only on the shared helper: spec.remoteStorage.redis.resources
-	// is the operator-owned baseline and passes through; autoscaling adds the
-	// CPU-request fallback the HPA needs as a utilization denominator; and the
+	// is the operator-owned baseline and passes through; the
 	// rendered resources must not ALIAS the CR — a caller mutating the pod it got
 	// back would otherwise be writing into the CacheBackend's spec.
 	t.Run("spec.remoteStorage.redis.resources passes through", func(t *testing.T) {
@@ -157,19 +157,6 @@ func TestResolveRedisL2ServerResourceContract(t *testing.T) {
 		}
 		if q := got.Requests[corev1.ResourceMemory]; q.String() != "1Gi" {
 			t.Errorf("requests.memory = %q, want the operator's 1Gi", q.String())
-		}
-	})
-
-	t.Run("autoscaling adds the CPU-request fallback", func(t *testing.T) {
-		cb := withMemory(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"), "3Gi", "1Gi")
-		cb.Spec.Autoscaling = &cachev1alpha1.CacheBackendAutoscalingSpec{MaxReplicas: 3}
-		pod, _, err := ResolveRedisL2Server(cb)
-		if err != nil {
-			t.Fatalf("ResolveRedisL2Server: %v", err)
-		}
-		cpu := pod.Containers[0].Resources.Requests[corev1.ResourceCPU]
-		if cpu.IsZero() {
-			t.Fatalf("requests.cpu is zero/absent under autoscaling — a targetCPUUtilization HPA would divide by zero: %+v", pod.Containers[0].Resources)
 		}
 	})
 
@@ -196,6 +183,68 @@ func TestResolveRedisL2ServerImageOverride(t *testing.T) {
 	}
 	if got := pod.Containers[0].Image; got != "registry.example/redis@sha256:deadbeef" {
 		t.Errorf("image = %q, want the typed Redis override", got)
+	}
+}
+
+func TestResolveRedisL2ServerPasswordAuthentication(t *testing.T) {
+	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang")
+	cb.Spec.RemoteStorage.Redis.Image = "registry.example/redis-compatible@sha256:deadbeef"
+	cb.Spec.RemoteStorage.Redis.Authentication = &cachev1alpha1.RedisAuthenticationSpec{
+		Password: corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "credential-source"},
+			Key:                  "password",
+		},
+	}
+	pod, _, err := ResolveRedisL2Server(cb)
+	if err != nil {
+		t.Fatalf("ResolveRedisL2Server: %v", err)
+	}
+	c := pod.Containers[0]
+	if c.Image != "registry.example/redis-compatible@sha256:deadbeef" {
+		t.Fatalf("authenticated Redis image = %q, want custom compatible image", c.Image)
+	}
+	if len(c.Command) != 0 {
+		t.Fatalf("authenticated Redis command = %v, want the custom image entrypoint preserved", c.Command)
+	}
+	if password, found := argVal(c.Args, "--requirepass"); !found || password != "$(REDIS_PASSWORD)" {
+		t.Fatalf("authenticated Redis --requirepass = %q (found=%v), want kubelet-expanded environment reference", password, found)
+	}
+	joined := strings.Join(c.Args, " ")
+	if strings.Contains(joined, "docker-entrypoint.sh") || strings.Contains(joined, "/bin/sh") {
+		t.Fatalf("authenticated Redis args depend on an image-private shell or entrypoint: %s", joined)
+	}
+	if strings.Contains(joined, "credential-source") {
+		t.Fatalf("secret name leaked into args: %s", joined)
+	}
+	for _, name := range []string{redisPasswordEnv, redisCLIAuthEnv} {
+		found := false
+		for i := range c.Env {
+			if c.Env[i].Name != name {
+				continue
+			}
+			found = true
+			ref := c.Env[i].ValueFrom
+			if ref == nil || ref.SecretKeyRef == nil || ref.SecretKeyRef.Name != "credential-source" || ref.SecretKeyRef.Key != "password" {
+				t.Fatalf("%s = %+v", name, c.Env[i])
+			}
+		}
+		if !found {
+			t.Fatalf("%s missing", name)
+		}
+	}
+	if c.ReadinessProbe == nil || c.ReadinessProbe.Exec == nil || !strings.Contains(strings.Join(c.ReadinessProbe.Exec.Command, " "), "redis-cli ping") {
+		t.Fatalf("authenticated readiness probe = %+v", c.ReadinessProbe)
+	}
+}
+
+func TestResolveRedisL2ServerRejectsManagedACLUsername(t *testing.T) {
+	cb := newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang")
+	cb.Spec.RemoteStorage.Redis.Authentication = &cachev1alpha1.RedisAuthenticationSpec{
+		Username: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"}, Key: "username"},
+		Password: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "redis-auth"}, Key: "password"},
+	}
+	if _, _, err := ResolveRedisL2Server(cb); err == nil || !strings.Contains(err.Error(), "default user only") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -289,8 +338,7 @@ func TestResolveRedisL2ServerNilCache(t *testing.T) {
 
 // TestResolveRedisL2ServerStaysClusterIP bounds the blast radius: the managed L2
 // stays a plain in-cluster virtual IP — no hostNetwork, no NodePort — so it fits
-// the engines-anywhere model (the whole reason Redis is the default L2, not the
-// Mooncake mesh).
+// the engines-anywhere model.
 func TestResolveRedisL2ServerStaysClusterIP(t *testing.T) {
 	pod, svc, err := ResolveRedisL2Server(newCacheBackend(cachev1alpha1.CacheBackendTypeLMCache, "sglang"))
 	if err != nil {

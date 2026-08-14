@@ -152,7 +152,7 @@ const (
 	// CodeBackendStale: status.indexParticipation.lastEventAt is older than the
 	// staleness window — KV events have stopped flowing.
 	CodeBackendStale = "CB004"
-	// CodeBackendEndpointUnreachable: status.endpoint is empty or not reachable
+	// CodeBackendEndpointUnreachable: the remote-storage endpoint is empty or not reachable
 	// over TCP.
 	CodeBackendEndpointUnreachable = "CB005"
 	// CodeBackendHealthy: the CacheBackend passed every per-backend check.
@@ -173,6 +173,11 @@ const (
 	// the validated inferencecache.io/injected-by annotation (authoritative,
 	// names the backend) or an InjectedByCacheBackend Event for its UID.
 	CodeEnginePodInjected = "EP002"
+	// CodeEngineSelectorAmbiguous: a pod is selected by more than one
+	// same-namespace CacheBackend. Admission rejects this configuration for new
+	// objects; seeing it indicates admission-bypassed or concurrently-created state
+	// that has no safe implicit owner.
+	CodeEngineSelectorAmbiguous = "EP003"
 
 	// CodeOrphanPod: a pod has a NoMatchingCacheBackend Event — it expected
 	// injection but matched no CacheBackend (likely operator misconfiguration).

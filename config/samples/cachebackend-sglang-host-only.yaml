@@ -2,10 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# SGLang with LMCache's node-local host-memory tier and no remote provider.
-# Omitting spec.remoteStorage is intentional: the controller creates no
-# Deployment or Service, and the runtime adapter injects an LMCache MP worker
-# without an --l2-adapter.
+# Typed SGLang PodLocal LMCache MP with no remote L3. L1 capacity is per engine
+# Pod; omitting spec.remoteStorage intentionally provides no cross-Pod sharing.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:
@@ -13,14 +11,26 @@ metadata:
 spec:
   runtime: SGLang
   type: LMCache
-  lmCache:
-    chunkSizeTokens: 256
-    hostMemory:
-      capacity: 32Gi
-  observation:
-    modelID: meta-llama/Meta-Llama-3-8B-Instruct
   integration:
     role: ReadWrite
   engineSelector:
     matchLabels:
-      app.kubernetes.io/name: sglang
+      inferencecache.io/cache-domain: sglang-host-only
+  lmCache:
+    topology: PodLocal
+    chunkSizeTokens: 256
+    podLocal:
+      server:
+        image: docker.io/lmcache/standalone@sha256:b813bf0bb616d1012b6a6edcbd4a44f1576dbbdaa857962e56d48b9f7c127d13
+        port: 5555
+        l1Capacity: 4Gi
+        maxWorkers: 4
+        resources:
+          requests:
+            cpu: "1"
+            memory: 5Gi
+          limits:
+            cpu: "2"
+            memory: 6Gi
+  observation:
+    modelID: meta-llama/Meta-Llama-3-8B-Instruct

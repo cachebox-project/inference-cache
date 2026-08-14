@@ -11,7 +11,8 @@
 //     and rejects configurations that can't be reconciled at all (External
 //     backend without an Endpoint, a cross-namespace Endpoint that wasn't
 //     explicitly opted into, an unsupported runtime/backend pair, reserved
-//     engineOverrides).
+//     engineOverrides, or an engine selector overlapping another backend in
+//     the namespace).
 //   - CachePolicy enforces at most one policy per namespace (the reconciler
 //     flattens to one ResolvedPolicy per namespace, so a second CR silently
 //     loses) and a strictly positive evictionTTL when set.

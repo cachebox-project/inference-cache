@@ -140,9 +140,8 @@ const (
 	// no port, embedded whitespace, unbracketed IPv6, …). Current admission
 	// rejects all of these; this defensive reason covers objects that bypassed
 	// admission. Status reflects the gap loudly rather than advertising the
-	// malformed value as Ready=True (which would let the pod webhook then inject
-	// an LMCACHE_REMOTE_URL the engine connector refuses at startup — turning a
-	// cache misconfiguration into a serving outage).
+	// malformed value as Ready=True (which would let the pod webhook inject a
+	// remote adapter target the engine rejects at startup).
 	conditionReasonExternalEndpointInvalid = "ExternalEndpointInvalid"
 )
 
@@ -158,9 +157,30 @@ const (
 func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backend *cachev1alpha1.CacheBackend, endpoint string, dep *appsv1.Deployment, applyOK bool) (time.Duration, error) {
 	now := time.Now()
 	readyStatus, reason, message := managedReadiness(backend, dep)
+	remoteStatus, remoteReason, remoteMessage := readyStatus, reason, message
+	if reason == conditionReasonRolloutInProgress {
+		remoteStatus = metav1.ConditionUnknown
+		remoteReason = reasonRemoteStoragePending
+		remoteMessage = "managed remote-storage rollout is still converging"
+	} else if endpoint == "" {
+		remoteStatus = metav1.ConditionFalse
+		remoteReason = reasonRemoteStorageUnavailable
+		remoteMessage = "managed remote storage has no live Service endpoint"
+	} else if readyStatus == metav1.ConditionTrue {
+		remoteReason = reasonRemoteStorageReady
+		remoteMessage = "managed remote storage workload is Available and its Service endpoint is published"
+	} else {
+		remoteReason = reasonRemoteStorageUnavailable
+	}
+	if isTypedLMCacheMP(backend) {
+		readyStatus, reason, message = lmCacheMPReadyBase(backend, remoteStatus, remoteReason, remoteMessage)
+	}
 	// Resolve the stable timeout anchor: the latched FirstAvailableAt, or — the
-	// first time the workload is Available — now. Using a latched value (not the
-	// live Deployment Available condition, which resets on a flap) keeps the
+	// first time the effective backend is Ready — now. For typed PodLocal MP,
+	// effective readiness is connector health (plus L3 only in fail-closed
+	// mode), not the optional managed Redis Deployment by itself. Using a
+	// latched value (not the live Deployment Available condition, which resets
+	// on a flap) keeps the
 	// firstEventTimeout window monotonic so Degraded stays sticky.
 	anchor := time.Time{}
 	if backend.Status.FirstAvailableAt != nil {
@@ -207,7 +227,7 @@ func (r *CacheBackendReconciler) updateManagedStatus(ctx context.Context, backen
 	engineCompatMsg, engineCompatObserved := r.detectEngineConnectorCrashLoop(ctx, backend)
 	prevEngineIncompatible := meta.IsStatusConditionFalse(backend.Status.Conditions, conditionTypeEngineCompatibility)
 	err := r.patchStatus(ctx, backend, func() {
-		backend.Status.Endpoint = endpoint
+		setRemoteStorageStatus(backend, endpoint, remoteStatus, remoteReason, remoteMessage, publishedGen)
 		backend.Status.ObservedGeneration = publishedGen
 		// Latch the first KV-event observation write-once. The poller can later
 		// clear indexParticipation.lastEventAt on a drain, so this durable
@@ -586,13 +606,6 @@ const (
 // to have observed its current generation and to have enough updated +
 // available replicas, so a stale rollout (e.g. mid image change) is never
 // reported Ready.
-//
-// When the CacheBackend is autoscaled the HPA owns the desired replica count,
-// so the comparison target is the live Deployment's spec.replicas (which the
-// HPA writes) rather than the CacheBackend's spec.replicas (which is ignored
-// in that mode). This keeps Ready accurate when an HPA decides to run more
-// pods than spec.replicas, and avoids a false ScaledToZero when spec.replicas
-// happens to be 0 with autoscaling configured.
 func managedReadiness(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) (metav1.ConditionStatus, string, string) {
 	want := desiredReplicas(backend, dep)
 
@@ -637,37 +650,12 @@ func progressingFromReady(readyStatus metav1.ConditionStatus, reason, message st
 	}
 }
 
-// desiredReplicas is the per-reconcile source of truth for "how many replicas
-// should this backend be running". With autoscaling enabled the HPA writes
-// spec.replicas on the Deployment, so the live value is authoritative; without
-// it, the user's spec.replicas (default 1) wins.
-//
-// It applies the same singleton clamp the render path does (clampSingletonReplicas):
-// readiness must expect the count actually DEPLOYED, not the CR's grandfathered
-// spec.replicas. Without this, a singleton backend (SGLang Redis L2, or a
-// host-network Mooncake master) whose spec.replicas was set to 3 before admission
-// rejected it deploys one pod but expects three, and reports RolloutInProgress
-// forever. spec.replicas 0 (disabled) is preserved.
-func desiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
-	want := unclampedDesiredReplicas(backend, dep)
-	if want > 1 && cacheServerIsSingleton(backend, &dep.Spec.Template.Spec) {
-		return 1
-	}
-	return want
-}
-
-func unclampedDesiredReplicas(backend *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
-	if backend.Spec.Autoscaling != nil {
-		// First reconcile after an HPA spec is added may briefly see
-		// dep.Spec.Replicas still set by the controller; the HPA will overwrite
-		// it within one cycle. Until then, fall back to the controller value.
-		if dep.Spec.Replicas != nil {
-			return *dep.Spec.Replicas
-		}
-		// Fall through to the floor.
-	}
-	if backend.Spec.Replicas != nil {
-		return *backend.Spec.Replicas
+// desiredReplicas reads the live managed Redis Deployment. The controller
+// renders one replica, and the live value keeps readiness aligned with the
+// workload actually observed.
+func desiredReplicas(_ *cachev1alpha1.CacheBackend, dep *appsv1.Deployment) int32 {
+	if dep.Spec.Replicas != nil {
+		return *dep.Spec.Replicas
 	}
 	return 1
 }
@@ -710,18 +698,15 @@ type matchedEnginePodsRefresh struct {
 // reconciler and with any future status writers (e.g. an index-participation
 // projector) that touch different sub-fields.
 //
-// Cadence-by-reconcile, not real-time: counts via a single namespaced
-// client.List with the engineSelector — there is no Pod watch, and pod
-// births/deaths between reconciles are not reflected until the next pass.
-// To keep the count from going indefinitely stale between unrelated
-// reconcile triggers, the Reconcile path sets `result.RequeueAfter =
-// matchedEnginePodsRequeueInterval` whenever the CR has a non-empty
-// EngineSelector, giving the field a bounded staleness without paying
-// for a Pod informer. The real-time per-pod signal lives on the engine
-// pods themselves (the `InjectedByCacheBackend` Event the
-// engine-pod-events controller emits on every annotated pod); this
-// status field answers the cluster-wide "is anyone connected at all?"
-// question.
+// Pod changes mapped to this CacheBackend normally trigger the refresh
+// immediately. The count itself comes from one namespaced APIReader List with
+// the engineSelector so reconciliation uses an authoritative snapshot rather
+// than a potentially lagging informer cache. The periodic
+// matchedEnginePodsRequeueInterval remains a bounded-staleness fallback for a
+// missed or coalesced watch event. The real-time per-pod signal also lives on
+// the engine pods themselves (the `InjectedByCacheBackend` Event the
+// engine-pod-events controller emits on every annotated pod); this status field
+// answers the cluster-wide "is anyone connected at all?" question.
 //
 // Selector resolution mirrors the mutating webhook's policy: a nil or
 // empty MatchLabels matches nothing (a broad selector at admission time
@@ -906,6 +891,15 @@ type stateSnapshot struct {
 	// rather than re-firing every time a rollout takes an already-event-seen
 	// backend through RolloutInProgress and back to KVEventsObserved.
 	firstEventLatched bool
+	connector         conditionSnapshot
+	remoteStorage     conditionSnapshot
+}
+
+type conditionSnapshot struct {
+	present            bool
+	status             metav1.ConditionStatus
+	reason             string
+	observedGeneration int64
 }
 
 // snapshotState captures the prior status values that drive transition events.
@@ -918,6 +912,21 @@ func snapshotState(cb *cachev1alpha1.CacheBackend) stateSnapshot {
 		failOpen:          statusFailOpen(cb.Status.FailOpen),
 		readyReason:       readyConditionReason(cb),
 		firstEventLatched: cb.Status.FirstKVEventObservedAt != nil,
+		connector:         snapshotCondition(cb, conditionTypeConnectorReady),
+		remoteStorage:     snapshotCondition(cb, conditionTypeRemoteStorageReady),
+	}
+}
+
+func snapshotCondition(cb *cachev1alpha1.CacheBackend, conditionType string) conditionSnapshot {
+	condition := meta.FindStatusCondition(cb.Status.Conditions, conditionType)
+	if condition == nil {
+		return conditionSnapshot{}
+	}
+	return conditionSnapshot{
+		present:            true,
+		status:             condition.Status,
+		reason:             condition.Reason,
+		observedGeneration: condition.ObservedGeneration,
 	}
 }
 
@@ -979,6 +988,8 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 		return
 	}
 	after := snapshotState(cb)
+	r.emitMPConditionTransition(cb, before.connector, after.connector, conditionTypeConnectorReady)
+	r.emitMPConditionTransition(cb, before.remoteStorage, after.remoteStorage, conditionTypeRemoteStorageReady)
 
 	// Generic Conditions[Degraded] transitions. The KV-event gate's Degraded
 	// and Ready flavors carry their own, more specific events below, so
@@ -1045,6 +1056,21 @@ func (r *CacheBackendReconciler) emitTransitionEvents(cb *cachev1alpha1.CacheBac
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, eventReasonFailOpenRestored, eventReasonFailOpenRestored,
 			"fail-open mode restored — cache is again an optimization, not a serving dependency")
 	}
+}
+
+func (r *CacheBackendReconciler) emitMPConditionTransition(cb *cachev1alpha1.CacheBackend, before, after conditionSnapshot, conditionType string) {
+	if !after.present || (before.present && before.status == after.status && before.reason == after.reason && before.observedGeneration == after.observedGeneration) {
+		return
+	}
+	condition := meta.FindStatusCondition(cb.Status.Conditions, conditionType)
+	if condition == nil {
+		return
+	}
+	eventType := corev1.EventTypeWarning
+	if condition.Status == metav1.ConditionTrue {
+		eventType = corev1.EventTypeNormal
+	}
+	r.Recorder.Eventf(cb, nil, eventType, condition.Reason, condition.Reason, "%s", condition.Message)
 }
 
 // degradedMessage surfaces the Ready=False condition's message (set by
