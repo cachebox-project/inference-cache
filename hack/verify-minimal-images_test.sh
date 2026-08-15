@@ -14,7 +14,7 @@ trap 'rm -rf "$workdir"' EXIT
 
 valid_dockerfile="$workdir/Dockerfile.valid"
 cat >"$valid_dockerfile" <<'EOF'
-FROM golang:1.26.5 AS builder
+FROM golang:1.26.6 AS builder
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS controller
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS server
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS subscriber

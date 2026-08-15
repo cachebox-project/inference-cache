@@ -12,7 +12,7 @@ in the repository.
 
 ## Local setup
 
-Requirements: **Go 1.26.5+**, Make, Docker, kind, and protoc.
+Requirements: **Go 1.26.6+**, Make, Docker, kind, and protoc.
 
 Install the git hooks once per clone — they enforce the project rules below:
 
