@@ -1159,6 +1159,10 @@ immutable artifacts. The numbered items below are the future-work backlog.
 
 ### 1. NodeLocal hostile-process isolation and aggregate SHM capacity
 
+**Linear tracking:**
+[CAC-271 — isolation and aggregate capacity](https://linear.app/cachebox/issue/CAC-271/nodelocal-hostile-process-isolation-and-aggregate-shm-capacity) and
+[CAC-268 — ownership-verified reclamation](https://linear.app/cachebox/issue/CAC-268/nodelocal-mp-reclaim-orphaned-devshminference-cacheuid-pools-on).
+
 Phase 8 owns the accidental-collision fix: every NodeLocal pool uses a
 deterministic full-UID `--shm-name` and mounts only its full-UID host directory;
 startup/status verify that exact identity. This future item covers stronger
@@ -1189,6 +1193,9 @@ security and capacity guarantees that mount scoping cannot provide.
 
 ### 2. MP client/server compatibility signaling
 
+**Linear tracking:**
+[CAC-280](https://linear.app/cachebox/issue/CAC-280/lmcache-mp-clientserver-compatibility-signaling-and-qualified-version).
+
 - [ ] Add client/server compatibility signaling or health detection before
       supporting multiple LMCache version baselines.
 - [ ] Define the admitted version/digest relationship and surface actionable
@@ -1198,6 +1205,9 @@ security and capacity guarantees that mount scoping cannot provide.
       recovery evidence.
 
 ### 3. SGLang TP>1 control-plane convergence
+
+**Linear tracking:**
+[CAC-270](https://linear.app/cachebox/issue/CAC-270/sglang-tp1-lmcache-mp-control-plane-convergence).
 
 SGLang TP>1 is outside the migration baseline. Inference-cache neither patches
 the engine-owned connector nor adds a TP=1 admission guard.
@@ -1223,6 +1233,9 @@ the engine-owned connector nor adds a TP=1 admission guard.
 
 ### 4. Multi-node TP and distributed executors
 
+**Linear tracking:**
+[CAC-274](https://linear.app/cachebox/issue/CAC-274/multi-node-tp-and-distributed-executor-lmcache-mp-profile).
+
 - [ ] Define connector and MP-server cardinality for vLLM distributed executors
       and multi-node TP without allowing cross-node CUDA IPC.
 - [ ] Specify deterministic endpoint discovery, engine/server placement,
@@ -1233,6 +1246,9 @@ the engine-owned connector nor adds a TP=1 admission guard.
 
 ### 5. MLA and architecture-specific connectors
 
+**Linear tracking:**
+[CAC-272](https://linear.app/cachebox/issue/CAC-272/typed-mla-and-architecture-specific-lmcache-connector-capabilities).
+
 - [ ] Define an explicit typed capability contract for MLA and other
       model-specific connector behavior.
 - [ ] Use authoritative model architecture metadata; never infer support from
@@ -1241,6 +1257,9 @@ the engine-owned connector nor adds a TP=1 admission guard.
       admission accepts the profile.
 
 ### 6. Directional LMCache roles for PD separation
+
+**Linear tracking:**
+[CAC-273](https://linear.app/cachebox/issue/CAC-273/directional-lmcache-producerconsumer-roles-for-pd-separation).
 
 `ReadOnly` / `WriteOnly` remain generic CacheBackend API concepts, but all
 LMCache backends currently admit only `ReadWrite`. This is an intentional safety
@@ -1263,6 +1282,9 @@ restriction, not a claim that producer/consumer roles are unnecessary.
 
 ### 7. Typed MP Mooncake L2 adapter
 
+**Linear tracking:**
+[CAC-269](https://linear.app/cachebox/issue/CAC-269/typed-lmcache-mp-mooncake-store-remote-tier-adapter-replace-removed).
+
 Mooncake remains a supported provider direction, but its removed implementation
 was coupled to the legacy IP connector and is not safe to restore. Future work
 must add a new typed MP binding using LMCache's `mooncake_store` L2 adapter:
@@ -1280,6 +1302,9 @@ must add a new typed MP binding using LMCache's `mooncake_store` L2 adapter:
       settings from its old URL; migration requires an explicit operator choice.
 
 ### 8. Managed backend topology and security
+
+**Linear tracking:**
+[CAC-275](https://linear.app/cachebox/issue/CAC-275/production-managed-redis-topology-and-security-profile).
 
 The current managed Redis renderer intentionally creates one standalone Redis
 Pod. Multiple replicas behind its Service would be independent keyspaces, not a
@@ -1312,6 +1337,9 @@ or private network, not as a secure multi-tenant production profile.
 
 ### 9. LMCache MP server restart and connector re-registration
 
+**Linear tracking:**
+[CAC-276](https://linear.app/cachebox/issue/CAC-276/lmcache-mp-server-restart-and-connector-re-registration).
+
 The migration guarantees steady-state MP operation and sidecar process-health
 observation. It does not guarantee that a running engine continues caching after
 its MP server restarts, and it does not patch LMCache 0.5.3 to add that behavior.
@@ -1343,6 +1371,9 @@ If this capability is selected later, its independent scope is:
 
 ### 10. LMCache fail-open and fail-closed semantics
 
+**Linear tracking:**
+[CAC-278](https://linear.app/cachebox/issue/CAC-278/lmcache-mp-fail-open-and-fail-closed-enforcement-and-validation).
+
 `spec.integration.failOpen` currently drives status, Events, and the injected
 `INFERENCECACHE_FAIL_OPEN` environment variable. The pinned vLLM and SGLang
 LMCache MP connectors have not been shown to consume that project-specific
@@ -1366,6 +1397,9 @@ an L1+L2 outage or a fail-closed request failure. Consequently, accepting
 
 ### 11. MP worker-pool saturation and sizing
 
+**Linear tracking:**
+[CAC-277](https://linear.app/cachebox/issue/CAC-277/lmcache-mp-worker-pool-saturation-sizing-and-backpressure).
+
 Phase 8 proved that multiple TP=1 engine Pods can share one NodeLocal server and
 requires `maxGPUWorkers` to cover their count. It did not establish saturation,
 queueing, backpressure, or latency behavior at and beyond the configured worker
@@ -1383,6 +1417,9 @@ limits, nor how a future TP profile contributes workers.
       extrapolating from TP=1 engine counts.
 
 ### 12. Remote L3 concurrency and connection limits
+
+**Linear tracking:**
+[CAC-279](https://linear.app/cachebox/issue/CAC-279/redis-remote-l3-concurrency-and-connection-limits).
 
 The current Redis/RESP profile has no typed or validated bound for connections
 and concurrent store/retrieve work as the number of engine Pods, NodeLocal
