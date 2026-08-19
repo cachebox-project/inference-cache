@@ -875,8 +875,8 @@ The trace and generated per-knob curves live in
 `SLOTightTTFTMs = 200 ms`, `SLOTightBias = 1.0`,
 `TenantHotMinHitRate = 0.2`, and `TenantHotMaxAge = 2 min`; both measured hit
 ratios are 100% on this boundary-case fixture. CI regenerates the result in
-check mode so trace, curves, documentation, and defaults cannot silently
-diverge.
+check mode, and tests keep the trace, generated result, and code defaults from
+silently diverging. Documentation changes remain subject to normal review.
 
 ## 7. The reason-code summary
 

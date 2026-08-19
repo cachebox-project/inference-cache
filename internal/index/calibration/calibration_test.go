@@ -127,6 +127,21 @@ func TestReplayTenantHotMissWithoutCandidate(t *testing.T) {
 	}
 }
 
+func TestReplayUsesObservationClockAtTenantHotBoundary(t *testing.T) {
+	trace := Trace{TTLMillis: int64(time.Minute / time.Millisecond)}
+	observation := Observation{
+		ID: "tenant-hot-boundary", Kind: ObservationTenantHot, AtMillis: 100_000,
+		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "novel", TokenCount: 1,
+		Replicas: []ReplicaObservation{{
+			ID: "warm", ReportedAtMillis: 40_001, HitRate: 0.8, ObservedHit: true,
+		}},
+	}
+	config := Config{TenantHotMinHitRate: 0.2, TenantHotMaxAgeMillis: 60_000}
+	if !replayObservation(trace, observation, config) {
+		t.Fatal("replayObservation = miss, want hit for stats one millisecond inside the replay window")
+	}
+}
+
 func TestObservationRejectsFutureReplicaReport(t *testing.T) {
 	observation := Observation{
 		ID: "future", Kind: ObservationPrefix, AtMillis: 10,

@@ -337,7 +337,7 @@ func Replay(trace Trace, config Config) Metrics {
 }
 
 func replayObservation(trace Trace, observation Observation, config Config) bool {
-	anchor := time.Now()
+	anchor := time.UnixMilli(observation.AtMillis)
 	ranker := index.RankerConfig{
 		PressureWeight:      float32(config.PressureWeight),
 		SLOTightTTFTMs:      config.SLOTightTTFTMillis,
@@ -348,6 +348,7 @@ func replayObservation(trace Trace, observation Observation, config Config) bool
 	idx := index.New(
 		index.WithTTL(time.Duration(trace.TTLMillis)*time.Millisecond),
 		index.WithRanker(ranker),
+		index.WithClock(func() time.Time { return anchor }),
 	)
 	observedHits := make(map[string]bool, len(observation.Replicas))
 	for _, replica := range observation.Replicas {
@@ -357,13 +358,12 @@ func replayObservation(trace Trace, observation Observation, config Config) bool
 			hash = "serving/" + observation.ID + "/" + replica.ID
 			tokens = 1
 		}
-		age := time.Duration(observation.AtMillis-replica.ReportedAtMillis) * time.Millisecond
 		idx.Ingest(index.Update{
 			ReplicaID:  replica.ID,
 			Model:      observation.Model,
 			Tenant:     observation.Tenant,
 			HashScheme: observation.HashScheme,
-			Timestamp:  anchor.Add(-age),
+			Timestamp:  time.UnixMilli(replica.ReportedAtMillis),
 			Prefixes: []index.PrefixRef{{
 				PrefixHash: []byte(hash),
 				TokenCount: tokens,

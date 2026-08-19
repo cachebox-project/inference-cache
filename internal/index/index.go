@@ -264,8 +264,11 @@ func WithReservedTenants(tenants ...string) Option {
 	}
 }
 
-// withClock overrides the time source (tests only).
-func withClock(now func() time.Time) Option { return func(i *Index) { i.now = now } }
+// WithClock overrides the time source for deterministic replay and tests.
+func WithClock(now func() time.Time) Option { return func(i *Index) { i.now = now } }
+
+// withClock keeps the package-local test helper concise.
+func withClock(now func() time.Time) Option { return WithClock(now) }
 
 // New builds an index with the given options.
 func New(opts ...Option) *Index {
