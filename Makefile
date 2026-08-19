@@ -358,6 +358,17 @@ verify-golden-vectors: ## Verify pkg/fingerprint/testdata/golden_vectors.json ma
 		     "(pip install -r pkg/fingerprint/testdata/requirements.txt to enable)"; \
 	fi
 
+RANKER_CALIBRATION_TRACE ?= internal/index/calibration/testdata/c1_synthetic_trace.json
+RANKER_CALIBRATION_RESULT ?= internal/index/calibration/testdata/c1_synthetic_result.json
+
+.PHONY: ranker-calibration
+ranker-calibration: ## Replay the checked-in ranker trace and regenerate per-knob calibration curves.
+	$(GO_CMD) run ./hack/ranker-calibration -trace $(RANKER_CALIBRATION_TRACE) -out $(RANKER_CALIBRATION_RESULT)
+
+.PHONY: verify-ranker-calibration
+verify-ranker-calibration: ## Verify the checked-in ranker calibration output matches its trace and sweep.
+	$(GO_CMD) run ./hack/ranker-calibration -trace $(RANKER_CALIBRATION_TRACE) -out $(RANKER_CALIBRATION_RESULT) -check
+
 .PHONY: image-build
 image-build: controller-image server-image subscriber-image ## Build controller, server, and kvevent-subscriber images.
 
@@ -619,7 +630,7 @@ verify-prometheus: promtool kustomize ## Lint + unit-test the Prometheus alertin
 	@echo "✓ Prometheus rules valid"
 
 .PHONY: ci
-ci: verify-naming verify-no-internal-refs verify-dco test-dco reuse-lint verify-syft-pin verify-minimal-base test-minimal-images fmt-check vet ci-lint python-lint verify-prometheus verify-golden-vectors test-docs-sync test-race build ## Local CI gate (naming + internal-refs + DCO/REUSE compliance + Syft/minimal-image policy + Go/Python lint + Prometheus rules + golden vectors + docs-sync tests + race tests + build). Run by the pre-push hook.
+ci: verify-naming verify-no-internal-refs verify-dco test-dco reuse-lint verify-syft-pin verify-minimal-base test-minimal-images fmt-check vet ci-lint python-lint verify-prometheus verify-golden-vectors verify-ranker-calibration test-docs-sync test-race build ## Local CI gate (naming + internal-refs + DCO/REUSE compliance + Syft/minimal-image policy + Go/Python lint + Prometheus rules + calibration/golden fixtures + docs-sync tests + race tests + build). Run by the pre-push hook.
 
 .PHONY: pre-pr
 pre-pr: ci ## Pre-PR gate: CI gate + generated-code drift check + sample admission check + review checklist.

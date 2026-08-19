@@ -14,9 +14,9 @@ import (
 // when no stats are present and no SLO hint is set — see DefaultRankerConfig.
 const (
 	// Pressure penalty: pressureFactor = 1 - PressureWeight × pressure.
-	// 1.0 → a fully-saturated replica (pressure=1.0) drops to score 0, so a
-	// fresher lower-pressure peer can win. Lower values are gentler.
-	DefaultPressureWeight = 1.0
+	// 0.5 keeps locality meaningful while letting a lower-pressure peer win
+	// when the reported token advantage is modest.
+	DefaultPressureWeight = 0.5
 	// TTFT below this (ms) is treated as "tight" — the SLO bias kicks in.
 	// 200 ms is a conservative threshold; tune per workload.
 	DefaultSLOTightTTFTMs = 200
@@ -25,10 +25,10 @@ const (
 	// against matched-token count when latency is critical.
 	DefaultSLOTightBias = 1.0
 	// TENANT_HOT fallback: replicas with hit_rate >= this count as "warm".
-	DefaultTenantHotMinHitRate = 0.1
+	DefaultTenantHotMinHitRate = 0.2
 	// TENANT_HOT fallback: stats lastSeen within this window count as
 	// "recent" — anything older is treated as cold for the fallback.
-	DefaultTenantHotMaxAge = 5 * time.Minute
+	DefaultTenantHotMaxAge = 2 * time.Minute
 )
 
 // applyChainDistinguishingPower folds the depth-aware distinguishing-power

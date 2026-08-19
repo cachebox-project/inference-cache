@@ -1,0 +1,347 @@
+{
+  "schema_version": 1,
+  "name": "c1-synthetic-mixed-routing-v1",
+  "provenance": {
+    "kind": "synthetic",
+    "source": "Deterministic boundary-case replay derived from the C1 ReplicaStats and LookupRoute contracts",
+    "description": "No production C1 request trace is checked into the repository. This fixture exercises pressure/locality tradeoffs, tight and loose TTFT budgets, stale soft-state observations, and TENANT_HOT rate/age gates without claiming to represent production traffic."
+  },
+  "ttl_ms": 1800000,
+  "sweep": {
+    "pressure_weights": [0, 0.25, 0.5, 0.75, 1],
+    "slo_tight_ttft_ms": [100, 150, 200, 250, 300],
+    "slo_tight_biases": [0, 0.5, 1, 1.5, 2],
+    "tenant_hot_min_hit_rates": [0.05, 0.1, 0.2, 0.3, 0.4],
+    "tenant_hot_max_age_ms": [60000, 120000, 300000, 600000]
+  },
+  "observations": [
+    {
+      "id": "pressure-shed-1",
+      "kind": "prefix",
+      "at_ms": 100000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "pressure-shed-1",
+      "token_count": 320,
+      "replicas": [
+        {"id": "a-hot", "reported_at_ms": 100000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.7, "pressure": 0.8, "observed_hit": false},
+        {"id": "b-cool", "reported_at_ms": 100000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.4, "pressure": 0.1, "observed_hit": true},
+        {"id": "z-decoy", "reported_at_ms": 100000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "pressure-shed-2",
+      "kind": "prefix",
+      "at_ms": 200000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "pressure-shed-2",
+      "token_count": 320,
+      "replicas": [
+        {"id": "a-hot", "reported_at_ms": 200000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.7, "pressure": 0.8, "observed_hit": false},
+        {"id": "b-cool", "reported_at_ms": 200000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.4, "pressure": 0.1, "observed_hit": true},
+        {"id": "z-decoy", "reported_at_ms": 200000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "pressure-shed-3",
+      "kind": "prefix",
+      "at_ms": 300000,
+      "tenant": "tenant-b",
+      "model": "model-b",
+      "hash_scheme": "vllm",
+      "prefix_hash": "pressure-shed-3",
+      "token_count": 320,
+      "replicas": [
+        {"id": "a-hot", "reported_at_ms": 300000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.65, "pressure": 0.8, "observed_hit": false},
+        {"id": "b-cool", "reported_at_ms": 300000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.45, "pressure": 0.1, "observed_hit": true},
+        {"id": "z-decoy", "reported_at_ms": 300000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "pressure-preserve-1",
+      "kind": "prefix",
+      "at_ms": 400000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "pressure-preserve-1",
+      "token_count": 512,
+      "replicas": [
+        {"id": "a-local", "reported_at_ms": 400000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.75, "pressure": 0.7, "observed_hit": true},
+        {"id": "b-cool", "reported_at_ms": 400000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.3, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "reported_at_ms": 400000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "pressure-preserve-2",
+      "kind": "prefix",
+      "at_ms": 500000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "pressure-preserve-2",
+      "token_count": 512,
+      "replicas": [
+        {"id": "a-local", "reported_at_ms": 500000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.75, "pressure": 0.7, "observed_hit": true},
+        {"id": "b-cool", "reported_at_ms": 500000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.3, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "reported_at_ms": 500000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "pressure-preserve-3",
+      "kind": "prefix",
+      "at_ms": 600000,
+      "tenant": "tenant-b",
+      "model": "model-b",
+      "hash_scheme": "vllm",
+      "prefix_hash": "pressure-preserve-3",
+      "token_count": 512,
+      "replicas": [
+        {"id": "a-local", "reported_at_ms": 600000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.7, "pressure": 0.7, "observed_hit": true},
+        {"id": "b-cool", "reported_at_ms": 600000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.35, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "reported_at_ms": 600000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "slo-promote-120-1",
+      "kind": "prefix",
+      "at_ms": 700000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "slo-promote-120-1",
+      "token_count": 512,
+      "ttft_budget_ms": 120,
+      "replicas": [
+        {"id": "a-old", "reported_at_ms": 160000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "b-fresh", "reported_at_ms": 700000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
+        {"id": "z-decoy", "reported_at_ms": 700000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "slo-promote-120-2",
+      "kind": "prefix",
+      "at_ms": 800000,
+      "tenant": "tenant-b",
+      "model": "model-b",
+      "hash_scheme": "vllm",
+      "prefix_hash": "slo-promote-120-2",
+      "token_count": 512,
+      "ttft_budget_ms": 120,
+      "replicas": [
+        {"id": "a-old", "reported_at_ms": 260000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "b-fresh", "reported_at_ms": 800000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
+        {"id": "z-decoy", "reported_at_ms": 800000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "slo-promote-180-1",
+      "kind": "prefix",
+      "at_ms": 900000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "slo-promote-180-1",
+      "token_count": 512,
+      "ttft_budget_ms": 180,
+      "replicas": [
+        {"id": "a-old", "reported_at_ms": 360000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "b-fresh", "reported_at_ms": 900000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
+        {"id": "z-decoy", "reported_at_ms": 900000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "slo-promote-180-2",
+      "kind": "prefix",
+      "at_ms": 1000000,
+      "tenant": "tenant-b",
+      "model": "model-b",
+      "hash_scheme": "vllm",
+      "prefix_hash": "slo-promote-180-2",
+      "token_count": 512,
+      "ttft_budget_ms": 180,
+      "replicas": [
+        {"id": "a-old", "reported_at_ms": 460000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "b-fresh", "reported_at_ms": 1000000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
+        {"id": "z-decoy", "reported_at_ms": 1000000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "slo-preserve-120-1",
+      "kind": "prefix",
+      "at_ms": 1100000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "slo-preserve-120-1",
+      "token_count": 550,
+      "ttft_budget_ms": 120,
+      "replicas": [
+        {"id": "a-deep", "reported_at_ms": 560000, "reported_prefix": true, "matched_tokens": 550, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
+        {"id": "b-fresh", "reported_at_ms": 1100000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "reported_at_ms": 1100000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "slo-preserve-120-2",
+      "kind": "prefix",
+      "at_ms": 1200000,
+      "tenant": "tenant-b",
+      "model": "model-b",
+      "hash_scheme": "vllm",
+      "prefix_hash": "slo-preserve-120-2",
+      "token_count": 550,
+      "ttft_budget_ms": 120,
+      "replicas": [
+        {"id": "a-deep", "reported_at_ms": 660000, "reported_prefix": true, "matched_tokens": 550, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
+        {"id": "b-fresh", "reported_at_ms": 1200000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "reported_at_ms": 1200000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "slo-loose-220-1",
+      "kind": "prefix",
+      "at_ms": 1300000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "slo-loose-220-1",
+      "token_count": 512,
+      "ttft_budget_ms": 220,
+      "replicas": [
+        {"id": "a-deep", "reported_at_ms": 760000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
+        {"id": "b-fresh", "reported_at_ms": 1300000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "reported_at_ms": 1300000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "slo-loose-220-2",
+      "kind": "prefix",
+      "at_ms": 1400000,
+      "tenant": "tenant-b",
+      "model": "model-b",
+      "hash_scheme": "vllm",
+      "prefix_hash": "slo-loose-220-2",
+      "token_count": 512,
+      "ttft_budget_ms": 220,
+      "replicas": [
+        {"id": "a-deep", "reported_at_ms": 860000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
+        {"id": "b-fresh", "reported_at_ms": 1400000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "reported_at_ms": 1400000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+      ]
+    },
+    {
+      "id": "tenant-rate-1",
+      "kind": "tenant_hot",
+      "at_ms": 1500000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "tenant-rate-1",
+      "token_count": 64,
+      "replicas": [
+        {"id": "a-noisy", "reported_at_ms": 1500000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.19, "pressure": 0, "observed_hit": false},
+        {"id": "z-warm", "reported_at_ms": 1470000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.25, "pressure": 0, "observed_hit": true}
+      ]
+    },
+    {
+      "id": "tenant-rate-2",
+      "kind": "tenant_hot",
+      "at_ms": 1600000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "tenant-rate-2",
+      "token_count": 64,
+      "replicas": [
+        {"id": "a-noisy", "reported_at_ms": 1600000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.19, "pressure": 0, "observed_hit": false},
+        {"id": "z-warm", "reported_at_ms": 1570000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.25, "pressure": 0, "observed_hit": true}
+      ]
+    },
+    {
+      "id": "tenant-rate-3",
+      "kind": "tenant_hot",
+      "at_ms": 1700000,
+      "tenant": "tenant-b",
+      "model": "model-b",
+      "hash_scheme": "vllm",
+      "prefix_hash": "tenant-rate-3",
+      "token_count": 64,
+      "replicas": [
+        {"id": "a-noisy", "reported_at_ms": 1700000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.19, "pressure": 0, "observed_hit": false},
+        {"id": "z-warm", "reported_at_ms": 1670000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.25, "pressure": 0, "observed_hit": true}
+      ]
+    },
+    {
+      "id": "tenant-age-preserve-1",
+      "kind": "tenant_hot",
+      "at_ms": 1800000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "tenant-age-preserve-1",
+      "token_count": 64,
+      "replicas": [
+        {"id": "a-moderate", "reported_at_ms": 1725000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+      ]
+    },
+    {
+      "id": "tenant-age-preserve-2",
+      "kind": "tenant_hot",
+      "at_ms": 1900000,
+      "tenant": "tenant-b",
+      "model": "model-b",
+      "hash_scheme": "vllm",
+      "prefix_hash": "tenant-age-preserve-2",
+      "token_count": 64,
+      "replicas": [
+        {"id": "a-moderate", "reported_at_ms": 1825000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+      ]
+    },
+    {
+      "id": "tenant-age-expire-1",
+      "kind": "tenant_hot",
+      "at_ms": 2000000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "tenant-age-expire-1",
+      "token_count": 64,
+      "replicas": [
+        {"id": "a-stale", "reported_at_ms": 1850000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.8, "pressure": 0, "observed_hit": false},
+        {"id": "z-recent", "reported_at_ms": 1970000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+      ]
+    },
+    {
+      "id": "tenant-age-expire-2",
+      "kind": "tenant_hot",
+      "at_ms": 2100000,
+      "tenant": "tenant-a",
+      "model": "model-a",
+      "hash_scheme": "vllm",
+      "prefix_hash": "tenant-age-expire-2",
+      "token_count": 64,
+      "replicas": [
+        {"id": "a-stale", "reported_at_ms": 1950000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.8, "pressure": 0, "observed_hit": false},
+        {"id": "z-recent", "reported_at_ms": 2070000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+      ]
+    },
+    {
+      "id": "tenant-age-expire-3",
+      "kind": "tenant_hot",
+      "at_ms": 2200000,
+      "tenant": "tenant-b",
+      "model": "model-b",
+      "hash_scheme": "vllm",
+      "prefix_hash": "tenant-age-expire-3",
+      "token_count": 64,
+      "replicas": [
+        {"id": "a-stale", "reported_at_ms": 2050000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.8, "pressure": 0, "observed_hit": false},
+        {"id": "z-recent", "reported_at_ms": 2170000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+      ]
+    }
+  ]
+}
