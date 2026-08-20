@@ -174,8 +174,8 @@ func (s Sweep) validate() error {
 		return errors.New("every sweep dimension must contain at least one value")
 	}
 	for _, value := range append(append([]float64{}, s.PressureWeights...), s.SLOTightBiases...) {
-		if !finiteNonNegative(value) {
-			return fmt.Errorf("sweep contains invalid non-negative value %v", value)
+		if !finiteNonNegativeFloat32(value) {
+			return fmt.Errorf("sweep contains invalid finite non-negative float32 value %v", value)
 		}
 	}
 	for _, value := range s.TenantHotMinHitRates {
@@ -245,6 +245,10 @@ func (o Observation) validate() error {
 
 func finiteNonNegative(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
+}
+
+func finiteNonNegativeFloat32(value float64) bool {
+	return finiteNonNegative(value) && value <= math.MaxFloat32
 }
 
 func finiteRate(value float64) bool {
@@ -361,6 +365,7 @@ func Replay(trace Trace, config Config) Metrics {
 
 func replayObservation(trace Trace, observation Observation, config Config) bool {
 	anchor := time.UnixMilli(observation.AtMillis)
+	ttl := time.Duration(trace.TTLMillis) * time.Millisecond
 	ranker := index.RankerConfig{
 		PressureWeight:      float32(config.PressureWeight),
 		SLOTightTTFTMs:      config.SLOTightTTFTMillis,
@@ -369,7 +374,7 @@ func replayObservation(trace Trace, observation Observation, config Config) bool
 		TenantHotMaxAge:     time.Duration(config.TenantHotMaxAgeMillis) * time.Millisecond,
 	}
 	idx := index.New(
-		index.WithTTL(time.Duration(trace.TTLMillis)*time.Millisecond),
+		index.WithTTL(ttl),
 		index.WithRanker(ranker),
 		index.WithClock(func() time.Time { return anchor }),
 	)
@@ -381,28 +386,34 @@ func replayObservation(trace Trace, observation Observation, config Config) bool
 			hash = "serving/" + observation.ID + "/" + replica.ID
 			tokens = 1
 		}
-		idx.Ingest(index.Update{
-			ReplicaID:  replica.ID,
-			Model:      observation.Model,
-			Tenant:     observation.Tenant,
-			HashScheme: observation.HashScheme,
-			Timestamp:  time.UnixMilli(replica.PrefixReportedAtMillis),
-			Prefixes: []index.PrefixRef{{
-				PrefixHash: []byte(hash),
-				TokenCount: tokens,
-			}},
-		})
-		idx.Ingest(index.Update{
-			ReplicaID:  replica.ID,
-			Model:      observation.Model,
-			Tenant:     observation.Tenant,
-			HashScheme: observation.HashScheme,
-			Timestamp:  time.UnixMilli(replica.StatsReportedAtMillis),
-			Stats: &index.ReplicaStats{
-				HitRate:  replica.HitRate,
-				Pressure: replica.Pressure,
-			},
-		})
+		prefixReportedAt := time.UnixMilli(replica.PrefixReportedAtMillis)
+		if anchor.Sub(prefixReportedAt) < ttl {
+			idx.Ingest(index.Update{
+				ReplicaID:  replica.ID,
+				Model:      observation.Model,
+				Tenant:     observation.Tenant,
+				HashScheme: observation.HashScheme,
+				Timestamp:  prefixReportedAt,
+				Prefixes: []index.PrefixRef{{
+					PrefixHash: []byte(hash),
+					TokenCount: tokens,
+				}},
+			})
+		}
+		statsReportedAt := time.UnixMilli(replica.StatsReportedAtMillis)
+		if anchor.Sub(statsReportedAt) < ttl {
+			idx.Ingest(index.Update{
+				ReplicaID:  replica.ID,
+				Model:      observation.Model,
+				Tenant:     observation.Tenant,
+				HashScheme: observation.HashScheme,
+				Timestamp:  statsReportedAt,
+				Stats: &index.ReplicaStats{
+					HitRate:  replica.HitRate,
+					Pressure: replica.Pressure,
+				},
+			})
+		}
 		observedHits[replica.ID] = replica.ObservedHit
 	}
 	result := idx.LookupRoute(index.LookupRequest{

@@ -199,6 +199,8 @@ func TestSweepValidationRejectsInvalidValues(t *testing.T) {
 		want   string
 	}{
 		{"pressure", func(sweep *Sweep) { sweep.PressureWeights[0] = -1 }, "non-negative"},
+		{"pressure float32 overflow", func(sweep *Sweep) { sweep.PressureWeights[0] = math.MaxFloat64 }, "float32"},
+		{"bias float32 overflow", func(sweep *Sweep) { sweep.SLOTightBiases[0] = math.MaxFloat64 }, "float32"},
 		{"hit rate", func(sweep *Sweep) { sweep.TenantHotMinHitRates[0] = 2 }, "invalid rate"},
 		{"ttft", func(sweep *Sweep) { sweep.SLOTightTTFTMillis[0] = 0 }, "non-positive"},
 		{"max age", func(sweep *Sweep) { sweep.TenantHotMaxAgeMillis[0] = 0 }, "non-positive"},
@@ -311,6 +313,22 @@ func TestReplayUsesIndependentPrefixAndStatsTimestamps(t *testing.T) {
 	config := Config{PressureWeight: 1, TenantHotMaxAgeMillis: 60_000}
 	if !replayObservation(trace, observation, config) {
 		t.Fatal("replayObservation = miss, want stale pressure ignored while fresh prefix remains routable")
+	}
+}
+
+func TestReplayExcludesTTLExpiredServingEntries(t *testing.T) {
+	trace := Trace{TTLMillis: int64(time.Minute / time.Millisecond)}
+	observation := Observation{
+		ID: "expired-serving", Kind: ObservationTenantHot, AtMillis: 100_000,
+		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "novel", TokenCount: 1,
+		Replicas: []ReplicaObservation{{
+			ID: "stale", PrefixReportedAtMillis: 40_000, StatsReportedAtMillis: 100_000,
+			HitRate: 1, ObservedHit: true,
+		}},
+	}
+	config := Config{TenantHotMinHitRate: 0.2, TenantHotMaxAgeMillis: 120_000}
+	if replayObservation(trace, observation, config) {
+		t.Fatal("replayObservation = hit, want TTL-expired serving entry evicted before lookup")
 	}
 }
 
