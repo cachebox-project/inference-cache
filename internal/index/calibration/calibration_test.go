@@ -6,6 +6,7 @@ package calibration
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -109,6 +110,126 @@ func TestLoadRejectsUnknownAndInvalidFields(t *testing.T) {
 				t.Fatalf("Load error = %v, want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestTraceValidationRejectsInvalidFields(t *testing.T) {
+	valid := func() Trace {
+		return Trace{
+			SchemaVersion: SchemaVersion,
+			Name:          "unit",
+			Provenance:    Provenance{Kind: "synthetic", Source: "unit test"},
+			TTLMillis:     1,
+			Sweep: Sweep{
+				PressureWeights:       []float64{0.5},
+				SLOTightTTFTMillis:    []int32{200},
+				SLOTightBiases:        []float64{1},
+				TenantHotMinHitRates:  []float64{0.2},
+				TenantHotMaxAgeMillis: []int64{60_000},
+			},
+			Observations: []Observation{{
+				ID: "o", Kind: ObservationPrefix, Tenant: "t", Model: "m",
+				HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
+				Replicas: []ReplicaObservation{{
+					ID: "r", ReportedPrefix: true, MatchedTokens: 1,
+				}},
+			}},
+		}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Trace)
+		want   string
+	}{
+		{"version", func(trace *Trace) { trace.SchemaVersion++ }, "schema_version"},
+		{"name", func(trace *Trace) { trace.Name = "" }, "trace name"},
+		{"provenance kind", func(trace *Trace) { trace.Provenance.Kind = "unknown" }, "captured or synthetic"},
+		{"provenance source", func(trace *Trace) { trace.Provenance.Source = "" }, "provenance source"},
+		{"ttl", func(trace *Trace) { trace.TTLMillis = 0 }, "ttl_ms"},
+		{"empty sweep", func(trace *Trace) { trace.Sweep.PressureWeights = nil }, "every sweep dimension"},
+		{"empty observations", func(trace *Trace) { trace.Observations = nil }, "at least one observation"},
+		{"invalid observation", func(trace *Trace) { trace.Observations[0].Kind = "unknown" }, "observation 0"},
+		{"duplicate observation", func(trace *Trace) { trace.Observations = append(trace.Observations, trace.Observations[0]) }, "duplicate id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := valid()
+			tc.mutate(&trace)
+			if err := trace.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSweepValidationRejectsInvalidValues(t *testing.T) {
+	valid := func() Sweep {
+		return Sweep{
+			PressureWeights:       []float64{0.5},
+			SLOTightTTFTMillis:    []int32{200},
+			SLOTightBiases:        []float64{1},
+			TenantHotMinHitRates:  []float64{0.2},
+			TenantHotMaxAgeMillis: []int64{60_000},
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Sweep)
+		want   string
+	}{
+		{"pressure", func(sweep *Sweep) { sweep.PressureWeights[0] = -1 }, "non-negative"},
+		{"hit rate", func(sweep *Sweep) { sweep.TenantHotMinHitRates[0] = 2 }, "invalid rate"},
+		{"ttft", func(sweep *Sweep) { sweep.SLOTightTTFTMillis[0] = 0 }, "non-positive"},
+		{"max age", func(sweep *Sweep) { sweep.TenantHotMaxAgeMillis[0] = 0 }, "non-positive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sweep := valid()
+			tc.mutate(&sweep)
+			if err := sweep.validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validate error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestObservationValidationRejectsInvalidReplicas(t *testing.T) {
+	valid := func() Observation {
+		return Observation{
+			ID: "o", Kind: ObservationPrefix, Tenant: "t", Model: "m",
+			HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
+			Replicas: []ReplicaObservation{{ID: "r", ReportedPrefix: true, MatchedTokens: 1}},
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Observation)
+		want   string
+	}{
+		{"identity", func(observation *Observation) { observation.ID = "" }, "required"},
+		{"kind", func(observation *Observation) { observation.Kind = "unknown" }, "prefix or tenant_hot"},
+		{"tokens", func(observation *Observation) { observation.TokenCount = 0 }, "token_count"},
+		{"replicas", func(observation *Observation) { observation.Replicas = nil }, "at least one replica"},
+		{"replica id", func(observation *Observation) { observation.Replicas[0].ID = "" }, "id is required"},
+		{"matched tokens", func(observation *Observation) { observation.Replicas[0].MatchedTokens = 0 }, "matched_tokens"},
+		{"rate", func(observation *Observation) { observation.Replicas[0].HitRate = 2 }, "finite values"},
+		{"duplicate replica", func(observation *Observation) {
+			observation.Replicas = append(observation.Replicas, observation.Replicas[0])
+		}, "duplicate replica"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observation := valid()
+			tc.mutate(&observation)
+			if err := observation.validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validate error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestMarshalResultWrapsJSONErrors(t *testing.T) {
+	_, err := MarshalResult(Result{BestConfig: Config{PressureWeight: math.NaN()}})
+	if err == nil || !strings.Contains(err.Error(), "marshal calibration result") {
+		t.Fatalf("MarshalResult error = %v, want wrapped JSON error", err)
 	}
 }
 
