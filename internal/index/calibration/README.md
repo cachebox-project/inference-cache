@@ -17,10 +17,12 @@ gentler pressure/SLO multipliers and shorter fallback windows.
 
 Each observation is a self-contained point-in-time view. `reported_prefix`
 records whether the cache plane believed that replica held the requested
-prefix; `matched_tokens`, `hit_rate`, `pressure`, and `reported_at_ms` are the
-signals visible to the ranker. `observed_hit` is the later ground-truth outcome
-for routing to that replica. Replicas without the requested prefix still receive
-a unique serving-prefix entry during replay so `TENANT_HOT` can apply its real
+prefix; `prefix_reported_at_ms` records that prefix observation's freshness,
+while `stats_reported_at_ms` independently records when `hit_rate` and
+`pressure` were reported. `matched_tokens` and those timestamps are the signals
+visible to the ranker. `observed_hit` is the later ground-truth outcome for
+routing to that replica. Replicas without the requested prefix still receive a
+unique serving-prefix entry during replay so `TENANT_HOT` can apply its real
 engine-domain membership guard.
 
 Captured data should contain opaque or one-way prefix hashes only. Do not put

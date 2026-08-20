@@ -25,9 +25,9 @@
       "prefix_hash": "pressure-shed-1",
       "token_count": 320,
       "replicas": [
-        {"id": "a-hot", "reported_at_ms": 100000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.7, "pressure": 0.8, "observed_hit": false},
-        {"id": "b-cool", "reported_at_ms": 100000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.4, "pressure": 0.1, "observed_hit": true},
-        {"id": "z-decoy", "reported_at_ms": 100000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-hot", "prefix_reported_at_ms": 100000, "stats_reported_at_ms": 100000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.7, "pressure": 0.8, "observed_hit": false},
+        {"id": "b-cool", "prefix_reported_at_ms": 100000, "stats_reported_at_ms": 100000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.4, "pressure": 0.1, "observed_hit": true},
+        {"id": "z-decoy", "prefix_reported_at_ms": 100000, "stats_reported_at_ms": 100000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -40,9 +40,9 @@
       "prefix_hash": "pressure-shed-2",
       "token_count": 320,
       "replicas": [
-        {"id": "a-hot", "reported_at_ms": 200000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.7, "pressure": 0.8, "observed_hit": false},
-        {"id": "b-cool", "reported_at_ms": 200000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.4, "pressure": 0.1, "observed_hit": true},
-        {"id": "z-decoy", "reported_at_ms": 200000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-hot", "prefix_reported_at_ms": 200000, "stats_reported_at_ms": 200000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.7, "pressure": 0.8, "observed_hit": false},
+        {"id": "b-cool", "prefix_reported_at_ms": 200000, "stats_reported_at_ms": 200000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.4, "pressure": 0.1, "observed_hit": true},
+        {"id": "z-decoy", "prefix_reported_at_ms": 200000, "stats_reported_at_ms": 200000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -55,9 +55,9 @@
       "prefix_hash": "pressure-shed-3",
       "token_count": 320,
       "replicas": [
-        {"id": "a-hot", "reported_at_ms": 300000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.65, "pressure": 0.8, "observed_hit": false},
-        {"id": "b-cool", "reported_at_ms": 300000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.45, "pressure": 0.1, "observed_hit": true},
-        {"id": "z-decoy", "reported_at_ms": 300000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-hot", "prefix_reported_at_ms": 300000, "stats_reported_at_ms": 300000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.65, "pressure": 0.8, "observed_hit": false},
+        {"id": "b-cool", "prefix_reported_at_ms": 300000, "stats_reported_at_ms": 300000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.45, "pressure": 0.1, "observed_hit": true},
+        {"id": "z-decoy", "prefix_reported_at_ms": 300000, "stats_reported_at_ms": 300000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -70,9 +70,9 @@
       "prefix_hash": "pressure-preserve-1",
       "token_count": 512,
       "replicas": [
-        {"id": "a-local", "reported_at_ms": 400000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.75, "pressure": 0.7, "observed_hit": true},
-        {"id": "b-cool", "reported_at_ms": 400000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.3, "pressure": 0, "observed_hit": false},
-        {"id": "z-decoy", "reported_at_ms": 400000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-local", "prefix_reported_at_ms": 400000, "stats_reported_at_ms": 400000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.75, "pressure": 0.7, "observed_hit": true},
+        {"id": "b-cool", "prefix_reported_at_ms": 400000, "stats_reported_at_ms": 400000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.3, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "prefix_reported_at_ms": 400000, "stats_reported_at_ms": 400000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -85,9 +85,9 @@
       "prefix_hash": "pressure-preserve-2",
       "token_count": 512,
       "replicas": [
-        {"id": "a-local", "reported_at_ms": 500000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.75, "pressure": 0.7, "observed_hit": true},
-        {"id": "b-cool", "reported_at_ms": 500000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.3, "pressure": 0, "observed_hit": false},
-        {"id": "z-decoy", "reported_at_ms": 500000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-local", "prefix_reported_at_ms": 500000, "stats_reported_at_ms": 500000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.75, "pressure": 0.7, "observed_hit": true},
+        {"id": "b-cool", "prefix_reported_at_ms": 500000, "stats_reported_at_ms": 500000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.3, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "prefix_reported_at_ms": 500000, "stats_reported_at_ms": 500000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -100,9 +100,9 @@
       "prefix_hash": "pressure-preserve-3",
       "token_count": 512,
       "replicas": [
-        {"id": "a-local", "reported_at_ms": 600000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.7, "pressure": 0.7, "observed_hit": true},
-        {"id": "b-cool", "reported_at_ms": 600000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.35, "pressure": 0, "observed_hit": false},
-        {"id": "z-decoy", "reported_at_ms": 600000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-local", "prefix_reported_at_ms": 600000, "stats_reported_at_ms": 600000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.7, "pressure": 0.7, "observed_hit": true},
+        {"id": "b-cool", "prefix_reported_at_ms": 600000, "stats_reported_at_ms": 600000, "reported_prefix": true, "matched_tokens": 256, "hit_rate": 0.35, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "prefix_reported_at_ms": 600000, "stats_reported_at_ms": 600000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -116,9 +116,9 @@
       "token_count": 512,
       "ttft_budget_ms": 120,
       "replicas": [
-        {"id": "a-old", "reported_at_ms": 160000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
-        {"id": "b-fresh", "reported_at_ms": 700000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
-        {"id": "z-decoy", "reported_at_ms": 700000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-old", "prefix_reported_at_ms": 160000, "stats_reported_at_ms": 160000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "b-fresh", "prefix_reported_at_ms": 700000, "stats_reported_at_ms": 700000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
+        {"id": "z-decoy", "prefix_reported_at_ms": 700000, "stats_reported_at_ms": 700000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -132,9 +132,9 @@
       "token_count": 512,
       "ttft_budget_ms": 120,
       "replicas": [
-        {"id": "a-old", "reported_at_ms": 260000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
-        {"id": "b-fresh", "reported_at_ms": 800000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
-        {"id": "z-decoy", "reported_at_ms": 800000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-old", "prefix_reported_at_ms": 260000, "stats_reported_at_ms": 260000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "b-fresh", "prefix_reported_at_ms": 800000, "stats_reported_at_ms": 800000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
+        {"id": "z-decoy", "prefix_reported_at_ms": 800000, "stats_reported_at_ms": 800000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -148,9 +148,9 @@
       "token_count": 512,
       "ttft_budget_ms": 180,
       "replicas": [
-        {"id": "a-old", "reported_at_ms": 360000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
-        {"id": "b-fresh", "reported_at_ms": 900000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
-        {"id": "z-decoy", "reported_at_ms": 900000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-old", "prefix_reported_at_ms": 360000, "stats_reported_at_ms": 360000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "b-fresh", "prefix_reported_at_ms": 900000, "stats_reported_at_ms": 900000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
+        {"id": "z-decoy", "prefix_reported_at_ms": 900000, "stats_reported_at_ms": 900000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -164,9 +164,9 @@
       "token_count": 512,
       "ttft_budget_ms": 180,
       "replicas": [
-        {"id": "a-old", "reported_at_ms": 460000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
-        {"id": "b-fresh", "reported_at_ms": 1000000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
-        {"id": "z-decoy", "reported_at_ms": 1000000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-old", "prefix_reported_at_ms": 460000, "stats_reported_at_ms": 460000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "b-fresh", "prefix_reported_at_ms": 1000000, "stats_reported_at_ms": 1000000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": true},
+        {"id": "z-decoy", "prefix_reported_at_ms": 1000000, "stats_reported_at_ms": 1000000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -180,9 +180,9 @@
       "token_count": 550,
       "ttft_budget_ms": 120,
       "replicas": [
-        {"id": "a-deep", "reported_at_ms": 560000, "reported_prefix": true, "matched_tokens": 550, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
-        {"id": "b-fresh", "reported_at_ms": 1100000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
-        {"id": "z-decoy", "reported_at_ms": 1100000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-deep", "prefix_reported_at_ms": 560000, "stats_reported_at_ms": 560000, "reported_prefix": true, "matched_tokens": 550, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
+        {"id": "b-fresh", "prefix_reported_at_ms": 1100000, "stats_reported_at_ms": 1100000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "prefix_reported_at_ms": 1100000, "stats_reported_at_ms": 1100000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -196,9 +196,9 @@
       "token_count": 550,
       "ttft_budget_ms": 120,
       "replicas": [
-        {"id": "a-deep", "reported_at_ms": 660000, "reported_prefix": true, "matched_tokens": 550, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
-        {"id": "b-fresh", "reported_at_ms": 1200000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
-        {"id": "z-decoy", "reported_at_ms": 1200000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-deep", "prefix_reported_at_ms": 660000, "stats_reported_at_ms": 660000, "reported_prefix": true, "matched_tokens": 550, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
+        {"id": "b-fresh", "prefix_reported_at_ms": 1200000, "stats_reported_at_ms": 1200000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "prefix_reported_at_ms": 1200000, "stats_reported_at_ms": 1200000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -212,9 +212,9 @@
       "token_count": 512,
       "ttft_budget_ms": 220,
       "replicas": [
-        {"id": "a-deep", "reported_at_ms": 760000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
-        {"id": "b-fresh", "reported_at_ms": 1300000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
-        {"id": "z-decoy", "reported_at_ms": 1300000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-deep", "prefix_reported_at_ms": 760000, "stats_reported_at_ms": 760000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
+        {"id": "b-fresh", "prefix_reported_at_ms": 1300000, "stats_reported_at_ms": 1300000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "prefix_reported_at_ms": 1300000, "stats_reported_at_ms": 1300000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -228,9 +228,9 @@
       "token_count": 512,
       "ttft_budget_ms": 220,
       "replicas": [
-        {"id": "a-deep", "reported_at_ms": 860000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
-        {"id": "b-fresh", "reported_at_ms": 1400000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
-        {"id": "z-decoy", "reported_at_ms": 1400000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
+        {"id": "a-deep", "prefix_reported_at_ms": 860000, "stats_reported_at_ms": 860000, "reported_prefix": true, "matched_tokens": 512, "hit_rate": 0.6, "pressure": 0, "observed_hit": true},
+        {"id": "b-fresh", "prefix_reported_at_ms": 1400000, "stats_reported_at_ms": 1400000, "reported_prefix": true, "matched_tokens": 320, "hit_rate": 0.5, "pressure": 0, "observed_hit": false},
+        {"id": "z-decoy", "prefix_reported_at_ms": 1400000, "stats_reported_at_ms": 1400000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.1, "pressure": 0, "observed_hit": false}
       ]
     },
     {
@@ -243,8 +243,8 @@
       "prefix_hash": "tenant-rate-1",
       "token_count": 64,
       "replicas": [
-        {"id": "a-noisy", "reported_at_ms": 1500000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.19, "pressure": 0, "observed_hit": false},
-        {"id": "z-warm", "reported_at_ms": 1470000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.25, "pressure": 0, "observed_hit": true}
+        {"id": "a-noisy", "prefix_reported_at_ms": 1500000, "stats_reported_at_ms": 1500000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.19, "pressure": 0, "observed_hit": false},
+        {"id": "z-warm", "prefix_reported_at_ms": 1470000, "stats_reported_at_ms": 1470000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.25, "pressure": 0, "observed_hit": true}
       ]
     },
     {
@@ -257,8 +257,8 @@
       "prefix_hash": "tenant-rate-2",
       "token_count": 64,
       "replicas": [
-        {"id": "a-noisy", "reported_at_ms": 1600000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.19, "pressure": 0, "observed_hit": false},
-        {"id": "z-warm", "reported_at_ms": 1570000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.25, "pressure": 0, "observed_hit": true}
+        {"id": "a-noisy", "prefix_reported_at_ms": 1600000, "stats_reported_at_ms": 1600000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.19, "pressure": 0, "observed_hit": false},
+        {"id": "z-warm", "prefix_reported_at_ms": 1570000, "stats_reported_at_ms": 1570000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.25, "pressure": 0, "observed_hit": true}
       ]
     },
     {
@@ -271,8 +271,8 @@
       "prefix_hash": "tenant-rate-3",
       "token_count": 64,
       "replicas": [
-        {"id": "a-noisy", "reported_at_ms": 1700000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.19, "pressure": 0, "observed_hit": false},
-        {"id": "z-warm", "reported_at_ms": 1670000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.25, "pressure": 0, "observed_hit": true}
+        {"id": "a-noisy", "prefix_reported_at_ms": 1700000, "stats_reported_at_ms": 1700000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.19, "pressure": 0, "observed_hit": false},
+        {"id": "z-warm", "prefix_reported_at_ms": 1670000, "stats_reported_at_ms": 1670000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.25, "pressure": 0, "observed_hit": true}
       ]
     },
     {
@@ -285,7 +285,7 @@
       "prefix_hash": "tenant-age-preserve-1",
       "token_count": 64,
       "replicas": [
-        {"id": "a-moderate", "reported_at_ms": 1725000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+        {"id": "a-moderate", "prefix_reported_at_ms": 1725000, "stats_reported_at_ms": 1725000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
       ]
     },
     {
@@ -298,7 +298,7 @@
       "prefix_hash": "tenant-age-preserve-2",
       "token_count": 64,
       "replicas": [
-        {"id": "a-moderate", "reported_at_ms": 1825000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+        {"id": "a-moderate", "prefix_reported_at_ms": 1825000, "stats_reported_at_ms": 1825000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
       ]
     },
     {
@@ -311,8 +311,8 @@
       "prefix_hash": "tenant-age-expire-1",
       "token_count": 64,
       "replicas": [
-        {"id": "a-stale", "reported_at_ms": 1850000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.8, "pressure": 0, "observed_hit": false},
-        {"id": "z-recent", "reported_at_ms": 1970000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+        {"id": "a-stale", "prefix_reported_at_ms": 1850000, "stats_reported_at_ms": 1850000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.8, "pressure": 0, "observed_hit": false},
+        {"id": "z-recent", "prefix_reported_at_ms": 1970000, "stats_reported_at_ms": 1970000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
       ]
     },
     {
@@ -325,8 +325,8 @@
       "prefix_hash": "tenant-age-expire-2",
       "token_count": 64,
       "replicas": [
-        {"id": "a-stale", "reported_at_ms": 1950000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.8, "pressure": 0, "observed_hit": false},
-        {"id": "z-recent", "reported_at_ms": 2070000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+        {"id": "a-stale", "prefix_reported_at_ms": 1950000, "stats_reported_at_ms": 1950000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.8, "pressure": 0, "observed_hit": false},
+        {"id": "z-recent", "prefix_reported_at_ms": 2070000, "stats_reported_at_ms": 2070000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
       ]
     },
     {
@@ -339,8 +339,8 @@
       "prefix_hash": "tenant-age-expire-3",
       "token_count": 64,
       "replicas": [
-        {"id": "a-stale", "reported_at_ms": 2050000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.8, "pressure": 0, "observed_hit": false},
-        {"id": "z-recent", "reported_at_ms": 2170000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
+        {"id": "a-stale", "prefix_reported_at_ms": 2050000, "stats_reported_at_ms": 2050000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.8, "pressure": 0, "observed_hit": false},
+        {"id": "z-recent", "prefix_reported_at_ms": 2170000, "stats_reported_at_ms": 2170000, "reported_prefix": false, "matched_tokens": 0, "hit_rate": 0.3, "pressure": 0, "observed_hit": true}
       ]
     }
   ]

@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+func TestWithClockIgnoresNil(t *testing.T) {
+	idx := New(WithClock(nil))
+	if idx.now == nil {
+		t.Fatal("WithClock(nil) cleared the default clock")
+	}
+	idx.Ingest(Update{ReplicaID: "r", Model: "m", Tenant: "t", HashScheme: "vllm",
+		Prefixes: []PrefixRef{{PrefixHash: hash("p"), TokenCount: 1}}})
+}
+
 func TestIngestAndLookupRanksByTokensAndFreshness(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	idx := New(withClock(clk.now), WithTTL(time.Hour))

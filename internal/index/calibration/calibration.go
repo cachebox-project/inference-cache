@@ -20,6 +20,8 @@ import (
 
 const SchemaVersion = 1
 
+const maxDurationMillis int64 = (1<<63 - 1) / int64(time.Millisecond)
+
 const (
 	ObservationPrefix    = "prefix"
 	ObservationTenantHot = "tenant_hot"
@@ -62,13 +64,14 @@ type Observation struct {
 }
 
 type ReplicaObservation struct {
-	ID               string  `json:"id"`
-	ReportedAtMillis int64   `json:"reported_at_ms"`
-	ReportedPrefix   bool    `json:"reported_prefix"`
-	MatchedTokens    int32   `json:"matched_tokens"`
-	HitRate          float32 `json:"hit_rate"`
-	Pressure         float32 `json:"pressure"`
-	ObservedHit      bool    `json:"observed_hit"`
+	ID                     string  `json:"id"`
+	PrefixReportedAtMillis int64   `json:"prefix_reported_at_ms"`
+	StatsReportedAtMillis  int64   `json:"stats_reported_at_ms"`
+	ReportedPrefix         bool    `json:"reported_prefix"`
+	MatchedTokens          int32   `json:"matched_tokens"`
+	HitRate                float32 `json:"hit_rate"`
+	Pressure               float32 `json:"pressure"`
+	ObservedHit            bool    `json:"observed_hit"`
 }
 
 type Config struct {
@@ -137,6 +140,9 @@ func (t Trace) Validate() error {
 	if t.TTLMillis <= 0 {
 		return errors.New("ttl_ms must be positive")
 	}
+	if t.TTLMillis > maxDurationMillis {
+		return fmt.Errorf("ttl_ms exceeds maximum representable duration (%d ms)", maxDurationMillis)
+	}
 	if err := t.Sweep.validate(); err != nil {
 		return err
 	}
@@ -181,6 +187,9 @@ func (s Sweep) validate() error {
 		if value <= 0 {
 			return fmt.Errorf("tenant_hot_max_age_ms contains non-positive value %d", value)
 		}
+		if value > maxDurationMillis {
+			return fmt.Errorf("tenant_hot_max_age_ms contains value exceeding maximum representable duration: %d", value)
+		}
 	}
 	return nil
 }
@@ -203,8 +212,11 @@ func (o Observation) validate() error {
 		if replica.ID == "" {
 			return fmt.Errorf("replica %d: id is required", i)
 		}
-		if replica.ReportedAtMillis > o.AtMillis {
-			return fmt.Errorf("replica %q: reported_at_ms is after observation", replica.ID)
+		if replica.PrefixReportedAtMillis > o.AtMillis {
+			return fmt.Errorf("replica %q: prefix_reported_at_ms is after observation", replica.ID)
+		}
+		if replica.StatsReportedAtMillis > o.AtMillis {
+			return fmt.Errorf("replica %q: stats_reported_at_ms is after observation", replica.ID)
 		}
 		if replica.ReportedPrefix && replica.MatchedTokens <= 0 {
 			return fmt.Errorf("replica %q: matched_tokens must be positive when reported_prefix is true", replica.ID)
@@ -363,11 +375,18 @@ func replayObservation(trace Trace, observation Observation, config Config) bool
 			Model:      observation.Model,
 			Tenant:     observation.Tenant,
 			HashScheme: observation.HashScheme,
-			Timestamp:  time.UnixMilli(replica.ReportedAtMillis),
+			Timestamp:  time.UnixMilli(replica.PrefixReportedAtMillis),
 			Prefixes: []index.PrefixRef{{
 				PrefixHash: []byte(hash),
 				TokenCount: tokens,
 			}},
+		})
+		idx.Ingest(index.Update{
+			ReplicaID:  replica.ID,
+			Model:      observation.Model,
+			Tenant:     observation.Tenant,
+			HashScheme: observation.HashScheme,
+			Timestamp:  time.UnixMilli(replica.StatsReportedAtMillis),
 			Stats: &index.ReplicaStats{
 				HitRate:  replica.HitRate,
 				Pressure: replica.Pressure,

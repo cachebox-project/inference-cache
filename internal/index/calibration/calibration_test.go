@@ -74,9 +74,9 @@ func TestCalibrateSeparatesKnobEffects(t *testing.T) {
 				Tenant: "tenant-a", Model: "model-a", HashScheme: "vllm",
 				PrefixHash: "p", TokenCount: 320,
 				Replicas: []ReplicaObservation{
-					{ID: "hot", ReportedAtMillis: 100_000, ReportedPrefix: true, MatchedTokens: 320, HitRate: 0.8, Pressure: 0.8},
-					{ID: "cool", ReportedAtMillis: 100_000, ReportedPrefix: true, MatchedTokens: 256, HitRate: 0.4, Pressure: 0.1, ObservedHit: true},
-					{ID: "decoy", ReportedAtMillis: 100_000, HitRate: 0.1},
+					{ID: "hot", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, ReportedPrefix: true, MatchedTokens: 320, HitRate: 0.8, Pressure: 0.8},
+					{ID: "cool", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, ReportedPrefix: true, MatchedTokens: 256, HitRate: 0.4, Pressure: 0.1, ObservedHit: true},
+					{ID: "decoy", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, HitRate: 0.1},
 				},
 			},
 		},
@@ -149,6 +149,7 @@ func TestTraceValidationRejectsInvalidFields(t *testing.T) {
 		{"provenance kind", func(trace *Trace) { trace.Provenance.Kind = "unknown" }, "captured or synthetic"},
 		{"provenance source", func(trace *Trace) { trace.Provenance.Source = "" }, "provenance source"},
 		{"ttl", func(trace *Trace) { trace.TTLMillis = 0 }, "ttl_ms"},
+		{"ttl overflow", func(trace *Trace) { trace.TTLMillis = maxDurationMillis + 1 }, "maximum representable"},
 		{"empty sweep", func(trace *Trace) { trace.Sweep.PressureWeights = nil }, "every sweep dimension"},
 		{"empty observations", func(trace *Trace) { trace.Observations = nil }, "at least one observation"},
 		{"invalid observation", func(trace *Trace) { trace.Observations[0].Kind = "unknown" }, "observation 0"},
@@ -183,6 +184,7 @@ func TestSweepValidationRejectsInvalidValues(t *testing.T) {
 		{"hit rate", func(sweep *Sweep) { sweep.TenantHotMinHitRates[0] = 2 }, "invalid rate"},
 		{"ttft", func(sweep *Sweep) { sweep.SLOTightTTFTMillis[0] = 0 }, "non-positive"},
 		{"max age", func(sweep *Sweep) { sweep.TenantHotMaxAgeMillis[0] = 0 }, "non-positive"},
+		{"max age overflow", func(sweep *Sweep) { sweep.TenantHotMaxAgeMillis[0] = maxDurationMillis + 1 }, "maximum representable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sweep := valid()
@@ -241,7 +243,8 @@ func TestReplayTenantHotMissWithoutCandidate(t *testing.T) {
 		ID: "tenant-hot", Kind: ObservationTenantHot, AtMillis: 100_000,
 		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "novel", TokenCount: 1,
 		Replicas: []ReplicaObservation{{
-			ID: "cold", ReportedAtMillis: 100_000, HitRate: 0.1, ObservedHit: true,
+			ID: "cold", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000,
+			HitRate: 0.1, ObservedHit: true,
 		}},
 	}
 	config := Config{TenantHotMinHitRate: 0.2, TenantHotMaxAgeMillis: 60_000}
@@ -256,7 +259,8 @@ func TestReplayUsesObservationClockAtTenantHotBoundary(t *testing.T) {
 		ID: "tenant-hot-boundary", Kind: ObservationTenantHot, AtMillis: 100_000,
 		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "novel", TokenCount: 1,
 		Replicas: []ReplicaObservation{{
-			ID: "warm", ReportedAtMillis: 40_001, HitRate: 0.8, ObservedHit: true,
+			ID: "warm", PrefixReportedAtMillis: 40_001, StatsReportedAtMillis: 40_001,
+			HitRate: 0.8, ObservedHit: true,
 		}},
 	}
 	config := Config{TenantHotMinHitRate: 0.2, TenantHotMaxAgeMillis: 60_000}
@@ -265,15 +269,47 @@ func TestReplayUsesObservationClockAtTenantHotBoundary(t *testing.T) {
 	}
 }
 
-func TestObservationRejectsFutureReplicaReport(t *testing.T) {
+func TestReplayUsesIndependentPrefixAndStatsTimestamps(t *testing.T) {
+	trace := Trace{TTLMillis: int64(time.Minute / time.Millisecond)}
 	observation := Observation{
-		ID: "future", Kind: ObservationPrefix, AtMillis: 10,
-		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
-		Replicas: []ReplicaObservation{{
-			ID: "r", ReportedAtMillis: 11, ReportedPrefix: true, MatchedTokens: 1,
-		}},
+		ID: "independent-clocks", Kind: ObservationPrefix, AtMillis: 100_000,
+		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "p", TokenCount: 320,
+		Replicas: []ReplicaObservation{
+			{
+				ID: "deep-stale-stats", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 0,
+				ReportedPrefix: true, MatchedTokens: 320, Pressure: 1, ObservedHit: true,
+			},
+			{
+				ID: "shallow-fresh-stats", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000,
+				ReportedPrefix: true, MatchedTokens: 256,
+			},
+		},
 	}
-	if err := observation.validate(); err == nil || !strings.Contains(err.Error(), "after observation") {
-		t.Fatalf("validate error = %v, want future-report rejection", err)
+	config := Config{PressureWeight: 1, TenantHotMaxAgeMillis: 60_000}
+	if !replayObservation(trace, observation, config) {
+		t.Fatal("replayObservation = miss, want stale pressure ignored while fresh prefix remains routable")
+	}
+}
+
+func TestObservationRejectsFutureReplicaReport(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ReplicaObservation)
+		want   string
+	}{
+		{"prefix", func(replica *ReplicaObservation) { replica.PrefixReportedAtMillis = 11 }, "prefix_reported_at_ms"},
+		{"stats", func(replica *ReplicaObservation) { replica.StatsReportedAtMillis = 11 }, "stats_reported_at_ms"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observation := Observation{
+				ID: "future", Kind: ObservationPrefix, AtMillis: 10,
+				Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
+				Replicas: []ReplicaObservation{{ID: "r", ReportedPrefix: true, MatchedTokens: 1}},
+			}
+			tc.mutate(&observation.Replicas[0])
+			if err := observation.validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validate error = %v, want substring %q", err, tc.want)
+			}
+		})
 	}
 }
