@@ -79,6 +79,15 @@ func TestCalibrateSeparatesKnobEffects(t *testing.T) {
 					{ID: "decoy", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, HitRate: 0.1},
 				},
 			},
+			{
+				ID: "tenant-hot", Kind: ObservationTenantHot, AtMillis: 100_000,
+				Tenant: "tenant-a", Model: "model-a", HashScheme: "vllm",
+				PrefixHash: "other", TokenCount: 320,
+				Replicas: []ReplicaObservation{{
+					ID: "hot", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000,
+					HitRate: 1, ObservedHit: true,
+				}},
+			},
 		},
 	}
 	if err := trace.Validate(); err != nil {
@@ -129,13 +138,20 @@ func TestTraceValidationRejectsInvalidFields(t *testing.T) {
 				TenantHotMinHitRates:  []float64{0.2},
 				TenantHotMaxAgeMillis: []int64{60_000},
 			},
-			Observations: []Observation{{
-				ID: "o", Kind: ObservationPrefix, Tenant: "t", Model: "m",
-				HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
-				Replicas: []ReplicaObservation{{
-					ID: "r", ReportedPrefix: true, MatchedTokens: 1,
-				}},
-			}},
+			Observations: []Observation{
+				{
+					ID: "prefix", Kind: ObservationPrefix, Tenant: "t", Model: "m",
+					HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
+					Replicas: []ReplicaObservation{{
+						ID: "r", ReportedPrefix: true, MatchedTokens: 1,
+					}},
+				},
+				{
+					ID: "tenant-hot", Kind: ObservationTenantHot, Tenant: "t", Model: "m",
+					HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
+					Replicas: []ReplicaObservation{{ID: "r"}},
+				},
+			},
 		}
 	}
 
@@ -152,6 +168,8 @@ func TestTraceValidationRejectsInvalidFields(t *testing.T) {
 		{"ttl overflow", func(trace *Trace) { trace.TTLMillis = maxDurationMillis + 1 }, "maximum representable"},
 		{"empty sweep", func(trace *Trace) { trace.Sweep.PressureWeights = nil }, "every sweep dimension"},
 		{"empty observations", func(trace *Trace) { trace.Observations = nil }, "at least one observation"},
+		{"missing prefix observation", func(trace *Trace) { trace.Observations = trace.Observations[1:] }, "one prefix and one tenant_hot"},
+		{"missing tenant-hot observation", func(trace *Trace) { trace.Observations = trace.Observations[:1] }, "one prefix and one tenant_hot"},
 		{"invalid observation", func(trace *Trace) { trace.Observations[0].Kind = "unknown" }, "observation 0"},
 		{"duplicate observation", func(trace *Trace) { trace.Observations = append(trace.Observations, trace.Observations[0]) }, "duplicate id"},
 	} {
@@ -212,9 +230,14 @@ func TestObservationValidationRejectsInvalidReplicas(t *testing.T) {
 		{"identity", func(observation *Observation) { observation.ID = "" }, "required"},
 		{"kind", func(observation *Observation) { observation.Kind = "unknown" }, "prefix or tenant_hot"},
 		{"tokens", func(observation *Observation) { observation.TokenCount = 0 }, "token_count"},
+		{"negative ttft budget", func(observation *Observation) { observation.TTFTBudgetMillis = -1 }, "ttft_budget_ms"},
 		{"replicas", func(observation *Observation) { observation.Replicas = nil }, "at least one replica"},
 		{"replica id", func(observation *Observation) { observation.Replicas[0].ID = "" }, "id is required"},
 		{"matched tokens", func(observation *Observation) { observation.Replicas[0].MatchedTokens = 0 }, "matched_tokens"},
+		{"negative unused matched tokens", func(observation *Observation) {
+			observation.Replicas[0].ReportedPrefix = false
+			observation.Replicas[0].MatchedTokens = -1
+		}, "matched_tokens must be non-negative"},
 		{"rate", func(observation *Observation) { observation.Replicas[0].HitRate = 2 }, "finite values"},
 		{"duplicate replica", func(observation *Observation) {
 			observation.Replicas = append(observation.Replicas, observation.Replicas[0])

@@ -150,6 +150,7 @@ func (t Trace) Validate() error {
 		return errors.New("at least one observation is required")
 	}
 	seen := make(map[string]struct{}, len(t.Observations))
+	seenKinds := make(map[string]bool, 2)
 	for i, observation := range t.Observations {
 		if err := observation.validate(); err != nil {
 			return fmt.Errorf("observation %d: %w", i, err)
@@ -158,6 +159,10 @@ func (t Trace) Validate() error {
 			return fmt.Errorf("observation %d: duplicate id %q", i, observation.ID)
 		}
 		seen[observation.ID] = struct{}{}
+		seenKinds[observation.Kind] = true
+	}
+	if !seenKinds[ObservationPrefix] || !seenKinds[ObservationTenantHot] {
+		return errors.New("trace must contain at least one prefix and one tenant_hot observation")
 	}
 	return nil
 }
@@ -204,6 +209,9 @@ func (o Observation) validate() error {
 	if o.TokenCount <= 0 {
 		return errors.New("token_count must be positive")
 	}
+	if o.TTFTBudgetMillis < 0 {
+		return errors.New("ttft_budget_ms must be non-negative")
+	}
 	if len(o.Replicas) == 0 {
 		return errors.New("at least one replica is required")
 	}
@@ -218,7 +226,10 @@ func (o Observation) validate() error {
 		if replica.StatsReportedAtMillis > o.AtMillis {
 			return fmt.Errorf("replica %q: stats_reported_at_ms is after observation", replica.ID)
 		}
-		if replica.ReportedPrefix && replica.MatchedTokens <= 0 {
+		if replica.MatchedTokens < 0 {
+			return fmt.Errorf("replica %q: matched_tokens must be non-negative", replica.ID)
+		}
+		if replica.ReportedPrefix && replica.MatchedTokens == 0 {
 			return fmt.Errorf("replica %q: matched_tokens must be positive when reported_prefix is true", replica.ID)
 		}
 		if !finiteRate(float64(replica.HitRate)) || !finiteRate(float64(replica.Pressure)) {
