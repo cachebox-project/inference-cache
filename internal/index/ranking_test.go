@@ -9,17 +9,17 @@ import (
 	"time"
 )
 
-func TestDefaultRankerConfigMatchesCalibratedTuple(t *testing.T) {
+func TestDefaultRankerConfigMatchesStableProductionTuple(t *testing.T) {
 	got := DefaultRankerConfig()
 	want := RankerConfig{
-		PressureWeight:      0.5,
+		PressureWeight:      1,
 		SLOTightTTFTMs:      200,
 		SLOTightBias:        1,
-		TenantHotMinHitRate: 0.2,
-		TenantHotMaxAge:     2 * time.Minute,
+		TenantHotMinHitRate: 0.1,
+		TenantHotMaxAge:     5 * time.Minute,
 	}
 	if got != want {
-		t.Fatalf("DefaultRankerConfig() = %+v, want calibrated tuple %+v", got, want)
+		t.Fatalf("DefaultRankerConfig() = %+v, want stable production tuple %+v", got, want)
 	}
 }
 

@@ -44,11 +44,11 @@ See [LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/#diagnostics-
 | `strategy.requireChain` | CachePolicy | false | (n/a) |
 | `strategy.enableTenantHot` | CachePolicy | true | false |
 | `affinityRouting` | CachePolicy | `Enabled` | `Disabled` |
-| `PressureWeight` | server RankerConfig | 0.5 | 0 |
+| `PressureWeight` | server RankerConfig | 1.0 | 0 |
 | `SLOTightTTFTMs` | server RankerConfig | 200ms | 0 |
 | `SLOTightBias` | server RankerConfig | 1.0 | 0 |
-| `TenantHotMaxAge` | server RankerConfig | 2m | 0 |
-| `TenantHotMinHitRate` | server RankerConfig | 0.2 | — |
+| `TenantHotMaxAge` | server RankerConfig | 5m | 0 |
+| `TenantHotMinHitRate` | server RankerConfig | 0.1 | — |
 
 ## RenderTemplate
 

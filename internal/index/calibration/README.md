@@ -33,7 +33,9 @@ The checked-in fixture is intentionally synthetic because no production C1
 trace is available in this repository. It provides deterministic boundary
 coverage and proves the calibration pipeline, but it should be replaced or
 supplemented with a sanitized captured trace before treating the coefficients
-as a production benchmark conclusion.
+as a production benchmark conclusion. Its selected tuple is therefore a
+candidate only and does not change `DefaultRankerConfig`; production defaults
+remain stable until representative captured data supports a retune.
 
 ## Reproduce
 

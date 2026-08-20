@@ -11,11 +11,9 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
-func TestCheckedInTraceSelectsDefaultConfigAndCurrentResult(t *testing.T) {
+func TestCheckedInSyntheticTraceSelectsCandidateAndCurrentResult(t *testing.T) {
 	traceFile, err := os.Open("testdata/c1_synthetic_trace.json")
 	if err != nil {
 		t.Fatalf("open trace: %v", err)
@@ -28,14 +26,18 @@ func TestCheckedInTraceSelectsDefaultConfigAndCurrentResult(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	result := Calibrate(trace)
-	defaults := index.DefaultRankerConfig()
-	best := result.BestConfig
-	if float32(best.PressureWeight) != defaults.PressureWeight ||
-		best.SLOTightTTFTMillis != defaults.SLOTightTTFTMs ||
-		float32(best.SLOTightBias) != defaults.SLOTightBias ||
-		float32(best.TenantHotMinHitRate) != defaults.TenantHotMinHitRate ||
-		time.Duration(best.TenantHotMaxAgeMillis)*time.Millisecond != defaults.TenantHotMaxAge {
-		t.Fatalf("calibrated config = %+v, DefaultRankerConfig = %+v", best, defaults)
+	if trace.Provenance.Kind != "synthetic" {
+		t.Fatalf("provenance kind = %q, want synthetic", trace.Provenance.Kind)
+	}
+	want := Config{
+		PressureWeight:        0.5,
+		SLOTightTTFTMillis:    200,
+		SLOTightBias:          1,
+		TenantHotMinHitRate:   0.2,
+		TenantHotMaxAgeMillis: 120_000,
+	}
+	if result.BestConfig != want {
+		t.Fatalf("synthetic candidate = %+v, want %+v", result.BestConfig, want)
 	}
 	if result.BestMetrics.PrefixHitRatePct != 100 || result.BestMetrics.TenantHotHitRatePct != 100 {
 		t.Fatalf("best metrics = %+v, want both fixture hit rates at 100%%", result.BestMetrics)

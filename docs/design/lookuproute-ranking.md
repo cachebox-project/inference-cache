@@ -584,11 +584,11 @@ pressure_factor = max(0, 1 − PressureWeight × pressure)
 score          = matched_tokens × freshness × pressure_factor
 ```
 
-Worked example with the default `PressureWeight = 0.5`:
+Worked example with `PressureWeight = 1`:
 
 | Replica       | tokens | freshness | pressure | baseline score | new score |
 |---|---|---|---|---|---|
-| `big-but-hot` |  80    | 1.0       | 0.9      |  80            | **44**    |
+| `big-but-hot` | 100    | 1.0       | 0.9      | 100            | **10**    |
 | `small-cool`  |  50    | 1.0       | 0.0      |  50            | **50**    |
 
 Under the baseline `big-but-hot` wins; with pressure folded in, the smaller
@@ -623,8 +623,8 @@ When the prefix-match path returns empty, the ranker runs a second
 strategy:
 
 1. Find replicas under `(tenant, model)` whose stats are recent
-   (`statsReported` within `TenantHotMaxAge`, default 2 min) AND whose
-   `hit_rate` is at least a floor (default `0.2`). These are "warm."
+   (`statsReported` within `TenantHotMaxAge`, default 5 min) AND whose
+   `hit_rate` is at least a floor (default `0.1`). These are "warm."
 2. Restrict to replicas that *actually serve* the requested
    `hash_scheme` — i.e. they hold at least one prefix entry in the
    request's engine domain. Without this guard, a stats-only update with
@@ -848,10 +848,9 @@ set so that:
 
 ### Calibration provenance and replay
 
-The default tuple is selected by the reproducible sweep under
-`internal/index/calibration`, which calls the production `LookupRoute`
-implementation for every observation and searches the configured Cartesian
-grid. The objective is the macro-average of prefix-hit ratio and
+The reproducible sweep under `internal/index/calibration` calls the production
+`LookupRoute` implementation for every observation and searches the configured
+Cartesian grid. The objective is the macro-average of prefix-hit ratio and
 `TENANT_HOT`-hit ratio; ties prefer gentler score multipliers and the shorter
 fallback window.
 
@@ -860,9 +859,10 @@ The checked-in `c1-synthetic-mixed-routing-v1` trace contains 22 observations:
 TTFT budgets, plus 8 prefix-miss cases spanning noisy hit-rate reports and
 fresh/stale `TENANT_HOT` candidates. Its provenance is explicitly
 `synthetic`: no production C1 request trace is currently checked into this
-repository, so these values are a deterministic first calibration, not a claim
-about production traffic. Replace the trace with a sanitized captured fixture
-and rerun the same command when such data is available.
+repository, so these values verify the harness and identify a provisional
+candidate, not a production calibration. `DefaultRankerConfig` therefore keeps
+its existing `1.0 / 200 ms / 1.0 / 0.1 / 5 min` tuple. Replace or supplement
+the trace with a sanitized captured fixture before changing those defaults.
 
 ```bash
 make ranker-calibration
@@ -871,12 +871,13 @@ make verify-ranker-calibration
 
 The trace and generated per-knob curves live in
 `internal/index/calibration/testdata/c1_synthetic_trace.json` and
-`c1_synthetic_result.json`. The sweep selects `PressureWeight = 0.5`,
+`c1_synthetic_result.json`. On this synthetic boundary fixture, the sweep
+selects the candidate `PressureWeight = 0.5`,
 `SLOTightTTFTMs = 200 ms`, `SLOTightBias = 1.0`,
 `TenantHotMinHitRate = 0.2`, and `TenantHotMaxAge = 2 min`; both measured hit
-ratios are 100% on this boundary-case fixture. CI regenerates the result in
-check mode, and tests keep the trace, generated result, and code defaults from
-silently diverging. Documentation changes remain subject to normal review.
+ratios are 100%. CI regenerates the result in check mode, and tests keep the
+trace and generated result from silently diverging. This candidate is not
+applied to production defaults without representative captured evidence.
 
 ## 7. The reason-code summary
 
@@ -902,9 +903,9 @@ carve-outs that keep them on `NO_HINT`).
 Six concrete scenarios that exercise the strategies in §2–5 end-to-end.
 Each shows the relevant index state, the request, the score
 computation, and the response. All examples use the default
-`RankerConfig`: `PressureWeight = 0.5`, `SLOTightTTFTMs = 200 ms`,
-`SLOTightBias = 1`, `TenantHotMaxAge = 2 min`,
-`TenantHotMinHitRate = 0.2`.
+`RankerConfig`: `PressureWeight = 1`, `SLOTightTTFTMs = 200 ms`,
+`SLOTightBias = 1`, `TenantHotMaxAge = 5 min`,
+`TenantHotMinHitRate = 0.1`.
 
 ### 8.1. Baseline: one replica holds the prefix
 
@@ -916,7 +917,7 @@ Index state — tenant `team-a`, model `m`, scheme `vllm`:
 
 Request: `{tenant=team-a, model=m, hash_scheme=vllm, prefix_hash=p}`, no SLO.
 
-Computation: `100 × 1.0 × (1 − 0.5 × 0.0) × 1 = 100`.
+Computation: `100 × 1.0 × (1 − 1 × 0.0) × 1 = 100`.
 
 Response: `reason_code=PREFIX_MATCH`, scores `[{r1, score=100, matched_tokens=100}]`.
 
@@ -929,19 +930,19 @@ Index state:
 
 | Replica       | Prefix | Tokens | Freshness | Pressure |
 |---|---|---|---|---|
-| `big-but-hot` | `p`    |  80    | 1.0       | 0.9      |
+| `big-but-hot` | `p`    | 100    | 1.0       | 0.9      |
 | `small-cool`  | `p`    |  50    | 1.0       | 0.0      |
 
 Request: same as §8.1, no SLO.
 
 Computation:
-- `big-but-hot`: `80 × 1.0 × (1 − 0.5 × 0.9) × 1 = 80 × 0.55 = 44`
-- `small-cool`:  `50 × 1.0 × (1 − 0.5 × 0.0) × 1 = 50`
+- `big-but-hot`: `100 × 1.0 × (1 − 1 × 0.9) × 1 = 100 × 0.1 = 10`
+- `small-cool`:  `50 × 1.0 × (1 − 1 × 0.0) × 1 = 50`
 
-Response: `PREFIX_MATCH`, ranked `[small-cool (50), big-but-hot (44)]`.
+Response: `PREFIX_MATCH`, ranked `[small-cool (50), big-but-hot (10)]`.
 
 The pure baseline (`tokens × freshness`) would have given `big-but-hot`
-a score of `80` vs `small-cool`'s `50` and routed traffic to the
+a score of `100` vs `small-cool`'s `50` and routed traffic to the
 already-saturated replica. The pressure factor flips it: locality
 weighed against load.
 
@@ -982,16 +983,16 @@ no SLO.
 
 Prefix-match path: empty (no replica holds `novel`).
 
-Tenant-hot fallback (defaults `TenantHotMaxAge = 2 min`,
-`TenantHotMinHitRate = 0.2`):
-- `r-warm` reported 30 s ago (well under 2 min), `hit_rate = 0.8 ≥ 0.2`,
+Tenant-hot fallback (defaults `TenantHotMaxAge = 5 min`,
+`TenantHotMinHitRate = 0.1`):
+- `r-warm` reported 30 s ago (well under 5 min), `hit_rate = 0.8 ≥ 0.1`,
   and it holds at least one prefix in `vllm` (`other`) — qualifies.
-- `recency = 1 − 30 s / 2 min = 0.75`
-- `pressure_factor = 1 − 0.5 × 0.1 = 0.95`
+- `recency = 1 − 30 s / 5 min = 0.9`
+- `pressure_factor = 1 − 1 × 0.1 = 0.9`
 - `slo_bias = 1`
-- `score = 0.8 × 0.75 × 0.95 × 1 = 0.57`
+- `score = 0.8 × 0.9 × 0.9 × 1 = 0.648`
 
-Response: `TENANT_HOT`, scores `[{r-warm, score=0.57, matched_tokens=0}]`.
+Response: `TENANT_HOT`, scores `[{r-warm, score=0.648, matched_tokens=0}]`.
 
 `matched_tokens` is `0` because there's no prefix overlap — the gateway
 must rely on `reason_code` (not `matched_tokens`) to tell `TENANT_HOT`
