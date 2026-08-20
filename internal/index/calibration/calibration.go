@@ -57,7 +57,7 @@ type Observation struct {
 	Tenant           string               `json:"tenant"`
 	Model            string               `json:"model"`
 	HashScheme       string               `json:"hash_scheme"`
-	PrefixHash       string               `json:"prefix_hash"`
+	PrefixHash       []byte               `json:"prefix_hash"`
 	TokenCount       int32                `json:"token_count"`
 	TTFTBudgetMillis int32                `json:"ttft_budget_ms,omitempty"`
 	Replicas         []ReplicaObservation `json:"replicas"`
@@ -71,6 +71,7 @@ type ReplicaObservation struct {
 	MatchedTokens          int32   `json:"matched_tokens"`
 	HitRate                float32 `json:"hit_rate"`
 	Pressure               float32 `json:"pressure"`
+	OutcomeAvailable       bool    `json:"outcome_available"`
 	ObservedHit            bool    `json:"observed_hit"`
 }
 
@@ -184,13 +185,13 @@ func (s Sweep) validate() error {
 		}
 	}
 	for _, value := range s.SLOTightTTFTMillis {
-		if value <= 0 {
-			return fmt.Errorf("slo_tight_ttft_ms contains non-positive value %d", value)
+		if value < 0 {
+			return fmt.Errorf("slo_tight_ttft_ms contains negative value %d", value)
 		}
 	}
 	for _, value := range s.TenantHotMaxAgeMillis {
-		if value <= 0 {
-			return fmt.Errorf("tenant_hot_max_age_ms contains non-positive value %d", value)
+		if value < 0 {
+			return fmt.Errorf("tenant_hot_max_age_ms contains negative value %d", value)
 		}
 		if value > maxDurationMillis {
 			return fmt.Errorf("tenant_hot_max_age_ms contains value exceeding maximum representable duration: %d", value)
@@ -200,7 +201,7 @@ func (s Sweep) validate() error {
 }
 
 func (o Observation) validate() error {
-	if o.ID == "" || o.Tenant == "" || o.Model == "" || o.HashScheme == "" || o.PrefixHash == "" {
+	if o.ID == "" || o.Tenant == "" || o.Model == "" || o.HashScheme == "" || len(o.PrefixHash) == 0 {
 		return errors.New("id, tenant, model, hash_scheme, and prefix_hash are required")
 	}
 	if o.Kind != ObservationPrefix && o.Kind != ObservationTenantHot {
@@ -234,6 +235,9 @@ func (o Observation) validate() error {
 		}
 		if !finiteRate(float64(replica.HitRate)) || !finiteRate(float64(replica.Pressure)) {
 			return fmt.Errorf("replica %q: hit_rate and pressure must be finite values in [0,1]", replica.ID)
+		}
+		if !replica.OutcomeAvailable {
+			return fmt.Errorf("replica %q: outcome_available must be true", replica.ID)
 		}
 		if _, ok := seen[replica.ID]; ok {
 			return fmt.Errorf("duplicate replica id %q", replica.ID)
@@ -383,7 +387,7 @@ func replayObservation(trace Trace, observation Observation, config Config) bool
 		hash := observation.PrefixHash
 		tokens := replica.MatchedTokens
 		if !replica.ReportedPrefix {
-			hash = "serving/" + observation.ID + "/" + replica.ID
+			hash = servingOnlyHash(observation.PrefixHash, replica.ID)
 			tokens = 1
 		}
 		prefixReportedAt := time.UnixMilli(replica.PrefixReportedAtMillis)
@@ -395,7 +399,7 @@ func replayObservation(trace Trace, observation Observation, config Config) bool
 				HashScheme: observation.HashScheme,
 				Timestamp:  prefixReportedAt,
 				Prefixes: []index.PrefixRef{{
-					PrefixHash: []byte(hash),
+					PrefixHash: hash,
 					TokenCount: tokens,
 				}},
 			})
@@ -420,7 +424,7 @@ func replayObservation(trace Trace, observation Observation, config Config) bool
 		Model:        observation.Model,
 		Tenant:       observation.Tenant,
 		HashScheme:   observation.HashScheme,
-		PrefixHash:   []byte(observation.PrefixHash),
+		PrefixHash:   observation.PrefixHash,
 		TokenCount:   observation.TokenCount,
 		TTFTBudgetMs: observation.TTFTBudgetMillis,
 	})
@@ -429,6 +433,13 @@ func replayObservation(trace Trace, observation Observation, config Config) bool
 		wantStrategy = index.StrategyTenantHot
 	}
 	return result.Strategy == wantStrategy && len(result.Scores) > 0 && observedHits[result.Scores[0].ReplicaID]
+}
+
+func servingOnlyHash(requested []byte, replicaID string) []byte {
+	hash := make([]byte, 0, len(requested)+1+len(replicaID))
+	hash = append(hash, requested...)
+	hash = append(hash, 0)
+	return append(hash, replicaID...)
 }
 
 func percentage(numerator, denominator int) float64 {

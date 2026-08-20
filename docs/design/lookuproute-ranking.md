@@ -854,6 +854,14 @@ Cartesian grid. The objective is the macro-average of prefix-hit ratio and
 `TENANT_HOT`-hit ratio; ties prefer gentler score multipliers and the shorter
 fallback window.
 
+Calibration rows are controlled counterfactual experiments, not ordinary
+single-route request logs: every candidate replica must have an available
+ground-truth outcome. Captured traces must measure those outcomes experimentally
+under an equivalent cache snapshot; synthetic traces define them by
+construction. The loader rejects rows without that explicit availability.
+Prefix hashes remain engine-opaque bytes and use standard base64 JSON encoding
+in trace files.
+
 The checked-in `c1-synthetic-mixed-routing-v1` trace contains 22 observations:
 14 prefix-routing cases spanning pressure/locality tradeoffs and tight/loose
 TTFT budgets, plus 8 prefix-miss cases spanning noisy hit-rate reports and

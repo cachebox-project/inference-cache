@@ -6,6 +6,7 @@ package calibration
 
 import (
 	"bytes"
+	"encoding/json"
 	"math"
 	"os"
 	"strings"
@@ -28,6 +29,9 @@ func TestCheckedInSyntheticTraceSelectsCandidateAndCurrentResult(t *testing.T) {
 	result := Calibrate(trace)
 	if trace.Provenance.Kind != "synthetic" {
 		t.Fatalf("provenance kind = %q, want synthetic", trace.Provenance.Kind)
+	}
+	if !bytes.Equal(trace.Observations[0].PrefixHash, []byte("pressure-shed-1")) {
+		t.Fatalf("decoded prefix hash = %x, want opaque fixture bytes", trace.Observations[0].PrefixHash)
 	}
 	want := Config{
 		PressureWeight:        0.5,
@@ -72,20 +76,20 @@ func TestCalibrateSeparatesKnobEffects(t *testing.T) {
 			{
 				ID: "pressure", Kind: ObservationPrefix, AtMillis: 100_000,
 				Tenant: "tenant-a", Model: "model-a", HashScheme: "vllm",
-				PrefixHash: "p", TokenCount: 320,
+				PrefixHash: []byte("p"), TokenCount: 320,
 				Replicas: []ReplicaObservation{
-					{ID: "hot", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, ReportedPrefix: true, MatchedTokens: 320, HitRate: 0.8, Pressure: 0.8},
-					{ID: "cool", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, ReportedPrefix: true, MatchedTokens: 256, HitRate: 0.4, Pressure: 0.1, ObservedHit: true},
-					{ID: "decoy", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, HitRate: 0.1},
+					{ID: "hot", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, ReportedPrefix: true, MatchedTokens: 320, HitRate: 0.8, Pressure: 0.8, OutcomeAvailable: true},
+					{ID: "cool", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, ReportedPrefix: true, MatchedTokens: 256, HitRate: 0.4, Pressure: 0.1, OutcomeAvailable: true, ObservedHit: true},
+					{ID: "decoy", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000, HitRate: 0.1, OutcomeAvailable: true},
 				},
 			},
 			{
 				ID: "tenant-hot", Kind: ObservationTenantHot, AtMillis: 100_000,
 				Tenant: "tenant-a", Model: "model-a", HashScheme: "vllm",
-				PrefixHash: "other", TokenCount: 320,
+				PrefixHash: []byte("other"), TokenCount: 320,
 				Replicas: []ReplicaObservation{{
 					ID: "hot", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000,
-					HitRate: 1, ObservedHit: true,
+					HitRate: 1, OutcomeAvailable: true, ObservedHit: true,
 				}},
 			},
 		},
@@ -141,15 +145,15 @@ func TestTraceValidationRejectsInvalidFields(t *testing.T) {
 			Observations: []Observation{
 				{
 					ID: "prefix", Kind: ObservationPrefix, Tenant: "t", Model: "m",
-					HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
+					HashScheme: "vllm", PrefixHash: []byte("p"), TokenCount: 1,
 					Replicas: []ReplicaObservation{{
-						ID: "r", ReportedPrefix: true, MatchedTokens: 1,
+						ID: "r", ReportedPrefix: true, MatchedTokens: 1, OutcomeAvailable: true,
 					}},
 				},
 				{
 					ID: "tenant-hot", Kind: ObservationTenantHot, Tenant: "t", Model: "m",
-					HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
-					Replicas: []ReplicaObservation{{ID: "r"}},
+					HashScheme: "vllm", PrefixHash: []byte("p"), TokenCount: 1,
+					Replicas: []ReplicaObservation{{ID: "r", OutcomeAvailable: true}},
 				},
 			},
 		}
@@ -202,8 +206,8 @@ func TestSweepValidationRejectsInvalidValues(t *testing.T) {
 		{"pressure float32 overflow", func(sweep *Sweep) { sweep.PressureWeights[0] = math.MaxFloat64 }, "float32"},
 		{"bias float32 overflow", func(sweep *Sweep) { sweep.SLOTightBiases[0] = math.MaxFloat64 }, "float32"},
 		{"hit rate", func(sweep *Sweep) { sweep.TenantHotMinHitRates[0] = 2 }, "invalid rate"},
-		{"ttft", func(sweep *Sweep) { sweep.SLOTightTTFTMillis[0] = 0 }, "non-positive"},
-		{"max age", func(sweep *Sweep) { sweep.TenantHotMaxAgeMillis[0] = 0 }, "non-positive"},
+		{"ttft", func(sweep *Sweep) { sweep.SLOTightTTFTMillis[0] = -1 }, "negative"},
+		{"max age", func(sweep *Sweep) { sweep.TenantHotMaxAgeMillis[0] = -1 }, "negative"},
 		{"max age overflow", func(sweep *Sweep) { sweep.TenantHotMaxAgeMillis[0] = maxDurationMillis + 1 }, "maximum representable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -214,14 +218,22 @@ func TestSweepValidationRejectsInvalidValues(t *testing.T) {
 			}
 		})
 	}
+	t.Run("zero kill switches", func(t *testing.T) {
+		sweep := valid()
+		sweep.SLOTightTTFTMillis[0] = 0
+		sweep.TenantHotMaxAgeMillis[0] = 0
+		if err := sweep.validate(); err != nil {
+			t.Fatalf("validate zero kill switches: %v", err)
+		}
+	})
 }
 
 func TestObservationValidationRejectsInvalidReplicas(t *testing.T) {
 	valid := func() Observation {
 		return Observation{
 			ID: "o", Kind: ObservationPrefix, Tenant: "t", Model: "m",
-			HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
-			Replicas: []ReplicaObservation{{ID: "r", ReportedPrefix: true, MatchedTokens: 1}},
+			HashScheme: "vllm", PrefixHash: []byte("p"), TokenCount: 1,
+			Replicas: []ReplicaObservation{{ID: "r", ReportedPrefix: true, MatchedTokens: 1, OutcomeAvailable: true}},
 		}
 	}
 	for _, tc := range []struct {
@@ -241,6 +253,7 @@ func TestObservationValidationRejectsInvalidReplicas(t *testing.T) {
 			observation.Replicas[0].MatchedTokens = -1
 		}, "matched_tokens must be non-negative"},
 		{"rate", func(observation *Observation) { observation.Replicas[0].HitRate = 2 }, "finite values"},
+		{"outcome unavailable", func(observation *Observation) { observation.Replicas[0].OutcomeAvailable = false }, "outcome_available"},
 		{"duplicate replica", func(observation *Observation) {
 			observation.Replicas = append(observation.Replicas, observation.Replicas[0])
 		}, "duplicate replica"},
@@ -262,11 +275,26 @@ func TestMarshalResultWrapsJSONErrors(t *testing.T) {
 	}
 }
 
+func TestObservationPrefixHashRoundTripsOpaqueBytes(t *testing.T) {
+	want := []byte{0, 0xff, 0x80, 'x'}
+	encoded, err := json.Marshal(Observation{PrefixHash: want})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got Observation
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !bytes.Equal(got.PrefixHash, want) {
+		t.Fatalf("prefix hash = %x, want %x", got.PrefixHash, want)
+	}
+}
+
 func TestReplayTenantHotMissWithoutCandidate(t *testing.T) {
 	trace := Trace{TTLMillis: int64(time.Minute / time.Millisecond)}
 	observation := Observation{
 		ID: "tenant-hot", Kind: ObservationTenantHot, AtMillis: 100_000,
-		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "novel", TokenCount: 1,
+		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: []byte("novel"), TokenCount: 1,
 		Replicas: []ReplicaObservation{{
 			ID: "cold", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000,
 			HitRate: 0.1, ObservedHit: true,
@@ -282,7 +310,7 @@ func TestReplayUsesObservationClockAtTenantHotBoundary(t *testing.T) {
 	trace := Trace{TTLMillis: int64(time.Minute / time.Millisecond)}
 	observation := Observation{
 		ID: "tenant-hot-boundary", Kind: ObservationTenantHot, AtMillis: 100_000,
-		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "novel", TokenCount: 1,
+		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: []byte("novel"), TokenCount: 1,
 		Replicas: []ReplicaObservation{{
 			ID: "warm", PrefixReportedAtMillis: 40_001, StatsReportedAtMillis: 40_001,
 			HitRate: 0.8, ObservedHit: true,
@@ -298,7 +326,7 @@ func TestReplayUsesIndependentPrefixAndStatsTimestamps(t *testing.T) {
 	trace := Trace{TTLMillis: int64(time.Minute / time.Millisecond)}
 	observation := Observation{
 		ID: "independent-clocks", Kind: ObservationPrefix, AtMillis: 100_000,
-		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "p", TokenCount: 320,
+		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"), TokenCount: 320,
 		Replicas: []ReplicaObservation{
 			{
 				ID: "deep-stale-stats", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 0,
@@ -320,7 +348,7 @@ func TestReplayExcludesTTLExpiredServingEntries(t *testing.T) {
 	trace := Trace{TTLMillis: int64(time.Minute / time.Millisecond)}
 	observation := Observation{
 		ID: "expired-serving", Kind: ObservationTenantHot, AtMillis: 100_000,
-		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "novel", TokenCount: 1,
+		Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: []byte("novel"), TokenCount: 1,
 		Replicas: []ReplicaObservation{{
 			ID: "stale", PrefixReportedAtMillis: 40_000, StatsReportedAtMillis: 100_000,
 			HitRate: 1, ObservedHit: true,
@@ -329,6 +357,22 @@ func TestReplayExcludesTTLExpiredServingEntries(t *testing.T) {
 	config := Config{TenantHotMinHitRate: 0.2, TenantHotMaxAgeMillis: 120_000}
 	if replayObservation(trace, observation, config) {
 		t.Fatal("replayObservation = hit, want TTL-expired serving entry evicted before lookup")
+	}
+}
+
+func TestReplayServingOnlyHashCannotMatchRequestedPrefix(t *testing.T) {
+	trace := Trace{TTLMillis: int64(time.Minute / time.Millisecond)}
+	observation := Observation{
+		ID: "collision", Kind: ObservationPrefix, AtMillis: 100_000,
+		Tenant: "t", Model: "m", HashScheme: "vllm",
+		PrefixHash: []byte("serving/collision/not-holder"), TokenCount: 1,
+		Replicas: []ReplicaObservation{{
+			ID: "not-holder", PrefixReportedAtMillis: 100_000, StatsReportedAtMillis: 100_000,
+			ObservedHit: true,
+		}},
+	}
+	if replayObservation(trace, observation, Config{TenantHotMaxAgeMillis: 60_000}) {
+		t.Fatal("replayObservation = hit, want serving-only key distinct from requested prefix")
 	}
 }
 
@@ -344,8 +388,8 @@ func TestObservationRejectsFutureReplicaReport(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			observation := Observation{
 				ID: "future", Kind: ObservationPrefix, AtMillis: 10,
-				Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: "p", TokenCount: 1,
-				Replicas: []ReplicaObservation{{ID: "r", ReportedPrefix: true, MatchedTokens: 1}},
+				Tenant: "t", Model: "m", HashScheme: "vllm", PrefixHash: []byte("p"), TokenCount: 1,
+				Replicas: []ReplicaObservation{{ID: "r", ReportedPrefix: true, MatchedTokens: 1, OutcomeAvailable: true}},
 			}
 			tc.mutate(&observation.Replicas[0])
 			if err := observation.validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
