@@ -9,6 +9,20 @@ import (
 	"time"
 )
 
+func TestDefaultRankerConfigMatchesStableProductionTuple(t *testing.T) {
+	got := DefaultRankerConfig()
+	want := RankerConfig{
+		PressureWeight:      1,
+		SLOTightTTFTMs:      200,
+		SLOTightBias:        1,
+		TenantHotMinHitRate: 0.1,
+		TenantHotMaxAge:     5 * time.Minute,
+	}
+	if got != want {
+		t.Fatalf("DefaultRankerConfig() = %+v, want stable production tuple %+v", got, want)
+	}
+}
+
 // TestLookupPressureAndSLOFactorsCollapseToUnityWhenSignalsAbsent locks in the
 // contract that the pressure and SLO score factors collapse to 1 when (a) no
 // replica stats are reported (pressure=0) and (b) the request carries no SLO
@@ -257,7 +271,9 @@ func TestWorstTierPrefersLeastLocal(t *testing.T) {
 // have a chain hit would outrank a fresher idle peer the chain-aware
 // formula was supposed to demote.
 func TestChainLookupSharesPressureAndSLOFactorsWithExact(t *testing.T) {
-	idx := New(WithTTL(time.Hour))
+	cfg := DefaultRankerConfig()
+	cfg.PressureWeight = 1
+	idx := New(WithTTL(time.Hour), WithRanker(cfg))
 	hashes, counts := chain("b1", "b2", "b3")
 
 	idx.Ingest(Update{ReplicaID: "big-but-hot", Model: "m", Tenant: "t", HashScheme: "vllm",

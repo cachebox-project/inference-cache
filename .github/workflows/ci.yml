@@ -181,6 +181,9 @@ jobs:
         python3 -m pip install --quiet -r pkg/fingerprint/testdata/requirements.txt
         make verify-golden-vectors
 
+    - name: Verify ranker calibration result
+      run: make verify-ranker-calibration
+
   race-test:
     name: Race Tests
     runs-on: ubuntu-latest
