@@ -97,14 +97,14 @@ code lands.
 | D3 | `LMCacheServer` is removed from the canonical `remoteStorage.provider` set. | `lm://` is a legacy IP remote connector and is absent from the MP L3 adapter catalog. |
 | D4 | PodLocal is the first production candidate and migration target. | It has the smallest scheduling and ownership surface and builds on the existing SGLang proof. |
 | D5 | NodeLocal means one controller-owned server Pod per active engine node per `CacheBackend`; the inference system remains the placement authority. This replaces the earlier DaemonSet/server-first decision on 2026-08-12. | A DaemonSet requires a node set before engines are scheduled and therefore inverted ownership by forcing engines onto cache-selected nodes. Engine-demanded Pods preserve arbitrary inference-system scheduling while still allowing same-node sharing. |
-| D6 | A generic Deployment behind a load-balanced Service is not a valid CUDA MP topology. | CUDA IPC and shared memory require the engine to reach the MP server on its own node. |
+| D6 | A generic Deployment behind a load-balanced Service is not a valid CUDA MP topology. | CUDA IPC requires the engine to reach the MP server on its own node; a load balancer may select a server that cannot open that engine's GPU handle. |
 | D7 | Connector endpoints are not published in the generic `status.endpoint`. | PodLocal uses loopback; NodeLocal is node-dependent. Only remote L3 has a globally meaningful provider endpoint. |
 | D8 | Unsupported combinations are rejected at admission. | An accepted but inert cache field commonly produces silent zero-hit behavior. |
 | D9 | Fail-open is rendered into runtime-native behavior and tested. | A custom environment variable without a known consumer is not an enforceable serving contract. |
 | D10 | Component lifecycle ownership is capability-specific. | The Pod-local MP process is kubelet-owned while remote L3 is independently managed; connector re-registration after an MP-process restart is a post-migration enhancement, not an MVP contract. |
 | D11 | Each supported vLLM integration explicitly identifies its MP connector implementation; the initial reference baseline uses the LMCache-shipped connector. | With vLLM 0.20 or newer, `LMCacheMPConnector` without a module path selects vLLM's built-in implementation. The initial adapter uses `kv_connector_module_path: lmcache.integration.vllm.lmcache_mp_connector` so the tested client tracks the pinned LMCache server protocol; a future adapter revision may validate a different implementation explicitly. |
 | D12 | CacheBackend never owns or rewrites the inference engine image. Engine images in validation matrices are reproducible fixtures only; CacheBackend digest-pins only cache components it injects or manages. | The inference system owns its runtime lifecycle. The selected adapter renders its engine-specific connector contract, while normal engine initialization is the authoritative compatibility check; tested images are neither an admission allowlist nor a mutation default. |
-| D13 | Selecting `NodeLocal` explicitly opts the backend into one host-networked MP server per active engine node. Server and selected engine Pods mount only `/dev/shm/inference-cache/<cacheBackendUID>` from the host as container `/dev/shm`; engine Pods themselves remain off host networking and host IPC. | LMCache 0.5.3 requires node-visible networking and shared host memory for cross-Pod CUDA IPC. A UID-scoped bind mount retains that path without exposing the entire node SHM namespace to normally behaving pool processes. Keeping engine placement and networking under the inference system reduces coupling, while the topology choice and documented trust domain make the remaining host access explicit. |
+| D13 | Selecting `NodeLocal` explicitly opts the backend into one host-networked MP server per active engine node. Server and selected engine Pods mount only `/dev/shm/inference-cache/<cacheBackendUID>` from the host as container `/dev/shm`; engine Pods themselves remain off host networking and host IPC. | LMCache 0.5.3 CUDA IPC requires node-visible networking and GPU visibility. The UID-scoped mount is retained for observed CUDA/PyTorch auxiliary IPC objects without exposing the entire node SHM namespace to normally behaving pool processes; L1 KV bytes are private pinned host memory. Keeping engine placement and networking under the inference system reduces coupling, while the topology choice and documented trust domain make the remaining host access explicit. |
 
 ## Migration baseline (before Phase 1)
 
@@ -878,8 +878,8 @@ skipped because `xxhash` was unavailable; `make ci` still passed.
 
 ## Phase 8 — NodeLocal shared MP servers
 
-- **Status:** Complete (2026-08-12), including focused live-node and GPU
-  validation of the UID-scoped POSIX SHM remediation.
+- **Status:** Implementation revised (2026-08-22); focused GPU revalidation of
+  the explicit non-lazy/private-pinned-L1 profile is pending.
 - **Depends on:** Phases 3–4; does not block Phase 7
 
 ### Objective
@@ -918,26 +918,27 @@ The final contract is:
   the selected NVIDIA runtime without reserving allocatable GPUs, and a
   restrictive container security context. Servers and selected engines mount
   only the backend's `/dev/shm/inference-cache/<uid>` host directory as their
-  container `/dev/shm`; engines remain off host networking and host IPC.
+  container `/dev/shm` for CUDA/PyTorch auxiliary IPC objects; engines remain
+  off host networking and host IPC. L1 itself is private pinned host memory.
 - **Endpoint and gate:** Engines derive the same-node address from Downward API
   `status.hostIP`. A blocking init gate requires healthy `/healthcheck` plus an
   exact `/config` match for namespace/name/UID/generation, ports, and chunk size
-  before the engine starts. It also verifies both the declared MP `shm_name`
-  and the effective L1 memory-manager `shm_name`, so an unsafe pool or LMCache
-  shared-memory fallback cannot silently admit the engine. SGLang writes its
+  before the engine starts. It also verifies `supported_transfer_mode` is
+  `lmcache_driven`, lazy L1 allocation is disabled, and both declared and
+  effective `shm_name` are empty. SGLang writes its
   engine-specific client YAML; vLLM retains its connector JSON. No Service or
   ClusterIP participates in CUDA MP traffic.
 - **Ownership and isolation:** One CacheBackend name/UID/runtime and its sole
   namespace-unique `inferencecache.io/cache-domain` value own one server pool.
   CREATE and UPDATE reject non-canonical or duplicate ownership; Pod admission
-  denies concurrent ambiguity. Every server receives the full UID-derived
-  `lmcache_l1_pool_inferencecache_<uid>` name through `--shm-name`; the name and
-  UID host directory are stable across same-UID generation/server replacement
-  and distinct after CacheBackend delete/recreate. Disjoint port pairs prevent
-  network bind conflicts, while the UID-scoped name and mount prevent normal
-  co-located pools from accidentally unlinking/rebinding or seeing each
-  other's POSIX SHM objects. Idle-retained servers continue reserving their
-  ports and SHM budget until expiry. UID matching and mount scoping are
+  denies concurrent ambiguity. Every server explicitly selects
+  `lmcache_driven`, non-lazy allocation, and empty `shm_name`, so no named
+  POSIX SHM-backed L1 pool exists to collide. The UID host directory is stable
+  across same-UID generation/server replacement and distinct after
+  CacheBackend delete/recreate. Disjoint port pairs prevent network bind
+  conflicts, while the UID-scoped mount separates normally created auxiliary
+  IPC files. Idle-retained servers continue reserving their ports, pinned L1,
+  and IPC directory until expiry. UID matching and mount scoping are
   routing/ownership identities, not authentication: host root, privileged
   Pods, and processes mounting the parent host directory remain outside this
   isolation boundary. Co-located pools must therefore remain inside one
@@ -952,15 +953,16 @@ The final contract is:
   domain requires a separate CacheBackend.
 - **Status:** `desiredServers` is the distinct active scheduled-engine node
   count. `readyServers` counts current-generation, name/UID-verified Ready
-  servers carrying the expected UID-scoped SHM annotation and exact
-  `--shm-name` argument on those nodes. An engine is covered only by exactly one
-  healthy current server on its own node; unscheduled, stale-generation,
-  SHM-mismatched, ambiguous, or serverless engines are uncovered. Connector
+  servers carrying the exact CUDA/non-lazy/empty-`shm_name` runtime profile and
+  UID-scoped host IPC directory on those nodes. An engine is covered only by
+  exactly one healthy current server on its own node; unscheduled,
+  stale-generation, runtime-profile-mismatched, ambiguous, or serverless
+  engines are uncovered. Connector
   readiness requires all desired servers and all matched engines to be Ready
   and covered.
-- **Capacity:** `l1Capacity` is one shared budget per active node, not per engine
-  Pod. `maxGPUWorkers` must cover the maximum engine instances expected on one
-  node.
+- **Capacity:** `l1Capacity` is one eagerly allocated private pinned-memory
+  budget per active node, not per engine Pod. `maxGPUWorkers` must cover the
+  maximum engine instances expected on one node.
 
 ### Deliverables
 
@@ -977,9 +979,9 @@ The final contract is:
       CREATE and UPDATE; deny ambiguous Pod injection and cross-backend sharing.
 - [x] Gate engine startup on the healthy same-node server's exact
       name/UID/generation/port/chunk-size identity.
-- [x] Derive one full UID-scoped POSIX SHM name per CacheBackend, pass it
-      explicitly to every NodeLocal server, verify declared and effective live
-      configuration, and replace or un-cover servers missing that identity.
+- [x] Explicitly select `lmcache_driven`, non-lazy allocation, and empty
+      `shm_name` on every server; verify declared and effective live
+      configuration, and replace or un-cover servers missing that profile.
 - [x] Mount only `/dev/shm/inference-cache/<cacheBackendUID>` as `/dev/shm` in
       each NodeLocal server and selected engine; replace or un-cover a server
       whose declared hostPath does not match its owner UID.
@@ -1005,6 +1007,12 @@ on-demand server-Pod implementation only.
 
 Local and repository validation completed on 2026-08-12 PDT:
 
+The CPU collision and UID-named rows below are retained as historical evidence
+for the former `auto`/engine-driven POSIX-SHM profile. They do not validate the
+current CUDA-only profile. The 2026-08-22 implementation now pins
+`lmcache_driven`, non-lazy allocation, and empty `shm_name`; repository
+validation and focused GPU requalification are tracked separately.
+
 | Check | Result |
 |---|---|
 | Generated API artifacts | `make generate manifests` passed after the final engine-first/idle-retention API change; deepcopy, served CRD, Pod create/patch/delete RBAC, and webhook manifests are synchronized. No DaemonSet RBAC remains. |
@@ -1012,9 +1020,10 @@ Local and repository validation completed on 2026-08-12 PDT:
 | Samples | `make verify-samples` passed: 27 admitted, one pre-existing explicit skip, zero failures. Both engine-first NodeLocal samples passed real admission. |
 | Coverage | `make cover-check` passed. |
 | CI | The baseline was amended as `628194e` with a matching `Signed-off-by`; `make verify-dco` and the complete `make ci` target passed. The optional Python golden-vector regeneration explicitly skipped because `xxhash` is unavailable. |
+| Explicit CUDA allocation profile (2026-08-22) | `make generate manifests`, `git diff --check`, gate-script Python syntax parsing, `bash -n` for the reference smoke, `go test ./...`, `make verify-samples` (27 passed, one explicit skip), `make cover-check` (90.7%), and complete `make ci` passed. Tests require `lmcache_driven`, non-lazy allocation, and empty `shm_name` in rendered server args, the live-config gate, status/lifecycle identity, and vLLM connector JSON. Focused GPU revalidation remains pending and is not implied by these repository results. |
 | Fresh install | Dedicated Kubernetes 1.32 kind clusters passed the engine-first CRD/controller/webhook installation, real duplicate cache-domain rejection, zero speculative server Pods, placement-preserving NodeLocal engine admission, scheduler-selected engine node followed by one exact-node-affinity direct server Pod, host boundary/host ports, no MP Service, PodLocal admission, current samples, doctor, idempotent re-apply, served idle-retention default/bounds, Pod patch RBAC, idle marking, and same-UID reuse. VPN-safe temporary self-signed webhook TLS replaced only the cert-manager download; both clusters were deleted. The later UID-scoped `--shm-name` delta updated this smoke with exact annotation/argument checks but was not rerun end-to-end because no kind node image/cluster was cached and the standard cert-manager URL remained unavailable through the VPN. That delta instead passed real envtest admission plus the SJC current-controller live tests recorded below. |
 | Legacy production search | Production Go/manifests contain no `LMCacheConnectorV1`, `LMCACHE_REMOTE_URL`, `LMCACHE_REMOTE_SERDE`, `ProtocolLMCache`, `lm://`, or LMCacheServer provider path. Remaining LMCacheServer matches are sample comments explicitly describing its removal. |
-| Confirmed SHM collision root cause | A focused SJC dev test placed two independent LMCache 0.5.3 standalone Pods on node `10.0.103.182`, with disjoint ports and instance IDs but no `--shm-name`. Both ran as PID 1: A created `/dev/shm/lmcache_l1_pool_1` at inode `14092`; B unlinked that name and recreated inode `14097`; A retained a mapping to deleted inode `14092`. The dedicated namespace was deleted and no control-plane object changed. |
+| Confirmed historical SHM collision root cause | A focused SJC CPU dev test placed two independent LMCache 0.5.3 standalone Pods on node `10.0.103.182`, with disjoint ports and instance IDs but no `--shm-name`. Both ran as PID 1: A created `/dev/shm/lmcache_l1_pool_1` at inode `14092`; B unlinked that name and recreated inode `14097`; A retained a mapping to deleted inode `14092`. This proves the collision in the former CPU/engine-driven profile, not in the current CUDA-only profile. The dedicated namespace was deleted and no control-plane object changed. |
 | UID-scoped SHM implementation | `git diff --check`, gate-script Python syntax parsing, `go test ./...`, `make verify-samples` (27 passed, one explicit skip), `make cover-check`, and complete `make ci` passed. Tests cover deterministic full-UID naming, distinct UIDs, unsafe/oversized UID rejection, exact server args/annotation, declared and effective startup-gate checks, status exclusion, automatic replacement of an existing server missing the managed SHM identity, and PodLocal regression. Fresh-install could not run locally because no kind node image/cluster is cached and the standard cert-manager bootstrap requires the known-unavailable GitHub path; real envtest API-server admission did run. |
 | UID-directory mount hardening | Local validation passed `git diff --check`, `go test ./...`, `make verify-samples` (27 passed, one explicit skip), `make cover-check` at 90.0%, complete `make ci`, and a fresh Kubernetes 1.32 kind install smoke. Tests cover stable and distinct full-UID host paths, exact `DirectoryOrCreate` mounts in server and engine Pods, rejection of the whole host `/dev/shm` and another backend's directory, status exclusion, automatic stale-server replacement, PodLocal regression, current samples, and idempotent re-apply. The live kind node physically created `/dev/shm/inference-cache/<uid>` as `root:root 0755`; focused SJC GPU evidence for the pinned root engine/server identities is recorded below. The temporary kind cluster was deleted. Arbitrary non-root runtime compatibility remains outside this validation. |
 | Focused live SHM remediation | On SJC Kubernetes 1.31.1, two raw LMCache 0.5.3 servers with distinct explicit UID-style names ran together on CPU node `10.0.103.182`: A remained at inode `14166`, while B used inode `14176` and then `14181` after replacement. A's mapping remained named and unchanged throughout. The current controller then created two independent NodeLocal pools on the same node with real CacheBackend UIDs `61a98028-653a-4cfb-83ef-2dc3a9321b50` and `47205c02-6d7d-45aa-bf40-0e1882346309`: their effective names and inodes were respectively `14196` and `14200`; replacing only B moved it to `14207` while A stayed `14196`; deleting and recreating B's engine demand inside idle retention reused B's same server Pod UID and inode `14207`. Both pools reported server/engine coverage `1/1/1/1`. All CPU test resources were deleted. |
@@ -1067,13 +1076,16 @@ mechanism and was not supplied by CacheBackend.
       before expiry and removes it only after expiry (or immediately at zero).
 - [x] Before/after MP `/metrics` snapshots on the representative common server
       data path, in addition to the separate vLLM and SGLang functional runs.
-- [x] Two CacheBackends with disjoint ports retain distinct UID-scoped SHM
-      names and inodes on one live node through server startup/replacement and
-      idle-retention reuse.
+- [x] Historical CPU-profile test: two CacheBackends with disjoint ports retain
+      distinct UID-scoped SHM names and inodes on one live node through server
+      startup/replacement and idle-retention reuse.
 - [x] Two GPU engines independently pass store → engine GPU/local KV clear → L1
-      retrieve and worker restart/reconnect; exact effective SHM identities,
+      retrieve and worker restart/reconnect; the former exact effective SHM identities,
       disjoint worker registrations, and an identical-prompt cold miss prove
       that neither pool retrieved or registered the other pool's object/worker.
+- [ ] Re-run NodeLocal vLLM and SGLang store/reset-or-flush/retrieve with the
+      explicit `lmcache_driven` + non-lazy + empty-`shm_name` profile; verify
+      startup fails before health when the full pinned allocation is unavailable.
 
 ### Exit criteria
 
@@ -1086,9 +1098,10 @@ mechanism and was not supplied by CacheBackend.
 - [x] Cross-`CacheBackend` sharing remains rejected by the name+UID demand filter.
 - [x] Required vLLM and SGLang functional matrix evidence is supplemented by
       before/after metrics from their common standalone MP-server data path.
-- [x] UID-scoped SHM object-name isolation passes focused live-node and GPU
-      validation; missing or mismatched name identity never counts as Ready or
-      covered and never admits an engine.
+- [x] The current implementation no longer creates or treats a UID-scoped
+      POSIX SHM L1 name as identity; status and the startup gate instead require
+      the explicit CUDA/non-lazy/empty-`shm_name` profile.
+- [ ] Focused GPU validation passes for that revised allocation profile.
 - [x] UID-directory mounts pass focused SJC GPU validation for one pool, two
       same-node engines, and two co-located CacheBackends; the pinned root
       engine/server identities successfully use the kubelet-created
@@ -1143,8 +1156,9 @@ The migration is complete only when all of the following are true:
       including LMCache access through the kubelet-created directory and
       isolation between two co-located CacheBackends.
 
-Phase 8 production behavior and its UID-scoped object-name and directory-mount
-validation are complete. This remains the final phase of the migration; the
+Phase 8 remains the final phase of the migration. Its engine-first topology and
+UID-directory evidence are complete; the revised explicit CUDA allocation
+profile remains pending focused GPU revalidation. The
 future capability profiles below are independent backlog items rather than
 additional phases.
 
@@ -1159,19 +1173,37 @@ immutable artifacts. The numbered items below are the future-work backlog.
 
 ### 1. NodeLocal hostile-process isolation and aggregate SHM capacity
 
-Phase 8 owns the accidental-collision fix: every NodeLocal pool uses a
-deterministic full-UID `--shm-name` and mounts only its full-UID host directory;
-startup/status verify that exact identity. This future item covers stronger
-security and capacity guarantees that mount scoping cannot provide.
+The supported CUDA profile no longer places L1 KV bytes in POSIX shared memory:
+every server uses `lmcache_driven`, non-lazy allocation, and empty `shm_name`,
+so `l1Capacity` is eagerly allocated private pinned host memory. The old
+`/dev/shm/lmcache_l1_pool_<pid>` collision came from a CPU/engine-driven test
+profile that this project does not support. UID-derived `shm_name` therefore is
+not a production identity or capacity control.
+
+NodeLocal still mounts only its full-UID host directory as container `/dev/shm`
+because GPU tests observed CUDA, PyTorch, and semaphore auxiliary objects there.
+Startup/status verify the CUDA allocation profile and UID directory. The
+remaining work is to prove how much of that directory is required and to govern
+two different node resources: aggregate pinned host memory for L1, and tmpfs
+pages consumed by auxiliary IPC objects.
 
 - [ ] Define the hostile-process boundary. A UID-directory mount does not stop
       host root, a privileged Pod, or another process that independently mounts
       the parent host `/dev/shm` from deliberately opening or unlinking another
       pool. Decide whether production support requires distinct Unix
       identities, admission-enforced node separation, or a combination.
-- [ ] Account for aggregate host `/dev/shm` capacity across co-located pools and
-      expose actionable admission/Pending/status behavior before publishing a
-      supported multi-pool capacity envelope.
+- [ ] Account for aggregate pinned host-memory capacity across co-located
+      servers. Kubernetes requests schedule each declared `l1Capacity + 1Gi`,
+      and non-lazy startup fails fast if pinning cannot complete, but the
+      supported multi-pool envelope still needs node-level capacity/status and
+      an operational response to memory-fragmentation or memlock failures.
+- [ ] Run a negative GPU test without the shared UID `/dev/shm` mount. If CUDA
+      IPC remains correct through store/reset/retrieve and worker reconnect,
+      remove the hostPath entirely. If it is required, measure and bound only
+      the auxiliary IPC footprint instead of treating `l1Capacity` as SHM use.
+- [ ] Account for aggregate host `/dev/shm` tmpfs usage by those auxiliary
+      objects and expose actionable status before publishing a supported
+      multi-pool capacity envelope.
 - [ ] Define ownership-verified reclamation for an idle/deleted pool's UID
       directory. The focused GPU run found CUDA, torch, and semaphore files
       still present after every engine and server Pod had exited. This SHM

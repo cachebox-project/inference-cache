@@ -65,16 +65,12 @@ func TestIntegrationCacheBackendNodeLocalServerPod(t *testing.T) {
 	if got := server.Labels[enginebinding.LabelCacheBackendUID]; got == "" {
 		t.Fatal("server Pod is missing CacheBackend UID identity")
 	}
-	wantShmName, err := builtinruntime.NodeLocalServerShmName(&live)
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantShmPath, err := builtinruntime.NodeLocalServerShmHostPath(&live)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !nodeLocalServerHasShmIdentity(&server, wantShmName, wantShmPath) {
-		t.Fatalf("server Pod lacks UID-scoped shm identity: annotations=%v args=%v", server.Annotations, server.Spec.Containers[0].Args)
+	if !nodeLocalServerHasRuntimeIdentity(&server, wantShmPath) {
+		t.Fatalf("server Pod lacks managed CUDA runtime identity: volumes=%v args=%v", server.Spec.Volumes, server.Spec.Containers[0].Args)
 	}
 
 	if err := k8s.Get(ctx, key, &live); err != nil {

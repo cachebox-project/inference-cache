@@ -143,10 +143,10 @@ engine starts.
 
 For **NodeLocal**, the controller creates one direct server Pod per active
 engine node using exact-node affinity, host networking, declared host ports,
-and a UID-scoped `--shm-name`. The engine receives a same-node endpoint derived
-from the Downward API and a startup gate that verifies server ownership,
-generation, shared-memory identity, and health. No load-balanced MP Service is
-created.
+and the explicit CUDA profile (`lmcache_driven`, non-lazy, empty `shm_name`).
+The engine receives a same-node endpoint derived from the Downward API and a
+startup gate that verifies server ownership, generation, effective allocation
+profile, and health. No load-balanced MP Service is created.
 
 Redis is an optional remote tier for either topology. Managed Redis is a
 single-replica Deployment and Service; external Redis publishes the declared
@@ -252,9 +252,8 @@ serving component), and Phase 2 must *validate* rather than assume it:
 Upstream's documented MP deploy is a per-node DaemonSet worker (`hostNetwork` +
 host `/dev/shm` + `hostIPC`) shared by all engines on the node. That is a heavier
 privilege posture and does not fit the per-CacheBackend, engines-anywhere model:
-the shared-memory data path (CUDA-IPC / POSIX `/dev/shm`) requires the engine and
-worker to share an IPC namespace + `/dev/shm`, which across separate pods means
-`hostIPC` + a host-path `/dev/shm` mount on every engine pod. The same-pod
+the CUDA-IPC data path requires the engine and worker to run on the same node
+with the required GPU visibility and runtime IPC surfaces. The same-pod
 sidecar avoids all of that — one worker per engine pod, isolated, no host
 namespaces — at the cost of not sharing an L1 across co-located engines (they
 share instead through the L2, which is the cross-node path anyway). The DaemonSet
@@ -267,10 +266,12 @@ nodes, but is not what the managed adapter renders.
 to end.** This section records the answer, because the reasoning that got here is
 load-bearing for anyone touching the worker's security posture.
 
-The question was which data path the MP worker uses: **CUDA-IPC** (the worker maps
-the engine's GPU KV directly — needs GPU visibility) or **POSIX `/dev/shm`**
-(`non_gpu` transfer via `--shm-name` — no GPU needed). The answer is **CUDA-IPC**,
-and the worker therefore **does** need to see the engine's GPU.
+The question was which data path the MP worker uses: **CUDA-IPC** (the worker
+maps the engine's GPU KV directly — needs GPU visibility) or the engine-driven
+CPU/POSIX-SHM path. The supported answer is **CUDA-IPC**. The server and vLLM
+client now select `lmcache_driven` explicitly, so `--shm-name ""` disables a
+POSIX SHM-backed L1 instead of naming one; the worker still needs to see the
+engine's GPU.
 
 But the anticipated consequence — "a separate sidecar cannot get the engine's GPU,
 so fall back to one container" — **does not hold**, which is why the clean design

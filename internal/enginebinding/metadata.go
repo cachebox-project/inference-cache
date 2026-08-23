@@ -45,10 +45,6 @@ const (
 	// node affinity rather than spec.nodeName so hostPort conflicts are checked.
 	AnnotationNodeLocalTargetNode = "inferencecache.io/node-local-target-node"
 
-	// AnnotationNodeLocalShmName records the controller-derived POSIX shared
-	// memory object owned by this CacheBackend's NodeLocal server pool.
-	AnnotationNodeLocalShmName = "inferencecache.io/node-local-shm-name"
-
 	// AnnotationNodeLocalIdleSince records when the final active engine left a
 	// node. The controller removes it when demand returns and deletes the server
 	// only after the configured idle-retention window expires.

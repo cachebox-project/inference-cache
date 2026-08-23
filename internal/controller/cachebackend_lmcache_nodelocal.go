@@ -48,10 +48,6 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 	if err != nil {
 		return err
 	}
-	wantShmName, err := builtinruntime.NodeLocalServerShmName(backend)
-	if err != nil {
-		return err
-	}
 	wantShmHostPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
 	if err != nil {
 		return err
@@ -80,7 +76,7 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 		current := pod.Annotations[enginebinding.AnnotationNodeLocalOwnerUID] == string(backend.UID) &&
 			pod.Annotations[enginebinding.AnnotationNodeLocalGeneration] == wantGeneration &&
 			pod.Name == builtinruntime.NodeLocalServerPodName(backend.Name, targetNode) &&
-			nodeLocalServerHasShmIdentity(pod, wantShmName, wantShmHostPath)
+			nodeLocalServerHasRuntimeIdentity(pod, wantShmHostPath)
 		if !current {
 			if pod.DeletionTimestamp == nil {
 				if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
@@ -169,8 +165,8 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 	return nil
 }
 
-func nodeLocalServerHasShmIdentity(pod *corev1.Pod, wantName, wantHostPath string) bool {
-	if pod == nil || wantName == "" || wantHostPath == "" || pod.Annotations[enginebinding.AnnotationNodeLocalShmName] != wantName {
+func nodeLocalServerHasRuntimeIdentity(pod *corev1.Pod, wantHostPath string) bool {
+	if pod == nil || wantHostPath == "" {
 		return false
 	}
 	for i := range pod.Spec.Containers {
@@ -201,12 +197,7 @@ func nodeLocalServerHasShmIdentity(pod *corev1.Pod, wantName, wantHostPath strin
 		if !validHostPath {
 			return false
 		}
-		args := container.Args
-		for j := 0; j+1 < len(args); j++ {
-			if args[j] == "--shm-name" && args[j+1] == wantName {
-				return true
-			}
-		}
+		return builtinruntime.IsLMCacheMPCUDAServerProfile(container.Args)
 	}
 	return false
 }

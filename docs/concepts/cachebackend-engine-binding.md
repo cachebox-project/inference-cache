@@ -30,13 +30,14 @@ server uses exact node-name affinity, so Kubernetes still evaluates taints,
 resources, and declared host-port conflicts. The Downward API supplies the
 engine's `status.hostIP`; no ClusterIP participates. The init gate blocks normal
 engine startup until `/config` and `/healthcheck` verify the same
-name/UID/generation and live server configuration. Each CacheBackend UID also
-derives an explicit `lmcache_l1_pool_inferencecache_<uid>` POSIX SHM name; the
-gate verifies both the declared and effective live name before starting the
-engine. The server and engines mount only
+name/UID/generation and live server configuration. The server explicitly
+selects `lmcache_driven`, disables lazy allocation, and passes an empty
+`shm_name`; L1 is therefore eagerly allocated as private pinned host memory,
+not as a named POSIX SHM object. The server and engines still mount only
 `/dev/shm/inference-cache/<cacheBackendUID>` from the host as their container
-`/dev/shm`, so normally behaving co-located pools do not see one another's SHM
-objects. This remains ownership isolation rather than cryptographic
+`/dev/shm`, so normally behaving co-located pools do not see one another's
+CUDA/PyTorch auxiliary IPC objects. This remains ownership isolation rather
+than cryptographic
 authentication: host root, privileged Pods, or processes mounting the parent
 directory can bypass it, so the host-network/server pool still requires one
 trusted tenant domain.
@@ -146,7 +147,7 @@ A fuller paired sample is
 | A matching Pod has no injection annotation | Admission failed open because of an invalid/colliding Pod shape or an unavailable managed Redis endpoint. | Read webhook logs and Pod Events, fix the reported shape, then recreate the Pod. |
 | Engine crashes after successful injection | The runtime-owned image lacks a compatible LMCache client/API, or another engine startup requirement failed. | Inspect engine logs and use a compatible pinned image; CacheBackend does not replace it. |
 | Multiple CacheBackends could match one Pod | A cache-domain value was reused by concurrent creates. CacheBackend admission normally rejects the duplicate; the Pod webhook also denies an ambiguous live match rather than choosing a backend. | Give every CacheBackend a unique namespace-scoped `inferencecache.io/cache-domain` value and put that value on only the intended engine Pod templates. |
-| NodeLocal engine stays in `lmcache-node-local-gate` | Its on-demand same-node server is not healthy, the host ports conflict, the effective UID-scoped SHM pool is unavailable/mismatched, or live config belongs to another backend. | Inspect the server Pod args, `/config`, scheduler events, and `status.connector.enginePodCoverage`; fix ports, host `/dev/shm` capacity, resources, or runtime configuration and recreate or reschedule. |
+| NodeLocal engine stays in `lmcache-node-local-gate` | Its on-demand same-node server is not healthy, the host ports conflict, the effective CUDA/non-lazy/private-L1 profile is mismatched, or live config belongs to another backend. | Inspect the server Pod args, `/config`, scheduler events, and `status.connector.enginePodCoverage`; fix ports, pinned host-memory capacity, resources, or runtime configuration and recreate or reschedule. |
 | Pod was relabeled after creation | Admission is CREATE-only. | Recreate the Pod. |
 | Pod intentionally needs no cache injection | No explicit opt-out was set. | Put `inferencecache.io/skip-inject: "true"` on the Pod template and recreate it. |
 

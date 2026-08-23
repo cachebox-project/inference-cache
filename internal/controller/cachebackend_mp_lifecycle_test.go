@@ -291,7 +291,7 @@ func TestReconcileNodeLocalReplacesServerOnBackendGenerationChange(t *testing.T)
 	}
 }
 
-func TestReconcileNodeLocalReplacesServerMissingUIDScopedShmIdentity(t *testing.T) {
+func TestReconcileNodeLocalReplacesServerMissingManagedCUDAProfile(t *testing.T) {
 	backend := nodeLocalBackend("node-cache", "ns1")
 	engine := nodeLocalEngine(backend, "engine-a", "node-a")
 	reconciler := newReconciler(newScheme(t), backend, engine)
@@ -305,13 +305,12 @@ func TestReconcileNodeLocalReplacesServerMissingUIDScopedShmIdentity(t *testing.
 	if err := reconciler.Delete(context.Background(), &old); err != nil {
 		t.Fatalf("delete original server Pod: %v", err)
 	}
-	delete(old.Annotations, enginebinding.AnnotationNodeLocalShmName)
 	old.ResourceVersion = ""
 	old.UID = ""
 	old.CreationTimestamp = metav1.Time{}
 	args := old.Spec.Containers[0].Args
 	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "--shm-name" {
+		if args[i] == "--supported-transfer-mode" {
 			old.Spec.Containers[0].Args = append(args[:i], args[i+2:]...)
 			break
 		}
@@ -325,16 +324,12 @@ func TestReconcileNodeLocalReplacesServerMissingUIDScopedShmIdentity(t *testing.
 	if err := reconciler.Get(context.Background(), key, &replaced); err != nil {
 		t.Fatalf("get replacement server Pod: %v", err)
 	}
-	want, err := builtinruntime.NodeLocalServerShmName(backend)
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !nodeLocalServerHasShmIdentity(&replaced, want, wantPath) {
-		t.Fatalf("replacement server lacks UID-scoped shm identity: annotations=%v args=%v", replaced.Annotations, replaced.Spec.Containers[0].Args)
+	if !nodeLocalServerHasRuntimeIdentity(&replaced, wantPath) {
+		t.Fatalf("replacement server lacks managed CUDA runtime identity: volumes=%v args=%v", replaced.Spec.Volumes, replaced.Spec.Containers[0].Args)
 	}
 }
 
@@ -365,15 +360,11 @@ func TestReconcileNodeLocalReplacesServerWithWrongUIDScopedShmDirectory(t *testi
 	if err := reconciler.Get(context.Background(), key, &replaced); err != nil {
 		t.Fatalf("get replacement server Pod: %v", err)
 	}
-	wantName, err := builtinruntime.NodeLocalServerShmName(backend)
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !nodeLocalServerHasShmIdentity(&replaced, wantName, wantPath) {
+	if !nodeLocalServerHasRuntimeIdentity(&replaced, wantPath) {
 		t.Fatalf("replacement server lacks UID-scoped SHM directory: volumes=%v", replaced.Spec.Volumes)
 	}
 }

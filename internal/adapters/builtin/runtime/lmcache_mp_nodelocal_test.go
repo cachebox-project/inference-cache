@@ -106,13 +106,15 @@ func TestRenderLMCacheNodeLocalServerPod(t *testing.T) {
 	args := strings.Join(server.Args, " ")
 	for _, want := range []string{
 		"--instance-id team-a/node-cache@11111111-2222-3333-4444-555555555555#7",
-		"--shm-name lmcache_l1_pool_inferencecache_11111111-2222-3333-4444-555555555555",
 		"--host $(INFERENCECACHE_NODE_IP)", "--http-port 18080",
 		"--max-gpu-workers 4", "--max-cpu-workers 8",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("server args %q missing %q", args, want)
 		}
+	}
+	if !IsLMCacheMPCUDAServerProfile(server.Args) {
+		t.Fatalf("server args do not explicitly select the CUDA/private-pinned-L1 profile: %v", server.Args)
 	}
 	if got := serverPod.Annotations[enginebinding.AnnotationNodeLocalOwnerUID]; got != string(cache.UID) {
 		t.Fatalf("owner UID annotation = %q", got)
@@ -123,8 +125,8 @@ func TestRenderLMCacheNodeLocalServerPod(t *testing.T) {
 	if got := serverPod.Annotations[enginebinding.AnnotationNodeLocalTargetNode]; got != "gpu-node-a" {
 		t.Fatalf("target-node annotation = %q", got)
 	}
-	if got := serverPod.Annotations[enginebinding.AnnotationNodeLocalShmName]; got != "lmcache_l1_pool_inferencecache_11111111-2222-3333-4444-555555555555" {
-		t.Fatalf("shared-memory annotation = %q", got)
+	if _, found := serverPod.Annotations["inferencecache.io/node-local-shm-name"]; found {
+		t.Fatalf("obsolete POSIX SHM identity annotation remains: %v", serverPod.Annotations)
 	}
 }
 
@@ -191,27 +193,6 @@ func TestNodeLocalServerPodNameIsStableAndBounded(t *testing.T) {
 	}
 }
 
-func TestNodeLocalServerShmNameIsStableAndUIDScoped(t *testing.T) {
-	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
-	want := "lmcache_l1_pool_inferencecache_11111111-2222-3333-4444-555555555555"
-	got, err := NodeLocalServerShmName(cache)
-	if err != nil || got != want {
-		t.Fatalf("NodeLocalServerShmName = %q, %v; want %q", got, err, want)
-	}
-	cache.Name = "renamed"
-	cache.Namespace = "other"
-	cache.Generation++
-	stable, err := NodeLocalServerShmName(cache)
-	if err != nil || stable != want {
-		t.Fatalf("same-UID replacement shm name = %q, %v; want %q", stable, err, want)
-	}
-	cache.UID = types.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
-	distinct, err := NodeLocalServerShmName(cache)
-	if err != nil || distinct == want {
-		t.Fatalf("different-UID shm name = %q, %v; must differ from %q", distinct, err, want)
-	}
-}
-
 func TestNodeLocalServerShmHostPathIsStableAndUIDScoped(t *testing.T) {
 	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
 	want := "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555"
@@ -231,14 +212,14 @@ func TestNodeLocalServerShmHostPathIsStableAndUIDScoped(t *testing.T) {
 	}
 }
 
-func TestNodeLocalServerShmNameRejectsUnsafeUID(t *testing.T) {
+func TestNodeLocalServerShmHostPathRejectsUnsafeUID(t *testing.T) {
 	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
 	cache.UID = types.UID("unsafe/uid")
-	if _, err := NodeLocalServerShmName(cache); err == nil || !strings.Contains(err.Error(), "unsafe character") {
+	if _, err := NodeLocalServerShmHostPath(cache); err == nil || !strings.Contains(err.Error(), "unsafe character") {
 		t.Fatalf("unsafe UID error = %v", err)
 	}
-	cache.UID = types.UID(strings.Repeat("a", posixShmNameMaxLength))
-	if _, err := NodeLocalServerShmName(cache); err == nil || !strings.Contains(err.Error(), "exceeds POSIX limit") {
+	cache.UID = types.UID(strings.Repeat("a", hostPathComponentMaxLength+1))
+	if _, err := NodeLocalServerShmHostPath(cache); err == nil || !strings.Contains(err.Error(), "exceeds path-component limit") {
 		t.Fatalf("oversized UID error = %v", err)
 	}
 }
@@ -271,7 +252,8 @@ func TestVLLMNodeLocalEngineInjection(t *testing.T) {
 		t.Fatalf("engine node IP env = %+v", engine.Env)
 	}
 	joined := strings.Join(engine.Args, " ")
-	if !strings.Contains(joined, `tcp://$(INFERENCECACHE_NODE_IP)`) || !strings.Contains(joined, `"lmcache.mp.port":"6555"`) {
+	if !strings.Contains(joined, `tcp://$(INFERENCECACHE_NODE_IP)`) || !strings.Contains(joined, `"lmcache.mp.port":"6555"`) ||
+		!strings.Contains(joined, `"lmcache.mp.mp_transfer_mode":"lmcache_driven"`) {
 		t.Fatalf("vLLM args do not carry node-derived endpoint: %s", joined)
 	}
 	shmMount := mountAtPath(engine.VolumeMounts, "/dev/shm")
@@ -291,11 +273,13 @@ func TestVLLMNodeLocalEngineInjection(t *testing.T) {
 	}
 	gate := pod.Spec.InitContainers[0]
 	if !strings.Contains(gate.Args[0], "/config") || !strings.Contains(gate.Args[0], "EXPECTED_INSTANCE_ID") ||
-		!strings.Contains(gate.Args[0], `memory.get("shm_name")`) {
+		!strings.Contains(gate.Args[0], `"supported_transfer_mode": "lmcache_driven"`) ||
+		!strings.Contains(gate.Args[0], `memory.get("use_lazy") is not False`) ||
+		!strings.Contains(gate.Args[0], `memory.get("shm_name") != ""`) {
 		t.Fatalf("gate script does not verify live server identity: %q", gate.Args[0])
 	}
-	if got, found := lookupEnv(gate.Env, "EXPECTED_SHM_NAME"); !found || got != "lmcache_l1_pool_inferencecache_11111111-2222-3333-4444-555555555555" {
-		t.Fatalf("gate EXPECTED_SHM_NAME = %q, found=%v", got, found)
+	if _, found := lookupEnv(gate.Env, "EXPECTED_SHM_NAME"); found {
+		t.Fatal("gate still carries obsolete UID-derived POSIX SHM identity")
 	}
 
 	before := pod.Spec.DeepCopy()
@@ -487,6 +471,7 @@ func TestNodeLocalAdaptersValidateTopologyContract(t *testing.T) {
 	sglangCache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeSGLang)
 	sglangPod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
 		Name: SGLangEngineContainerName, Args: []string{"--page-size", "64"},
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{gpuResourceName: resource.MustParse("1")}},
 	}}}}
 	sglang := sglangLMCacheAdapter{}
 	if !sglang.Supports("sglang", sglangCache) {

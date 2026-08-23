@@ -29,9 +29,8 @@ const (
 	lmCacheNodeLocalConfigMountPath   = "/var/run/inference-cache/lmcache-node"
 	lmCacheNodeLocalConfigFilePath    = lmCacheNodeLocalConfigMountPath + "/client.yaml"
 	lmCacheNodeIPEnv                  = "INFERENCECACHE_NODE_IP"
-	lmCacheNodeLocalShmNamePrefix     = "lmcache_l1_pool_inferencecache_"
 	lmCacheNodeLocalShmHostRoot       = "/dev/shm/inference-cache"
-	posixShmNameMaxLength             = 255
+	hostPathComponentMaxLength        = 255
 )
 
 // RenderLMCacheNodeLocalServerPod renders the engine-neutral server for one
@@ -65,10 +64,6 @@ func RenderLMCacheNodeLocalServerPod(cache *cachev1alpha1.CacheBackend, binding 
 	}
 
 	identity := lmCacheNodeLocalInstanceID(cache)
-	shmName, err := NodeLocalServerShmName(cache)
-	if err != nil {
-		return nil, err
-	}
 	shmHostPath, err := NodeLocalServerShmHostPath(cache)
 	if err != nil {
 		return nil, err
@@ -76,7 +71,9 @@ func RenderLMCacheNodeLocalServerPod(cache *cachev1alpha1.CacheBackend, binding 
 	args := []string{
 		"server",
 		"--instance-id", identity,
-		"--shm-name", shmName,
+		lmCacheMPTransferModeArg, lmCacheMPTransferModeLMCacheDriven,
+		lmCacheMPL1NonLazyArg,
+		lmCacheMPShmNameArg, "",
 		"--host", "$(" + lmCacheNodeIPEnv + ")",
 		"--port", strconv.FormatInt(int64(server.Port), 10),
 		"--http-host", "$(" + lmCacheNodeIPEnv + ")",
@@ -131,7 +128,6 @@ func RenderLMCacheNodeLocalServerPod(cache *cachev1alpha1.CacheBackend, binding 
 		enginebinding.AnnotationNodeLocalOwnerUID:   string(cache.UID),
 		enginebinding.AnnotationNodeLocalGeneration: strconv.FormatInt(cache.Generation, 10),
 		enginebinding.AnnotationNodeLocalTargetNode: nodeName,
-		enginebinding.AnnotationNodeLocalShmName:    shmName,
 	}
 	pathType := corev1.HostPathDirectoryOrCreate
 	noToken := false
@@ -213,13 +209,9 @@ func NodeLocalServerPodName(backendName, nodeName string) string {
 	return prefix + "-" + suffix
 }
 
-// NodeLocalServerShmName returns the exact LMCache POSIX shared-memory object
-// name owned by one CacheBackend UID. It intentionally excludes generation and
-// node identity: replacements of the same backend reclaim their own stale
-// object, while Kubernetes-assigned UIDs isolate delete/recreate lifecycles.
-func NodeLocalServerShmName(cache *cachev1alpha1.CacheBackend) (string, error) {
+func nodeLocalBackendUID(cache *cachev1alpha1.CacheBackend) (string, error) {
 	if cache == nil || cache.UID == "" {
-		return "", fmt.Errorf("derive LMCache NodeLocal shm name: CacheBackend UID is empty")
+		return "", fmt.Errorf("derive LMCache NodeLocal host path: CacheBackend UID is empty")
 	}
 	uid := string(cache.UID)
 	for _, char := range uid {
@@ -227,24 +219,25 @@ func NodeLocalServerShmName(cache *cachev1alpha1.CacheBackend) (string, error) {
 			(char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' {
 			continue
 		}
-		return "", fmt.Errorf("derive LMCache NodeLocal shm name: CacheBackend UID contains unsafe character %q", char)
+		return "", fmt.Errorf("derive LMCache NodeLocal host path: CacheBackend UID contains unsafe character %q", char)
 	}
-	name := lmCacheNodeLocalShmNamePrefix + uid
-	if len(name) > posixShmNameMaxLength {
-		return "", fmt.Errorf("derive LMCache NodeLocal shm name: %d-byte name exceeds POSIX limit %d", len(name), posixShmNameMaxLength)
+	if len(uid) > hostPathComponentMaxLength {
+		return "", fmt.Errorf("derive LMCache NodeLocal host path: %d-byte UID exceeds path-component limit %d", len(uid), hostPathComponentMaxLength)
 	}
-	return name, nil
+	return uid, nil
 }
 
 // NodeLocalServerShmHostPath returns the host tmpfs directory mounted as
 // /dev/shm by one CacheBackend's NodeLocal servers and engines. Mounting only
-// the UID directory keeps normally behaving co-located pools out of each
-// other's POSIX SHM namespace while retaining the node-local CUDA IPC path.
+// the UID directory keeps CUDA/PyTorch auxiliary IPC objects from normally
+// behaving co-located pools out of each other's directory while retaining the
+// node-local CUDA IPC path. The LMCache L1 itself is private pinned memory.
 func NodeLocalServerShmHostPath(cache *cachev1alpha1.CacheBackend) (string, error) {
-	if _, err := NodeLocalServerShmName(cache); err != nil {
+	uid, err := nodeLocalBackendUID(cache)
+	if err != nil {
 		return "", err
 	}
-	return lmCacheNodeLocalShmHostRoot + "/" + string(cache.UID), nil
+	return lmCacheNodeLocalShmHostRoot + "/" + uid, nil
 }
 
 func exactNodeAffinity(nodeName string) *corev1.Affinity {
@@ -341,10 +334,6 @@ func renderLMCacheNodeLocalEngine(pod *corev1.PodSpec, engineContainerName strin
 	if err := validateLMCacheNodeLocalServerConfig(server, effectiveLMCacheChunkSize(cache.Spec.LMCache)); err != nil {
 		return "", err
 	}
-	shmName, err := NodeLocalServerShmName(cache)
-	if err != nil {
-		return "", err
-	}
 	shmHostPath, err := NodeLocalServerShmHostPath(cache)
 	if err != nil {
 		return "", err
@@ -405,7 +394,7 @@ func renderLMCacheNodeLocalEngine(pod *corev1.PodSpec, engineContainerName strin
 		gateMounts = append(gateMounts, configMount)
 	}
 
-	gate := lmCacheNodeLocalGateContainer(cache, shmName, configPath, gateMounts)
+	gate := lmCacheNodeLocalGateContainer(cache, configPath, gateMounts)
 	work.InitContainers, err = adoptNodeLocalGate(work.InitContainers, gate, owned)
 	if err != nil {
 		return "", err
@@ -414,7 +403,7 @@ func renderLMCacheNodeLocalEngine(pod *corev1.PodSpec, engineContainerName strin
 	return configPath, nil
 }
 
-func lmCacheNodeLocalGateContainer(cache *cachev1alpha1.CacheBackend, shmName, configPath string, mounts []corev1.VolumeMount) corev1.Container {
+func lmCacheNodeLocalGateContainer(cache *cachev1alpha1.CacheBackend, configPath string, mounts []corev1.VolumeMount) corev1.Container {
 	server := cache.Spec.LMCache.NodeLocal.Server
 	const gateScript = `import json, os, time, urllib.request
 ip = os.environ["INFERENCECACHE_NODE_IP"]
@@ -422,7 +411,8 @@ host = "[" + ip + "]" if ":" in ip else ip
 base = "http://%s:%s" % (host, os.environ["EXPECTED_HTTP_PORT"])
 expected = {
     "instance_id": os.environ["EXPECTED_INSTANCE_ID"],
-    "shm_name": os.environ["EXPECTED_SHM_NAME"],
+    "supported_transfer_mode": "lmcache_driven",
+    "shm_name": "",
     "port": int(os.environ["EXPECTED_MP_PORT"]),
     "chunk_size": int(os.environ["EXPECTED_CHUNK_SIZE"]),
     "max_gpu_workers": int(os.environ["EXPECTED_MAX_GPU_WORKERS"]),
@@ -438,8 +428,10 @@ while True:
             if mp.get(key) != value:
                 raise RuntimeError("server config %s=%r, expected %r" % (key, mp.get(key), value))
         memory = config.get("storage_manager", {}).get("l1_manager_config", {}).get("memory_config", {})
-        if memory.get("shm_name") != expected["shm_name"]:
-            raise RuntimeError("effective L1 shm_name=%r, expected %r" % (memory.get("shm_name"), expected["shm_name"]))
+        if memory.get("use_lazy") is not False:
+            raise RuntimeError("effective L1 use_lazy=%r, expected False" % memory.get("use_lazy"))
+        if memory.get("shm_name") != "":
+            raise RuntimeError("effective L1 shm_name=%r, expected empty" % memory.get("shm_name"))
         if http.get("http_port") != int(os.environ["EXPECTED_HTTP_PORT"]):
             raise RuntimeError("server HTTP port does not match")
         with urllib.request.urlopen(base + "/healthcheck", timeout=2) as response:
@@ -470,7 +462,6 @@ while True:
 			{Name: lmCacheNodeLocalGateManagedEnv, Value: lmCacheNodeLocalGateManagedValue},
 			{Name: lmCacheNodeIPEnv, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.hostIP"}}},
 			{Name: "EXPECTED_INSTANCE_ID", Value: lmCacheNodeLocalInstanceID(cache)},
-			{Name: "EXPECTED_SHM_NAME", Value: shmName},
 			{Name: "EXPECTED_MP_PORT", Value: strconv.FormatInt(int64(server.Port), 10)},
 			{Name: "EXPECTED_HTTP_PORT", Value: strconv.FormatInt(int64(server.HTTPPort), 10)},
 			{Name: "EXPECTED_CHUNK_SIZE", Value: strconv.FormatInt(int64(effectiveLMCacheChunkSize(cache.Spec.LMCache)), 10)},

@@ -215,7 +215,7 @@ func validateMPServer(
 			"a positive memory request is required for the MP server"))
 	} else if memoryBudget != nil && memoryRequest.Cmp(*memoryBudget) < 0 {
 		errs = append(errs, field.Invalid(path.Child("resources", "requests").Key(string(corev1.ResourceMemory)),
-			memoryRequest.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) so scheduling accounts for the memory-backed /dev/shm", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
+			memoryRequest.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) so scheduling accounts for the eagerly allocated pinned L1 and server overhead", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
 	}
 
 	memoryLimit, hasMemoryLimit := resources.Limits[corev1.ResourceMemory]
@@ -229,7 +229,7 @@ func validateMPServer(
 		}
 		if memoryBudget != nil && memoryLimit.Cmp(*memoryBudget) < 0 {
 			errs = append(errs, field.Invalid(path.Child("resources", "limits").Key(string(corev1.ResourceMemory)),
-				memoryLimit.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) to bound the memory-backed /dev/shm", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
+				memoryLimit.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) to cover the eagerly allocated pinned L1 and server overhead", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
 		}
 	}
 

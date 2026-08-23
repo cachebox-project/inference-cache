@@ -192,8 +192,9 @@ type vllmMPKVTransferConfig struct {
 }
 
 type vllmMPConnectorExtraConfig struct {
-	Host string `json:"lmcache.mp.host"`
-	Port string `json:"lmcache.mp.port"`
+	Host         string `json:"lmcache.mp.host"`
+	Port         string `json:"lmcache.mp.port"`
+	TransferMode string `json:"lmcache.mp.mp_transfer_mode"`
 }
 
 func vllmMPKVTransferConfigJSON(role cachev1alpha1.CacheBackendIntegrationRole, port int32) (string, error) {
@@ -217,8 +218,9 @@ func vllmMPKVTransferConfigJSONForHost(role cachev1alpha1.CacheBackendIntegratio
 		ConnectorModule: vllmLMCacheMPConnectorModulePath,
 		Role:            kvRole,
 		ExtraConfig: vllmMPConnectorExtraConfig{
-			Host: host,
-			Port: strconv.FormatInt(int64(port), 10),
+			Host:         host,
+			Port:         strconv.FormatInt(int64(port), 10),
+			TransferMode: lmCacheMPTransferModeLMCacheDriven,
 		},
 	})
 	if err != nil {
