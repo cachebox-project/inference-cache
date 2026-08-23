@@ -916,10 +916,16 @@ The final contract is:
   deletion. No Deployment, ReplicaSet, or DaemonSet owns these Pods.
 - **Host boundary:** Server Pods use `hostNetwork`, `ClusterFirstWithHostNet`,
   the selected NVIDIA runtime without reserving allocatable GPUs, and a
-  restrictive container security context. Servers and selected engines mount
-  only the backend's `/dev/shm/inference-cache/<uid>` host directory as their
-  container `/dev/shm` for CUDA/PyTorch auxiliary IPC objects; engines remain
-  off host networking and host IPC. L1 itself is private pinned host memory.
+  restrictive container security context. The controller-created server and
+  injected startup gate disable privilege escalation, drop all Linux
+  capabilities, and use the runtime-default seccomp profile; the server also
+  disables host IPC and service-account token automount. Servers and selected
+  engines mount only the backend's `/dev/shm/inference-cache/<uid>` host
+  directory as their container `/dev/shm` for CUDA/PyTorch auxiliary IPC
+  objects. The injector does not enable or otherwise govern engine-owned
+  Pod/container settings such as host networking, host IPC, PID namespace,
+  privileged mode, capabilities, or seccomp policy; those remain
+  inference-system responsibilities. L1 itself is private pinned host memory.
 - **Endpoint and gate:** Engines derive the same-node address from Downward API
   `status.hostIP`. A blocking init gate requires healthy `/healthcheck` plus an
   exact `/config` match for namespace/name/UID/generation, ports, and chunk size
@@ -939,11 +945,11 @@ The final contract is:
   conflicts, while the UID-scoped mount separates normally created auxiliary
   IPC files. Idle-retained servers continue reserving their ports, pinned L1,
   and IPC directory until expiry. UID matching and mount scoping are
-  routing/ownership identities, not authentication: host root, privileged
-  Pods, and processes mounting the parent host directory remain outside this
-  isolation boundary. Co-located pools must therefore remain inside one
-  mutually trusted node domain; host firewall controls are required, and
-  NetworkPolicy does not isolate host-network listeners.
+  routing/ownership identities, not authentication. The supported contract
+  assumes that co-located workloads belong to one mutually trusted node
+  domain; controlling unrelated or privileged Pods, host root, namespace
+  security policy, node separation, and host firewall policy belongs to the
+  inference/cluster platform and is not enforced by this controller.
 - **Runtime consistency:** A pool cannot mix vLLM and SGLang. CacheBackend
   supplies one server image, chunk size, port tuple, generation, and runtime for
   the pool. The inference-system owner remains responsible for engine
@@ -1171,53 +1177,31 @@ A profile enters the supported matrix only after its API contract, GPU
 correctness, failure-recovery, security, and operability gates pass against
 immutable artifacts. The numbered items below are the future-work backlog.
 
-### 1. NodeLocal hostile-process isolation and aggregate SHM capacity
+### 1. NodeLocal shared `/dev/shm` and UID-directory reclamation
 
-The supported CUDA profile no longer places L1 KV bytes in POSIX shared memory:
-every server uses `lmcache_driven`, non-lazy allocation, and empty `shm_name`,
-so `l1Capacity` is eagerly allocated private pinned host memory. The old
-`/dev/shm/lmcache_l1_pool_<pid>` collision came from a CPU/engine-driven test
-profile that this project does not support. UID-derived `shm_name` therefore is
-not a production identity or capacity control.
-
-NodeLocal still mounts only its full-UID host directory as container `/dev/shm`
-because GPU tests observed CUDA, PyTorch, and semaphore auxiliary objects there.
-Startup/status verify the CUDA allocation profile and UID directory. The
-remaining work is to prove how much of that directory is required and to govern
-two different node resources: aggregate pinned host memory for L1, and tmpfs
-pages consumed by auxiliary IPC objects.
-
-- [ ] Define the hostile-process boundary. A UID-directory mount does not stop
-      host root, a privileged Pod, or another process that independently mounts
-      the parent host `/dev/shm` from deliberately opening or unlinking another
-      pool. Decide whether production support requires distinct Unix
-      identities, admission-enforced node separation, or a combination.
-- [ ] Account for aggregate pinned host-memory capacity across co-located
-      servers. Kubernetes requests schedule each declared `l1Capacity + 1Gi`,
-      and non-lazy startup fails fast if pinning cannot complete, but the
-      supported multi-pool envelope still needs node-level capacity/status and
-      an operational response to memory-fragmentation or memlock failures.
-- [ ] Run a negative GPU test without the shared UID `/dev/shm` mount. If CUDA
-      IPC remains correct through store/reset/retrieve and worker reconnect,
-      remove the hostPath entirely. If it is required, measure and bound only
-      the auxiliary IPC footprint instead of treating `l1Capacity` as SHM use.
-- [ ] Account for aggregate host `/dev/shm` tmpfs usage by those auxiliary
-      objects and expose actionable status before publishing a supported
-      multi-pool capacity envelope.
-- [ ] Define ownership-verified reclamation for an idle/deleted pool's UID
-      directory. The focused GPU run found CUDA, torch, and semaphore files
-      still present after every engine and server Pod had exited. This SHM
-      lifetime behavior pre-dates UID directories: under the former whole-host
-      mount the same classes of objects shared the unowned `/dev/shm` root and
-      could not be attributed or safely reclaimed. UID scoping makes that
-      existing lifecycle problem ownership-visible; it adds only the directory
-      entry itself. Without safe last-user cleanup, the objects and their tmpfs
-      pages can remain until explicit node cleanup or reboot. Cleanup must prove
-      that no selected engine or server still uses the directory and must never
-      traverse or delete another CacheBackend UID.
-- [ ] Validate the selected tenant boundary with unauthorized open/unlink tests;
-      until then, multiple pools on one node are supported only inside one
-      mutually trusted node domain.
+- [x] Use `lmcache_driven`, non-lazy allocation, and empty `shm_name`, keeping
+      `l1Capacity` in private pinned host memory rather than POSIX SHM.
+- [x] Retain the exact `/dev/shm/inference-cache/<uid>` hostPath for
+      PyTorch/CUDA IPC lifetime objects. It is an IPC correctness boundary, not
+      L1 storage or capacity control.
+- [x] Limit inference-cache ownership to its rendered Server/helper containers,
+      startup gate, and exact LMCache configuration and UID-volume wiring. The
+      Engine Pod and unrelated workloads retain their existing policy owners.
+- [x] Disable privilege escalation, drop all capabilities, and use
+      `RuntimeDefault` seccomp for managed containers. The NodeLocal Server also
+      uses `hostIPC: false`, disables service-account token automount, declares
+      only its MP/HTTP host ports, and is the only renderer enabling
+      `hostNetwork`.
+- [x] Install no namespace security exemption or cluster-wide Pod policy.
+      Co-located pools remain within one mutually trusted node domain; UID
+      directories isolate managed pools but are not hostile-process boundaries.
+- [x] Use declared memory requests plus non-lazy startup as the capacity
+      contract. Allocation failure keeps the Server unhealthy and the Engine
+      gate closed; no aggregate pinned-memory prediction, SHM quota, or separate
+      capacity API is planned.
+- [ ] Reclaim an idle/deleted pool's exact UID directory only after proving no
+      selected Engine or Server still uses it. Cleanup must verify ownership,
+      remove only that UID, and never traverse or delete another pool's path.
 
 ### 2. MP client/server compatibility signaling
 
