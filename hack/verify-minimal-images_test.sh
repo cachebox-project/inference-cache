@@ -18,6 +18,7 @@ FROM golang:1.26.6 AS builder
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS controller
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS server
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS subscriber
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS cleanup
 EOF
 
 expect_failure() {
@@ -71,6 +72,7 @@ if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
         controller:test) echo '["/controller"]' ;;
         server:test) echo '["/server"]' ;;
         subscriber:test) echo '["/kvevent-subscriber"]' ;;
+        cleanup:test) echo '["/node-local-shm-cleanup"]' ;;
         *) echo "unexpected image: $image" >&2; exit 2 ;;
       esac
       ;;
@@ -84,6 +86,7 @@ if [ "$1" = "create" ]; then
     controller:test) echo cid-controller ;;
     server:test) echo cid-server ;;
     subscriber:test) echo cid-subscriber ;;
+    cleanup:test) echo cid-cleanup ;;
     *) echo "unexpected create image: $2" >&2; exit 2 ;;
   esac
   exit 0
@@ -99,6 +102,7 @@ if [ "$1" = "export" ] && [ "$2" = "-o" ]; then
     controller) payload="$root/controller" ;;
     server) payload="$root/server" ;;
     subscriber) payload="$root/kvevent-subscriber" ;;
+    cleanup) payload="$root/node-local-shm-cleanup" ;;
     *) echo "unexpected container: $4" >&2; exit 2 ;;
   esac
   if [ "${FAKE_MISSING_PAYLOAD:-0}" != "1" ]; then
@@ -158,6 +162,7 @@ run_runtime_check() {
     IMG=controller:test \
     SERVER_IMG=server:test \
     SUBSCRIBER_IMG=subscriber:test \
+    CLEANUP_IMG=cleanup:test \
     "$@" \
     "$verifier" "$valid_dockerfile"
 }
@@ -173,7 +178,7 @@ expect_failure missing-payload run_runtime_check FAKE_MISSING_PAYLOAD=1
 expect_failure payload-name-as-field run_runtime_check \
   FAKE_MISSING_PAYLOAD=1 \
   FAKE_EXTRA_PATH_EXECUTABLE=1 \
-  "FAKE_EXTRA_PATH=opt/foo controller server kvevent-subscriber"
+  "FAKE_EXTRA_PATH=opt/foo controller server kvevent-subscriber node-local-shm-cleanup"
 expect_failure non-executable-payload run_runtime_check FAKE_NON_EXECUTABLE_PAYLOAD=1
 expect_failure owner-only-executable-payload run_runtime_check FAKE_OWNER_ONLY_EXECUTABLE_PAYLOAD=1
 expect_failure directory-payload run_runtime_check FAKE_DIRECTORY_PAYLOAD=1
@@ -194,6 +199,7 @@ expect_failure docker-unavailable env \
   IMG=controller:test \
   SERVER_IMG=server:test \
   SUBSCRIBER_IMG=subscriber:test \
+  CLEANUP_IMG=cleanup:test \
   "$verifier" "$valid_dockerfile"
 
 echo "All minimal-image verifier tests passed."

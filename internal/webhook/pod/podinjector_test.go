@@ -381,7 +381,8 @@ func TestHandle_TypedNodeLocalVLLMGatesOnOwnershipVerifiedSameNodeServer(t *test
 		t.Fatalf("ownership-verifying NodeLocal gate = %+v", gate)
 	}
 	config := testArgValue(mutated.Spec.Containers[0].Args, "--kv-transfer-config")
-	if !strings.Contains(config, `tcp://$(INFERENCECACHE_NODE_IP)`) {
+	if !strings.Contains(config, `tcp://$(INFERENCECACHE_NODE_IP)`) ||
+		!strings.Contains(config, `"lmcache.mp.mp_transfer_mode":"lmcache_driven"`) {
 		t.Fatalf("node-derived vLLM config = %q", config)
 	}
 	if mutated.Spec.HostNetwork || mutated.Spec.HostIPC {
@@ -426,6 +427,7 @@ func TestHandle_TypedPodLocalVLLMUsesDedicatedMPAdapter(t *testing.T) {
 		`"kv_role":"kv_both"`,
 		`"lmcache.mp.host":"tcp://127.0.0.1"`,
 		`"lmcache.mp.port":"6500"`,
+		`"lmcache.mp.mp_transfer_mode":"lmcache_driven"`,
 	} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("kv-transfer-config %q missing %q", config, want)

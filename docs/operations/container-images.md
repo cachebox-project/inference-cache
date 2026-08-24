@@ -1,8 +1,8 @@
 # Container Image Hardening
 
-The repository ships three Go binaries as container images: the controller,
-policy server, and KV-event subscriber. They share one multi-stage Dockerfile
-at `dockerfiles/Dockerfile`.
+The repository ships four Go binaries as container images: the controller,
+policy server, KV-event subscriber, and NodeLocal SHM cleanup helper. They share
+one multi-stage Dockerfile at `dockerfiles/Dockerfile`.
 
 ## Runtime Base
 
@@ -11,13 +11,37 @@ the multi-architecture index digest
 `sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6`.
 The explicit Debian version and immutable digest prevent upstream aliases or
 tags from silently changing the runtime. The `static` variant is sufficient
-because all three binaries are built with `CGO_ENABLED=0`; it contains neither
+because all four binaries are built with `CGO_ENABLED=0`; it contains neither
 a shell nor a package manager. Each target also declares `USER 65532:65532`
-and a vector-form entrypoint.
+and a vector-form entrypoint. The cleanup image is still non-root by default;
+its controller-rendered Pod explicitly runs the helper as UID 0 with no Linux
+capabilities so it can remove IPC files created by different container users.
 
 The `golang` image appears only in the builder stage. It is not present in any
 shipped runtime image. BusyBox images created by reference-stack smoke scripts
 are short-lived test fixtures loaded into kind; they are not release targets.
+
+The cleanup image is a platform implementation detail, configured once on the
+controller with `--node-local-shm-cleanup-image=<repository>@sha256:<digest>`.
+Use the cleanup image published by the same inference-cache release; individual
+CacheBackends do not select or override it.
+
+Each GitHub release attaches `inference-cache-<tag>.yaml`, rendered from
+`config/default` with the matching controller, server, and cleanup image
+digests. Prefer that artifact for release installs; the checked-in manager YAML
+contains an all-zero cleanup digest only as a source-tree rendering placeholder,
+and the controller deliberately rejects that value. A source checkout can render
+and apply the same contract with:
+
+```bash
+make deploy \
+  IMG="${CONTROLLER_IMAGE}" \
+  SERVER_IMG="${SERVER_IMAGE}" \
+  CLEANUP_IMG="${CLEANUP_IMAGE}"
+```
+
+All three variables must contain full `repository@sha256:digest` references.
+Set `INSTALL_KUSTOMIZATION=overlays/server-tls` when rendering the TLS overlay.
 
 ## Verification
 
@@ -35,7 +59,7 @@ make image-build
 make verify-minimal-images
 ```
 
-`verify-minimal-images` checks all three targets for:
+`verify-minimal-images` checks all four targets for:
 
 - the approved Distroless runtime stage;
 - the numeric non-root user and group `65532:65532`;
@@ -50,10 +74,10 @@ while this gate enforces the runtime-image shape.
 ## Release Signatures and Provenance
 
 The `Release Supply Chain` workflow checks out the release tag and
-unconditionally builds and publishes the controller, server, and subscriber
-images from that source. It captures each immutable digest directly from
-Buildx, verifies the published tag resolves to the same digest, and only then
-signs and attests that digest. The workflow uses keyless Cosign, generates
+unconditionally builds and publishes the controller, server, subscriber, and
+NodeLocal cleanup images from that source. It captures each immutable digest
+directly from Buildx, verifies the published tag resolves to the same digest,
+and only then signs and attests that digest. The workflow uses keyless Cosign, generates
 signed SLSA v1 build provenance, pushes the provenance to GHCR, and verifies
 both the signature and provenance before attaching release artifacts. The
 Sigstore provenance bundles are also attached to the corresponding GitHub
@@ -83,9 +107,10 @@ gh attestation verify "oci://${image}@${digest}" \
   --predicate-type https://slsa.dev/provenance/v1
 ```
 
-Repeat the same verification for `inference-cache-server` and
-`inference-cache-subscriber`. Verification is intentionally digest-based; a
-mutable release tag is never accepted as the signed subject.
+Repeat the same verification for `inference-cache-server`,
+`inference-cache-subscriber`, and `inference-cache-shm-cleanup`. Verification
+is intentionally digest-based; a mutable release tag is never accepted as the
+signed subject.
 
 See the upstream [Distroless project](https://github.com/GoogleContainerTools/distroless)
 for image contents, supported Debian variants, and signature-verification

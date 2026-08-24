@@ -45,6 +45,14 @@ func typedSGLangBackend() *cachev1alpha1.CacheBackend {
 	}
 }
 
+func sglangMPValidationPod(args ...string) *corev1.Pod {
+	return &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+		Name:      SGLangEngineContainerName,
+		Args:      args,
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{gpuResourceName: resource.MustParse("1")}},
+	}}}}
+}
+
 func observedTypedSGLangBackend(model string) *cachev1alpha1.CacheBackend {
 	backend := typedSGLangBackend()
 	backend.Spec.Observation = &cachev1alpha1.CacheBackendObservationSpec{ModelID: model}
@@ -91,7 +99,7 @@ func TestSGLangLMCacheInjectsTypedMP(t *testing.T) {
 func TestSGLangLMCacheValidatesPageSize(t *testing.T) {
 	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{}).(runtimeadapter.LMCacheMPRuntimeAdapter)
 	cache := typedSGLangBackend()
-	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Args: []string{"--page-size", "64"}}}}}
+	pod := sglangMPValidationPod("--page-size", "64")
 	if err := adapter.ValidateMPEnginePod(pod, cache); err != nil {
 		t.Fatalf("ValidateMPEnginePod: %v", err)
 	}
@@ -190,10 +198,7 @@ func TestSGLangValidateTypedMPEnginePodPageSize(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
-				Name: SGLangEngineContainerName,
-				Args: tc.args,
-			}}}}
+			pod := sglangMPValidationPod(tc.args...)
 			err := adapter.ValidateMPEnginePod(pod, typedSGLangBackend())
 			if tc.wantErr == "" {
 				if err != nil {
@@ -210,7 +215,7 @@ func TestSGLangValidateTypedMPEnginePodPageSize(t *testing.T) {
 
 func TestSGLangValidateRejectsIncompleteTopology(t *testing.T) {
 	adapter := NewSGLangLMCacheAdapter(SubscriberConfig{}).(runtimeadapter.LMCacheMPRuntimeAdapter)
-	validPod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: SGLangEngineContainerName, Args: []string{"--page-size", "64"}}}}}
+	validPod := sglangMPValidationPod("--page-size", "64")
 	tests := []struct {
 		name    string
 		pod     *corev1.Pod

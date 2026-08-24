@@ -295,6 +295,9 @@ func TestValidateLMCacheTopologyCurrentMatrix(t *testing.T) {
 		{name: "digest without repository", mutate: func(cb *cachev1alpha1.CacheBackend) {
 			cb.Spec.LMCache.PodLocal.Server.Image = "@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		}, wantField: "spec.lmCache.podLocal.server.image"},
+		{name: "missing server image", mutate: func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.LMCache.PodLocal.Server.Image = ""
+		}, wantField: "spec.lmCache.podLocal.server.image"},
 		{name: "KV event port collision", mutate: func(cb *cachev1alpha1.CacheBackend) { cb.Spec.LMCache.PodLocal.Server.Port = lmcacheKVEventPort }, wantField: "spec.lmCache.podLocal.server.port"},
 		{name: "HTTP health port collision", mutate: func(cb *cachev1alpha1.CacheBackend) { cb.Spec.LMCache.PodLocal.Server.Port = lmcacheMPHTTPPort }, wantField: "spec.lmCache.podLocal.server.port"},
 		{name: "memory request below shm", mutate: func(cb *cachev1alpha1.CacheBackend) {

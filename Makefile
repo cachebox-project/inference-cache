@@ -19,9 +19,14 @@ TAG ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
 CONTROLLER_IMAGE_REPO ?= $(REGISTRY)/inference-cache-controller
 SERVER_IMAGE_REPO ?= $(REGISTRY)/inference-cache-server
 SUBSCRIBER_IMAGE_REPO ?= $(REGISTRY)/inference-cache-subscriber
+CLEANUP_IMAGE_REPO ?= $(REGISTRY)/inference-cache-shm-cleanup
 IMG ?= $(CONTROLLER_IMAGE_REPO):$(TAG)
 SERVER_IMG ?= $(SERVER_IMAGE_REPO):$(TAG)
 SUBSCRIBER_IMG ?= $(SUBSCRIBER_IMAGE_REPO):$(TAG)
+CLEANUP_IMG ?= $(CLEANUP_IMAGE_REPO):$(TAG)
+INSTALL_MANIFEST ?= dist/install/inference-cache.yaml
+INSTALL_KUSTOMIZATION ?= default
+KUBECTL ?= kubectl
 DOCKER_BUILD_CMD ?= docker
 KIND ?= $(shell command -v kind 2>/dev/null || echo $(LOCAL_KIND))
 KIND_CLUSTER ?= inference-cache
@@ -265,10 +270,11 @@ proto-lint: buf ## Lint the gRPC contract with buf (lint-only; codegen stays on 
 	$(BUF) lint
 
 .PHONY: build
-build: ## Build controller, server, kvevent-subscriber, and inferencecache binaries.
+build: ## Build controller, server, kvevent-subscriber, NodeLocal cleanup, and inferencecache binaries.
 	$(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/controller ./cmd/controller
 	$(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/server ./cmd/server
 	$(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/kvevent-subscriber ./cmd/kvevent-subscriber
+	$(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/node-local-shm-cleanup ./cmd/node-local-shm-cleanup
 	$(GO_CMD) build -ldflags="$(LD_FLAGS)" -o bin/inferencecache ./cmd/inferencecache
 
 .PHONY: test
@@ -370,7 +376,7 @@ verify-ranker-calibration: ## Verify the checked-in ranker calibration output ma
 	$(GO_CMD) run ./hack/ranker-calibration -trace $(RANKER_CALIBRATION_TRACE) -out $(RANKER_CALIBRATION_RESULT) -check
 
 .PHONY: image-build
-image-build: controller-image server-image subscriber-image ## Build controller, server, and kvevent-subscriber images.
+image-build: controller-image server-image subscriber-image cleanup-image ## Build all release images.
 
 .PHONY: controller-image
 controller-image: ## Build the controller container image.
@@ -383,6 +389,10 @@ server-image: ## Build the server container image.
 .PHONY: subscriber-image
 subscriber-image: ## Build the kvevent-subscriber container image (sidecar auto-attached to engine pods).
 	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target subscriber -t "$(SUBSCRIBER_IMG)" .
+
+.PHONY: cleanup-image
+cleanup-image: ## Build the NodeLocal SHM cleanup helper image.
+	$(DOCKER_BUILD_CMD) build -f dockerfiles/Dockerfile --target cleanup -t "$(CLEANUP_IMG)" .
 
 .PHONY: verify-minimal-base
 verify-minimal-base: ## Verify every shipped runtime stage uses the approved Distroless non-root base.
@@ -399,7 +409,7 @@ verify-minimal-images: verify-minimal-base ## Inspect built images for non-root 
 	@DOCKER="$(DOCKER_BUILD_CMD)" \
 		MINIMAL_IMAGE_DOCKERFILE="$(MINIMAL_IMAGE_DOCKERFILE)" \
 		MINIMAL_RUNTIME_BASE="$(MINIMAL_RUNTIME_BASE)" \
-		IMG="$(IMG)" SERVER_IMG="$(SERVER_IMG)" SUBSCRIBER_IMG="$(SUBSCRIBER_IMG)" \
+		IMG="$(IMG)" SERVER_IMG="$(SERVER_IMG)" SUBSCRIBER_IMG="$(SUBSCRIBER_IMG)" CLEANUP_IMG="$(CLEANUP_IMG)" \
 		bash hack/verify-minimal-images.sh
 
 .PHONY: syft-check
@@ -425,7 +435,7 @@ sbom-release: syft-check ## Generate a source/release SBOM for the checked-out t
 		-o "spdx-json=$(SBOM_DIR)/inference-cache-$(SBOM_TAG).spdx.json"
 
 .PHONY: sbom-images
-sbom-images: syft-check ## Generate SBOMs for controller, server, and kvevent-subscriber images.
+sbom-images: syft-check ## Generate SBOMs for all release images.
 	@if [ "$(SBOM_IMAGE_SOURCE)" = "docker" ] && [ "$(SBOM_IMAGE_BUILD)" = "1" ]; then \
 		$(MAKE) -f "$(MAKEFILE_SELF)" image-build; \
 	fi
@@ -433,6 +443,7 @@ sbom-images: syft-check ## Generate SBOMs for controller, server, and kvevent-su
 	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-controller-$(SBOM_TAG).spdx.json"
 	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(SERVER_IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-server-$(SBOM_TAG).spdx.json"
 	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(SUBSCRIBER_IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-subscriber-$(SBOM_TAG).spdx.json"
+	"$(SYFT)" scan "$(SBOM_IMAGE_SOURCE):$(CLEANUP_IMG)" -o "spdx-json=$(SBOM_DIR)/inference-cache-cleanup-$(SBOM_TAG).spdx.json"
 
 .PHONY: sbom-registry-images
 sbom-registry-images: syft-check ## Generate SBOMs for published release images by immutable registry digest.
@@ -441,7 +452,8 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 	for image in \
 		"controller|$(CONTROLLER_IMAGE_REPO)" \
 		"server|$(SERVER_IMAGE_REPO)" \
-		"subscriber|$(SUBSCRIBER_IMAGE_REPO)"; do \
+		"subscriber|$(SUBSCRIBER_IMAGE_REPO)" \
+		"cleanup|$(CLEANUP_IMAGE_REPO)"; do \
 		component="$${image%%|*}"; \
 		repo="$${image#*|}"; \
 		ref="$${repo}:$(TAG)"; \
@@ -528,6 +540,20 @@ sbom-registry-images: syft-check ## Generate SBOMs for published release images 
 .PHONY: test-release-image-digests
 test-release-image-digests: ## Test fail-closed release image digest resolution with a fake registry client.
 	@bash hack/resolve-release-image-digests_test.sh
+
+.PHONY: test-release-install
+test-release-install: kustomize ## Test digest-pinned release install rendering.
+	@KUSTOMIZE_CMD="$(LOCAL_KUSTOMIZE)" bash hack/render-release-install_test.sh
+
+.PHONY: render-install
+render-install: kustomize ## Render an install manifest; IMG, SERVER_IMG, and CLEANUP_IMG must be digest-pinned.
+	@CONTROLLER_IMAGE="$(IMG)" SERVER_IMAGE="$(SERVER_IMG)" CLEANUP_IMAGE="$(CLEANUP_IMG)" \
+		OUTPUT_FILE="$(INSTALL_MANIFEST)" KUSTOMIZATION_PATH="$(INSTALL_KUSTOMIZATION)" \
+		KUSTOMIZE_CMD="$(LOCAL_KUSTOMIZE)" hack/render-release-install.sh
+
+.PHONY: deploy
+deploy: render-install ## Apply the digest-pinned install manifest to the current Kubernetes context.
+	$(KUBECTL) apply -f "$(INSTALL_MANIFEST)"
 
 .PHONY: dev-cluster
 dev-cluster: kind ## Create a local kind cluster for development.

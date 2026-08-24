@@ -30,11 +30,12 @@ native sidecar contract, so inventing a chart mapping would be unsafe.
 
 ## Install the operator
 
-Install `config/default` (or the equivalent published release) before creating
-the reference `CacheBackend`:
+Install the digest-pinned manifest attached to the selected inference-cache
+release before creating the reference `CacheBackend`:
 
 ```bash
-kubectl apply -k config/default
+RELEASE_TAG=vX.Y.Z
+kubectl apply -f "inference-cache-${RELEASE_TAG}.yaml"
 kubectl -n inference-cache-system wait \
   --for=condition=Available deployment --all --timeout=180s
 ```

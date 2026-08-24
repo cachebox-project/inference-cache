@@ -50,7 +50,7 @@ func newScheme(t *testing.T) *runtime.Scheme {
 func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendReconciler {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}).
+		WithStatusSubresource(&cachev1alpha1.CacheBackend{}, &appsv1.Deployment{}, &corev1.Pod{}).
 		WithObjects(objs...).
 		Build()
 	r := &CacheBackendReconciler{
@@ -63,6 +63,9 @@ func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendR
 }
 
 func configureTestRegistries(r *CacheBackendReconciler) {
+	if r.NodeLocalShmCleanupImage == "" {
+		r.NodeLocalShmCleanupImage = "registry.example/inference-cache-shm-cleanup@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	}
 	if r.Registry != nil && r.BackendRegistry != nil {
 		return
 	}

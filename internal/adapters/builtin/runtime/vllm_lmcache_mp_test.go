@@ -49,9 +49,10 @@ func newTypedVLLMMPBackend() *cachev1alpha1.CacheBackend {
 
 func newVLLMMPEnginePod(args ...string) *corev1.Pod {
 	return &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
-		Name:  EngineContainerName,
-		Image: "vllm:connector-ready",
-		Args:  args,
+		Name:      EngineContainerName,
+		Image:     "vllm:connector-ready",
+		Args:      args,
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{gpuResourceName: resource.MustParse("1")}},
 	}}}}
 }
 
@@ -240,7 +241,8 @@ func TestVLLMLMCacheMPKVTransferConfigRoles(t *testing.T) {
 				got.ConnectorModule != vllmLMCacheMPConnectorModulePath ||
 				got.Role != tc.want ||
 				got.ExtraConfig.Host != "tcp://127.0.0.1" ||
-				got.ExtraConfig.Port != "6500" {
+				got.ExtraConfig.Port != "6500" ||
+				got.ExtraConfig.TransferMode != lmCacheMPTransferModeLMCacheDriven {
 				t.Fatalf("config = %+v", got)
 			}
 		})

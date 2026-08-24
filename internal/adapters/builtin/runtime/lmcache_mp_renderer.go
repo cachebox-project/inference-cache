@@ -33,6 +33,12 @@ const (
 	lmCacheMPShmMountPath  = "/dev/shm"
 	lmCacheMPShmHeadroom   = "1Gi"
 
+	lmCacheMPTransferModeArg           = "--supported-transfer-mode"
+	lmCacheMPTransferModeLMCacheDriven = "lmcache_driven"
+	lmCacheMPL1NonLazyArg              = "--no-l1-use-lazy"
+	lmCacheMPL1LazyArg                 = "--l1-use-lazy"
+	lmCacheMPShmNameArg                = "--shm-name"
+
 	lmCacheMPServerPortName = "lmcache-mp"
 	lmCacheMPHTTPPortName   = "lmcache-http"
 	lmCacheMPHTTPPort       = int32(8080)
@@ -161,8 +167,9 @@ func lmCacheMPMemoryBudget(l1Capacity resource.Quantity) resource.Quantity {
 }
 
 // checkLMCacheMPShmBudget validates an engine-owned /dev/shm volume without
-// mutating it. A larger operator-owned tmpfs is safe to share; an unbounded,
-// disk-backed, or undersized volume cannot satisfy the typed L1 contract.
+// mutating it. The supported L1 is private pinned host memory, but the engine
+// and CUDA runtime still use /dev/shm for auxiliary IPC objects. Keep the
+// existing l1Capacity+headroom bound as a conservative PodLocal IPC budget.
 func checkLMCacheMPShmBudget(volumes []corev1.Volume, mount corev1.VolumeMount, budget resource.Quantity) error {
 	for i := range volumes {
 		if volumes[i].Name != mount.Name {
@@ -170,7 +177,7 @@ func checkLMCacheMPShmBudget(volumes []corev1.Volume, mount corev1.VolumeMount, 
 		}
 		emptyDir := volumes[i].EmptyDir
 		if emptyDir == nil || emptyDir.Medium != corev1.StorageMediumMemory {
-			return fmt.Errorf("render LMCache MP server: engine container mounts %q from volume %q, but PodLocal L1 requires a memory-backed emptyDir", lmCacheMPShmMountPath, mount.Name)
+			return fmt.Errorf("render LMCache MP server: engine container mounts %q from volume %q, but the PodLocal CUDA IPC budget requires a memory-backed emptyDir", lmCacheMPShmMountPath, mount.Name)
 		}
 		if emptyDir.SizeLimit == nil || emptyDir.SizeLimit.Cmp(budget) < 0 {
 			var got string
@@ -212,6 +219,9 @@ func lmCacheMPServerContainer(cfg lmCacheMPServerConfig, l2Adapter string, bindi
 
 	serverArgs := []string{
 		"server",
+		lmCacheMPTransferModeArg, lmCacheMPTransferModeLMCacheDriven,
+		lmCacheMPL1NonLazyArg,
+		lmCacheMPShmNameArg, "",
 		"--host", "127.0.0.1",
 		"--port", strconv.FormatInt(int64(cfg.Port), 10),
 		"--http-host", "0.0.0.0",
@@ -279,6 +289,28 @@ exec "$@"`
 		LivenessProbe:   lmCacheMPHTTPProbe(10, 3),
 		SecurityContext: lmCacheMPServerSecurityContext(nil),
 	}, nil
+}
+
+// IsLMCacheMPCUDAServerProfile reports whether args explicitly select the
+// supported CUDA-only MP transfer and L1 allocation contract. An empty
+// --shm-name keeps the eagerly allocated pinned L1 private to the server
+// process instead of creating a POSIX SHM-backed L1 arena.
+func IsLMCacheMPCUDAServerProfile(args []string) bool {
+	transferModes, transferMalformed := argValues(args, lmCacheMPTransferModeArg)
+	shmNames, shmMalformed := argValues(args, lmCacheMPShmNameArg)
+	nonLazyCount := 0
+	lazyCount := 0
+	for _, arg := range args {
+		switch arg {
+		case lmCacheMPL1NonLazyArg:
+			nonLazyCount++
+		case lmCacheMPL1LazyArg:
+			lazyCount++
+		}
+	}
+	return !transferMalformed && len(transferModes) == 1 && transferModes[0] == lmCacheMPTransferModeLMCacheDriven &&
+		!shmMalformed && len(shmNames) == 1 && shmNames[0] == "" &&
+		nonLazyCount == 1 && lazyCount == 0
 }
 
 func lmCacheMPHTTPProbe(period, failures int32) *corev1.Probe {

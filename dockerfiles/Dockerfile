@@ -22,6 +22,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-s -w" -o /out/kvevent-subscriber ./cmd/kvevent-subscriber
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-s -w" -o /out/node-local-shm-cleanup ./cmd/node-local-shm-cleanup
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS controller
 COPY --from=builder /out/controller /controller
@@ -37,3 +40,8 @@ FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae
 COPY --from=builder /out/kvevent-subscriber /kvevent-subscriber
 USER 65532:65532
 ENTRYPOINT ["/kvevent-subscriber"]
+
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6 AS cleanup
+COPY --from=builder /out/node-local-shm-cleanup /node-local-shm-cleanup
+USER 65532:65532
+ENTRYPOINT ["/node-local-shm-cleanup"]

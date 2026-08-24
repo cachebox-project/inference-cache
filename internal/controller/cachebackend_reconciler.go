@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlreconcile "sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -64,6 +65,9 @@ type CacheBackendReconciler struct {
 	// BackendRegistry resolves remote provider lifecycle independently from
 	// engine/runtime wiring. The composition root must inject it.
 	BackendRegistry *backendadapter.Registry
+	// NodeLocalShmCleanupImage is the platform-owned, digest-pinned helper image
+	// used by one-shot NodeLocal SHM cleanup Pods.
+	NodeLocalShmCleanupImage string
 	// MatchedEnginePodsRequeueInterval overrides the self-requeue cadence
 	// that keeps status.matchedEnginePods fresh between unrelated reconcile
 	// triggers. Zero means "use [DefaultMatchedEnginePodsRequeueInterval]".
@@ -169,6 +173,19 @@ func (r *CacheBackendReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	if backend.DeletionTimestamp.IsZero() && isTypedLMCacheNodeLocal(&backend) && !controllerutil.ContainsFinalizer(&backend, nodeLocalShmCleanupFinalizer) {
+		before := backend.DeepCopy()
+		controllerutil.AddFinalizer(&backend, nodeLocalShmCleanupFinalizer)
+		if err := r.Patch(ctx, &backend, client.MergeFrom(before)); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if !backend.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&backend, nodeLocalShmCleanupFinalizer) {
+			return r.finalizeLMCacheNodeLocal(ctx, &backend)
+		}
+		return ctrl.Result{}, nil
 	}
 	before := snapshotState(&backend)
 

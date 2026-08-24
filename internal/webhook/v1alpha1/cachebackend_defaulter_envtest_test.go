@@ -273,11 +273,6 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 			Scheduling: &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{},
 		}
 	}
-	toNodeLocal(&persistedMP)
-	if err := k8s.Update(ctx, &persistedMP); err != nil {
-		t.Fatalf("valid PodLocal-to-NodeLocal update should be admitted: %v", err)
-	}
-
 	nodeLocalCreate := validPodLocalMPBackend()
 	nodeLocalCreate.Name = "nodelocal-create"
 	nodeLocalCreate.Namespace = "team-a"
@@ -289,6 +284,10 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	var persistedNodeLocal cachev1alpha1.CacheBackend
 	if err := live.Get(ctx, client.ObjectKeyFromObject(nodeLocalCreate), &persistedNodeLocal); err != nil {
 		t.Fatalf("get back NodeLocal CR: %v", err)
+	}
+	persistedNodeLocal.Spec.LMCache.NodeLocal.IdleRetentionSeconds++
+	if err := k8s.Update(ctx, &persistedNodeLocal); err != nil {
+		t.Fatalf("NodeLocal operational setting should remain mutable: %v", err)
 	}
 	persistedNodeLocal.Spec.LMCache.NodeLocal.Server.HTTPPort = persistedNodeLocal.Spec.LMCache.NodeLocal.Server.Port
 	if err := k8s.Update(ctx, &persistedNodeLocal); err == nil {

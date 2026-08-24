@@ -9,7 +9,8 @@
 # intentionally disjoint from the sibling vLLM sample if both backends have
 # engines on the same node. Set scheduling.runtimeClassName when the engine's
 # runtime does not provide the server's required NVIDIA visibility. The server
-# and engines mount only this backend UID's host SHM directory as `/dev/shm`.
+# and engines mount only this backend UID's host IPC directory as `/dev/shm`;
+# L1 itself is private pinned host memory, not a POSIX SHM file.
 apiVersion: inferencecache.io/v1alpha1
 kind: CacheBackend
 metadata:

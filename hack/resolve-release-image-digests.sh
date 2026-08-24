@@ -17,6 +17,7 @@ docker_cmd="${DOCKER_BUILD_CMD:-docker}"
 controller_repo="${CONTROLLER_IMAGE_REPO:-ghcr.io/cachebox-project/inference-cache-controller}"
 server_repo="${SERVER_IMAGE_REPO:-ghcr.io/cachebox-project/inference-cache-server}"
 subscriber_repo="${SUBSCRIBER_IMAGE_REPO:-ghcr.io/cachebox-project/inference-cache-subscriber}"
+cleanup_repo="${CLEANUP_IMAGE_REPO:-ghcr.io/cachebox-project/inference-cache-shm-cleanup}"
 
 if ! command -v "$docker_cmd" >/dev/null 2>&1; then
   echo "registry client is unavailable: $docker_cmd" >&2
@@ -49,3 +50,4 @@ resolve_digest() {
 resolve_digest controller "$controller_repo"
 resolve_digest server "$server_repo"
 resolve_digest subscriber "$subscriber_repo"
+resolve_digest cleanup "$cleanup_repo"

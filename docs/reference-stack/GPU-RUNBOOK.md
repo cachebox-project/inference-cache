@@ -72,8 +72,8 @@ Rules of thumb:
 
 | Resource | Reference (8B) | Why |
 |---|---|---|
-| Host RAM | engine budget + MP L1 + headroom | The reference uses `l1Capacity: 4Gi`; the MP server request/limit and `/dev/shm` must cover L1 plus at least 1Gi. |
-| `/dev/shm` | ≥ typed L1 + 1Gi | Shared by the engine and injected MP server; the reference uses 8Gi. |
+| Host RAM | engine budget + MP L1 + headroom | The reference uses `l1Capacity: 4Gi`; the MP server request/limit must cover the eagerly allocated pinned L1 plus at least 1Gi. |
+| `/dev/shm` | conservative IPC budget ≥ typed L1 + 1Gi | Shared by the engine and injected MP server for CUDA/PyTorch IPC objects; L1 KV bytes themselves are private pinned memory. The reference uses 8Gi. |
 | Local disk | model size × 1.5 | HF weight cache. The host-only reference does not claim a local-disk LMCache tier. |
 | Network | 100 Gb+ RDMA for multi-node | Only if you later shard across nodes; single-node TP uses NVLink. |
 | Driver/runtime | NVIDIA driver + Container Toolkit; `nvidia` default Docker runtime | So local or managed-cluster pods can request `nvidia.com/gpu`. |
@@ -96,9 +96,11 @@ kubectl get nodes -o json | jq '.items[].status.allocatable["nvidia.com/gpu"]'  
 kubectl create namespace cache-substrate
 kubectl -n cache-substrate create secret generic hf-token --from-literal=token="$HF_TOKEN"
 
-# 2. Install inference-cache first, then apply. Replace the deliberately
-#    non-pullable engine-image placeholder before creating the Deployment.
-kubectl apply -k ../../config/default
+# 2. Install inference-cache from its digest-pinned release manifest first,
+#    then apply. Replace the deliberately non-pullable engine-image placeholder
+#    before creating the Deployment.
+RELEASE_TAG=vX.Y.Z
+kubectl apply -f "inference-cache-${RELEASE_TAG}.yaml"
 kubectl apply -f manifests/namespace.yaml -f manifests/deployment.yaml -f manifests/service.yaml
 kubectl -n cache-substrate rollout status deploy/vllm-lmcache-llama-8b --timeout=20m
 ```
@@ -127,4 +129,4 @@ like"): subscribe with `scripts/kv_events_subscriber.py` and fire
 | Loads but low throughput / frequent recompute | KV pool too small | bigger card, raise `gpu_memory_utilization`, or lean on LMCache offload |
 | `tensor-parallel-size` mismatch / hang at startup | TP ≠ GPU count, or heads not divisible | set TP = `nvidia.com/gpu`; check head count divisibility |
 | NCCL / loader hang on multi-GPU | small `/dev/shm`, or no NVLink (multi-GPU VM) | raise `/dev/shm`; use a bare-metal NVLink shape for TP |
-| Host OOM with LMCache enabled | typed `l1Capacity` + 1Gi headroom exceeds the sidecar/pod memory budget | lower `l1Capacity` consistently or raise the MP-server request/limit and `/dev/shm` size |
+| Host OOM with LMCache enabled | typed `l1Capacity` + 1Gi headroom exceeds the server/container memory budget | lower `l1Capacity` consistently or raise the MP-server request/limit; size `/dev/shm` separately for runtime IPC |

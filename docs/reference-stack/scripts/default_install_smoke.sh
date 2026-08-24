@@ -103,6 +103,13 @@ kubectl -n cert-manager wait --for=condition=Available deployment --all --timeou
 
 tmpdir="$(mktemp -d)"
 cp -R config "$tmpdir/config"
+# This smoke never starts the cleanup helper. Replace the source placeholder
+# with a syntactically valid test-only digest so controller startup exercises
+# the same fail-closed option validation as a rendered release install.
+sed -i.bak \
+  's|sha256:0000000000000000000000000000000000000000000000000000000000000000|sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|' \
+  "$tmpdir/config/manager/manager.yaml"
+rm -f "$tmpdir/config/manager/manager.yaml.bak"
 (
   cd "$tmpdir/config/default"
   if command -v kustomize >/dev/null 2>&1; then
@@ -367,6 +374,7 @@ EOF
 grep -Fq 'lmcache-mp-server' "$pod_json" || fail "native MP sidecar was not injected"
 grep -Fq 'LMCacheMPConnector' "$pod_json" || fail "vLLM MP connector was not injected"
 grep -Fq 'lmcache.mp.host' "$pod_json" || fail "MP loopback host was not injected"
+grep -Fq 'lmcache.mp.mp_transfer_mode' "$pod_json" || fail "vLLM MP connector does not pin lmcache-driven transfer"
 for retired in LMCacheConnectorV1 LMCACHE_REMOTE_URL LMCACHE_REMOTE_SERDE 'lm://'; do
   if grep -Fq "$retired" "$pod_json"; then
     fail "admitted Pod contains retired wire: $retired"
@@ -391,7 +399,8 @@ spec:
       command: ["sh", "-c", "sleep 3600"]
 EOF
 grep -Fq 'lmcache-node-local-gate' "$node_pod_json" || fail "NodeLocal ownership/health startup gate was not injected"
-grep -Fq 'EXPECTED_SHM_NAME' "$node_pod_json" || fail "NodeLocal startup gate does not verify UID-scoped shared memory"
+grep -Fq 'supported_transfer_mode' "$node_pod_json" || fail "NodeLocal startup gate does not verify lmcache-driven transfer"
+grep -Fq 'use_lazy' "$node_pod_json" || fail "NodeLocal startup gate does not verify eager L1 allocation"
 grep -Fq 'INFERENCECACHE_NODE_IP' "$node_pod_json" || fail "NodeLocal hostIP Downward API was not injected"
 grep -Fq 'status.hostIP' "$node_pod_json" || fail "NodeLocal endpoint is not derived from status.hostIP"
 grep -Fq 'kubernetes.io/os' "$node_pod_json" || fail "inference-owned nodeSelector was not preserved"
@@ -429,14 +438,15 @@ node_local_host_ipc="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o j
   || fail "NodeLocal server does not mount its UID-scoped host SHM directory"
 [ "$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.spec.volumes[0].hostPath.type}')" = "DirectoryOrCreate" ] \
   || fail "NodeLocal server UID-scoped SHM hostPath is not DirectoryOrCreate"
-node_local_shm_name="lmcache_l1_pool_inferencecache_${node_local_backend_uid}"
-[ "$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.metadata.annotations.inferencecache\.io/node-local-shm-name}')" = "$node_local_shm_name" ] \
-  || fail "NodeLocal server does not carry its UID-scoped shared-memory identity"
-node_local_shm_arg="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" \
+node_local_runtime_profile="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" \
   -o jsonpath='{range .spec.containers[?(@.name=="lmcache-mp-server")].args[*]}{@}{"\n"}{end}' | \
-  awk 'previous == "--shm-name" && value == "" { value = $0 } { previous = $0 } END { print value }')"
-[ "$node_local_shm_arg" = "$node_local_shm_name" ] \
-  || fail "NodeLocal server does not pass its UID-scoped --shm-name: $node_local_shm_arg"
+  awk 'previous == "--supported-transfer-mode" && $0 == "lmcache_driven" { transfer = 1 }
+       $0 == "--no-l1-use-lazy" { eager = 1 }
+       previous == "--shm-name" { shm_seen = 1; if ($0 == "") shm_empty = 1 }
+       { previous = $0 }
+       END { if (transfer && eager && shm_seen && shm_empty) print "ok" }')"
+[ "$node_local_runtime_profile" = "ok" ] \
+  || fail "NodeLocal server does not declare lmcache_driven + non-lazy + empty shm-name"
 node_local_ports="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{range .spec.containers[?(@.name=="lmcache-mp-server")].ports[*]}{.containerPort}:{.hostPort}{" "}{end}')"
 [ "$node_local_ports" = "5556:5556 8081:8081 " ] || fail "NodeLocal host ports were not declared: $node_local_ports"
 node_affinity_target="$(kubectl -n "$SMOKE_NAMESPACE" get pod "$server_name" -o jsonpath='{.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0].values[0]}')"

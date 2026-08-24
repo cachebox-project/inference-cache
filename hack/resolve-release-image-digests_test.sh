@@ -41,6 +41,9 @@ case "$ref" in
   ghcr.io/cachebox-project/inference-cache-subscriber:v1.2.3)
     digit=3
     ;;
+  ghcr.io/cachebox-project/inference-cache-shm-cleanup:v1.2.3)
+    digit=4
+    ;;
   *)
     echo "unexpected image ref: $ref" >&2
     exit 2
@@ -62,7 +65,8 @@ actual="$(RELEASE_TAG=v1.2.3 hack/resolve-release-image-digests.sh)"
 expected="$(printf '%s\n' \
   'controller=sha256:0000000000000000000000000000000000000000000000000000000000000001' \
   'server=sha256:0000000000000000000000000000000000000000000000000000000000000002' \
-  'subscriber=sha256:0000000000000000000000000000000000000000000000000000000000000003')"
+  'subscriber=sha256:0000000000000000000000000000000000000000000000000000000000000003' \
+  'cleanup=sha256:0000000000000000000000000000000000000000000000000000000000000004')"
 if [[ "$actual" != "$expected" ]]; then
   echo "unexpected digest output" >&2
   diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2

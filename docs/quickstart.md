@@ -52,6 +52,8 @@ To share one MP L1 across several engine Pods on each GPU node, use the
 focused NodeLocal samples for
 [vLLM](../config/samples/cachebackend-vllm-nodelocal-host-only.yaml) or
 [SGLang](../config/samples/cachebackend-sglang-nodelocal-host-only.yaml).
+Configure the controller's `--node-local-shm-cleanup-image` once with the
+cleanup helper digest published by the same inference-cache release.
 NodeLocal is an advanced host-bound topology. The inference system schedules
 each engine without CacheBackend changing its placement; the controller then
 creates one shared server Pod on every node that actually has an active

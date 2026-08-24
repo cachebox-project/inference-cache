@@ -247,14 +247,20 @@ vLLM image/version, KV reuse, TP determinism, and failure recovery remain Phase
 4 runtime gates. Canonical examples are the three PodLocal profiles plus
 `config/samples/cachebackend-vllm-nodelocal-host-only.yaml`.
 
-For both typed vLLM and SGLang PodLocal adapters, `l1Capacity` is the usable L1
-target, not the complete container budget. The common renderer creates a
-memory-backed `/dev/shm` with `sizeLimit: l1Capacity + 1Gi`; admission requires
-both the MP-server memory request and memory limit to be at least that value. If
-the engine already mounts `/dev/shm`, the adapter reuses it only when it is a
-memory-backed `emptyDir` with a `sizeLimit` at least as large as that budget.
-This keeps scheduling/cgroup accounting aligned with the tmpfs and leaves room
-for LMCache metadata and shared-memory allocator overhead.
+For both typed vLLM and SGLang adapters, the supported server profile is
+CUDA-only and explicit: `--supported-transfer-mode lmcache_driven`,
+`--no-l1-use-lazy`, and `--shm-name ""`. LMCache therefore allocates the full
+`l1Capacity` eagerly as private CUDA-pinned host memory during server startup;
+allocation failure prevents health from becoming ready. It does not create a
+POSIX SHM-backed `/dev/shm/lmcache_l1_pool_*` L1 arena. Admission still requires
+the MP-server memory request and limit to cover `l1Capacity + 1Gi` so scheduling
+and the container cgroup account for L1 plus server overhead.
+
+PodLocal continues to provide a memory-backed `/dev/shm` with
+`sizeLimit: l1Capacity + 1Gi` as a conservative budget for CUDA/PyTorch IPC
+objects. If the engine already mounts `/dev/shm`, the adapter reuses it only
+when it is a memory-backed `emptyDir` with at least that `sizeLimit`. This tmpfs
+is an IPC surface; it is not where the supported LMCache L1 KV cache resides.
 
 For NodeLocal, `l1Capacity` is instead one shared per-node budget. CacheBackend
 creation alone creates no server and never changes engine placement. After an
@@ -265,30 +271,42 @@ backend's `/dev/shm/inference-cache/<cacheBackendUID>` host directory as their
 container `/dev/shm`; they do not mount the whole node SHM namespace. Exact
 node-name affinity sends the server through the normal scheduler on the
 engine's node; `status.hostIP` prevents ClusterIP or cross-node CUDA IPC.
-`maxGPUWorkers` must cover all selected engine instances on one node. Every
-server receives the controller-derived
-`lmcache_l1_pool_inferencecache_<cacheBackendUID>` through `--shm-name`; the
-engine gate verifies both the declared MP value and the effective L1
-memory-manager value before startup. Different CacheBackend UIDs therefore do
-not accidentally unlink or rebind the same POSIX SHM object. The server sets
+`maxGPUWorkers` must cover all selected engine instances on one node. The
+engine gate verifies the declared `lmcache_driven` transfer mode and the
+effective non-lazy, empty-`shm_name` L1 configuration before startup. Different
+CacheBackend UIDs do not share a POSIX SHM-backed L1 object because this profile
+creates none; the UID directory remains to separate observed CUDA, PyTorch, and
+semaphore auxiliary IPC objects. The server sets
 `NVIDIA_VISIBLE_DEVICES=all` but requests no
-allocatable GPU. It inherits the source engine's runtime class, tolerations,
-image-pull secrets, priority class, and scheduler unless optional
+allocatable GPU. The server inherits the source engine's runtime class,
+tolerations, image-pull secrets, priority class, and scheduler unless optional
 `nodeLocal.scheduling` server overrides are supplied. The FastAPI/MP listeners
 are unauthenticated and host networking bypasses NetworkPolicy, so this topology
 requires one trusted tenant domain per pool plus node firewall controls.
 CacheBackend name/UID/generation verification detects wrong ownership but is
 not cryptographic authentication. The UID-scoped mount prevents normal pool
-processes from seeing another pool through their container `/dev/shm`, but does
-not isolate host root, privileged Pods, or processes that independently mount
-the parent host directory. Co-located pools therefore remain limited to one
-trusted node domain. After the last
+processes from seeing another pool's auxiliary IPC directory through their
+container `/dev/shm`, but does not isolate host root, privileged Pods, or
+processes that independently mount the parent host directory. Co-located pools
+therefore remain limited to one trusted node domain. After the last
 selected engine leaves a
 node, `nodeLocal.idleRetentionSeconds` keeps the server and shared L1 warm for
 the configured window (300 seconds by default); new demand on that node reuses
 the same Pod. Set it to zero for immediate deletion. A retained Pod continues
 to reserve its declared host ports, so another NodeLocal backend using the same
 pair remains in the normal Kubernetes host-port conflict path until expiry.
+Before an idle server or deleting CacheBackend releases the pool, a gated
+one-shot Pod runs the controller-wide, digest-pinned
+`--node-local-shm-cleanup-image` and clears only
+that backend UID directory after its consumers are gone. This small helper is
+independent of LMCache and uses only `nodeLocal.scheduling.imagePullSecrets`;
+it never copies registry credentials from an Engine Pod. Consumer checks are
+cluster-wide because the path is node-global. A managed Engine arriving after
+cleanup starts cannot use the directory: its main container remains behind the
+same-node startup gate, and Server recreation stays blocked until cleanup
+succeeds. Failed helpers are retried at most three times to bound API churn.
+Unmanaged processes that race an exact hostPath mount remain outside
+the trusted-node boundary described above.
 
 NodeLocal ports are explicit rather than dynamically allocated. Engine Pods
 are immutable and receive their endpoint during admission, before the
@@ -338,10 +356,12 @@ With a RESP binding it offloads to Redis; without a binding it runs host-only.
 `NVIDIA_VISIBLE_DEVICES=all`
 lets the GPU-less sidecar use CUDA-IPC with no device-plugin
 allocation, an `exec` startup-probe on the loopback ZMQ port gates the engine's
-start, and a shared `emptyDir` carries the config file. For `/dev/shm` (the L1 tier)
-it reuses the engine's own volume when the engine already mounts one (a duplicate
-mountPath is an invalid Pod), else adds a sized `emptyDir{medium: Memory}` — see the
-reserved-names note below for the reuse/reject rules. On the engine container (name
+start, and a shared `emptyDir` carries the config file. For `/dev/shm`, it reuses
+the engine's own volume when the engine already mounts one (a duplicate
+mountPath is an invalid Pod), else adds a sized `emptyDir{medium: Memory}` for
+CUDA/PyTorch auxiliary IPC objects. L1 KV bytes are private pinned memory, not
+files in that tmpfs. See the reserved-names note below for the reuse/reject
+rules. On the engine container (name
 `sglang`) it injects:
 
 - `--enable-lmcache` — SGLang's boolean flag (an argparse `store_true`) that activates its LMCache connector. This replaces vLLM's `--kv-transfer-config` JSON.
@@ -373,11 +393,11 @@ The old lm:// `LMCACHE_REMOTE_URL` / serde / chunk-size / local-CPU env is
 | `lmCache.topology` | required | `PodLocal`, `NodeLocal` | Chooses native-sidecar or engine-demanded per-node server placement. |
 | `lmCache.podLocal.server.image` | required | digest-pinned reference | Independently owned LMCache server image; never copied from or into the engine image. |
 | `lmCache.podLocal.server.port` | required | `1`–`65535` | Loopback MP port. |
-| `lmCache.podLocal.server.l1Capacity` | required | positive quantity | Usable L1; `/dev/shm` and memory resources must cover this plus 1Gi. |
+| `lmCache.podLocal.server.l1Capacity` | required | positive quantity | Eager private pinned L1; memory resources and the conservative IPC tmpfs budget cover this plus 1Gi. |
 | `lmCache.podLocal.server.maxWorkers` | required | `>=1` | Server worker bound. |
 | `lmCache.podLocal.server.resources` | required | validated K8s resources | Positive CPU request and sufficient memory request/limit. |
 | `lmCache.nodeLocal.server.{image,port,httpPort}` | required | digest plus distinct ports | One server image/config and real node-bound listeners for the pool. |
-| `lmCache.nodeLocal.server.l1Capacity` | required | positive quantity | Shared L1 budget per active engine node; memory request/limit cover it plus 1Gi. |
+| `lmCache.nodeLocal.server.l1Capacity` | required | positive quantity | Eager private pinned L1 budget per active engine node; memory request/limit cover it plus 1Gi. |
 | `lmCache.nodeLocal.server.{maxGPUWorkers,maxCPUWorkers}` | required | `>=1` | Shared per-server worker bounds. |
 | `lmCache.nodeLocal.idleRetentionSeconds` | `300` | `0`–`86400` | Warm retention after the last selected engine leaves a node; `0` deletes immediately. |
 | `lmCache.nodeLocal.scheduling` | optional | server operational overrides | May override tolerations, image-pull secrets, ServiceAccount, Pod security context, priority/scheduler, runtime class, and termination grace on server Pods. It does not expose node selection or mutate engine placement. |

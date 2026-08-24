@@ -7,7 +7,10 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"go.uber.org/zap/zapcore"
@@ -31,6 +34,10 @@ import (
 
 const leaderLockName = "inference-cache-controller-leader-lock"
 
+var sha256ImagePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[a-f0-9]{64}$`)
+
+const zeroSHA256Digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
@@ -53,6 +60,7 @@ type options struct {
 	cacheIndexRefreshEvery  time.Duration
 	policyPushEvery         time.Duration
 	subscriberImage         string
+	nodeLocalCleanupImage   string
 	policyServerGRPCAddress string
 	zapOpts                 zap.Options
 }
@@ -69,6 +77,7 @@ func defaultOptions() options {
 		cacheIndexRefreshEvery:  controller.DefaultRefreshInterval,
 		policyPushEvery:         controller.DefaultPolicyPushInterval,
 		subscriberImage:         "",
+		nodeLocalCleanupImage:   "",
 		policyServerGRPCAddress: "inference-cache-server.inference-cache-system.svc.cluster.local:9090",
 		zapOpts: zap.Options{
 			TimeEncoder: zapcore.RFC3339TimeEncoder,
@@ -89,6 +98,7 @@ func parseOptions() options {
 	flag.DurationVar(&opts.cacheIndexRefreshEvery, "cacheindex-refresh-interval", opts.cacheIndexRefreshEvery, "How often to refresh the CacheIndex status from the server snapshot.")
 	flag.DurationVar(&opts.policyPushEvery, "cachepolicy-push-interval", opts.policyPushEvery, "How often to re-push the full CachePolicy snapshot to the server (self-healing on server restart).")
 	flag.StringVar(&opts.subscriberImage, "kvevent-subscriber-image", opts.subscriberImage, "Image reference the pod-mutating webhook uses for the kvevent-subscriber sidecar it auto-attaches to managed-LMCache engine pods (vLLM and SGLang). Empty (default) disables auto-attach — the engine pod wiring still happens but no subscriber container is appended. Pin to a digest in production.")
+	flag.StringVar(&opts.nodeLocalCleanupImage, "node-local-shm-cleanup-image", opts.nodeLocalCleanupImage, "Digest-pinned inference-cache helper image used to reclaim NodeLocal LMCache SHM pools. Required.")
 	flag.StringVar(&opts.policyServerGRPCAddress, "policy-server-grpc-address", opts.policyServerGRPCAddress, "host:port the kvevent-subscriber sidecar dials to ReportCacheState. Defaults to the in-cluster Service DNS in the inference-cache-system namespace.")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -98,6 +108,10 @@ func parseOptions() options {
 func main() {
 	opts := parseOptions()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts.zapOpts)))
+	if err := validateOptions(opts); err != nil {
+		setupLog.Error(err, "invalid controller configuration")
+		os.Exit(1)
+	}
 	setupLog.Info("initializing", "gitVersion", version.GitVersion, "gitCommit", version.GitCommit)
 
 	tlsOpts := []func(*tls.Config){}
@@ -147,14 +161,15 @@ func main() {
 	probeClient := &controller.ProbeClient{ProbeURL: opts.serverProbeURL}
 
 	if err := (&controller.CacheBackendReconciler{
-		Client:          mgr.GetClient(),
-		Scheme:          mgr.GetScheme(),
-		Log:             ctrl.Log.WithName("controllers").WithName("CacheBackend"),
-		Recorder:        mgr.GetEventRecorder("cachebackend-controller"),
-		APIReader:       mgr.GetAPIReader(),
-		Registry:        adapterRegistry,
-		BackendRegistry: adapterRegistries.Storage,
-		ProbeClient:     probeClient,
+		Client:                   mgr.GetClient(),
+		Scheme:                   mgr.GetScheme(),
+		Log:                      ctrl.Log.WithName("controllers").WithName("CacheBackend"),
+		Recorder:                 mgr.GetEventRecorder("cachebackend-controller"),
+		APIReader:                mgr.GetAPIReader(),
+		Registry:                 adapterRegistry,
+		BackendRegistry:          adapterRegistries.Storage,
+		ProbeClient:              probeClient,
+		NodeLocalShmCleanupImage: opts.nodeLocalCleanupImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CacheBackend")
 		os.Exit(1)
@@ -240,4 +255,11 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func validateOptions(opts options) error {
+	if !sha256ImagePattern.MatchString(opts.nodeLocalCleanupImage) || strings.HasSuffix(opts.nodeLocalCleanupImage, zeroSHA256Digest) {
+		return fmt.Errorf("--node-local-shm-cleanup-image must be a digest-pinned image reference")
+	}
+	return nil
 }

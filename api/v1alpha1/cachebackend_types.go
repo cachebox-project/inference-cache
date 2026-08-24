@@ -192,9 +192,10 @@ type LMCachePodLocalServerSpec struct {
 	// +kubebuilder:validation:Maximum=65535
 	Port int32 `json:"port"`
 
-	// L1Capacity is the server's host-memory cache capacity. The renderer sizes
-	// /dev/shm to this value plus 1Gi; container memory requests and limits must
-	// each cover that complete budget.
+	// L1Capacity is the server's eagerly allocated private pinned host-memory
+	// cache capacity. The PodLocal renderer also keeps a conservative /dev/shm
+	// IPC budget of this value plus 1Gi; container memory requests and limits
+	// must each cover the same complete budget.
 	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0'))",message="l1Capacity must be greater than zero"
 	L1Capacity resource.Quantity `json:"l1Capacity"`
 
@@ -204,7 +205,7 @@ type LMCachePodLocalServerSpec struct {
 
 	// Resources are applied to the injected MP server container. Admission
 	// requires a positive CPU request and requires both the memory request and
-	// memory limit to cover l1Capacity plus 1Gi of /dev/shm headroom.
+	// memory limit to cover l1Capacity plus 1Gi of server headroom.
 	Resources corev1.ResourceRequirements `json:"resources"`
 }
 
@@ -233,8 +234,8 @@ type LMCacheNodeLocalServerSpec struct {
 	// +kubebuilder:validation:Maximum=65535
 	HTTPPort int32 `json:"httpPort"`
 
-	// L1Capacity is one shared host-memory budget per active engine node, not per
-	// selected engine Pod.
+	// L1Capacity is one eagerly allocated private pinned host-memory budget per
+	// active engine node, not per selected engine Pod.
 	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).isGreaterThan(quantity('0'))",message="l1Capacity must be greater than zero"
 	L1Capacity resource.Quantity `json:"l1Capacity"`
 
@@ -263,6 +264,8 @@ type LMCacheNodeLocalSchedulingSpec struct {
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
+	// ImagePullSecrets are used by controller-managed Server and cleanup Pods.
+	// The cleanup Pod does not inherit registry credentials from an Engine Pod.
 	// +optional
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 

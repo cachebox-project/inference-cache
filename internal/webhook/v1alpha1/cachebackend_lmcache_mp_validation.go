@@ -171,15 +171,7 @@ func validateMPServer(
 	path *field.Path,
 	reservedPorts map[int32]string,
 ) field.ErrorList {
-	var errs field.ErrorList
-	trimmedImage := strings.TrimSpace(image)
-	switch {
-	case trimmedImage == "":
-		errs = append(errs, field.Required(path.Child("image"), "a CacheBackend-owned LMCache MP server image is required"))
-	case !sha256ImagePattern.MatchString(trimmedImage):
-		errs = append(errs, field.Invalid(path.Child("image"), image,
-			"must be pinned by sha256 digest (for example registry.example/lmcache@sha256:<64-hex-digest>)"))
-	}
+	errs := validateDigestPinnedImage(image, path.Child("image"), "a CacheBackend-owned LMCache MP server image is required")
 
 	if port < 1 || port > 65535 {
 		errs = append(errs, field.Invalid(path.Child("port"), port, "must be between 1 and 65535"))
@@ -215,7 +207,7 @@ func validateMPServer(
 			"a positive memory request is required for the MP server"))
 	} else if memoryBudget != nil && memoryRequest.Cmp(*memoryBudget) < 0 {
 		errs = append(errs, field.Invalid(path.Child("resources", "requests").Key(string(corev1.ResourceMemory)),
-			memoryRequest.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) so scheduling accounts for the memory-backed /dev/shm", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
+			memoryRequest.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) so scheduling accounts for the eagerly allocated pinned L1 and server overhead", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
 	}
 
 	memoryLimit, hasMemoryLimit := resources.Limits[corev1.ResourceMemory]
@@ -229,11 +221,23 @@ func validateMPServer(
 		}
 		if memoryBudget != nil && memoryLimit.Cmp(*memoryBudget) < 0 {
 			errs = append(errs, field.Invalid(path.Child("resources", "limits").Key(string(corev1.ResourceMemory)),
-				memoryLimit.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) to bound the memory-backed /dev/shm", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
+				memoryLimit.String(), fmt.Sprintf("must be at least %s (l1Capacity %s + %s headroom) to cover the eagerly allocated pinned L1 and server overhead", memoryBudget.String(), l1Capacity.String(), lmcacheMPMemoryHeadroom)))
 		}
 	}
 
 	return errs
+}
+
+func validateDigestPinnedImage(image string, path *field.Path, requiredMessage string) field.ErrorList {
+	trimmed := strings.TrimSpace(image)
+	if trimmed == "" {
+		return field.ErrorList{field.Required(path, requiredMessage)}
+	}
+	if !sha256ImagePattern.MatchString(trimmed) {
+		return field.ErrorList{field.Invalid(path, image,
+			"must be pinned by sha256 digest (for example registry.example/image@sha256:<64-hex-digest>)")}
+	}
+	return nil
 }
 
 // validateMPServerResourceRequirements mirrors the generic provider-resource

@@ -24,6 +24,10 @@ const (
 	// server Pod.
 	LabelLMCacheNodeLocalServer = "inferencecache.io/lmcache-node-server"
 
+	// LabelLMCacheNodeLocalCleanup identifies a controller-owned, one-shot Pod
+	// that clears one backend UID's auxiliary IPC files on one node.
+	LabelLMCacheNodeLocalCleanup = "inferencecache.io/lmcache-node-shm-cleanup"
+
 	// LabelCacheBackendUID is the immutable, label-safe identity used to list
 	// one CacheBackend's NodeLocal server Pods.
 	LabelCacheBackendUID = "inferencecache.io/cache-backend-uid"
@@ -44,10 +48,6 @@ const (
 	// this server Pod was rendered. The Pod still uses scheduler-bound exact
 	// node affinity rather than spec.nodeName so hostPort conflicts are checked.
 	AnnotationNodeLocalTargetNode = "inferencecache.io/node-local-target-node"
-
-	// AnnotationNodeLocalShmName records the controller-derived POSIX shared
-	// memory object owned by this CacheBackend's NodeLocal server pool.
-	AnnotationNodeLocalShmName = "inferencecache.io/node-local-shm-name"
 
 	// AnnotationNodeLocalIdleSince records when the final active engine left a
 	// node. The controller removes it when demand returns and deletes the server

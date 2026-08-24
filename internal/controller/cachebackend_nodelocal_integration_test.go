@@ -27,6 +27,7 @@ func TestIntegrationCacheBackendNodeLocalServerPod(t *testing.T) {
 	skipWithoutEnvtest(t)
 	k8s, scheme, _ := startEnv(t)
 	r := &CacheBackendReconciler{Client: k8s, APIReader: k8s, Scheme: scheme, Log: logr.Discard()}
+	configureTestRegistries(r)
 	ctx := context.Background()
 	ns := freshNS(t, k8s)
 	backend := nodeLocalBackend("node-cache", ns)
@@ -65,16 +66,12 @@ func TestIntegrationCacheBackendNodeLocalServerPod(t *testing.T) {
 	if got := server.Labels[enginebinding.LabelCacheBackendUID]; got == "" {
 		t.Fatal("server Pod is missing CacheBackend UID identity")
 	}
-	wantShmName, err := builtinruntime.NodeLocalServerShmName(&live)
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantShmPath, err := builtinruntime.NodeLocalServerShmHostPath(&live)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !nodeLocalServerHasShmIdentity(&server, wantShmName, wantShmPath) {
-		t.Fatalf("server Pod lacks UID-scoped shm identity: annotations=%v args=%v", server.Annotations, server.Spec.Containers[0].Args)
+	if !nodeLocalServerHasRuntimeIdentity(&server, wantShmPath) {
+		t.Fatalf("server Pod lacks managed CUDA runtime identity: volumes=%v args=%v", server.Spec.Volumes, server.Spec.Containers[0].Args)
 	}
 
 	if err := k8s.Get(ctx, key, &live); err != nil {
@@ -95,9 +92,7 @@ func TestIntegrationCacheBackendNodeLocalServerPod(t *testing.T) {
 	if err := k8s.Get(ctx, key, &live); err != nil {
 		t.Fatalf("refresh NodeLocal CacheBackend: %v", err)
 	}
-	live.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyPodLocal
-	live.Spec.LMCache.PodLocal = lmcacheBackend("podlocal-shape", ns).Spec.LMCache.PodLocal.DeepCopy()
-	live.Spec.LMCache.NodeLocal = nil
+	live.Spec.LMCache = lmcacheBackend("podlocal-shape", ns).Spec.LMCache.DeepCopy()
 	if err := k8s.Update(ctx, &live); err != nil {
 		t.Fatalf("switch NodeLocal to PodLocal: %v", err)
 	}

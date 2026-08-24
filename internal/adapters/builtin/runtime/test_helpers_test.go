@@ -9,6 +9,7 @@ import corev1 "k8s.io/api/core/v1"
 import backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 
 const testLMCacheServerImage = "registry.example/lmcache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const testNodeLocalCleanupImage = "registry.example/inference-cache-shm-cleanup@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 func findVolume(volumes []corev1.Volume, name string) *corev1.Volume {
 	for i := range volumes {

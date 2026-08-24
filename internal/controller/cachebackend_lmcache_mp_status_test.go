@@ -23,23 +23,16 @@ import (
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 )
 
-func setNodeLocalShmIdentity(t *testing.T, backend *cachev1alpha1.CacheBackend, pod *corev1.Pod) {
+func setNodeLocalRuntimeIdentity(t *testing.T, backend *cachev1alpha1.CacheBackend, pod *corev1.Pod) {
 	t.Helper()
-	name, err := builtinruntime.NodeLocalServerShmName(backend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pod.Annotations == nil {
-		pod.Annotations = map[string]string{}
-	}
 	path, err := builtinruntime.NodeLocalServerShmHostPath(backend)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pathType := corev1.HostPathDirectoryOrCreate
-	pod.Annotations[enginebinding.AnnotationNodeLocalShmName] = name
 	pod.Spec.Containers = []corev1.Container{{
-		Name: lmCacheMPServerStatusContainerName, Args: []string{"server", "--shm-name", name},
+		Name:         lmCacheMPServerStatusContainerName,
+		Args:         []string{"server", "--supported-transfer-mode", "lmcache_driven", "--no-l1-use-lazy", "--shm-name", ""},
 		VolumeMounts: []corev1.VolumeMount{{Name: "shm", MountPath: "/dev/shm"}},
 	}}
 	pod.Spec.Volumes = []corev1.Volume{{Name: "shm", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
@@ -217,7 +210,7 @@ func TestRefreshLMCacheNodeLocalConnectorStatusSameNodeCoverage(t *testing.T) {
 		if ready {
 			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 		}
-		setNodeLocalShmIdentity(t, backend, pod)
+		setNodeLocalRuntimeIdentity(t, backend, pod)
 		return pod
 	}
 	enginePod := func(name, node string) *corev1.Pod {
@@ -330,9 +323,9 @@ func TestRefreshLMCacheNodeLocalConnectorStatusFailureModes(t *testing.T) {
 			wantCondition: reasonNodeLocalWorkerCapacity, wantCoverage: reasonNodeLocalWorkerCapacity, wantReadyServers: 1,
 		},
 		{
-			name: "server is missing UID-scoped shared-memory identity",
+			name: "server uses implicit transfer mode",
 			mutate: func(_ *cachev1alpha1.CacheBackend, servers *[]*corev1.Pod, _ *corev1.Pod) {
-				delete((*servers)[0].Annotations, enginebinding.AnnotationNodeLocalShmName)
+				(*servers)[0].Spec.Containers[0].Args = []string{"server", "--no-l1-use-lazy", "--shm-name", ""}
 			},
 			wantCondition: reasonNodeLocalPoolPending, wantCoverage: reasonMPServersNotReady, wantReadyServers: 0,
 		},
@@ -376,7 +369,7 @@ func TestRefreshLMCacheNodeLocalConnectorStatusFailureModes(t *testing.T) {
 					ContainerStatuses: []corev1.ContainerStatus{{Name: lmCacheMPServerStatusContainerName, Ready: true, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}},
 				},
 			}
-			setNodeLocalShmIdentity(t, backend, server)
+			setNodeLocalRuntimeIdentity(t, backend, server)
 			servers := []*corev1.Pod{server}
 			engine := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "engine", Namespace: "ns1", Labels: map[string]string{"app": "engine"}, Annotations: map[string]string{

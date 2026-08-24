@@ -106,13 +106,15 @@ func TestRenderLMCacheNodeLocalServerPod(t *testing.T) {
 	args := strings.Join(server.Args, " ")
 	for _, want := range []string{
 		"--instance-id team-a/node-cache@11111111-2222-3333-4444-555555555555#7",
-		"--shm-name lmcache_l1_pool_inferencecache_11111111-2222-3333-4444-555555555555",
 		"--host $(INFERENCECACHE_NODE_IP)", "--http-port 18080",
 		"--max-gpu-workers 4", "--max-cpu-workers 8",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("server args %q missing %q", args, want)
 		}
+	}
+	if !IsLMCacheMPCUDAServerProfile(server.Args) {
+		t.Fatalf("server args do not explicitly select the CUDA/private-pinned-L1 profile: %v", server.Args)
 	}
 	if got := serverPod.Annotations[enginebinding.AnnotationNodeLocalOwnerUID]; got != string(cache.UID) {
 		t.Fatalf("owner UID annotation = %q", got)
@@ -123,8 +125,122 @@ func TestRenderLMCacheNodeLocalServerPod(t *testing.T) {
 	if got := serverPod.Annotations[enginebinding.AnnotationNodeLocalTargetNode]; got != "gpu-node-a" {
 		t.Fatalf("target-node annotation = %q", got)
 	}
-	if got := serverPod.Annotations[enginebinding.AnnotationNodeLocalShmName]; got != "lmcache_l1_pool_inferencecache_11111111-2222-3333-4444-555555555555" {
-		t.Fatalf("shared-memory annotation = %q", got)
+	if _, found := serverPod.Annotations["inferencecache.io/node-local-shm-name"]; found {
+		t.Fatalf("obsolete POSIX SHM identity annotation remains: %v", serverPod.Annotations)
+	}
+}
+
+func TestRenderLMCacheNodeLocalCleanupPod(t *testing.T) {
+	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
+	cache.Spec.LMCache.NodeLocal.Scheduling = &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{
+		ImagePullSecrets: []corev1.LocalObjectReference{{Name: "cache-pull"}},
+	}
+	source := nodeLocalSourceEngine()
+	source.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "engine-pull"}}
+	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testNodeLocalCleanupImage, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleanup.Name != NodeLocalCleanupPodName(cache.UID, "gpu-node-a") || cleanup.Spec.NodeName != "" || len(cleanup.Spec.SchedulingGates) != 1 {
+		t.Fatalf("cleanup identity/initial gate = name:%q node:%q gates:%+v", cleanup.Name, cleanup.Spec.NodeName, cleanup.Spec.SchedulingGates)
+	}
+	if cleanup.Spec.HostNetwork || cleanup.Spec.HostPID || cleanup.Spec.HostIPC || cleanup.Spec.AutomountServiceAccountToken == nil || *cleanup.Spec.AutomountServiceAccountToken {
+		t.Fatalf("cleanup host boundary = %+v", cleanup.Spec)
+	}
+	if cleanup.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("cleanup restart policy = %q, want Never so controller retries terminal failures", cleanup.Spec.RestartPolicy)
+	}
+	if len(cleanup.Spec.Volumes) != 1 || cleanup.Spec.Volumes[0].HostPath == nil ||
+		cleanup.Spec.Volumes[0].HostPath.Path != "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("cleanup volumes = %+v", cleanup.Spec.Volumes)
+	}
+	if len(cleanup.Spec.ImagePullSecrets) != 1 || cleanup.Spec.ImagePullSecrets[0].Name != "cache-pull" {
+		t.Fatalf("cleanup imagePullSecrets = %+v", cleanup.Spec.ImagePullSecrets)
+	}
+	container := cleanup.Spec.Containers[0]
+	if container.Image != testNodeLocalCleanupImage || !reflect.DeepEqual(container.Command, []string{"/node-local-shm-cleanup"}) ||
+		!reflect.DeepEqual(container.Args, []string{lmCacheNodeLocalShmCleanupPath}) {
+		t.Fatalf("cleanup container = image:%q command:%v args:%v", container.Image, container.Command, container.Args)
+	}
+	security := container.SecurityContext
+	if security == nil || security.AllowPrivilegeEscalation == nil || *security.AllowPrivilegeEscalation ||
+		security.RunAsUser == nil || *security.RunAsUser != 0 || security.ReadOnlyRootFilesystem == nil || !*security.ReadOnlyRootFilesystem {
+		t.Fatalf("cleanup security context = %+v", security)
+	}
+	controller := true
+	cleanup.OwnerReferences = []metav1.OwnerReference{{UID: cache.UID, Controller: &controller}}
+	if !IsLMCacheNodeLocalCleanupPod(cleanup, cache, "gpu-node-a", testNodeLocalCleanupImage) {
+		t.Fatal("rendered cleanup Pod did not satisfy its executable contract")
+	}
+	cleanup.Spec.Containers[0].Command = []string{"/bin/true"}
+	if IsLMCacheNodeLocalCleanupPod(cleanup, cache, "gpu-node-a", testNodeLocalCleanupImage) {
+		t.Fatal("cleanup Pod with a foreign command satisfied the executable contract")
+	}
+}
+
+func TestLMCacheNodeLocalCleanupSucceededRequiresHelperStatus(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{NodeName: "gpu-node-a"}, Status: corev1.PodStatus{
+		Phase: corev1.PodSucceeded,
+		ContainerStatuses: []corev1.ContainerStatus{{Name: "foreign", State: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+		}}},
+	}}
+	if LMCacheNodeLocalCleanupSucceeded(pod, "gpu-node-a") {
+		t.Fatal("foreign successful container was accepted as cleanup success")
+	}
+	pod.Status.ContainerStatuses[0].Name = lmCacheNodeLocalShmCleanupName
+	if !LMCacheNodeLocalCleanupSucceeded(pod, "gpu-node-a") {
+		t.Fatal("successful cleanup helper status was rejected")
+	}
+}
+
+func TestRenderLMCacheNodeLocalCleanupRetryPod(t *testing.T) {
+	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
+	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testNodeLocalCleanupImage, nodeLocalSourceEngine())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup.Spec.SchedulingGates = nil
+	cleanup.Spec.NodeName = "gpu-node-a"
+	retry, err := RenderLMCacheNodeLocalCleanupRetryPod(cache, cleanup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.Name != NodeLocalCleanupRetryPodName(cache.UID, "gpu-node-a", cleanup.Name) ||
+		!IsNodeLocalCleanupPodName(cache.UID, "gpu-node-a", retry.Name) || retry.Spec.NodeName != "" || len(retry.Spec.SchedulingGates) != 1 {
+		t.Fatalf("cleanup retry identity/gate = name:%q node:%q gates:%+v", retry.Name, retry.Spec.NodeName, retry.Spec.SchedulingGates)
+	}
+	if retry.Spec.Containers[0].Image != cleanup.Spec.Containers[0].Image || retry.Spec.Volumes[0].HostPath.Path != cleanup.Spec.Volumes[0].HostPath.Path {
+		t.Fatalf("cleanup retry changed image or hostPath: image:%q volumes:%+v", retry.Spec.Containers[0].Image, retry.Spec.Volumes)
+	}
+}
+
+func TestNodeLocalCleanupRejectsInvalidInputs(t *testing.T) {
+	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
+	base := NodeLocalCleanupPodName(cache.UID, "gpu-node-a")
+	if IsNodeLocalCleanupPodName(cache.UID, "gpu-node-a", base+"-retry-short") {
+		t.Fatal("short cleanup retry suffix was accepted")
+	}
+	if IsNodeLocalCleanupPodName(cache.UID, "gpu-node-a", base+"-retry-zzzzzzzzzzzz") {
+		t.Fatal("non-hex cleanup retry suffix was accepted")
+	}
+	if _, err := RenderLMCacheNodeLocalCleanupPod(nil, "gpu-node-a", testNodeLocalCleanupImage, nodeLocalSourceEngine()); err == nil {
+		t.Fatal("nil backend was accepted for cleanup rendering")
+	}
+	unsafeUID := cache.DeepCopy()
+	unsafeUID.UID = "unsafe/uid"
+	if _, err := RenderLMCacheNodeLocalCleanupPod(unsafeUID, "gpu-node-a", testNodeLocalCleanupImage, nodeLocalSourceEngine()); err == nil {
+		t.Fatal("unsafe backend UID was accepted for cleanup rendering")
+	}
+	if _, err := RenderLMCacheNodeLocalCleanupRetryPod(nil, nil); err == nil {
+		t.Fatal("nil backend and failed Pod were accepted for retry rendering")
+	}
+	failed := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "failed"}}
+	if _, err := RenderLMCacheNodeLocalCleanupRetryPod(cache, failed); err == nil {
+		t.Fatal("cleanup retry without target node was accepted")
+	}
+	if _, err := NodeLocalServerShmHostPath(nil); err == nil {
+		t.Fatal("nil backend produced a NodeLocal SHM hostPath")
 	}
 }
 
@@ -191,27 +307,6 @@ func TestNodeLocalServerPodNameIsStableAndBounded(t *testing.T) {
 	}
 }
 
-func TestNodeLocalServerShmNameIsStableAndUIDScoped(t *testing.T) {
-	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
-	want := "lmcache_l1_pool_inferencecache_11111111-2222-3333-4444-555555555555"
-	got, err := NodeLocalServerShmName(cache)
-	if err != nil || got != want {
-		t.Fatalf("NodeLocalServerShmName = %q, %v; want %q", got, err, want)
-	}
-	cache.Name = "renamed"
-	cache.Namespace = "other"
-	cache.Generation++
-	stable, err := NodeLocalServerShmName(cache)
-	if err != nil || stable != want {
-		t.Fatalf("same-UID replacement shm name = %q, %v; want %q", stable, err, want)
-	}
-	cache.UID = types.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
-	distinct, err := NodeLocalServerShmName(cache)
-	if err != nil || distinct == want {
-		t.Fatalf("different-UID shm name = %q, %v; must differ from %q", distinct, err, want)
-	}
-}
-
 func TestNodeLocalServerShmHostPathIsStableAndUIDScoped(t *testing.T) {
 	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
 	want := "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555"
@@ -231,14 +326,14 @@ func TestNodeLocalServerShmHostPathIsStableAndUIDScoped(t *testing.T) {
 	}
 }
 
-func TestNodeLocalServerShmNameRejectsUnsafeUID(t *testing.T) {
+func TestNodeLocalServerShmHostPathRejectsUnsafeUID(t *testing.T) {
 	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
 	cache.UID = types.UID("unsafe/uid")
-	if _, err := NodeLocalServerShmName(cache); err == nil || !strings.Contains(err.Error(), "unsafe character") {
+	if _, err := NodeLocalServerShmHostPath(cache); err == nil || !strings.Contains(err.Error(), "unsafe character") {
 		t.Fatalf("unsafe UID error = %v", err)
 	}
-	cache.UID = types.UID(strings.Repeat("a", posixShmNameMaxLength))
-	if _, err := NodeLocalServerShmName(cache); err == nil || !strings.Contains(err.Error(), "exceeds POSIX limit") {
+	cache.UID = types.UID(strings.Repeat("a", hostPathComponentMaxLength+1))
+	if _, err := NodeLocalServerShmHostPath(cache); err == nil || !strings.Contains(err.Error(), "exceeds path-component limit") {
 		t.Fatalf("oversized UID error = %v", err)
 	}
 }
@@ -271,7 +366,8 @@ func TestVLLMNodeLocalEngineInjection(t *testing.T) {
 		t.Fatalf("engine node IP env = %+v", engine.Env)
 	}
 	joined := strings.Join(engine.Args, " ")
-	if !strings.Contains(joined, `tcp://$(INFERENCECACHE_NODE_IP)`) || !strings.Contains(joined, `"lmcache.mp.port":"6555"`) {
+	if !strings.Contains(joined, `tcp://$(INFERENCECACHE_NODE_IP)`) || !strings.Contains(joined, `"lmcache.mp.port":"6555"`) ||
+		!strings.Contains(joined, `"lmcache.mp.mp_transfer_mode":"lmcache_driven"`) {
 		t.Fatalf("vLLM args do not carry node-derived endpoint: %s", joined)
 	}
 	shmMount := mountAtPath(engine.VolumeMounts, "/dev/shm")
@@ -291,11 +387,13 @@ func TestVLLMNodeLocalEngineInjection(t *testing.T) {
 	}
 	gate := pod.Spec.InitContainers[0]
 	if !strings.Contains(gate.Args[0], "/config") || !strings.Contains(gate.Args[0], "EXPECTED_INSTANCE_ID") ||
-		!strings.Contains(gate.Args[0], `memory.get("shm_name")`) {
+		!strings.Contains(gate.Args[0], `"supported_transfer_mode": "lmcache_driven"`) ||
+		!strings.Contains(gate.Args[0], `memory.get("use_lazy") is not False`) ||
+		!strings.Contains(gate.Args[0], `memory.get("shm_name") != ""`) {
 		t.Fatalf("gate script does not verify live server identity: %q", gate.Args[0])
 	}
-	if got, found := lookupEnv(gate.Env, "EXPECTED_SHM_NAME"); !found || got != "lmcache_l1_pool_inferencecache_11111111-2222-3333-4444-555555555555" {
-		t.Fatalf("gate EXPECTED_SHM_NAME = %q, found=%v", got, found)
+	if _, found := lookupEnv(gate.Env, "EXPECTED_SHM_NAME"); found {
+		t.Fatal("gate still carries obsolete UID-derived POSIX SHM identity")
 	}
 
 	before := pod.Spec.DeepCopy()
@@ -487,6 +585,7 @@ func TestNodeLocalAdaptersValidateTopologyContract(t *testing.T) {
 	sglangCache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeSGLang)
 	sglangPod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
 		Name: SGLangEngineContainerName, Args: []string{"--page-size", "64"},
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{gpuResourceName: resource.MustParse("1")}},
 	}}}}
 	sglang := sglangLMCacheAdapter{}
 	if !sglang.Supports("sglang", sglangCache) {

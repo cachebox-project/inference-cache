@@ -42,7 +42,8 @@ if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then
   case "$ref" in
     ghcr.io/cachebox-project/inference-cache-controller:ci-*|\
     ghcr.io/cachebox-project/inference-cache-server:ci-*|\
-    ghcr.io/cachebox-project/inference-cache-subscriber:ci-*) ;;
+    ghcr.io/cachebox-project/inference-cache-subscriber:ci-*|\
+    ghcr.io/cachebox-project/inference-cache-shm-cleanup:ci-*) ;;
     *) echo "unexpected inspect ref: $ref" >&2; exit 2 ;;
   esac
   case "${DOCKER_FAKE_MODE:-missing}" in
@@ -106,6 +107,7 @@ if [ "$1" = "buildx" ] && [ "$2" = "build" ]; then
     ghcr.io/cachebox-project/inference-cache-controller:ci-*) expected_target=controller ;;
     ghcr.io/cachebox-project/inference-cache-server:ci-*) expected_target=server ;;
     ghcr.io/cachebox-project/inference-cache-subscriber:ci-*) expected_target=subscriber ;;
+    ghcr.io/cachebox-project/inference-cache-shm-cleanup:ci-*) expected_target=cleanup ;;
     *) echo "unexpected build tag: $tag" >&2; exit 2 ;;
   esac
   test -n "$metadata"
@@ -154,7 +156,8 @@ if [ -z "$platform" ]; then
   case "$source" in
     registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:4444444444444444444444444444444444444444444444444444444444444444|\
     registry:ghcr.io/cachebox-project/inference-cache-server@sha256:4444444444444444444444444444444444444444444444444444444444444444|\
-    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:4444444444444444444444444444444444444444444444444444444444444444) ;;
+    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:4444444444444444444444444444444444444444444444444444444444444444|\
+    registry:ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:4444444444444444444444444444444444444444444444444444444444444444) ;;
     *) echo "unexpected syft source/platform: $source $platform" >&2; exit 2 ;;
   esac
 else
@@ -165,15 +168,20 @@ else
     registry:ghcr.io/cachebox-project/inference-cache-server@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/arm64|\
     registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/amd64|\
     registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/arm64|\
+    registry:ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:1111111111111111111111111111111111111111111111111111111111111111\|linux/arm64|\
     registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
     registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
     registry:ghcr.io/cachebox-project/inference-cache-server@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
     registry:ghcr.io/cachebox-project/inference-cache-server@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
     registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
     registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
+    registry:ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:2222222222222222222222222222222222222222222222222222222222222222\|linux/arm64|\
     registry:ghcr.io/cachebox-project/inference-cache-controller@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64|\
     registry:ghcr.io/cachebox-project/inference-cache-server@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64|\
-    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64) ;;
+    registry:ghcr.io/cachebox-project/inference-cache-subscriber@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64|\
+    registry:ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:3333333333333333333333333333333333333333333333333333333333333333\|linux/amd64) ;;
     *) echo "unexpected syft source/platform: $source $platform" >&2; exit 2 ;;
   esac
 fi
@@ -201,7 +209,7 @@ if PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=denied make sbom-registry-images TAG="
 fi
 
 PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=existing make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/existing" SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
-for component in controller server subscriber; do
+for component in controller server subscriber cleanup; do
   for platform in linux_amd64 linux_arm64; do
     sbom="$outdir/existing/inference-cache-${component}-${platform}-${IMAGE_TAG}.spdx.json"
     test -s "$sbom"
@@ -210,7 +218,7 @@ for component in controller server subscriber; do
 done
 
 PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=existing-amd64 make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/existing-amd64" SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
-for component in controller server subscriber; do
+for component in controller server subscriber cleanup; do
   sbom="$outdir/existing-amd64/inference-cache-${component}-linux_amd64-${IMAGE_TAG}.spdx.json"
   test -s "$sbom"
   jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
@@ -218,7 +226,7 @@ for component in controller server subscriber; do
 done
 
 PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=existing-single make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/existing-single" SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
-for component in controller server subscriber; do
+for component in controller server subscriber cleanup; do
   sbom="$outdir/existing-single/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
   test -s "$sbom"
   jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null
@@ -227,7 +235,7 @@ for component in controller server subscriber; do
 done
 
 PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=missing make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/missing" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
-for component in controller server subscriber; do
+for component in controller server subscriber cleanup; do
   for platform in linux_amd64 linux_arm64; do
     sbom="$outdir/missing/inference-cache-${component}-${platform}-${IMAGE_TAG}.spdx.json"
     test -s "$sbom"
@@ -236,7 +244,7 @@ for component in controller server subscriber; do
 done
 
 PATH="$fakebin:$PATH" DOCKER_FAKE_MODE=missing-notfound make sbom-registry-images TAG="$IMAGE_TAG" SBOM_DIR="$outdir/missing-notfound" SBOM_REGISTRY_PUBLISH_MISSING=1 SBOM_IMAGE_CONTEXT=. SBOM_DOCKERFILE=dockerfiles/Dockerfile
-for component in controller server subscriber; do
+for component in controller server subscriber cleanup; do
   for platform in linux_amd64 linux_arm64; do
     sbom="$outdir/missing-notfound/inference-cache-${component}-${platform}-${IMAGE_TAG}.spdx.json"
     test -s "$sbom"

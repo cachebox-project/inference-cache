@@ -75,6 +75,9 @@ func TestRenderLMCachePodLocalServerGolden(t *testing.T) {
 	if server.RestartPolicy == nil || *server.RestartPolicy != corev1.ContainerRestartPolicyAlways {
 		t.Fatalf("server is not a native sidecar: %v", server.RestartPolicy)
 	}
+	if !IsLMCacheMPCUDAServerProfile(server.Args) {
+		t.Fatalf("server args do not explicitly select the CUDA/private-pinned-L1 profile: %v", server.Args)
+	}
 	joined := strings.Join(append(server.Command, server.Args...), " ")
 	for _, want := range []string{
 		"lmcache server", "--host 127.0.0.1", "--port 6500",
@@ -110,10 +113,32 @@ func TestRenderLMCachePodLocalServerGolden(t *testing.T) {
 	}
 	shm := findVolume(pod.Volumes, lmCacheMPShmVolumeName)
 	if shm == nil || shm.EmptyDir == nil || shm.EmptyDir.Medium != corev1.StorageMediumMemory || shm.EmptyDir.SizeLimit == nil || shm.EmptyDir.SizeLimit.Cmp(resource.MustParse("5Gi")) != 0 {
-		t.Fatalf("shared-memory volume = %+v, want bounded 5Gi tmpfs (4Gi L1 + 1Gi headroom)", shm)
+		t.Fatalf("shared-memory volume = %+v, want conservative bounded 5Gi CUDA IPC tmpfs", shm)
 	}
 	if findVolume(pod.Volumes, lmCacheMPConfigVolumeName) == nil {
 		t.Fatalf("client config volume missing: %+v", pod.Volumes)
+	}
+}
+
+func TestIsLMCacheMPCUDAServerProfile(t *testing.T) {
+	valid := []string{"server", lmCacheMPTransferModeArg, lmCacheMPTransferModeLMCacheDriven, lmCacheMPL1NonLazyArg, lmCacheMPShmNameArg, ""}
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "explicit profile", args: valid, want: true},
+		{name: "implicit transfer mode", args: []string{"server", lmCacheMPL1NonLazyArg, lmCacheMPShmNameArg, ""}},
+		{name: "lazy", args: []string{"server", lmCacheMPTransferModeArg, lmCacheMPTransferModeLMCacheDriven, lmCacheMPL1LazyArg, lmCacheMPShmNameArg, ""}},
+		{name: "named L1 SHM", args: []string{"server", lmCacheMPTransferModeArg, lmCacheMPTransferModeLMCacheDriven, lmCacheMPL1NonLazyArg, lmCacheMPShmNameArg, "pool"}},
+		{name: "missing empty SHM override", args: []string{"server", lmCacheMPTransferModeArg, lmCacheMPTransferModeLMCacheDriven, lmCacheMPL1NonLazyArg}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsLMCacheMPCUDAServerProfile(tt.args); got != tt.want {
+				t.Fatalf("IsLMCacheMPCUDAServerProfile(%v) = %v, want %v", tt.args, got, tt.want)
+			}
+		})
 	}
 }
 
