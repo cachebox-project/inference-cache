@@ -59,6 +59,69 @@ func nodeLocalEngine(backend *cachev1alpha1.CacheBackend, name, node string) *co
 	}
 }
 
+func TestNodeLocalCleanupHelperGuards(t *testing.T) {
+	backend := nodeLocalBackend("node-cache", "ns1")
+	reconciler := newReconciler(newScheme(t), backend)
+	if nodeLocalServerTargetNode(nil) != "" {
+		t.Fatal("nil server Pod produced a target node")
+	}
+	server := &corev1.Pod{Spec: corev1.PodSpec{NodeName: "node-a"}}
+	if nodeLocalServerTargetNode(server) != "node-a" {
+		t.Fatal("server target did not fall back to spec.nodeName")
+	}
+	if nodeLocalServerUsesShmHostPath(nil, "/dev/shm/inference-cache/x") || nodeLocalServerUsesShmHostPath(server, "") {
+		t.Fatal("incomplete server identity reported an SHM hostPath")
+	}
+	if err := reconciler.cleanupLMCacheNodeLocalServerPods(context.Background(), nil); err != nil {
+		t.Fatalf("nil backend cleanup: %v", err)
+	}
+	if err := reconciler.ensureLMCacheNodeLocalCleanupPod(context.Background(), backend, nil); err == nil {
+		t.Fatal("nil source server was accepted for cleanup intent")
+	}
+	if _, err := reconciler.reconcileLMCacheNodeLocalCleanupPods(context.Background(), nil, nil, false); err != nil {
+		t.Fatalf("nil backend cleanup reconcile: %v", err)
+	}
+	if _, err := reconciler.nodeLocalShmConsumers(context.Background(), nil, ""); err == nil {
+		t.Fatal("nil backend produced an SHM consumer snapshot")
+	}
+	if err := reconciler.ensureLMCacheNodeLocalCleanupForNode(context.Background(), backend, "", server); err == nil {
+		t.Fatal("empty cleanup target node was accepted")
+	}
+}
+
+func TestNodeLocalCleanupPropagatesListErrors(t *testing.T) {
+	backend := nodeLocalBackend("node-cache", "ns1")
+	listErr := errors.New("list denied")
+	reconciler := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return listErr
+		},
+	}, backend)
+	server := nodeLocalEngine(backend, "engine-a", "node-a")
+	checks := []func() error{
+		func() error { return reconciler.cleanupLMCacheNodeLocalServerPods(context.Background(), backend) },
+		func() error {
+			return reconciler.ensureLMCacheNodeLocalCleanupForNode(context.Background(), backend, "node-a", server)
+		},
+		func() error {
+			return reconciler.ensureLMCacheNodeLocalCleanupForConsumers(context.Background(), backend)
+		},
+		func() error {
+			_, err := reconciler.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, nil, false)
+			return err
+		},
+		func() error {
+			_, err := reconciler.nodeLocalShmConsumers(context.Background(), backend, "")
+			return err
+		},
+	}
+	for i, check := range checks {
+		if err := check(); !errors.Is(err, listErr) {
+			t.Fatalf("list error check %d = %v, want %v", i, err, listErr)
+		}
+	}
+}
+
 func markNodeLocalCleanupSucceeded(t *testing.T, reconciler *CacheBackendReconciler, pod *corev1.Pod, nodeName string) {
 	t.Helper()
 	pod.Spec.NodeName = nodeName

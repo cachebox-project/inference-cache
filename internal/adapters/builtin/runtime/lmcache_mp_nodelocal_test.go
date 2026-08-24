@@ -215,6 +215,35 @@ func TestRenderLMCacheNodeLocalCleanupRetryPod(t *testing.T) {
 	}
 }
 
+func TestNodeLocalCleanupRejectsInvalidInputs(t *testing.T) {
+	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
+	base := NodeLocalCleanupPodName(cache.UID, "gpu-node-a")
+	if IsNodeLocalCleanupPodName(cache.UID, "gpu-node-a", base+"-retry-short") {
+		t.Fatal("short cleanup retry suffix was accepted")
+	}
+	if IsNodeLocalCleanupPodName(cache.UID, "gpu-node-a", base+"-retry-zzzzzzzzzzzz") {
+		t.Fatal("non-hex cleanup retry suffix was accepted")
+	}
+	if _, err := RenderLMCacheNodeLocalCleanupPod(nil, "gpu-node-a", testNodeLocalCleanupImage, nodeLocalSourceEngine()); err == nil {
+		t.Fatal("nil backend was accepted for cleanup rendering")
+	}
+	unsafeUID := cache.DeepCopy()
+	unsafeUID.UID = "unsafe/uid"
+	if _, err := RenderLMCacheNodeLocalCleanupPod(unsafeUID, "gpu-node-a", testNodeLocalCleanupImage, nodeLocalSourceEngine()); err == nil {
+		t.Fatal("unsafe backend UID was accepted for cleanup rendering")
+	}
+	if _, err := RenderLMCacheNodeLocalCleanupRetryPod(nil, nil); err == nil {
+		t.Fatal("nil backend and failed Pod were accepted for retry rendering")
+	}
+	failed := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "failed"}}
+	if _, err := RenderLMCacheNodeLocalCleanupRetryPod(cache, failed); err == nil {
+		t.Fatal("cleanup retry without target node was accepted")
+	}
+	if _, err := NodeLocalServerShmHostPath(nil); err == nil {
+		t.Fatal("nil backend produced a NodeLocal SHM hostPath")
+	}
+}
+
 func TestRenderLMCacheNodeLocalServerPodWithRedisL2(t *testing.T) {
 	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
 	pod, err := RenderLMCacheNodeLocalServerPod(cache, &backendadapter.Binding{
