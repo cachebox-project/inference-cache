@@ -7,6 +7,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -59,6 +61,23 @@ func nodeLocalEngine(backend *cachev1alpha1.CacheBackend, name, node string) *co
 	}
 }
 
+func nodeLocalCleanupPod(t *testing.T, backend *cachev1alpha1.CacheBackend) *corev1.Pod {
+	t.Helper()
+	pod, err := builtinruntime.RenderLMCacheNodeLocalCleanupPod(
+		backend,
+		"node-a",
+		"registry.example/inference-cache-shm-cleanup@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		nodeLocalEngine(backend, "engine-a", "node-a"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controllerutil.SetControllerReference(backend, pod, newScheme(t)); err != nil {
+		t.Fatal(err)
+	}
+	return pod
+}
+
 func TestNodeLocalCleanupHelperGuards(t *testing.T) {
 	backend := nodeLocalBackend("node-cache", "ns1")
 	reconciler := newReconciler(newScheme(t), backend)
@@ -72,11 +91,17 @@ func TestNodeLocalCleanupHelperGuards(t *testing.T) {
 	if nodeLocalServerUsesShmHostPath(nil, "/dev/shm/inference-cache/x") || nodeLocalServerUsesShmHostPath(server, "") {
 		t.Fatal("incomplete server identity reported an SHM hostPath")
 	}
+	if nodeLocalServerHasRuntimeIdentity(server, "/dev/shm/inference-cache/x") {
+		t.Fatal("server without the managed container reported a runtime identity")
+	}
 	if err := reconciler.cleanupLMCacheNodeLocalServerPods(context.Background(), nil); err != nil {
 		t.Fatalf("nil backend cleanup: %v", err)
 	}
 	if err := reconciler.ensureLMCacheNodeLocalCleanupPod(context.Background(), backend, nil); err == nil {
 		t.Fatal("nil source server was accepted for cleanup intent")
+	}
+	if err := reconciler.ensureLMCacheNodeLocalCleanupForConsumers(context.Background(), nil); err != nil {
+		t.Fatalf("nil backend consumer intent: %v", err)
 	}
 	if _, err := reconciler.reconcileLMCacheNodeLocalCleanupPods(context.Background(), nil, nil, false); err != nil {
 		t.Fatalf("nil backend cleanup reconcile: %v", err)
@@ -86,6 +111,11 @@ func TestNodeLocalCleanupHelperGuards(t *testing.T) {
 	}
 	if err := reconciler.ensureLMCacheNodeLocalCleanupForNode(context.Background(), backend, "", server); err == nil {
 		t.Fatal("empty cleanup target node was accepted")
+	}
+	unsafeUID := backend.DeepCopy()
+	unsafeUID.UID = "unsafe/uid"
+	if err := reconciler.ensureLMCacheNodeLocalCleanupForConsumers(context.Background(), unsafeUID); err == nil {
+		t.Fatal("unsafe backend UID was accepted for consumer cleanup")
 	}
 }
 
@@ -120,6 +150,262 @@ func TestNodeLocalCleanupPropagatesListErrors(t *testing.T) {
 			t.Fatalf("list error check %d = %v, want %v", i, err, listErr)
 		}
 	}
+}
+
+func TestEnsureNodeLocalCleanupRejectsInvalidOrOccupiedPod(t *testing.T) {
+	backend := nodeLocalBackend("node-cache", "ns1")
+	source := nodeLocalEngine(backend, "engine-a", "node-a")
+
+	t.Run("invalid existing", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		cleanup.Spec.Containers[0].Command = []string{"/bin/true"}
+		r := newReconciler(newScheme(t), backend, cleanup)
+		if err := r.ensureLMCacheNodeLocalCleanupForNode(context.Background(), backend, "node-a", source); err == nil {
+			t.Fatal("invalid existing cleanup Pod was accepted")
+		}
+	})
+
+	t.Run("invalid existing delete denied", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		cleanup.Spec.Containers[0].Command = []string{"/bin/true"}
+		deleteErr := errors.New("delete invalid denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
+				return deleteErr
+			},
+		}, backend, cleanup)
+		if err := r.ensureLMCacheNodeLocalCleanupForNode(context.Background(), backend, "node-a", source); !errors.Is(err, deleteErr) {
+			t.Fatalf("invalid cleanup delete error = %v, want %v", err, deleteErr)
+		}
+	})
+
+	t.Run("create denied", func(t *testing.T) {
+		createErr := errors.New("create denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+				return createErr
+			},
+		}, backend)
+		if err := r.ensureLMCacheNodeLocalCleanupForNode(context.Background(), backend, "node-a", source); !errors.Is(err, createErr) {
+			t.Fatalf("create error = %v, want %v", err, createErr)
+		}
+	})
+
+	t.Run("occupied name", func(t *testing.T) {
+		foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: builtinruntime.NodeLocalCleanupPodName(backend.UID, "node-a"), Namespace: backend.Namespace,
+		}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "foreign"}}}}
+		r := newReconciler(newScheme(t), backend, foreign)
+		if err := r.ensureLMCacheNodeLocalCleanupForNode(context.Background(), backend, "node-a", source); err == nil {
+			t.Fatal("occupied cleanup Pod name was accepted")
+		}
+	})
+
+	t.Run("owner scheme", func(t *testing.T) {
+		r := newReconciler(newScheme(t), backend)
+		r.Scheme = runtime.NewScheme()
+		if err := r.ensureLMCacheNodeLocalCleanupForNode(context.Background(), backend, "node-a", source); err == nil {
+			t.Fatal("cleanup Pod owner was resolved with an empty scheme")
+		}
+	})
+
+	t.Run("inspect collision denied", func(t *testing.T) {
+		inspectErr := errors.New("inspect denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
+				return apierrors.NewAlreadyExists(corev1.Resource("pods"), obj.GetName())
+			},
+			Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+				return inspectErr
+			},
+		}, backend)
+		if err := r.ensureLMCacheNodeLocalCleanupForNode(context.Background(), backend, "node-a", source); !errors.Is(err, inspectErr) {
+			t.Fatalf("inspect collision error = %v, want %v", err, inspectErr)
+		}
+	})
+}
+
+func TestReconcileNodeLocalCleanupPropagatesWriteErrors(t *testing.T) {
+	backend := nodeLocalBackend("node-cache", "ns1")
+
+	t.Run("completed delete", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		cleanup.Spec.SchedulingGates = nil
+		cleanup.Spec.NodeName = "node-a"
+		cleanup.Status.Phase = corev1.PodSucceeded
+		cleanup.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "lmcache-node-shm-cleanup",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 0,
+			}},
+		}}
+		deleteErr := errors.New("delete completed denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
+				return deleteErr
+			},
+		}, backend, cleanup)
+		if _, err := r.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, nil, false); !errors.Is(err, deleteErr) {
+			t.Fatalf("completed delete error = %v, want %v", err, deleteErr)
+		}
+	})
+
+	t.Run("retry create", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		cleanup.Spec.SchedulingGates = nil
+		cleanup.Spec.NodeName = "node-a"
+		cleanup.Status.Phase = corev1.PodFailed
+		createErr := errors.New("retry create denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+				return createErr
+			},
+		}, backend, cleanup)
+		if _, err := r.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, nil, false); !errors.Is(err, createErr) {
+			t.Fatalf("retry create error = %v, want %v", err, createErr)
+		}
+	})
+
+	t.Run("retry occupied", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		cleanup.Spec.SchedulingGates = nil
+		cleanup.Spec.NodeName = "node-a"
+		cleanup.Status.Phase = corev1.PodFailed
+		foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name:      builtinruntime.NodeLocalCleanupRetryPodName(backend.UID, "node-a", cleanup.Name),
+			Namespace: backend.Namespace,
+		}}
+		r := newReconciler(newScheme(t), backend, cleanup, foreign)
+		if _, err := r.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, nil, false); err == nil {
+			t.Fatal("occupied cleanup retry name was accepted")
+		}
+	})
+
+	t.Run("failed delete", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		cleanup.Spec.SchedulingGates = nil
+		cleanup.Spec.NodeName = "node-a"
+		cleanup.Status.Phase = corev1.PodFailed
+		deleteErr := errors.New("delete failed denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Delete: func(_ context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if obj.GetName() == cleanup.Name {
+					return deleteErr
+				}
+				return c.Delete(context.Background(), obj, opts...)
+			},
+		}, backend, cleanup)
+		if _, err := r.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, nil, false); !errors.Is(err, deleteErr) {
+			t.Fatalf("failed cleanup delete error = %v, want %v", err, deleteErr)
+		}
+	})
+
+	t.Run("invalid synthetic", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		cleanup.Spec.Containers[0].Command = []string{"/bin/true"}
+		r := newReconciler(newScheme(t), backend, cleanup)
+		if _, err := r.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, nil, false); err == nil {
+			t.Fatal("invalid cleanup Pod did not return a retry error")
+		}
+	})
+
+	t.Run("foreign owner", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		other := backend.DeepCopy()
+		other.UID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+		if err := controllerutil.SetControllerReference(other, cleanup, newScheme(t)); err != nil {
+			t.Fatal(err)
+		}
+		r := newReconciler(newScheme(t), backend, cleanup)
+		if blocked, err := r.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, nil, false); err != nil || len(blocked) != 0 {
+			t.Fatalf("foreign cleanup = blocked:%v err:%v", blocked, err)
+		}
+	})
+
+	t.Run("cancel delete", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		deleteErr := errors.New("cancel denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
+				return deleteErr
+			},
+		}, backend, cleanup)
+		demand := map[string]*corev1.Pod{"node-a": nodeLocalEngine(backend, "engine-a", "node-a")}
+		if _, err := r.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, demand, true); !errors.Is(err, deleteErr) {
+			t.Fatalf("cancel delete error = %v, want %v", err, deleteErr)
+		}
+	})
+
+	t.Run("gate patch", func(t *testing.T) {
+		cleanup := nodeLocalCleanupPod(t, backend)
+		patchErr := errors.New("gate patch denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+				return patchErr
+			},
+		}, backend, cleanup)
+		if _, err := r.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, nil, false); !errors.Is(err, patchErr) {
+			t.Fatalf("gate patch error = %v, want %v", err, patchErr)
+		}
+	})
+}
+
+func TestFinalizeNodeLocalPropagatesPodListErrors(t *testing.T) {
+	for _, failAt := range []int{1, 2, 3, 4, 5} {
+		t.Run(fmt.Sprintf("pod list %d", failAt), func(t *testing.T) {
+			backend := nodeLocalBackend("node-cache", "ns1")
+			listErr := errors.New("list denied")
+			podLists := 0
+			r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*corev1.PodList); ok {
+						podLists++
+						if podLists == failAt {
+							return listErr
+						}
+					}
+					return c.List(ctx, list, opts...)
+				},
+			}, backend)
+			if _, err := r.finalizeLMCacheNodeLocal(context.Background(), backend); !errors.Is(err, listErr) {
+				t.Fatalf("finalize Pod list %d error = %v, want %v", failAt, err, listErr)
+			}
+		})
+	}
+}
+
+func TestFinalizeNodeLocalPropagatesGetAndPatchErrors(t *testing.T) {
+	backend := nodeLocalBackend("node-cache", "ns1")
+
+	t.Run("owned workload get", func(t *testing.T) {
+		getErr := errors.New("deployment get denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*appsv1.Deployment); ok {
+					return getErr
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}, backend)
+		if _, err := r.finalizeLMCacheNodeLocal(context.Background(), backend); !errors.Is(err, getErr) {
+			t.Fatalf("finalize get error = %v, want %v", err, getErr)
+		}
+	})
+
+	t.Run("finalizer patch", func(t *testing.T) {
+		patchErr := errors.New("backend patch denied")
+		r := newReconcilerWithInterceptor(newScheme(t), interceptor.Funcs{
+			Patch: func(_ context.Context, _ client.WithWatch, obj client.Object, _ client.Patch, _ ...client.PatchOption) error {
+				if _, ok := obj.(*cachev1alpha1.CacheBackend); ok {
+					return patchErr
+				}
+				return nil
+			},
+		}, backend)
+		if _, err := r.finalizeLMCacheNodeLocal(context.Background(), backend); !errors.Is(err, patchErr) {
+			t.Fatalf("finalize patch error = %v, want %v", err, patchErr)
+		}
+	})
 }
 
 func markNodeLocalCleanupSucceeded(t *testing.T, reconciler *CacheBackendReconciler, pod *corev1.Pod, nodeName string) {
