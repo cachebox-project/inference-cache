@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
@@ -25,6 +26,9 @@ const (
 	lmCacheNodeLocalGateManagedEnv    = "INFERENCECACHE_NODE_LOCAL_GATE"
 	lmCacheNodeLocalGateManagedValue  = "true"
 	lmCacheNodeLocalShmVolumeName     = "lmcache-node-shm"
+	lmCacheNodeLocalShmCleanupName    = "lmcache-node-shm-cleanup"
+	lmCacheNodeLocalShmCleanupGate    = "inferencecache.io/await-shm-quiescence"
+	lmCacheNodeLocalShmCleanupPath    = "/var/run/inference-cache/shm-pool"
 	lmCacheNodeLocalConfigVolumeName  = "lmcache-node-config"
 	lmCacheNodeLocalConfigMountPath   = "/var/run/inference-cache/lmcache-node"
 	lmCacheNodeLocalConfigFilePath    = lmCacheNodeLocalConfigMountPath + "/client.yaml"
@@ -115,7 +119,6 @@ func RenderLMCacheNodeLocalServerPod(cache *cachev1alpha1.CacheBackend, binding 
 		LivenessProbe:   lmCacheMPHTTPProbeForPort(lmCacheMPHTTPPortName, 10, 3),
 		SecurityContext: lmCacheMPServerSecurityContext(nil),
 	}
-
 	labels := map[string]string{
 		"app.kubernetes.io/name":                  "lmcache-mp-server",
 		"app.kubernetes.io/managed-by":            "inference-cache-controller",
@@ -192,6 +195,120 @@ func RenderLMCacheNodeLocalServerPod(cache *cachev1alpha1.CacheBackend, binding 
 			Labels: copyStringMap(labels), Annotations: copyStringMap(annotations),
 		},
 		Spec: podSpec,
+	}, nil
+}
+
+const nodeLocalShmCleanupScript = `import os, stat
+root = os.environ["SHM_POOL_PATH"]
+def remove_entry(path):
+    mode = os.lstat(path).st_mode
+    if stat.S_ISDIR(mode):
+        with os.scandir(path) as entries:
+            for entry in entries:
+                remove_entry(entry.path)
+        os.rmdir(path)
+    else:
+        os.unlink(path)
+with os.scandir(root) as entries:
+    for entry in entries:
+        remove_entry(entry.path)
+`
+
+func nodeLocalShmHelperSecurityContext() *corev1.SecurityContext {
+	no := false
+	zero := int64(0)
+	readOnlyRoot := true
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &no,
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		ReadOnlyRootFilesystem:   &readOnlyRoot,
+		RunAsNonRoot:             &no,
+		RunAsUser:                &zero,
+		RunAsGroup:               &zero,
+		SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+}
+
+func nodeLocalShmHelperResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m"), corev1.ResourceMemory: resource.MustParse("32Mi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+	}
+}
+
+// NodeLocalCleanupPodName returns the stable name of one backend/node cleanup
+// intent. The name deliberately depends on the immutable backend UID rather
+// than the reusable CacheBackend name.
+func NodeLocalCleanupPodName(uid types.UID, nodeName string) string {
+	sum := sha256.Sum256([]byte(string(uid) + "\x00" + nodeName))
+	return fmt.Sprintf("lmcache-shm-cleanup-%x", sum[:12])
+}
+
+// RenderLMCacheNodeLocalCleanupPod renders a gated, one-shot cleanup intent.
+// It mounts only the exact UID directory; the controller removes the scheduling
+// gate after all prior consumers have disappeared.
+func RenderLMCacheNodeLocalCleanupPod(cache *cachev1alpha1.CacheBackend, nodeName, image string, source *corev1.Pod) (*corev1.Pod, error) {
+	if cache == nil || cache.UID == "" || strings.TrimSpace(nodeName) == "" || strings.TrimSpace(image) == "" || source == nil {
+		return nil, fmt.Errorf("render LMCache NodeLocal SHM cleanup Pod: backend UID, target node, image, and scheduling source are required")
+	}
+	shmHostPath, err := NodeLocalServerShmHostPath(cache)
+	if err != nil {
+		return nil, err
+	}
+	image = strings.TrimSpace(image)
+	pathType := corev1.HostPathDirectoryOrCreate
+	noToken := false
+	enableServiceLinks := false
+	grace := int64(5)
+	cleanup := corev1.Container{
+		Name:            lmCacheNodeLocalShmCleanupName,
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"python3", "-c"},
+		Args:            []string{nodeLocalShmCleanupScript},
+		Env:             []corev1.EnvVar{{Name: "SHM_POOL_PATH", Value: lmCacheNodeLocalShmCleanupPath}},
+		Resources:       nodeLocalShmHelperResources(),
+		VolumeMounts:    []corev1.VolumeMount{{Name: lmCacheNodeLocalShmVolumeName, MountPath: lmCacheNodeLocalShmCleanupPath}},
+		SecurityContext: nodeLocalShmHelperSecurityContext(),
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      NodeLocalCleanupPodName(cache.UID, nodeName),
+			Namespace: cache.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":                   "lmcache-shm-cleanup",
+				"app.kubernetes.io/managed-by":             "inference-cache-controller",
+				enginebinding.LabelLMCacheNodeLocalCleanup: "true",
+				enginebinding.LabelCacheBackendUID:         string(cache.UID),
+			},
+			Annotations: map[string]string{
+				enginebinding.AnnotationNodeLocalOwner:      cache.Namespace + "/" + cache.Name,
+				enginebinding.AnnotationNodeLocalOwnerUID:   string(cache.UID),
+				enginebinding.AnnotationNodeLocalTargetNode: nodeName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			HostNetwork:                   false,
+			HostPID:                       false,
+			HostIPC:                       false,
+			AutomountServiceAccountToken:  &noToken,
+			EnableServiceLinks:            &enableServiceLinks,
+			Affinity:                      exactNodeAffinity(nodeName),
+			Tolerations:                   append([]corev1.Toleration(nil), source.Spec.Tolerations...),
+			ImagePullSecrets:              append([]corev1.LocalObjectReference(nil), source.Spec.ImagePullSecrets...),
+			PriorityClassName:             source.Spec.PriorityClassName,
+			SchedulerName:                 source.Spec.SchedulerName,
+			TerminationGracePeriodSeconds: &grace,
+			RestartPolicy:                 corev1.RestartPolicyOnFailure,
+			SchedulingGates:               []corev1.PodSchedulingGate{{Name: lmCacheNodeLocalShmCleanupGate}},
+			Containers:                    []corev1.Container{cleanup},
+			Volumes: []corev1.Volume{{
+				Name: lmCacheNodeLocalShmVolumeName,
+				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+					Path: shmHostPath, Type: &pathType,
+				}},
+			}},
+		},
 	}, nil
 }
 

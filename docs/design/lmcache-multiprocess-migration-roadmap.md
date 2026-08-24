@@ -1199,9 +1199,10 @@ immutable artifacts. The numbered items below are the future-work backlog.
       contract. Allocation failure keeps the Server unhealthy and the Engine
       gate closed; no aggregate pinned-memory prediction, SHM quota, or separate
       capacity API is planned.
-- [ ] Reclaim an idle/deleted pool's exact UID directory only after proving no
-      selected Engine or Server still uses it. Cleanup must verify ownership,
-      remove only that UID, and never traverse or delete another pool's path.
+- [x] Reclaim an idle/deleted pool with a gated, one-shot cleanup Pod after no
+      Pod uses its exact UID hostPath. Cleanup mounts only that UID, clears its
+      contents without removing the directory, and blocks Server recreation
+      until completion; a finalizer covers CacheBackend deletion.
 
 ### 2. MP client/server compatibility signaling
 

@@ -24,6 +24,10 @@ const (
 	// server Pod.
 	LabelLMCacheNodeLocalServer = "inferencecache.io/lmcache-node-server"
 
+	// LabelLMCacheNodeLocalCleanup identifies a controller-owned, one-shot Pod
+	// that clears one backend UID's auxiliary IPC files on one node.
+	LabelLMCacheNodeLocalCleanup = "inferencecache.io/lmcache-node-shm-cleanup"
+
 	// LabelCacheBackendUID is the immutable, label-safe identity used to list
 	// one CacheBackend's NodeLocal server Pods.
 	LabelCacheBackendUID = "inferencecache.io/cache-backend-uid"

@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -23,6 +24,8 @@ import (
 	"github.com/cachebox-project/inference-cache/internal/enginebinding"
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 )
+
+const nodeLocalShmCleanupFinalizer = "inferencecache.io/nodelocal-shm-cleanup"
 
 func isTypedLMCacheNodeLocal(backend *cachev1alpha1.CacheBackend) bool {
 	return backend != nil &&
@@ -63,6 +66,10 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 	); err != nil {
 		return fmt.Errorf("list LMCache NodeLocal server Pods for %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
+	cleanupNodes, err := r.reconcileLMCacheNodeLocalCleanupPods(ctx, backend, demand, true)
+	if err != nil {
+		return err
+	}
 
 	wantGeneration := strconv.FormatInt(backend.Generation, 10)
 	liveByNode := make(map[string]*corev1.Pod, len(servers.Items))
@@ -89,6 +96,9 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 			retention := time.Duration(backend.Spec.LMCache.NodeLocal.IdleRetentionSeconds) * time.Second
 			if retention <= 0 {
 				if pod.DeletionTimestamp == nil {
+					if err := r.ensureLMCacheNodeLocalCleanupPod(ctx, backend, pod); err != nil {
+						return err
+					}
 					if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 						return fmt.Errorf("delete idle LMCache NodeLocal server Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 					}
@@ -108,6 +118,9 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 				continue
 			}
 			if time.Since(idleSince) >= retention && pod.DeletionTimestamp == nil {
+				if err := r.ensureLMCacheNodeLocalCleanupPod(ctx, backend, pod); err != nil {
+					return err
+				}
 				if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 					return fmt.Errorf("delete expired idle LMCache NodeLocal server Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 				}
@@ -138,7 +151,7 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 	}
 	sort.Strings(nodes)
 	for _, nodeName := range nodes {
-		if liveByNode[nodeName] != nil {
+		if liveByNode[nodeName] != nil || cleanupNodes[nodeName] {
 			continue
 		}
 		desired, err := builtinruntime.RenderLMCacheNodeLocalServerPod(backend, binding, nodeName, demand[nodeName])
@@ -257,14 +270,258 @@ func (r *CacheBackendReconciler) cleanupLMCacheNodeLocalServerPods(ctx context.C
 	); err != nil {
 		return fmt.Errorf("list obsolete LMCache NodeLocal server Pods for %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
+	wantShmHostPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if err != nil {
+		return err
+	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !metav1.IsControlledBy(pod, backend) || pod.DeletionTimestamp != nil {
 			continue
 		}
+		if nodeLocalServerHasRuntimeIdentity(pod, wantShmHostPath) {
+			if err := r.ensureLMCacheNodeLocalCleanupPod(ctx, backend, pod); err != nil {
+				return err
+			}
+		}
 		if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete LMCache NodeLocal server Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 	}
+	_, err = r.reconcileLMCacheNodeLocalCleanupPods(ctx, backend, nil, false)
+	return err
+}
+
+func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupPod(ctx context.Context, backend *cachev1alpha1.CacheBackend, server *corev1.Pod) error {
+	if backend == nil || server == nil || !metav1.IsControlledBy(server, backend) {
+		return fmt.Errorf("create LMCache NodeLocal SHM cleanup intent: controlled source server is required")
+	}
+	nodeName := server.Annotations[enginebinding.AnnotationNodeLocalTargetNode]
+	var image string
+	for i := range server.Spec.Containers {
+		if server.Spec.Containers[i].Name == lmCacheMPServerStatusContainerName {
+			image = server.Spec.Containers[i].Image
+			break
+		}
+	}
+	return r.ensureLMCacheNodeLocalCleanupForNode(ctx, backend, nodeName, image, server)
+}
+
+func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForNode(ctx context.Context, backend *cachev1alpha1.CacheBackend, nodeName, image string, source *corev1.Pod) error {
+	desired, err := builtinruntime.RenderLMCacheNodeLocalCleanupPod(backend, nodeName, image, source)
+	if err != nil {
+		return err
+	}
+	if err := controllerutil.SetControllerReference(backend, desired, r.Scheme); err != nil {
+		return fmt.Errorf("own LMCache NodeLocal SHM cleanup Pod %s/%s: %w", desired.Namespace, desired.Name, err)
+	}
+	if err := r.Client.Create(ctx, desired); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create LMCache NodeLocal SHM cleanup Pod %s/%s: %w", desired.Namespace, desired.Name, err)
+		}
+		var existing corev1.Pod
+		if getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(desired), &existing); getErr != nil {
+			return fmt.Errorf("inspect existing LMCache NodeLocal SHM cleanup Pod %s/%s: %w", desired.Namespace, desired.Name, getErr)
+		}
+		if !metav1.IsControlledBy(&existing, backend) {
+			return fmt.Errorf("LMCache NodeLocal SHM cleanup Pod name %s/%s is occupied by another object", desired.Namespace, desired.Name)
+		}
+	}
 	return nil
+}
+
+func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForConsumers(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
+	if !isTypedLMCacheNodeLocal(backend) || backend.Spec.LMCache.NodeLocal.Server == nil {
+		return nil
+	}
+	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if err != nil {
+		return err
+	}
+	reader := client.Reader(r.APIReader)
+	if reader == nil {
+		reader = r.Client
+	}
+	var pods corev1.PodList
+	if err := reader.List(ctx, &pods, client.InNamespace(backend.Namespace)); err != nil {
+		return fmt.Errorf("list NodeLocal SHM consumers for finalization of %s/%s: %w", backend.Namespace, backend.Name, err)
+	}
+	wantOwner := backend.Namespace + "/" + backend.Name
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Spec.NodeName == "" || pod.Labels[enginebinding.LabelLMCacheNodeLocalCleanup] == "true" ||
+			pod.Annotations[enginebinding.AnnotationInjectedBy] != wantOwner ||
+			pod.Annotations[enginebinding.AnnotationInjectedByUID] != string(backend.UID) {
+			continue
+		}
+		usesPath := false
+		for j := range pod.Spec.Volumes {
+			usesPath = usesPath || (pod.Spec.Volumes[j].HostPath != nil && pod.Spec.Volumes[j].HostPath.Path == wantPath)
+		}
+		if usesPath {
+			if err := r.ensureLMCacheNodeLocalCleanupForNode(ctx, backend, pod.Spec.NodeName, backend.Spec.LMCache.NodeLocal.Server.Image, pod); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *CacheBackendReconciler) finalizeLMCacheNodeLocal(ctx context.Context, backend *cachev1alpha1.CacheBackend) (ctrl.Result, error) {
+	if err := r.cleanupOwnedWorkload(ctx, backend); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.ensureLMCacheNodeLocalCleanupForConsumers(ctx, backend); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.cleanupLMCacheNodeLocalServerPods(ctx, backend); err != nil {
+		return ctrl.Result{}, err
+	}
+	if _, err := r.reconcileLMCacheNodeLocalCleanupPods(ctx, backend, nil, false); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	var servers, cleanups corev1.PodList
+	if err := r.Client.List(ctx, &servers, client.InNamespace(backend.Namespace), client.MatchingLabels{
+		enginebinding.LabelLMCacheNodeLocalServer: "true",
+		enginebinding.LabelCacheBackendUID:        string(backend.UID),
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.Client.List(ctx, &cleanups, client.InNamespace(backend.Namespace), client.MatchingLabels{
+		enginebinding.LabelLMCacheNodeLocalCleanup: "true",
+		enginebinding.LabelCacheBackendUID:         string(backend.UID),
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(servers.Items) != 0 || len(cleanups.Items) != 0 {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	consumers, err := r.nodeLocalShmConsumers(ctx, backend, "")
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(consumers) != 0 {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
+	before := backend.DeepCopy()
+	controllerutil.RemoveFinalizer(backend, nodeLocalShmCleanupFinalizer)
+	if err := r.Patch(ctx, backend, client.MergeFrom(before)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("remove NodeLocal SHM cleanup finalizer from %s/%s: %w", backend.Namespace, backend.Name, err)
+	}
+	return ctrl.Result{}, nil
+}
+
+// reconcileLMCacheNodeLocalCleanupPods advances existing cleanup intents. A
+// gated cleanup is cancelled when normal engine demand returns before it
+// starts; once scheduled, it blocks server recreation until it succeeds.
+func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx context.Context, backend *cachev1alpha1.CacheBackend, demand map[string]*corev1.Pod, cancelOnDemand bool) (map[string]bool, error) {
+	blocked := map[string]bool{}
+	if backend == nil || backend.UID == "" {
+		return blocked, nil
+	}
+	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if err != nil {
+		return nil, err
+	}
+	var pods corev1.PodList
+	if err := r.Client.List(ctx, &pods, client.InNamespace(backend.Namespace), client.MatchingLabels{
+		enginebinding.LabelLMCacheNodeLocalCleanup: "true",
+		enginebinding.LabelCacheBackendUID:         string(backend.UID),
+	}); err != nil {
+		return nil, fmt.Errorf("list LMCache NodeLocal SHM cleanup Pods for %s/%s: %w", backend.Namespace, backend.Name, err)
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, backend) {
+			continue
+		}
+		nodeName := pod.Annotations[enginebinding.AnnotationNodeLocalTargetNode]
+		if !nodeLocalCleanupPodHasIdentity(pod, backend, nodeName, wantPath) {
+			if pod.DeletionTimestamp == nil {
+				_ = r.Client.Delete(ctx, pod)
+			}
+			return nil, fmt.Errorf("delete invalid LMCache NodeLocal SHM cleanup Pod %s/%s", pod.Namespace, pod.Name)
+		}
+		if pod.Status.Phase == corev1.PodSucceeded {
+			if pod.DeletionTimestamp == nil {
+				if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+					return nil, fmt.Errorf("delete completed LMCache NodeLocal SHM cleanup Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+				}
+			}
+			continue
+		}
+		gated := len(pod.Spec.SchedulingGates) > 0
+		if gated && cancelOnDemand && demand[nodeName] != nil {
+			if pod.DeletionTimestamp == nil {
+				if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+					return nil, fmt.Errorf("cancel LMCache NodeLocal SHM cleanup Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+				}
+			}
+			continue
+		}
+		blocked[nodeName] = true
+		if !gated || pod.DeletionTimestamp != nil {
+			continue
+		}
+		consumers, err := r.nodeLocalShmConsumers(ctx, backend, nodeName)
+		if err != nil {
+			return nil, err
+		}
+		if len(consumers) != 0 {
+			continue
+		}
+		before := pod.DeepCopy()
+		pod.Spec.SchedulingGates = nil
+		if err := r.Client.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
+			return nil, fmt.Errorf("release LMCache NodeLocal SHM cleanup Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+	}
+	return blocked, nil
+}
+
+func (r *CacheBackendReconciler) nodeLocalShmConsumers(ctx context.Context, backend *cachev1alpha1.CacheBackend, nodeName string) ([]string, error) {
+	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if err != nil {
+		return nil, err
+	}
+	reader := client.Reader(r.APIReader)
+	if reader == nil {
+		reader = r.Client
+	}
+	var pods corev1.PodList
+	if err := reader.List(ctx, &pods, client.InNamespace(backend.Namespace)); err != nil {
+		return nil, fmt.Errorf("list SHM consumers for NodeLocal CacheBackend %s/%s: %w", backend.Namespace, backend.Name, err)
+	}
+	consumers := []string{}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if (nodeName != "" && pod.Spec.NodeName != nodeName) || pod.Labels[enginebinding.LabelLMCacheNodeLocalCleanup] == "true" {
+			continue
+		}
+		for j := range pod.Spec.Volumes {
+			hostPath := pod.Spec.Volumes[j].HostPath
+			if hostPath != nil && hostPath.Path == wantPath {
+				consumers = append(consumers, pod.Name)
+				break
+			}
+		}
+	}
+	return consumers, nil
+}
+
+func nodeLocalCleanupPodHasIdentity(pod *corev1.Pod, backend *cachev1alpha1.CacheBackend, nodeName, wantPath string) bool {
+	if pod == nil || backend == nil || nodeName == "" || wantPath == "" ||
+		pod.Name != builtinruntime.NodeLocalCleanupPodName(backend.UID, nodeName) ||
+		pod.Annotations[enginebinding.AnnotationNodeLocalOwnerUID] != string(backend.UID) {
+		return false
+	}
+	for i := range pod.Spec.Volumes {
+		hostPath := pod.Spec.Volumes[i].HostPath
+		if hostPath != nil && hostPath.Path == wantPath && hostPath.Type != nil && *hostPath.Type == corev1.HostPathDirectoryOrCreate {
+			return pod.Spec.NodeName == "" || pod.Spec.NodeName == nodeName
+		}
+	}
+	return false
 }

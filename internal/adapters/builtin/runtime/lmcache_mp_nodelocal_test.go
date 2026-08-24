@@ -5,6 +5,9 @@
 package runtime
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -127,6 +130,68 @@ func TestRenderLMCacheNodeLocalServerPod(t *testing.T) {
 	}
 	if _, found := serverPod.Annotations["inferencecache.io/node-local-shm-name"]; found {
 		t.Fatalf("obsolete POSIX SHM identity annotation remains: %v", serverPod.Annotations)
+	}
+}
+
+func TestRenderLMCacheNodeLocalCleanupPod(t *testing.T) {
+	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
+	server, err := RenderLMCacheNodeLocalServerPod(cache, nil, "gpu-node-a", nodeLocalSourceEngine())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testLMCacheServerImage, server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleanup.Name != NodeLocalCleanupPodName(cache.UID, "gpu-node-a") || cleanup.Spec.NodeName != "" || len(cleanup.Spec.SchedulingGates) != 1 {
+		t.Fatalf("cleanup identity/initial gate = name:%q node:%q gates:%+v", cleanup.Name, cleanup.Spec.NodeName, cleanup.Spec.SchedulingGates)
+	}
+	if cleanup.Spec.HostNetwork || cleanup.Spec.HostPID || cleanup.Spec.HostIPC || cleanup.Spec.AutomountServiceAccountToken == nil || *cleanup.Spec.AutomountServiceAccountToken {
+		t.Fatalf("cleanup host boundary = %+v", cleanup.Spec)
+	}
+	if len(cleanup.Spec.Volumes) != 1 || cleanup.Spec.Volumes[0].HostPath == nil ||
+		cleanup.Spec.Volumes[0].HostPath.Path != "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("cleanup volumes = %+v", cleanup.Spec.Volumes)
+	}
+	security := cleanup.Spec.Containers[0].SecurityContext
+	if security == nil || security.AllowPrivilegeEscalation == nil || *security.AllowPrivilegeEscalation ||
+		security.RunAsUser == nil || *security.RunAsUser != 0 || security.ReadOnlyRootFilesystem == nil || !*security.ReadOnlyRootFilesystem {
+		t.Fatalf("cleanup security context = %+v", security)
+	}
+}
+
+func TestNodeLocalShmCleanupScriptOnlyClearsMountedPool(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nested", "ipc"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(python, "-S", "-c", nodeLocalShmCleanupScript)
+	cmd.Env = append(os.Environ(),
+		"SHM_POOL_PATH="+root,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("cleanup script: %v: %s", err, output)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("pool after cleanup = %+v, %v", entries, err)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "keep" {
+		t.Fatalf("symlink target changed: %q, %v", got, err)
 	}
 }
 
