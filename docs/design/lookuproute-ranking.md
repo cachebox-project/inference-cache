@@ -846,6 +846,47 @@ set so that:
   degenerates to 1.0 with one replica); for multi-replica deployments
   it is "pre-floor raw recall with cardinality-adjusted scores."
 
+### Calibration provenance and replay
+
+The reproducible sweep under `internal/index/calibration` calls the production
+`LookupRoute` implementation for every observation and searches the configured
+Cartesian grid. The objective is the macro-average of prefix-hit ratio and
+`TENANT_HOT`-hit ratio; ties prefer gentler score multipliers and the shorter
+fallback window.
+
+Calibration rows are controlled counterfactual experiments, not ordinary
+single-route request logs: every candidate replica must have an available
+ground-truth outcome. Captured traces must measure those outcomes experimentally
+under an equivalent cache snapshot; synthetic traces define them by
+construction. The loader rejects rows without that explicit availability.
+Prefix hashes remain engine-opaque bytes and use standard base64 JSON encoding
+in trace files.
+
+The checked-in `c1-synthetic-mixed-routing-v1` trace contains 22 observations:
+14 prefix-routing cases spanning pressure/locality tradeoffs and tight/loose
+TTFT budgets, plus 8 prefix-miss cases spanning noisy hit-rate reports and
+fresh/stale `TENANT_HOT` candidates. Its provenance is explicitly
+`synthetic`: no production C1 request trace is currently checked into this
+repository, so these values verify the harness and identify a provisional
+candidate, not a production calibration. `DefaultRankerConfig` therefore keeps
+its existing `1.0 / 200 ms / 1.0 / 0.1 / 5 min` tuple. Replace or supplement
+the trace with a sanitized captured fixture before changing those defaults.
+
+```bash
+make ranker-calibration
+make verify-ranker-calibration
+```
+
+The trace and generated per-knob curves live in
+`internal/index/calibration/testdata/c1_synthetic_trace.json` and
+`c1_synthetic_result.json`. On this synthetic boundary fixture, the sweep
+selects the candidate `PressureWeight = 0.5`,
+`SLOTightTTFTMs = 200 ms`, `SLOTightBias = 1.0`,
+`TenantHotMinHitRate = 0.2`, and `TenantHotMaxAge = 2 min`; both measured hit
+ratios are 100%. CI regenerates the result in check mode, and tests keep the
+trace and generated result from silently diverging. This candidate is not
+applied to production defaults without representative captured evidence.
+
 ## 7. The reason-code summary
 
 | Code                  | When it fires                                                                                                                                                                                                                       | What the gateway treats it as           |
