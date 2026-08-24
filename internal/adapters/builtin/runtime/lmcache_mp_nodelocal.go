@@ -244,6 +244,55 @@ func NodeLocalCleanupPodName(uid types.UID, nodeName string) string {
 	return fmt.Sprintf("lmcache-shm-cleanup-%x", sum[:12])
 }
 
+// NodeLocalCleanupRetryPodName returns a deterministic successor name for one
+// failed cleanup Pod. The failed name changes on each retry, so another
+// terminal failure produces a distinct name without requiring extra state.
+func NodeLocalCleanupRetryPodName(uid types.UID, nodeName, failedName string) string {
+	sum := sha256.Sum256([]byte(failedName))
+	return fmt.Sprintf("%s-retry-%x", NodeLocalCleanupPodName(uid, nodeName), sum[:6])
+}
+
+// IsNodeLocalCleanupPodName accepts the initial deterministic intent and its
+// controller-rendered retry successors.
+func IsNodeLocalCleanupPodName(uid types.UID, nodeName, name string) bool {
+	base := NodeLocalCleanupPodName(uid, nodeName)
+	if name == base {
+		return true
+	}
+	suffix := strings.TrimPrefix(name, base+"-retry-")
+	if suffix == name || len(suffix) != 12 {
+		return false
+	}
+	for _, char := range suffix {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// NodeLocalCleanupImageFromSource recovers the LMCache image embedded in an
+// immutable, controller-injected NodeLocal Engine Pod. This lets an old UID
+// pool finish cleanup after the CacheBackend has changed topology and no
+// longer carries NodeLocal configuration.
+func NodeLocalCleanupImageFromSource(source *corev1.Pod) string {
+	if source == nil {
+		return ""
+	}
+	for i := range source.Spec.InitContainers {
+		container := &source.Spec.InitContainers[i]
+		if container.Name != lmCacheNodeLocalGateContainerName {
+			continue
+		}
+		for j := range container.Env {
+			if container.Env[j].Name == lmCacheNodeLocalGateManagedEnv && container.Env[j].Value == lmCacheNodeLocalGateManagedValue {
+				return strings.TrimSpace(container.Image)
+			}
+		}
+	}
+	return ""
+}
+
 // RenderLMCacheNodeLocalCleanupPod renders a gated, one-shot cleanup intent.
 // It mounts only the exact UID directory; the controller removes the scheduling
 // gate after all prior consumers have disappeared.
@@ -260,6 +309,10 @@ func RenderLMCacheNodeLocalCleanupPod(cache *cachev1alpha1.CacheBackend, nodeNam
 	noToken := false
 	enableServiceLinks := false
 	grace := int64(5)
+	imagePullSecrets := append([]corev1.LocalObjectReference(nil), source.Spec.ImagePullSecrets...)
+	if cache.Spec.LMCache != nil && cache.Spec.LMCache.NodeLocal != nil && cache.Spec.LMCache.NodeLocal.Scheduling != nil {
+		imagePullSecrets = mergeLocalObjectReferences(imagePullSecrets, cache.Spec.LMCache.NodeLocal.Scheduling.ImagePullSecrets)
+	}
 	cleanup := corev1.Container{
 		Name:            lmCacheNodeLocalShmCleanupName,
 		Image:           image,
@@ -295,7 +348,7 @@ func RenderLMCacheNodeLocalCleanupPod(cache *cachev1alpha1.CacheBackend, nodeNam
 			EnableServiceLinks:            &enableServiceLinks,
 			Affinity:                      exactNodeAffinity(nodeName),
 			Tolerations:                   append([]corev1.Toleration(nil), source.Spec.Tolerations...),
-			ImagePullSecrets:              append([]corev1.LocalObjectReference(nil), source.Spec.ImagePullSecrets...),
+			ImagePullSecrets:              imagePullSecrets,
 			PriorityClassName:             source.Spec.PriorityClassName,
 			SchedulerName:                 source.Spec.SchedulerName,
 			TerminationGracePeriodSeconds: &grace,
@@ -309,6 +362,35 @@ func RenderLMCacheNodeLocalCleanupPod(cache *cachev1alpha1.CacheBackend, nodeNam
 				}},
 			}},
 		},
+	}, nil
+}
+
+// RenderLMCacheNodeLocalCleanupRetryPod clones the already validated cleanup
+// contract into a fresh, gated Pod. Re-adding the gate makes every retry prove
+// consumer quiescence again before touching the UID directory.
+func RenderLMCacheNodeLocalCleanupRetryPod(cache *cachev1alpha1.CacheBackend, failed *corev1.Pod) (*corev1.Pod, error) {
+	if cache == nil || cache.UID == "" || failed == nil || strings.TrimSpace(failed.Name) == "" {
+		return nil, fmt.Errorf("render LMCache NodeLocal SHM cleanup retry: backend UID and failed cleanup Pod are required")
+	}
+	nodeName := failed.Annotations[enginebinding.AnnotationNodeLocalTargetNode]
+	if strings.TrimSpace(nodeName) == "" {
+		return nil, fmt.Errorf("render LMCache NodeLocal SHM cleanup retry: target node is required")
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        NodeLocalCleanupRetryPodName(cache.UID, nodeName, failed.Name),
+			Namespace:   cache.Namespace,
+			Labels:      copyStringMap(failed.Labels),
+			Annotations: copyStringMap(failed.Annotations),
+		},
+		Spec: func() corev1.PodSpec {
+			spec := *failed.Spec.DeepCopy()
+			// A terminal Pod may already be scheduler-bound. Clear NodeName so the
+			// retry's gate is authoritative before exact-node scheduling happens.
+			spec.NodeName = ""
+			spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: lmCacheNodeLocalShmCleanupGate}}
+			return spec
+		}(),
 	}, nil
 }
 

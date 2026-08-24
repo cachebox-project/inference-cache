@@ -135,11 +135,13 @@ func TestRenderLMCacheNodeLocalServerPod(t *testing.T) {
 
 func TestRenderLMCacheNodeLocalCleanupPod(t *testing.T) {
 	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
-	server, err := RenderLMCacheNodeLocalServerPod(cache, nil, "gpu-node-a", nodeLocalSourceEngine())
-	if err != nil {
-		t.Fatal(err)
+	cache.Spec.LMCache.NodeLocal.Scheduling = &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{
+		ImagePullSecrets: []corev1.LocalObjectReference{{Name: "cache-pull"}},
 	}
-	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testLMCacheServerImage, server)
+	source := nodeLocalSourceEngine()
+	source.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "engine-pull"}}
+	source.Spec.InitContainers = []corev1.Container{lmCacheNodeLocalGateContainer(cache, "", nil)}
+	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testLMCacheServerImage, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,10 +155,37 @@ func TestRenderLMCacheNodeLocalCleanupPod(t *testing.T) {
 		cleanup.Spec.Volumes[0].HostPath.Path != "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555" {
 		t.Fatalf("cleanup volumes = %+v", cleanup.Spec.Volumes)
 	}
+	if len(cleanup.Spec.ImagePullSecrets) != 2 || cleanup.Spec.ImagePullSecrets[0].Name != "engine-pull" || cleanup.Spec.ImagePullSecrets[1].Name != "cache-pull" {
+		t.Fatalf("cleanup imagePullSecrets = %+v", cleanup.Spec.ImagePullSecrets)
+	}
+	if got := NodeLocalCleanupImageFromSource(source); got != testLMCacheServerImage {
+		t.Fatalf("cleanup image from injected Engine = %q", got)
+	}
 	security := cleanup.Spec.Containers[0].SecurityContext
 	if security == nil || security.AllowPrivilegeEscalation == nil || *security.AllowPrivilegeEscalation ||
 		security.RunAsUser == nil || *security.RunAsUser != 0 || security.ReadOnlyRootFilesystem == nil || !*security.ReadOnlyRootFilesystem {
 		t.Fatalf("cleanup security context = %+v", security)
+	}
+}
+
+func TestRenderLMCacheNodeLocalCleanupRetryPod(t *testing.T) {
+	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
+	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testLMCacheServerImage, nodeLocalSourceEngine())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup.Spec.SchedulingGates = nil
+	cleanup.Spec.NodeName = "gpu-node-a"
+	retry, err := RenderLMCacheNodeLocalCleanupRetryPod(cache, cleanup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.Name != NodeLocalCleanupRetryPodName(cache.UID, "gpu-node-a", cleanup.Name) ||
+		!IsNodeLocalCleanupPodName(cache.UID, "gpu-node-a", retry.Name) || retry.Spec.NodeName != "" || len(retry.Spec.SchedulingGates) != 1 {
+		t.Fatalf("cleanup retry identity/gate = name:%q node:%q gates:%+v", retry.Name, retry.Spec.NodeName, retry.Spec.SchedulingGates)
+	}
+	if retry.Spec.Containers[0].Image != cleanup.Spec.Containers[0].Image || retry.Spec.Volumes[0].HostPath.Path != cleanup.Spec.Volumes[0].HostPath.Path {
+		t.Fatalf("cleanup retry changed image or hostPath: image:%q volumes:%+v", retry.Spec.Containers[0].Image, retry.Spec.Volumes)
 	}
 }
 
