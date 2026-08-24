@@ -147,6 +147,9 @@ func TestRenderLMCacheNodeLocalCleanupPod(t *testing.T) {
 	if cleanup.Spec.HostNetwork || cleanup.Spec.HostPID || cleanup.Spec.HostIPC || cleanup.Spec.AutomountServiceAccountToken == nil || *cleanup.Spec.AutomountServiceAccountToken {
 		t.Fatalf("cleanup host boundary = %+v", cleanup.Spec)
 	}
+	if cleanup.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("cleanup restart policy = %q, want Never so controller retries terminal failures", cleanup.Spec.RestartPolicy)
+	}
 	if len(cleanup.Spec.Volumes) != 1 || cleanup.Spec.Volumes[0].HostPath == nil ||
 		cleanup.Spec.Volumes[0].HostPath.Path != "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555" {
 		t.Fatalf("cleanup volumes = %+v", cleanup.Spec.Volumes)

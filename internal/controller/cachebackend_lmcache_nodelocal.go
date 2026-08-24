@@ -564,6 +564,14 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx contex
 		if len(consumers) != 0 {
 			continue
 		}
+		// A managed Engine admitted after this snapshot cannot use the UID
+		// directory while cleanup runs: only its main container receives the
+		// inference-cache-authored SHM mount, and that container remains behind
+		// the same-node startup gate. This cleanup Pod keeps Server recreation
+		// blocked until it succeeds, so the gate cannot complete early. Races
+		// from unmanaged processes mounting the hostPath are outside the trusted
+		// node boundary, but the cluster-wide snapshot above still waits for any
+		// such Pod that already exists.
 		before := pod.DeepCopy()
 		pod.Spec.SchedulingGates = nil
 		if err := r.Client.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
@@ -583,19 +591,22 @@ func (r *CacheBackendReconciler) nodeLocalShmConsumers(ctx context.Context, back
 		reader = r.Client
 	}
 	var pods corev1.PodList
-	if err := reader.List(ctx, &pods, client.InNamespace(backend.Namespace)); err != nil {
-		return nil, fmt.Errorf("list SHM consumers for NodeLocal CacheBackend %s/%s: %w", backend.Namespace, backend.Name, err)
+	if err := reader.List(ctx, &pods); err != nil {
+		return nil, fmt.Errorf("list cluster-wide SHM consumers for NodeLocal CacheBackend %s/%s: %w", backend.Namespace, backend.Name, err)
 	}
 	consumers := []string{}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if (nodeName != "" && pod.Spec.NodeName != nodeName) || pod.Labels[enginebinding.LabelLMCacheNodeLocalCleanup] == "true" {
+		if nodeName != "" && pod.Spec.NodeName != nodeName {
+			continue
+		}
+		if pod.Namespace == backend.Namespace && pod.Labels[enginebinding.LabelLMCacheNodeLocalCleanup] == "true" && metav1.IsControlledBy(pod, backend) {
 			continue
 		}
 		for j := range pod.Spec.Volumes {
 			hostPath := pod.Spec.Volumes[j].HostPath
 			if hostPath != nil && hostPath.Path == wantPath {
-				consumers = append(consumers, pod.Name)
+				consumers = append(consumers, pod.Namespace+"/"+pod.Name)
 				break
 			}
 		}

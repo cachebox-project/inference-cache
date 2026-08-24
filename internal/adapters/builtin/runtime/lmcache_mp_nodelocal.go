@@ -313,7 +313,7 @@ func RenderLMCacheNodeLocalCleanupPod(cache *cachev1alpha1.CacheBackend, nodeNam
 			PriorityClassName:             source.Spec.PriorityClassName,
 			SchedulerName:                 source.Spec.SchedulerName,
 			TerminationGracePeriodSeconds: &grace,
-			RestartPolicy:                 corev1.RestartPolicyOnFailure,
+			RestartPolicy:                 corev1.RestartPolicyNever,
 			SchedulingGates:               []corev1.PodSchedulingGate{{Name: lmCacheNodeLocalShmCleanupGate}},
 			Containers:                    []corev1.Container{cleanup},
 			Volumes: []corev1.Volume{{

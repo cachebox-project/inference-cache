@@ -255,6 +255,53 @@ func TestReconcileNodeLocalCancelsGatedCleanupWhenDemandReturns(t *testing.T) {
 	}
 }
 
+func TestReconcileNodeLocalActiveCleanupBlocksServerForNewDemand(t *testing.T) {
+	backend := nodeLocalBackend("node-cache", "ns1")
+	backend.Spec.LMCache.NodeLocal.IdleRetentionSeconds = 0
+	engine := nodeLocalEngine(backend, "engine-a", "node-a")
+	reconciler := newReconciler(newScheme(t), backend, engine)
+	reconcile(t, reconciler, backend.Name, backend.Namespace)
+	if err := reconciler.Delete(context.Background(), engine); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, reconciler, backend.Name, backend.Namespace)
+	reconcile(t, reconciler, backend.Name, backend.Namespace)
+
+	cleanupKey := types.NamespacedName{Name: builtinruntime.NodeLocalCleanupPodName(backend.UID, "node-a"), Namespace: backend.Namespace}
+	var cleanup corev1.Pod
+	if err := reconciler.Get(context.Background(), cleanupKey, &cleanup); err != nil {
+		t.Fatal(err)
+	}
+	if len(cleanup.Spec.SchedulingGates) != 0 {
+		t.Fatalf("cleanup gate was not released before new demand: %+v", cleanup.Spec.SchedulingGates)
+	}
+
+	replacement := nodeLocalEngine(backend, "engine-b", "node-a")
+	if err := builtinruntime.NewVLLMLMCacheMPAdapter(builtinruntime.SubscriberConfig{}).InjectEngineConfig(&replacement.Spec, nil, backend); err != nil {
+		t.Fatalf("inject replacement Engine startup gate: %v", err)
+	}
+	if len(replacement.Spec.InitContainers) != 1 || replacement.Spec.InitContainers[0].Name != "lmcache-node-local-gate" || len(replacement.Spec.InitContainers[0].VolumeMounts) != 0 {
+		t.Fatalf("replacement Engine does not have an SHM-free startup gate: %+v", replacement.Spec.InitContainers)
+	}
+	if err := reconciler.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, reconciler, backend.Name, backend.Namespace)
+
+	serverKey := types.NamespacedName{Name: builtinruntime.NodeLocalServerPodName(backend.Name, "node-a"), Namespace: backend.Namespace}
+	if err := reconciler.Get(context.Background(), serverKey, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("server while cleanup is active = %v, want NotFound", err)
+	}
+	cleanup.Status.Phase = corev1.PodSucceeded
+	if err := reconciler.Status().Update(context.Background(), &cleanup); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, reconciler, backend.Name, backend.Namespace)
+	if err := reconciler.Get(context.Background(), serverKey, &corev1.Pod{}); err != nil {
+		t.Fatalf("server after cleanup succeeded: %v", err)
+	}
+}
+
 func TestReconcileNodeLocalCleanupWaitsForExactHostPathConsumer(t *testing.T) {
 	backend := nodeLocalBackend("node-cache", "ns1")
 	backend.Spec.LMCache.NodeLocal.IdleRetentionSeconds = 0
@@ -270,7 +317,7 @@ func TestReconcileNodeLocalCleanupWaitsForExactHostPathConsumer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	consumer := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "terminating-consumer", Namespace: backend.Namespace}, Spec: corev1.PodSpec{
+	consumer := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "terminating-consumer", Namespace: "other-ns"}, Spec: corev1.PodSpec{
 		NodeName: "node-a", Containers: []corev1.Container{{Name: "engine"}}, Volumes: []corev1.Volume{{
 			Name: "shm", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: wantPath}},
 		}},
@@ -285,7 +332,7 @@ func TestReconcileNodeLocalCleanupWaitsForExactHostPathConsumer(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(cleanup.Spec.SchedulingGates) != 1 {
-		t.Fatalf("cleanup gate released while exact hostPath consumer remained: %+v", cleanup.Spec.SchedulingGates)
+		t.Fatalf("cleanup gate released while cross-namespace hostPath consumer remained: %+v", cleanup.Spec.SchedulingGates)
 	}
 	if err := reconciler.Delete(context.Background(), consumer); err != nil {
 		t.Fatal(err)
