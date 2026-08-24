@@ -45,6 +45,11 @@ func isTypedLMCacheMP(backend *cachev1alpha1.CacheBackend) bool {
 // placement.
 func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context.Context, backend *cachev1alpha1.CacheBackend, binding *backendadapter.Binding) error {
 	if !isTypedLMCacheNodeLocal(backend) {
+		if controllerutil.ContainsFinalizer(backend, nodeLocalShmCleanupFinalizer) {
+			if err := r.ensureLMCacheNodeLocalCleanupForConsumers(ctx, backend); err != nil {
+				return err
+			}
+		}
 		return r.cleanupLMCacheNodeLocalServerPods(ctx, backend)
 	}
 	demand, err := r.nodeLocalEngineDemand(ctx, backend)
@@ -78,14 +83,21 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context
 		if !metav1.IsControlledBy(pod, backend) {
 			continue
 		}
-		targetNode := pod.Annotations[enginebinding.AnnotationNodeLocalTargetNode]
+		targetNode := nodeLocalServerTargetNode(pod)
 		_, wanted := demand[targetNode]
+		runtimeCurrent := nodeLocalServerHasRuntimeIdentity(pod, wantShmHostPath)
 		current := pod.Annotations[enginebinding.AnnotationNodeLocalOwnerUID] == string(backend.UID) &&
 			pod.Annotations[enginebinding.AnnotationNodeLocalGeneration] == wantGeneration &&
 			pod.Name == builtinruntime.NodeLocalServerPodName(backend.Name, targetNode) &&
-			nodeLocalServerHasRuntimeIdentity(pod, wantShmHostPath)
+			runtimeCurrent
 		if !current {
 			if pod.DeletionTimestamp == nil {
+				if nodeLocalServerUsesShmHostPath(pod, wantShmHostPath) && (!runtimeCurrent || !wanted) {
+					if err := r.ensureLMCacheNodeLocalCleanupPod(ctx, backend, pod); err != nil {
+						return err
+					}
+					cleanupNodes[targetNode] = true
+				}
 				if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 					return fmt.Errorf("delete stale LMCache NodeLocal server Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 				}
@@ -215,6 +227,28 @@ func nodeLocalServerHasRuntimeIdentity(pod *corev1.Pod, wantHostPath string) boo
 	return false
 }
 
+func nodeLocalServerTargetNode(pod *corev1.Pod) string {
+	if pod == nil {
+		return ""
+	}
+	if nodeName := pod.Annotations[enginebinding.AnnotationNodeLocalTargetNode]; nodeName != "" {
+		return nodeName
+	}
+	return pod.Spec.NodeName
+}
+
+func nodeLocalServerUsesShmHostPath(pod *corev1.Pod, wantHostPath string) bool {
+	if pod == nil || wantHostPath == "" {
+		return false
+	}
+	for i := range pod.Spec.Volumes {
+		if hostPath := pod.Spec.Volumes[i].HostPath; hostPath != nil && hostPath.Path == wantHostPath {
+			return true
+		}
+	}
+	return false
+}
+
 // nodeLocalEngineDemand returns one deterministic source engine per active
 // node. The webhook-authored backend name+UID pair is required so overlapping
 // selectors cannot make two CacheBackends provision servers for one engine.
@@ -279,7 +313,7 @@ func (r *CacheBackendReconciler) cleanupLMCacheNodeLocalServerPods(ctx context.C
 		if !metav1.IsControlledBy(pod, backend) || pod.DeletionTimestamp != nil {
 			continue
 		}
-		if nodeLocalServerHasRuntimeIdentity(pod, wantShmHostPath) {
+		if nodeLocalServerUsesShmHostPath(pod, wantShmHostPath) {
 			if err := r.ensureLMCacheNodeLocalCleanupPod(ctx, backend, pod); err != nil {
 				return err
 			}
@@ -296,7 +330,7 @@ func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupPod(ctx context.Co
 	if backend == nil || server == nil || !metav1.IsControlledBy(server, backend) {
 		return fmt.Errorf("create LMCache NodeLocal SHM cleanup intent: controlled source server is required")
 	}
-	nodeName := server.Annotations[enginebinding.AnnotationNodeLocalTargetNode]
+	nodeName := nodeLocalServerTargetNode(server)
 	return r.ensureLMCacheNodeLocalCleanupForNode(ctx, backend, nodeName, server)
 }
 
@@ -338,7 +372,7 @@ func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForNode(ctx contex
 }
 
 func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForConsumers(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
-	if !isTypedLMCacheNodeLocal(backend) || backend.UID == "" {
+	if backend == nil || backend.UID == "" {
 		return nil
 	}
 	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)

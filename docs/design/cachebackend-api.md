@@ -302,14 +302,6 @@ that backend UID directory after its consumers are gone. This small helper is
 independent of LMCache and uses only `nodeLocal.scheduling.imagePullSecrets`;
 it never copies registry credentials from an Engine Pod.
 
-The structural identity fields `runtime`, `type`, LMCache presence/topology,
-`integration.mode`, `engineSelector`, and remote-storage presence/provider/
-ownership are immutable. Existing Engine Pods retain the wiring they received
-at admission and inference-cache never deletes or rewrites them. Changing that
-architecture requires a new CacheBackend and an explicit rollout by the
-inference workload owner; operational settings such as images, resources,
-capacity, scheduling, and observation remain mutable.
-
 NodeLocal ports are explicit rather than dynamically allocated. Engine Pods
 are immutable and receive their endpoint during admission, before the
 on-demand server exists; Kubernetes dynamically allocates Service node ports,

@@ -907,9 +907,7 @@ The final contract is:
   exposes only server operational overrides and cannot select nodes.
   `nodeLocal.idleRetentionSeconds` defaults to 300, accepts 0–86400, and owns
   warm server/L1 retention independently from engine-Pod lifetime. Host-bound
-  and security-relevant values have no implicit defaults. CacheBackend
-  architecture is immutable; migration uses a new CacheBackend and an
-  inference-owned Engine rollout, while operational settings remain mutable.
+  and security-relevant values have no implicit defaults.
 - **Lifecycle and placement:** CacheBackend creation alone creates no MP server.
   The inference system schedules engines first; the controller then owns one
   direct server Pod per distinct active engine node. Required node affinity to

@@ -68,11 +68,6 @@ hostNetwork bypasses Kubernetes NetworkPolicy. L1 capacity is per node, and
 focused samples retain an idle per-node server and its L1 for 300 seconds so an
 engine restart can reuse them; set `idleRetentionSeconds: 0` for immediate
 cleanup.
-CacheBackend architecture is immutable: runtime, type, LMCache topology,
-integration mode, engine selector, and remote-storage lifecycle cannot be
-changed in place. Migrate by creating a new CacheBackend and rolling the Engine
-workload through its inference-system owner. Operational settings remain
-mutable.
 
 > **One label does the binding.** Every non-empty selector contains only
 > `inferencecache.io/cache-domain`; its namespace-scoped value must also appear
