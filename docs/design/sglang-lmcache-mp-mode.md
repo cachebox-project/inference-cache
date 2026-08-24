@@ -385,9 +385,10 @@ data plane), different resolution because the data planes differ:
   gives no cross-node sharing). These are different valid MP sub-configs, and the
   exact surface moves between LMCache versions — Phase 2 re-confirms the config
   wire against the version actually pinned in `VERSIONS.md`, not the quickstart.
-- **`/dev/shm` sizing** — the L1 lives in `/dev/shm`; too small (default 64 MB)
-  silently falls back to slow pickle serialization. The shared `emptyDir` must be
-  `medium: Memory` and sized ≥ the L1.
+- **`/dev/shm` sizing** — L1 KV bytes live in eager private pinned host memory;
+  `/dev/shm` carries CUDA/PyTorch auxiliary IPC objects. The shared `emptyDir`
+  remains `medium: Memory` with the conservative typed L1 + 1Gi budget so the
+  IPC path does not fall back to slow serialization.
 - **L2 durability/HA** — a single managed Redis is a simple default, not an HA
   store. Future provider-specific work may add a real managed Redis Cluster;
   separately, a typed `mooncake_store` L2 adapter can provide Mooncake without

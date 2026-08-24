@@ -26,6 +26,11 @@ controller with `--node-local-shm-cleanup-image=<repository>@sha256:<digest>`.
 Use the cleanup image published by the same inference-cache release; individual
 CacheBackends do not select or override it.
 
+Each GitHub release attaches `inference-cache-<tag>.yaml`, rendered from
+`config/default` with the matching controller, server, and cleanup image
+digests. Prefer that artifact for release installs; the checked-in manager YAML
+contains an all-zero cleanup digest only as a source-tree rendering placeholder.
+
 ## Verification
 
 The source-only policy check is available without Docker:

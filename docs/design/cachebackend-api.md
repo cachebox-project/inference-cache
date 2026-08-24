@@ -355,10 +355,12 @@ With a RESP binding it offloads to Redis; without a binding it runs host-only.
 `NVIDIA_VISIBLE_DEVICES=all`
 lets the GPU-less sidecar use CUDA-IPC with no device-plugin
 allocation, an `exec` startup-probe on the loopback ZMQ port gates the engine's
-start, and a shared `emptyDir` carries the config file. For `/dev/shm` (the L1 tier)
-it reuses the engine's own volume when the engine already mounts one (a duplicate
-mountPath is an invalid Pod), else adds a sized `emptyDir{medium: Memory}` — see the
-reserved-names note below for the reuse/reject rules. On the engine container (name
+start, and a shared `emptyDir` carries the config file. For `/dev/shm`, it reuses
+the engine's own volume when the engine already mounts one (a duplicate
+mountPath is an invalid Pod), else adds a sized `emptyDir{medium: Memory}` for
+CUDA/PyTorch auxiliary IPC objects. L1 KV bytes are private pinned memory, not
+files in that tmpfs. See the reserved-names note below for the reuse/reject
+rules. On the engine container (name
 `sglang`) it injects:
 
 - `--enable-lmcache` — SGLang's boolean flag (an argparse `store_true`) that activates its LMCache connector. This replaces vLLM's `--kv-transfer-config` JSON.

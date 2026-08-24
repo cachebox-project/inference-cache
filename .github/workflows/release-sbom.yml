@@ -158,6 +158,20 @@ jobs:
         test "$BUILT_SUBSCRIBER_DIGEST" = "$PUBLISHED_SUBSCRIBER_DIGEST"
         test "$BUILT_CLEANUP_DIGEST" = "$PUBLISHED_CLEANUP_DIGEST"
 
+    - name: Render digest-pinned install manifest
+      env:
+        CONTROLLER_DIGEST: ${{ steps.built-image-digests.outputs.controller }}
+        SERVER_DIGEST: ${{ steps.built-image-digests.outputs.server }}
+        CLEANUP_DIGEST: ${{ steps.built-image-digests.outputs.cleanup }}
+      run: |
+        make -C release-source kustomize
+        CONTROLLER_IMAGE="${CONTROLLER_IMAGE_REPO}@${CONTROLLER_DIGEST}" \
+        SERVER_IMAGE="${SERVER_IMAGE_REPO}@${SERVER_DIGEST}" \
+        CLEANUP_IMAGE="${CLEANUP_IMAGE_REPO}@${CLEANUP_DIGEST}" \
+        OUTPUT_FILE="$GITHUB_WORKSPACE/dist/install/inference-cache-${RELEASE_TAG}.yaml" \
+        KUSTOMIZE_CMD="$GITHUB_WORKSPACE/release-source/bin/kustomize" \
+          release-source/hack/render-release-install.sh
+
     - name: Generate published image SBOMs
       run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-registry-images TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom"
 
@@ -259,6 +273,7 @@ jobs:
       with:
         name: release-supply-chain
         path: |
+          dist/install/*.yaml
           dist/sbom/*.spdx.json
           dist/provenance/*.sigstore.json
         if-no-files-found: error
@@ -281,4 +296,4 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         RELEASE_TAG: ${{ env.RELEASE_TAG }}
-      run: gh release upload "${RELEASE_TAG}" dist/sbom/*.spdx.json dist/provenance/*.sigstore.json --clobber
+      run: gh release upload "${RELEASE_TAG}" dist/install/*.yaml dist/sbom/*.spdx.json dist/provenance/*.sigstore.json --clobber

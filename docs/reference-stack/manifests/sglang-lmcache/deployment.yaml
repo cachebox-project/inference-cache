@@ -221,9 +221,9 @@ spec:
       volumes:
         - name: cache-home
           emptyDir: {}
-        # The MP L1 tier lives here; shared by the engine and injected server. Sized
-        # to provide a conservative CUDA/PyTorch IPC budget. The 4Gi LMCache L1
-        # itself is eagerly allocated private pinned host memory by the server.
+        # Shared by the engine and injected server for a conservative
+        # CUDA/PyTorch IPC budget. The 4Gi LMCache L1 itself is eagerly allocated
+        # private pinned host memory by the server.
         - name: shm
           emptyDir:
             medium: Memory
