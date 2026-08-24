@@ -346,7 +346,8 @@ func TestReconcileNodeLocalCleanupWaitsForExactHostPathConsumer(t *testing.T) {
 	if len(cleanup.Spec.SchedulingGates) != 1 {
 		t.Fatalf("cleanup gate released while cross-namespace hostPath consumer remained: %+v", cleanup.Spec.SchedulingGates)
 	}
-	if err := reconciler.Delete(context.Background(), consumer); err != nil {
+	consumer.Status.Phase = corev1.PodSucceeded
+	if err := reconciler.Status().Update(context.Background(), consumer); err != nil {
 		t.Fatal(err)
 	}
 	reconcile(t, reconciler, backend.Name, backend.Namespace)
@@ -354,7 +355,29 @@ func TestReconcileNodeLocalCleanupWaitsForExactHostPathConsumer(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(cleanup.Spec.SchedulingGates) != 0 {
-		t.Fatalf("cleanup gate remained after final consumer left: %+v", cleanup.Spec.SchedulingGates)
+		t.Fatalf("cleanup gate remained after consumer became terminal: %+v", cleanup.Spec.SchedulingGates)
+	}
+}
+
+func TestNodeLocalShmConsumersIgnoresUnscheduledPod(t *testing.T) {
+	backend := nodeLocalBackend("node-cache", "ns1")
+	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "unscheduled", Namespace: "other-ns"}, Spec: corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "engine"}},
+		Volumes: []corev1.Volume{{Name: "shm", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+			Path: wantPath,
+		}}}},
+	}}
+	reconciler := newReconciler(newScheme(t), backend, consumer)
+	consumers, err := reconciler.nodeLocalShmConsumers(context.Background(), backend, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(consumers) != 0 {
+		t.Fatalf("unscheduled Pod reported as SHM consumer: %v", consumers)
 	}
 }
 

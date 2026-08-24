@@ -615,6 +615,9 @@ func (r *CacheBackendReconciler) nodeLocalShmConsumers(ctx context.Context, back
 	consumers := []string{}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if pod.Spec.NodeName == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
 		if nodeName != "" && pod.Spec.NodeName != nodeName {
 			continue
 		}
