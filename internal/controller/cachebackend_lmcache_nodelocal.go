@@ -523,7 +523,7 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx contex
 		}
 		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
 			blocked[nodeName] = true
-			if !succeededByNode[nodeName] && !activeByNode[nodeName] {
+			if !succeededByNode[nodeName] {
 				retryCount, err := strconv.Atoi(pod.Annotations[nodeLocalShmCleanupRetryAnnotation])
 				if pod.Annotations[nodeLocalShmCleanupRetryAnnotation] == "" {
 					retryCount, err = 0, nil
@@ -531,27 +531,29 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx contex
 				if err != nil || retryCount < 0 || retryCount >= nodeLocalShmCleanupMaxRetryAttempts {
 					continue
 				}
-				retry, err := builtinruntime.RenderLMCacheNodeLocalCleanupRetryPod(backend, pod)
-				if err != nil {
-					return nil, err
-				}
-				retry.Annotations[nodeLocalShmCleanupRetryAnnotation] = strconv.Itoa(retryCount + 1)
-				if err := controllerutil.SetControllerReference(backend, retry, r.Scheme); err != nil {
-					return nil, fmt.Errorf("own LMCache NodeLocal SHM cleanup retry Pod %s/%s: %w", retry.Namespace, retry.Name, err)
-				}
-				if err := r.Client.Create(ctx, retry); err != nil {
-					if !apierrors.IsAlreadyExists(err) {
-						return nil, fmt.Errorf("create LMCache NodeLocal SHM cleanup retry Pod %s/%s: %w", retry.Namespace, retry.Name, err)
+				if !activeByNode[nodeName] {
+					retry, err := builtinruntime.RenderLMCacheNodeLocalCleanupRetryPod(backend, pod)
+					if err != nil {
+						return nil, err
 					}
-					var existing corev1.Pod
-					if getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(retry), &existing); getErr != nil {
-						return nil, fmt.Errorf("inspect existing LMCache NodeLocal SHM cleanup retry Pod %s/%s: %w", retry.Namespace, retry.Name, getErr)
+					retry.Annotations[nodeLocalShmCleanupRetryAnnotation] = strconv.Itoa(retryCount + 1)
+					if err := controllerutil.SetControllerReference(backend, retry, r.Scheme); err != nil {
+						return nil, fmt.Errorf("own LMCache NodeLocal SHM cleanup retry Pod %s/%s: %w", retry.Namespace, retry.Name, err)
 					}
-					if !metav1.IsControlledBy(&existing, backend) {
-						return nil, fmt.Errorf("LMCache NodeLocal SHM cleanup retry Pod name %s/%s is occupied by another object", retry.Namespace, retry.Name)
+					if err := r.Client.Create(ctx, retry); err != nil {
+						if !apierrors.IsAlreadyExists(err) {
+							return nil, fmt.Errorf("create LMCache NodeLocal SHM cleanup retry Pod %s/%s: %w", retry.Namespace, retry.Name, err)
+						}
+						var existing corev1.Pod
+						if getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(retry), &existing); getErr != nil {
+							return nil, fmt.Errorf("inspect existing LMCache NodeLocal SHM cleanup retry Pod %s/%s: %w", retry.Namespace, retry.Name, getErr)
+						}
+						if !metav1.IsControlledBy(&existing, backend) {
+							return nil, fmt.Errorf("LMCache NodeLocal SHM cleanup retry Pod name %s/%s is occupied by another object", retry.Namespace, retry.Name)
+						}
 					}
+					activeByNode[nodeName] = true
 				}
-				activeByNode[nodeName] = true
 			}
 			if pod.DeletionTimestamp == nil {
 				if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
