@@ -25,7 +25,11 @@ import (
 	backendadapter "github.com/cachebox-project/inference-cache/pkg/adapters/backend"
 )
 
-const nodeLocalShmCleanupFinalizer = "inferencecache.io/nodelocal-shm-cleanup"
+const (
+	nodeLocalShmCleanupFinalizer        = "inferencecache.io/nodelocal-shm-cleanup"
+	nodeLocalShmCleanupRetryAnnotation  = "inferencecache.io/node-local-shm-cleanup-retry"
+	nodeLocalShmCleanupMaxRetryAttempts = 3
+)
 
 func isTypedLMCacheNodeLocal(backend *cachev1alpha1.CacheBackend) bool {
 	return backend != nil &&
@@ -520,10 +524,18 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx contex
 		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
 			blocked[nodeName] = true
 			if !succeededByNode[nodeName] && !activeByNode[nodeName] {
+				retryCount, err := strconv.Atoi(pod.Annotations[nodeLocalShmCleanupRetryAnnotation])
+				if pod.Annotations[nodeLocalShmCleanupRetryAnnotation] == "" {
+					retryCount, err = 0, nil
+				}
+				if err != nil || retryCount < 0 || retryCount >= nodeLocalShmCleanupMaxRetryAttempts {
+					continue
+				}
 				retry, err := builtinruntime.RenderLMCacheNodeLocalCleanupRetryPod(backend, pod)
 				if err != nil {
 					return nil, err
 				}
+				retry.Annotations[nodeLocalShmCleanupRetryAnnotation] = strconv.Itoa(retryCount + 1)
 				if err := controllerutil.SetControllerReference(backend, retry, r.Scheme); err != nil {
 					return nil, fmt.Errorf("own LMCache NodeLocal SHM cleanup retry Pod %s/%s: %w", retry.Namespace, retry.Name, err)
 				}

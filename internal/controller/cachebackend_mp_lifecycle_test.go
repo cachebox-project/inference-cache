@@ -389,6 +389,9 @@ func TestReconcileNodeLocalRetriesFailedCleanupPod(t *testing.T) {
 	if len(retry.Spec.SchedulingGates) != 1 {
 		t.Fatalf("cleanup retry did not re-check quiescence: %+v", retry.Spec.SchedulingGates)
 	}
+	if retry.Annotations[nodeLocalShmCleanupRetryAnnotation] != "1" {
+		t.Fatalf("cleanup retry count = %q, want 1", retry.Annotations[nodeLocalShmCleanupRetryAnnotation])
+	}
 	if err := reconciler.Get(context.Background(), cleanupKey, &corev1.Pod{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("failed cleanup Pod after replacement = %v, want NotFound", err)
 	}
@@ -445,6 +448,44 @@ func TestReconcileNodeLocalRetriesSucceededPodWithoutHelperStatus(t *testing.T) 
 	}
 	if !builtinruntime.LMCacheNodeLocalCleanupIsGated(&retry) {
 		t.Fatalf("retry after untrusted success status is not gated: %+v", retry.Spec.SchedulingGates)
+	}
+	if retry.Annotations[nodeLocalShmCleanupRetryAnnotation] != "1" {
+		t.Fatalf("cleanup retry count = %q, want 1", retry.Annotations[nodeLocalShmCleanupRetryAnnotation])
+	}
+}
+
+func TestReconcileNodeLocalStopsAfterCleanupRetryLimit(t *testing.T) {
+	backend := nodeLocalBackend("node-cache", "ns1")
+	cleanup, err := builtinruntime.RenderLMCacheNodeLocalCleanupPod(
+		backend,
+		"node-a",
+		"registry.example/inference-cache-shm-cleanup@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		nodeLocalEngine(backend, "engine-a", "node-a"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controllerutil.SetControllerReference(backend, cleanup, newScheme(t)); err != nil {
+		t.Fatal(err)
+	}
+	cleanup.Spec.SchedulingGates = nil
+	cleanup.Spec.NodeName = "node-a"
+	cleanup.Annotations[nodeLocalShmCleanupRetryAnnotation] = "3"
+	cleanup.Status.Phase = corev1.PodFailed
+	reconciler := newReconciler(newScheme(t), backend, cleanup)
+	if _, err := reconciler.reconcileLMCacheNodeLocalCleanupPods(context.Background(), backend, nil, false); err != nil {
+		t.Fatal(err)
+	}
+
+	retryKey := types.NamespacedName{
+		Name:      builtinruntime.NodeLocalCleanupRetryPodName(backend.UID, "node-a", cleanup.Name),
+		Namespace: backend.Namespace,
+	}
+	if err := reconciler.Get(context.Background(), retryKey, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("cleanup retry beyond limit = %v, want NotFound", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(cleanup), &corev1.Pod{}); err != nil {
+		t.Fatalf("terminal cleanup Pod was not retained for diagnosis: %v", err)
 	}
 }
 

@@ -304,7 +304,8 @@ it never copies registry credentials from an Engine Pod. Consumer checks are
 cluster-wide because the path is node-global. A managed Engine arriving after
 cleanup starts cannot use the directory: its main container remains behind the
 same-node startup gate, and Server recreation stays blocked until cleanup
-succeeds. Unmanaged processes that race an exact hostPath mount remain outside
+succeeds. Failed helpers are retried at most three times to bound API churn.
+Unmanaged processes that race an exact hostPath mount remain outside
 the trusted-node boundary described above.
 
 NodeLocal ports are explicit rather than dynamically allocated. Engine Pods

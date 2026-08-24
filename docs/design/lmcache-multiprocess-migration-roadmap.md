@@ -1204,7 +1204,8 @@ immutable artifacts. The numbered items below are the future-work backlog.
 - [x] Reclaim an idle/deleted pool with a gated, one-shot cleanup Pod after no
       Pod uses its exact UID hostPath. Cleanup mounts only that UID, clears its
       contents with a dedicated inference-cache helper image, and blocks Server
-      recreation until completion; a finalizer covers CacheBackend deletion.
+      recreation until completion; failed helpers have a bounded retry count,
+      and a finalizer covers CacheBackend deletion.
 
 ### 2. MP client/server compatibility signaling
 

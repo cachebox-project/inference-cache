@@ -16,8 +16,9 @@ func emptyDirectory(root string) error {
 		return err
 	}
 	for _, entry := range entries {
-		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
-			return err
+		child := filepath.Join(root, entry.Name())
+		if err := os.RemoveAll(child); err != nil {
+			return fmt.Errorf("remove %s: %w", child, err)
 		}
 	}
 	return nil
