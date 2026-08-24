@@ -13,7 +13,12 @@ func TestValidateOptionsRequiresDigestPinnedCleanupImage(t *testing.T) {
 		t.Fatalf("valid options: %v", err)
 	}
 
-	for _, image := range []string{"", "registry.example/inference-cache-shm-cleanup:latest"} {
+	for _, image := range []string{
+		"",
+		"registry.example/inference-cache-shm-cleanup:latest",
+		"registry.example/bad@@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+	} {
 		opts := defaultOptions()
 		opts.nodeLocalCleanupImage = image
 		if err := validateOptions(opts); err == nil {

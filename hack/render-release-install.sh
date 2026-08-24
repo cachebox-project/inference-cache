@@ -12,17 +12,23 @@ set -euo pipefail
 : "${OUTPUT_FILE:?OUTPUT_FILE is required}"
 
 kustomize_cmd="${KUSTOMIZE_CMD:-kustomize}"
+kustomization_path="${KUSTOMIZATION_PATH:-default}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 placeholder='ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+zero_digest='sha256:0000000000000000000000000000000000000000000000000000000000000000'
 
 for ref in "$CONTROLLER_IMAGE" "$SERVER_IMAGE" "$CLEANUP_IMAGE"; do
-  if [[ ! "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]]; then
-    echo "release install image is not digest-pinned: $ref" >&2
+  if [[ ! "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$ || "$ref" == *"@$zero_digest" ]]; then
+    echo "install image is not digest-pinned: $ref" >&2
     exit 1
   fi
 done
 if ! command -v "$kustomize_cmd" >/dev/null 2>&1; then
   echo "kustomize is unavailable: $kustomize_cmd" >&2
+  exit 1
+fi
+if [[ "$kustomization_path" == /* || "$kustomization_path" == *..* ]]; then
+  echo "KUSTOMIZATION_PATH must stay within config: $kustomization_path" >&2
   exit 1
 fi
 
@@ -38,6 +44,11 @@ fi
 sed "s|$placeholder|$CLEANUP_IMAGE|" "$manager" >"$manager.tmp"
 mv "$manager.tmp" "$manager"
 
+render_dir="$workdir/config/$kustomization_path"
+if [[ ! -f "$render_dir/kustomization.yaml" ]]; then
+  echo "kustomization is unavailable: config/$kustomization_path" >&2
+  exit 1
+fi
 (
   cd "$workdir/config/default"
   "$kustomize_cmd" edit set image \
@@ -46,7 +57,7 @@ mv "$manager.tmp" "$manager"
 )
 
 mkdir -p "$(dirname "$OUTPUT_FILE")"
-"$kustomize_cmd" build "$workdir/config/default" >"$OUTPUT_FILE"
+"$kustomize_cmd" build "$render_dir" >"$OUTPUT_FILE"
 
 for ref in "$CONTROLLER_IMAGE" "$SERVER_IMAGE" "$CLEANUP_IMAGE"; do
   grep -Fq -- "$ref" "$OUTPUT_FILE" || {

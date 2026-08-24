@@ -167,6 +167,31 @@ func TestRenderLMCacheNodeLocalCleanupPod(t *testing.T) {
 		security.RunAsUser == nil || *security.RunAsUser != 0 || security.ReadOnlyRootFilesystem == nil || !*security.ReadOnlyRootFilesystem {
 		t.Fatalf("cleanup security context = %+v", security)
 	}
+	controller := true
+	cleanup.OwnerReferences = []metav1.OwnerReference{{UID: cache.UID, Controller: &controller}}
+	if !IsLMCacheNodeLocalCleanupPod(cleanup, cache, "gpu-node-a", testNodeLocalCleanupImage) {
+		t.Fatal("rendered cleanup Pod did not satisfy its executable contract")
+	}
+	cleanup.Spec.Containers[0].Command = []string{"/bin/true"}
+	if IsLMCacheNodeLocalCleanupPod(cleanup, cache, "gpu-node-a", testNodeLocalCleanupImage) {
+		t.Fatal("cleanup Pod with a foreign command satisfied the executable contract")
+	}
+}
+
+func TestLMCacheNodeLocalCleanupSucceededRequiresHelperStatus(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{NodeName: "gpu-node-a"}, Status: corev1.PodStatus{
+		Phase: corev1.PodSucceeded,
+		ContainerStatuses: []corev1.ContainerStatus{{Name: "foreign", State: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+		}}},
+	}}
+	if LMCacheNodeLocalCleanupSucceeded(pod, "gpu-node-a") {
+		t.Fatal("foreign successful container was accepted as cleanup success")
+	}
+	pod.Status.ContainerStatuses[0].Name = lmCacheNodeLocalShmCleanupName
+	if !LMCacheNodeLocalCleanupSucceeded(pod, "gpu-node-a") {
+		t.Fatal("successful cleanup helper status was rejected")
+	}
 }
 
 func TestRenderLMCacheNodeLocalCleanupRetryPod(t *testing.T) {

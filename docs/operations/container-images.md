@@ -29,7 +29,19 @@ CacheBackends do not select or override it.
 Each GitHub release attaches `inference-cache-<tag>.yaml`, rendered from
 `config/default` with the matching controller, server, and cleanup image
 digests. Prefer that artifact for release installs; the checked-in manager YAML
-contains an all-zero cleanup digest only as a source-tree rendering placeholder.
+contains an all-zero cleanup digest only as a source-tree rendering placeholder,
+and the controller deliberately rejects that value. A source checkout can render
+and apply the same contract with:
+
+```bash
+make deploy \
+  IMG="${CONTROLLER_IMAGE}" \
+  SERVER_IMG="${SERVER_IMAGE}" \
+  CLEANUP_IMG="${CLEANUP_IMAGE}"
+```
+
+All three variables must contain full `repository@sha256:digest` references.
+Set `INSTALL_KUSTOMIZATION=overlays/server-tls` when rendering the TLS overlay.
 
 ## Verification
 

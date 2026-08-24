@@ -355,6 +355,58 @@ func RenderLMCacheNodeLocalCleanupRetryPod(cache *cachev1alpha1.CacheBackend, fa
 	}, nil
 }
 
+// IsLMCacheNodeLocalCleanupPod reports whether pod has the exact executable
+// contract rendered for one backend/node cleanup. Scheduling-only fields copied
+// from the source Pod are intentionally excluded.
+func IsLMCacheNodeLocalCleanupPod(pod *corev1.Pod, cache *cachev1alpha1.CacheBackend, nodeName, image string) bool {
+	if pod == nil || cache == nil || cache.UID == "" || strings.TrimSpace(nodeName) == "" || strings.TrimSpace(image) == "" ||
+		pod.Namespace != cache.Namespace || !metav1.IsControlledBy(pod, cache) ||
+		!IsNodeLocalCleanupPodName(cache.UID, nodeName, pod.Name) ||
+		pod.Labels[enginebinding.LabelLMCacheNodeLocalCleanup] != "true" ||
+		pod.Labels[enginebinding.LabelCacheBackendUID] != string(cache.UID) ||
+		pod.Annotations[enginebinding.AnnotationNodeLocalOwnerUID] != string(cache.UID) ||
+		pod.Annotations[enginebinding.AnnotationNodeLocalTargetNode] != nodeName ||
+		(pod.Spec.NodeName != "" && pod.Spec.NodeName != nodeName) ||
+		!equality.Semantic.DeepEqual(pod.Spec.Affinity, exactNodeAffinity(nodeName)) ||
+		pod.Spec.RestartPolicy != corev1.RestartPolicyNever || len(pod.Spec.InitContainers) != 0 ||
+		len(pod.Spec.EphemeralContainers) != 0 || len(pod.Spec.Containers) != 1 || len(pod.Spec.Volumes) != 1 ||
+		(len(pod.Spec.SchedulingGates) != 0 && !LMCacheNodeLocalCleanupIsGated(pod)) {
+		return false
+	}
+
+	volume := pod.Spec.Volumes[0]
+	wantPath, err := NodeLocalServerShmHostPath(cache)
+	if err != nil || volume.Name != lmCacheNodeLocalShmVolumeName || volume.HostPath == nil ||
+		volume.HostPath.Path != wantPath || volume.HostPath.Type == nil || *volume.HostPath.Type != corev1.HostPathDirectoryOrCreate {
+		return false
+	}
+
+	container := pod.Spec.Containers[0]
+	return container.Name == lmCacheNodeLocalShmCleanupName && container.Image == strings.TrimSpace(image) &&
+		equality.Semantic.DeepEqual(container.Command, []string{"/node-local-shm-cleanup"}) &&
+		equality.Semantic.DeepEqual(container.Args, []string{lmCacheNodeLocalShmCleanupPath}) &&
+		len(container.VolumeMounts) == 1 && container.VolumeMounts[0].Name == lmCacheNodeLocalShmVolumeName &&
+		container.VolumeMounts[0].MountPath == lmCacheNodeLocalShmCleanupPath && !container.VolumeMounts[0].ReadOnly &&
+		container.VolumeMounts[0].SubPath == "" && container.VolumeMounts[0].SubPathExpr == "" &&
+		container.VolumeMounts[0].MountPropagation == nil
+}
+
+// LMCacheNodeLocalCleanupIsGated reports whether the cleanup Pod still carries
+// the controller-authored quiescence gate.
+func LMCacheNodeLocalCleanupIsGated(pod *corev1.Pod) bool {
+	return pod != nil && len(pod.Spec.SchedulingGates) == 1 && pod.Spec.SchedulingGates[0].Name == lmCacheNodeLocalShmCleanupGate
+}
+
+// LMCacheNodeLocalCleanupSucceeded reports success only for the rendered
+// helper container on the intended node.
+func LMCacheNodeLocalCleanupSucceeded(pod *corev1.Pod, nodeName string) bool {
+	if pod == nil || pod.Status.Phase != corev1.PodSucceeded || pod.Spec.NodeName != nodeName || len(pod.Status.ContainerStatuses) != 1 {
+		return false
+	}
+	status := pod.Status.ContainerStatuses[0]
+	return status.Name == lmCacheNodeLocalShmCleanupName && status.State.Terminated != nil && status.State.Terminated.ExitCode == 0
+}
+
 // NodeLocalServerPodName returns the stable object name for one backend/node
 // pair. It is exported for controller lifecycle reconciliation.
 func NodeLocalServerPodName(backendName, nodeName string) string {

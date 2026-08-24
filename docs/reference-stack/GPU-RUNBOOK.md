@@ -96,9 +96,11 @@ kubectl get nodes -o json | jq '.items[].status.allocatable["nvidia.com/gpu"]'  
 kubectl create namespace cache-substrate
 kubectl -n cache-substrate create secret generic hf-token --from-literal=token="$HF_TOKEN"
 
-# 2. Install inference-cache first, then apply. Replace the deliberately
-#    non-pullable engine-image placeholder before creating the Deployment.
-kubectl apply -k ../../config/default
+# 2. Install inference-cache from its digest-pinned release manifest first,
+#    then apply. Replace the deliberately non-pullable engine-image placeholder
+#    before creating the Deployment.
+RELEASE_TAG=vX.Y.Z
+kubectl apply -f "inference-cache-${RELEASE_TAG}.yaml"
 kubectl apply -f manifests/namespace.yaml -f manifests/deployment.yaml -f manifests/service.yaml
 kubectl -n cache-substrate rollout status deploy/vllm-lmcache-llama-8b --timeout=20m
 ```

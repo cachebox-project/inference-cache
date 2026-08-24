@@ -195,8 +195,14 @@ The default Kustomize overlay brings up both control-plane components:
   [docs/design/cachebackend-api.md#functional-probe-gate](docs/design/cachebackend-api.md#functional-probe-gate);
   it is intentionally not visible on a default install with no engine workload.
 
+Use the digest-pinned manifest attached to the selected GitHub release. The
+checked-in `config/default` is a rendering template, not a directly installable
+bundle; see [container image operations](docs/operations/container-images.md)
+for the equivalent source-tree `make deploy` command.
+
 ```bash
-kubectl apply -k config/default
+RELEASE_TAG=vX.Y.Z
+kubectl apply -f "inference-cache-${RELEASE_TAG}.yaml"
 kubectl -n inference-cache-system wait --for=condition=Available deployment --all --timeout=180s
 kubectl get cacheindex cluster-default -o yaml
 ```

@@ -345,7 +345,14 @@ func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForNode(ctx contex
 	for i := range cleanups.Items {
 		cleanup := &cleanups.Items[i]
 		if metav1.IsControlledBy(cleanup, backend) && cleanup.Annotations[enginebinding.AnnotationNodeLocalTargetNode] == nodeName {
-			return nil
+			if builtinruntime.IsLMCacheNodeLocalCleanupPod(cleanup, backend, nodeName, r.NodeLocalShmCleanupImage) &&
+				builtinruntime.LMCacheNodeLocalCleanupIsGated(cleanup) {
+				return nil
+			}
+			if err := r.Client.Delete(ctx, cleanup); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete invalid LMCache NodeLocal SHM cleanup Pod %s/%s: %w", cleanup.Namespace, cleanup.Name, err)
+			}
+			return fmt.Errorf("deleted invalid LMCache NodeLocal SHM cleanup Pod %s/%s", cleanup.Namespace, cleanup.Name)
 		}
 	}
 
@@ -364,7 +371,8 @@ func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForNode(ctx contex
 		if getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(desired), &existing); getErr != nil {
 			return fmt.Errorf("inspect existing LMCache NodeLocal SHM cleanup Pod %s/%s: %w", desired.Namespace, desired.Name, getErr)
 		}
-		if !metav1.IsControlledBy(&existing, backend) {
+		if !builtinruntime.IsLMCacheNodeLocalCleanupPod(&existing, backend, nodeName, r.NodeLocalShmCleanupImage) ||
+			!builtinruntime.LMCacheNodeLocalCleanupIsGated(&existing) {
 			return fmt.Errorf("LMCache NodeLocal SHM cleanup Pod name %s/%s is occupied by another object", desired.Namespace, desired.Name)
 		}
 	}
@@ -462,10 +470,6 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx contex
 	if backend == nil || backend.UID == "" {
 		return blocked, nil
 	}
-	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
-	if err != nil {
-		return nil, err
-	}
 	var pods corev1.PodList
 	if err := r.Client.List(ctx, &pods, client.InNamespace(backend.Namespace), client.MatchingLabels{
 		enginebinding.LabelLMCacheNodeLocalCleanup: "true",
@@ -481,7 +485,7 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx contex
 			continue
 		}
 		nodeName := pod.Annotations[enginebinding.AnnotationNodeLocalTargetNode]
-		if !nodeLocalCleanupPodHasIdentity(pod, backend, nodeName, wantPath) {
+		if !builtinruntime.IsLMCacheNodeLocalCleanupPod(pod, backend, nodeName, r.NodeLocalShmCleanupImage) {
 			if pod.DeletionTimestamp == nil {
 				if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 					return nil, fmt.Errorf("delete invalid LMCache NodeLocal SHM cleanup Pod %s/%s: %w", pod.Namespace, pod.Name, err)
@@ -489,10 +493,10 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx contex
 			}
 			return nil, fmt.Errorf("delete invalid LMCache NodeLocal SHM cleanup Pod %s/%s", pod.Namespace, pod.Name)
 		}
-		switch pod.Status.Phase {
-		case corev1.PodSucceeded:
+		switch {
+		case builtinruntime.LMCacheNodeLocalCleanupSucceeded(pod, nodeName):
 			succeededByNode[nodeName] = true
-		case corev1.PodFailed:
+		case pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded:
 		default:
 			if pod.DeletionTimestamp == nil {
 				activeByNode[nodeName] = true
@@ -505,7 +509,7 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx contex
 			continue
 		}
 		nodeName := pod.Annotations[enginebinding.AnnotationNodeLocalTargetNode]
-		if pod.Status.Phase == corev1.PodSucceeded {
+		if builtinruntime.LMCacheNodeLocalCleanupSucceeded(pod, nodeName) {
 			if pod.DeletionTimestamp == nil {
 				if err := r.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 					return nil, fmt.Errorf("delete completed LMCache NodeLocal SHM cleanup Pod %s/%s: %w", pod.Namespace, pod.Name, err)
@@ -513,7 +517,7 @@ func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalCleanupPods(ctx contex
 			}
 			continue
 		}
-		if pod.Status.Phase == corev1.PodFailed {
+		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
 			blocked[nodeName] = true
 			if !succeededByNode[nodeName] && !activeByNode[nodeName] {
 				retry, err := builtinruntime.RenderLMCacheNodeLocalCleanupRetryPod(backend, pod)
@@ -612,19 +616,4 @@ func (r *CacheBackendReconciler) nodeLocalShmConsumers(ctx context.Context, back
 		}
 	}
 	return consumers, nil
-}
-
-func nodeLocalCleanupPodHasIdentity(pod *corev1.Pod, backend *cachev1alpha1.CacheBackend, nodeName, wantPath string) bool {
-	if pod == nil || backend == nil || nodeName == "" || wantPath == "" ||
-		!builtinruntime.IsNodeLocalCleanupPodName(backend.UID, nodeName, pod.Name) ||
-		pod.Annotations[enginebinding.AnnotationNodeLocalOwnerUID] != string(backend.UID) {
-		return false
-	}
-	for i := range pod.Spec.Volumes {
-		hostPath := pod.Spec.Volumes[i].HostPath
-		if hostPath != nil && hostPath.Path == wantPath && hostPath.Type != nil && *hostPath.Type == corev1.HostPathDirectoryOrCreate {
-			return pod.Spec.NodeName == "" || pod.Spec.NodeName == nodeName
-		}
-	}
-	return false
 }

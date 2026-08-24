@@ -33,10 +33,23 @@ if grep -Fq -- 'sha256:000000000000000000000000000000000000000000000000000000000
 fi
 grep -Fq -- 'sha256:0000000000000000000000000000000000000000000000000000000000000000' config/manager/manager.yaml
 
+CONTROLLER_IMAGE="$controller" SERVER_IMAGE="$server" CLEANUP_IMAGE="$cleanup" \
+OUTPUT_FILE="$workdir/tls.yaml" KUSTOMIZATION_PATH=overlays/server-tls KUSTOMIZE_CMD="$KUSTOMIZE_CMD" \
+  hack/render-release-install.sh
+grep -Fq -- '--tls-cert-file=/var/run/secrets/tls/tls.crt' "$workdir/tls.yaml"
+
 if CONTROLLER_IMAGE='controller:latest' SERVER_IMAGE="$server" CLEANUP_IMAGE="$cleanup" \
   OUTPUT_FILE="$workdir/invalid.yaml" KUSTOMIZE_CMD="$KUSTOMIZE_CMD" \
   hack/render-release-install.sh >/dev/null 2>&1; then
   echo "expected a mutable controller image to fail" >&2
+  exit 1
+fi
+
+if CONTROLLER_IMAGE="$controller" SERVER_IMAGE="$server" \
+  CLEANUP_IMAGE='ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+  OUTPUT_FILE="$workdir/zero.yaml" KUSTOMIZE_CMD="$KUSTOMIZE_CMD" \
+  hack/render-release-install.sh >/dev/null 2>&1; then
+  echo "expected an all-zero cleanup digest to fail" >&2
   exit 1
 fi
 

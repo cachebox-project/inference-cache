@@ -217,7 +217,9 @@ For the demo / debugging-flow walkthrough, on a local kind cluster:
 
 ```sh
 make dev-cluster
-kubectl apply -k config/default   # install CRDs + controller + server
+# Install CRDs + controller + server from the selected release manifest first.
+RELEASE_TAG=vX.Y.Z
+kubectl apply -f "inference-cache-${RELEASE_TAG}.yaml"
 kubectl apply -f config/samples/cache_v1alpha1_cachebackend.yaml
 
 # Validate configuration without the live server (works pre-port-forward):

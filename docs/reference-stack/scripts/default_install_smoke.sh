@@ -103,6 +103,13 @@ kubectl -n cert-manager wait --for=condition=Available deployment --all --timeou
 
 tmpdir="$(mktemp -d)"
 cp -R config "$tmpdir/config"
+# This smoke never starts the cleanup helper. Replace the source placeholder
+# with a syntactically valid test-only digest so controller startup exercises
+# the same fail-closed option validation as a rendered release install.
+sed -i.bak \
+  's|sha256:0000000000000000000000000000000000000000000000000000000000000000|sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|' \
+  "$tmpdir/config/manager/manager.yaml"
+rm -f "$tmpdir/config/manager/manager.yaml.bak"
 (
   cd "$tmpdir/config/default"
   if command -v kustomize >/dev/null 2>&1; then

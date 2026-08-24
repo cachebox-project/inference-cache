@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"go.uber.org/zap/zapcore"
@@ -33,7 +34,9 @@ import (
 
 const leaderLockName = "inference-cache-controller-leader-lock"
 
-var sha256ImagePattern = regexp.MustCompile(`^[^[:space:]@]+@sha256:[a-f0-9]{64}$`)
+var sha256ImagePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[a-f0-9]{64}$`)
+
+const zeroSHA256Digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 var (
 	scheme   = runtime.NewScheme()
@@ -255,7 +258,7 @@ func main() {
 }
 
 func validateOptions(opts options) error {
-	if !sha256ImagePattern.MatchString(opts.nodeLocalCleanupImage) {
+	if !sha256ImagePattern.MatchString(opts.nodeLocalCleanupImage) || strings.HasSuffix(opts.nodeLocalCleanupImage, zeroSHA256Digest) {
 		return fmt.Errorf("--node-local-shm-cleanup-image must be a digest-pinned image reference")
 	}
 	return nil

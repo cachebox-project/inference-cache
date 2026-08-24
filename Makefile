@@ -24,6 +24,9 @@ IMG ?= $(CONTROLLER_IMAGE_REPO):$(TAG)
 SERVER_IMG ?= $(SERVER_IMAGE_REPO):$(TAG)
 SUBSCRIBER_IMG ?= $(SUBSCRIBER_IMAGE_REPO):$(TAG)
 CLEANUP_IMG ?= $(CLEANUP_IMAGE_REPO):$(TAG)
+INSTALL_MANIFEST ?= dist/install/inference-cache.yaml
+INSTALL_KUSTOMIZATION ?= default
+KUBECTL ?= kubectl
 DOCKER_BUILD_CMD ?= docker
 KIND ?= $(shell command -v kind 2>/dev/null || echo $(LOCAL_KIND))
 KIND_CLUSTER ?= inference-cache
@@ -530,6 +533,16 @@ test-release-image-digests: ## Test fail-closed release image digest resolution 
 .PHONY: test-release-install
 test-release-install: kustomize ## Test digest-pinned release install rendering.
 	@KUSTOMIZE_CMD="$(LOCAL_KUSTOMIZE)" bash hack/render-release-install_test.sh
+
+.PHONY: render-install
+render-install: kustomize ## Render an install manifest; IMG, SERVER_IMG, and CLEANUP_IMG must be digest-pinned.
+	@CONTROLLER_IMAGE="$(IMG)" SERVER_IMAGE="$(SERVER_IMG)" CLEANUP_IMAGE="$(CLEANUP_IMG)" \
+		OUTPUT_FILE="$(INSTALL_MANIFEST)" KUSTOMIZATION_PATH="$(INSTALL_KUSTOMIZATION)" \
+		KUSTOMIZE_CMD="$(LOCAL_KUSTOMIZE)" hack/render-release-install.sh
+
+.PHONY: deploy
+deploy: render-install ## Apply the digest-pinned install manifest to the current Kubernetes context.
+	$(KUBECTL) apply -f "$(INSTALL_MANIFEST)"
 
 .PHONY: dev-cluster
 dev-cluster: kind ## Create a local kind cluster for development.
