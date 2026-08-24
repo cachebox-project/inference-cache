@@ -28,6 +28,7 @@ env:
   CONTROLLER_IMAGE_REPO: ghcr.io/cachebox-project/inference-cache-controller
   SERVER_IMAGE_REPO: ghcr.io/cachebox-project/inference-cache-server
   SUBSCRIBER_IMAGE_REPO: ghcr.io/cachebox-project/inference-cache-subscriber
+  CLEANUP_IMAGE_REPO: ghcr.io/cachebox-project/inference-cache-shm-cleanup
 
 jobs:
   secure-release:
@@ -132,6 +133,7 @@ jobs:
         build_image controller "$CONTROLLER_IMAGE_REPO"
         build_image server "$SERVER_IMAGE_REPO"
         build_image subscriber "$SUBSCRIBER_IMAGE_REPO"
+        build_image cleanup "$CLEANUP_IMAGE_REPO"
 
     - name: Resolve published release image digests
       id: published-image-digests
@@ -144,14 +146,17 @@ jobs:
         BUILT_CONTROLLER_DIGEST: ${{ steps.built-image-digests.outputs.controller }}
         BUILT_SERVER_DIGEST: ${{ steps.built-image-digests.outputs.server }}
         BUILT_SUBSCRIBER_DIGEST: ${{ steps.built-image-digests.outputs.subscriber }}
+        BUILT_CLEANUP_DIGEST: ${{ steps.built-image-digests.outputs.cleanup }}
         PUBLISHED_CONTROLLER_DIGEST: ${{ steps.published-image-digests.outputs.controller }}
         PUBLISHED_SERVER_DIGEST: ${{ steps.published-image-digests.outputs.server }}
         PUBLISHED_SUBSCRIBER_DIGEST: ${{ steps.published-image-digests.outputs.subscriber }}
+        PUBLISHED_CLEANUP_DIGEST: ${{ steps.published-image-digests.outputs.cleanup }}
       run: |
         set -euo pipefail
         test "$BUILT_CONTROLLER_DIGEST" = "$PUBLISHED_CONTROLLER_DIGEST"
         test "$BUILT_SERVER_DIGEST" = "$PUBLISHED_SERVER_DIGEST"
         test "$BUILT_SUBSCRIBER_DIGEST" = "$PUBLISHED_SUBSCRIBER_DIGEST"
+        test "$BUILT_CLEANUP_DIGEST" = "$PUBLISHED_CLEANUP_DIGEST"
 
     - name: Generate published image SBOMs
       run: make -f "$GITHUB_WORKSPACE/Makefile" -C "$GITHUB_WORKSPACE/release-source" sbom-registry-images TAG="${RELEASE_TAG}" SBOM_DIR="$GITHUB_WORKSPACE/dist/sbom"
@@ -166,11 +171,13 @@ jobs:
         CONTROLLER_DIGEST: ${{ steps.built-image-digests.outputs.controller }}
         SERVER_DIGEST: ${{ steps.built-image-digests.outputs.server }}
         SUBSCRIBER_DIGEST: ${{ steps.built-image-digests.outputs.subscriber }}
+        CLEANUP_DIGEST: ${{ steps.built-image-digests.outputs.cleanup }}
       run: |
         set -euo pipefail
         cosign sign --yes "${CONTROLLER_IMAGE_REPO}@${CONTROLLER_DIGEST}"
         cosign sign --yes "${SERVER_IMAGE_REPO}@${SERVER_DIGEST}"
         cosign sign --yes "${SUBSCRIBER_IMAGE_REPO}@${SUBSCRIBER_DIGEST}"
+        cosign sign --yes "${CLEANUP_IMAGE_REPO}@${CLEANUP_DIGEST}"
 
     - name: Generate controller SLSA provenance
       id: attest-controller
@@ -196,17 +203,27 @@ jobs:
         subject-digest: ${{ steps.built-image-digests.outputs.subscriber }}
         push-to-registry: true
 
+    - name: Generate NodeLocal cleanup SLSA provenance
+      id: attest-cleanup
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+      with:
+        subject-name: ${{ env.CLEANUP_IMAGE_REPO }}
+        subject-digest: ${{ steps.built-image-digests.outputs.cleanup }}
+        push-to-registry: true
+
     - name: Collect provenance bundles
       env:
         CONTROLLER_BUNDLE: ${{ steps.attest-controller.outputs.bundle-path }}
         SERVER_BUNDLE: ${{ steps.attest-server.outputs.bundle-path }}
         SUBSCRIBER_BUNDLE: ${{ steps.attest-subscriber.outputs.bundle-path }}
+        CLEANUP_BUNDLE: ${{ steps.attest-cleanup.outputs.bundle-path }}
       run: |
         set -euo pipefail
         mkdir -p dist/provenance
         cp -- "$CONTROLLER_BUNDLE" "dist/provenance/inference-cache-controller-${RELEASE_TAG}.provenance.sigstore.json"
         cp -- "$SERVER_BUNDLE" "dist/provenance/inference-cache-server-${RELEASE_TAG}.provenance.sigstore.json"
         cp -- "$SUBSCRIBER_BUNDLE" "dist/provenance/inference-cache-subscriber-${RELEASE_TAG}.provenance.sigstore.json"
+        cp -- "$CLEANUP_BUNDLE" "dist/provenance/inference-cache-cleanup-${RELEASE_TAG}.provenance.sigstore.json"
 
     - name: Verify image signatures and SLSA provenance
       env:
@@ -215,12 +232,14 @@ jobs:
         CONTROLLER_DIGEST: ${{ steps.built-image-digests.outputs.controller }}
         SERVER_DIGEST: ${{ steps.built-image-digests.outputs.server }}
         SUBSCRIBER_DIGEST: ${{ steps.built-image-digests.outputs.subscriber }}
+        CLEANUP_DIGEST: ${{ steps.built-image-digests.outputs.cleanup }}
       run: |
         set -euo pipefail
         for ref in \
           "${CONTROLLER_IMAGE_REPO}@${CONTROLLER_DIGEST}" \
           "${SERVER_IMAGE_REPO}@${SERVER_DIGEST}" \
-          "${SUBSCRIBER_IMAGE_REPO}@${SUBSCRIBER_DIGEST}"; do
+          "${SUBSCRIBER_IMAGE_REPO}@${SUBSCRIBER_DIGEST}" \
+          "${CLEANUP_IMAGE_REPO}@${CLEANUP_DIGEST}"; do
           cosign verify \
             --certificate-identity "$COSIGN_IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \

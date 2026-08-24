@@ -278,8 +278,8 @@ CacheBackend UIDs do not share a POSIX SHM-backed L1 object because this profile
 creates none; the UID directory remains to separate observed CUDA, PyTorch, and
 semaphore auxiliary IPC objects. The server sets
 `NVIDIA_VISIBLE_DEVICES=all` but requests no
-allocatable GPU. It inherits the source engine's runtime class, tolerations,
-image-pull secrets, priority class, and scheduler unless optional
+allocatable GPU. The server inherits the source engine's runtime class,
+tolerations, image-pull secrets, priority class, and scheduler unless optional
 `nodeLocal.scheduling` server overrides are supplied. The FastAPI/MP listeners
 are unauthenticated and host networking bypasses NetworkPolicy, so this topology
 requires one trusted tenant domain per pool plus node firewall controls.
@@ -295,6 +295,20 @@ the configured window (300 seconds by default); new demand on that node reuses
 the same Pod. Set it to zero for immediate deletion. A retained Pod continues
 to reserve its declared host ports, so another NodeLocal backend using the same
 pair remains in the normal Kubernetes host-port conflict path until expiry.
+Before an idle server or deleting CacheBackend releases the pool, a gated
+one-shot Pod runs the controller-wide, digest-pinned
+`--node-local-shm-cleanup-image` and clears only
+that backend UID directory after its consumers are gone. This small helper is
+independent of LMCache and uses only `nodeLocal.scheduling.imagePullSecrets`;
+it never copies registry credentials from an Engine Pod.
+
+The structural identity fields `runtime`, `type`, LMCache presence/topology,
+`integration.mode`, `engineSelector`, and remote-storage presence/provider/
+ownership are immutable. Existing Engine Pods retain the wiring they received
+at admission and inference-cache never deletes or rewrites them. Changing that
+architecture requires a new CacheBackend and an explicit rollout by the
+inference workload owner; operational settings such as images, resources,
+capacity, scheduling, and observation remain mutable.
 
 NodeLocal ports are explicit rather than dynamically allocated. Engine Pods
 are immutable and receive their endpoint during admission, before the

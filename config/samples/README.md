@@ -68,6 +68,8 @@ they go `Ready` as soon as admission accepts the endpoint. See the
 [quickstart](../../docs/quickstart.md).
 
 NodeLocal focused samples are not five-minute recipes. Before applying one,
+configure the controller's `--node-local-shm-cleanup-image` with the matching
+digest from the inference-cache release, then
 reserve its MP and HTTP host ports on every node where the inference system may
 place a selected engine, and ensure all selected engine Pods belong to one
 mutually trusted tenant domain. CacheBackend does not select nodes or rewrite

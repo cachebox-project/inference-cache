@@ -11,7 +11,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cachev1alpha1 "github.com/cachebox-project/inference-cache/api/v1alpha1"
@@ -22,11 +21,12 @@ import (
 // TestIntegrationCacheBackendNodeLocalServerPod exercises the engine-demanded
 // child lifecycle against a real apiserver. Envtest has no scheduler or kubelet,
 // so same-node health is GPU tested separately; this pins CREATE, exact-node
-// affinity, UPDATE, ownership, and topology cleanup.
+// affinity, operational UPDATE, and ownership.
 func TestIntegrationCacheBackendNodeLocalServerPod(t *testing.T) {
 	skipWithoutEnvtest(t)
 	k8s, scheme, _ := startEnv(t)
 	r := &CacheBackendReconciler{Client: k8s, APIReader: k8s, Scheme: scheme, Log: logr.Discard()}
+	configureTestRegistries(r)
 	ctx := context.Background()
 	ns := freshNS(t, k8s)
 	backend := nodeLocalBackend("node-cache", ns)
@@ -88,17 +88,4 @@ func TestIntegrationCacheBackendNodeLocalServerPod(t *testing.T) {
 		t.Fatalf("server Pod args did not update: %s", args)
 	}
 
-	if err := k8s.Get(ctx, key, &live); err != nil {
-		t.Fatalf("refresh NodeLocal CacheBackend: %v", err)
-	}
-	live.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyPodLocal
-	live.Spec.LMCache.PodLocal = lmcacheBackend("podlocal-shape", ns).Spec.LMCache.PodLocal.DeepCopy()
-	live.Spec.LMCache.NodeLocal = nil
-	if err := k8s.Update(ctx, &live); err != nil {
-		t.Fatalf("switch NodeLocal to PodLocal: %v", err)
-	}
-	reconcile(t, r, live.Name, live.Namespace)
-	if err := k8s.Get(ctx, serverKey, &server); !apierrors.IsNotFound(err) {
-		t.Fatalf("server Pod after PodLocal transition = %v, want NotFound", err)
-	}
 }

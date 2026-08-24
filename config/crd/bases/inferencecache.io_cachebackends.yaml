@@ -493,6 +493,9 @@ spec:
                           It cannot select nodes; inference-engine scheduling remains authoritative.
                         properties:
                           imagePullSecrets:
+                            description: |-
+                              ImagePullSecrets are used by controller-managed Server and cleanup Pods.
+                              The cleanup Pod does not inherit registry credentials from an Engine Pod.
                             items:
                               description: |-
                                 LocalObjectReference contains enough information to let you locate the
@@ -1044,8 +1047,10 @@ spec:
                     - server
                     type: object
                   topology:
-                    description: Topology selects the canonical LMCache MP server
-                      placement.
+                    description: |-
+                      Topology selects the canonical LMCache MP server placement.
+                      Changing topology requires a new CacheBackend and an explicit engine
+                      rollout; the controller never rewrites existing engine Pods.
                     enum:
                     - PodLocal
                     - NodeLocal
@@ -2709,6 +2714,31 @@ spec:
             required:
             - runtime
             type: object
+            x-kubernetes-validations:
+            - message: runtime is immutable; create a new CacheBackend and roll the
+                engine workload
+              rule: self.runtime == oldSelf.runtime
+            - message: type is immutable; create a new CacheBackend and roll the engine
+                workload
+              rule: self.type == oldSelf.type
+            - message: LMCache presence and topology are immutable; create a new CacheBackend
+                and roll the engine workload
+              rule: has(self.lmCache) == has(oldSelf.lmCache) && (!has(self.lmCache)
+                || self.lmCache.topology == oldSelf.lmCache.topology)
+            - message: integration mode is immutable; create a new CacheBackend and
+                roll the engine workload
+              rule: '(!has(self.integration) || !has(self.integration.mode) ? ''Offload''
+                : self.integration.mode) == (!has(oldSelf.integration) || !has(oldSelf.integration.mode)
+                ? ''Offload'' : oldSelf.integration.mode)'
+            - message: engineSelector is immutable; create a new CacheBackend and
+                roll the engine workload
+              rule: has(self.engineSelector) == has(oldSelf.engineSelector) && (!has(self.engineSelector)
+                || self.engineSelector == oldSelf.engineSelector)
+            - message: remoteStorage presence, provider, and ownership are immutable;
+                create a new CacheBackend and roll the engine workload
+              rule: has(self.remoteStorage) == has(oldSelf.remoteStorage) && (!has(self.remoteStorage)
+                || (self.remoteStorage.provider == oldSelf.remoteStorage.provider
+                && self.remoteStorage.ownership == oldSelf.remoteStorage.ownership))
           status:
             description: CacheBackendStatus defines the observed state of a cache
               backend.

@@ -485,7 +485,7 @@ jobs:
     - name: Verify image SBOM outputs
       run: |
         set -euo pipefail
-        for component in controller server subscriber; do
+        for component in controller server subscriber cleanup; do
           sbom="$RUNNER_TEMP/sbom-image-smoke/inference-cache-${component}-${IMAGE_TAG}.spdx.json"
           test -s "$sbom"
           jq -e '.spdxVersion and ((.packages | type) == "array") and ((.packages | length) > 0)' "$sbom" >/dev/null

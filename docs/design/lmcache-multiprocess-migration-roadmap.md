@@ -898,14 +898,18 @@ sharing remain out of scope.
 
 The final contract is:
 
-- **API:** `nodeLocal.server` explicitly requires a digest-pinned image,
+- **API:** `nodeLocal.server` explicitly requires a digest-pinned LMCache image;
+  the controller-wide `--node-local-shm-cleanup-image` supplies the separate
+  digest-pinned cleanup helper,
   distinct MP and FastAPI host ports, per-node L1 capacity, GPU/CPU worker
   limits, and resources covering `l1Capacity + 1Gi`. The FastAPI listener also
   serves `/metrics`; no third metrics port is created. `nodeLocal.scheduling`
   exposes only server operational overrides and cannot select nodes.
   `nodeLocal.idleRetentionSeconds` defaults to 300, accepts 0–86400, and owns
   warm server/L1 retention independently from engine-Pod lifetime. Host-bound
-  and security-relevant values have no implicit defaults.
+  and security-relevant values have no implicit defaults. CacheBackend
+  architecture is immutable; migration uses a new CacheBackend and an
+  inference-owned Engine rollout, while operational settings remain mutable.
 - **Lifecycle and placement:** CacheBackend creation alone creates no MP server.
   The inference system schedules engines first; the controller then owns one
   direct server Pod per distinct active engine node. Required node affinity to
@@ -1201,8 +1205,8 @@ immutable artifacts. The numbered items below are the future-work backlog.
       capacity API is planned.
 - [x] Reclaim an idle/deleted pool with a gated, one-shot cleanup Pod after no
       Pod uses its exact UID hostPath. Cleanup mounts only that UID, clears its
-      contents without removing the directory, and blocks Server recreation
-      until completion; a finalizer covers CacheBackend deletion.
+      contents with a dedicated inference-cache helper image, and blocks Server
+      recreation until completion; a finalizer covers CacheBackend deletion.
 
 ### 2. MP client/server compatibility signaling
 

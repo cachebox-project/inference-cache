@@ -171,15 +171,7 @@ func validateMPServer(
 	path *field.Path,
 	reservedPorts map[int32]string,
 ) field.ErrorList {
-	var errs field.ErrorList
-	trimmedImage := strings.TrimSpace(image)
-	switch {
-	case trimmedImage == "":
-		errs = append(errs, field.Required(path.Child("image"), "a CacheBackend-owned LMCache MP server image is required"))
-	case !sha256ImagePattern.MatchString(trimmedImage):
-		errs = append(errs, field.Invalid(path.Child("image"), image,
-			"must be pinned by sha256 digest (for example registry.example/lmcache@sha256:<64-hex-digest>)"))
-	}
+	errs := validateDigestPinnedImage(image, path.Child("image"), "a CacheBackend-owned LMCache MP server image is required")
 
 	if port < 1 || port > 65535 {
 		errs = append(errs, field.Invalid(path.Child("port"), port, "must be between 1 and 65535"))
@@ -234,6 +226,18 @@ func validateMPServer(
 	}
 
 	return errs
+}
+
+func validateDigestPinnedImage(image string, path *field.Path, requiredMessage string) field.ErrorList {
+	trimmed := strings.TrimSpace(image)
+	if trimmed == "" {
+		return field.ErrorList{field.Required(path, requiredMessage)}
+	}
+	if !sha256ImagePattern.MatchString(trimmed) {
+		return field.ErrorList{field.Invalid(path, image,
+			"must be pinned by sha256 digest (for example registry.example/image@sha256:<64-hex-digest>)")}
+	}
+	return nil
 }
 
 // validateMPServerResourceRequirements mirrors the generic provider-resource

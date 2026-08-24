@@ -45,11 +45,6 @@ func isTypedLMCacheMP(backend *cachev1alpha1.CacheBackend) bool {
 // placement.
 func (r *CacheBackendReconciler) reconcileLMCacheNodeLocalServerPods(ctx context.Context, backend *cachev1alpha1.CacheBackend, binding *backendadapter.Binding) error {
 	if !isTypedLMCacheNodeLocal(backend) {
-		if controllerutil.ContainsFinalizer(backend, nodeLocalShmCleanupFinalizer) {
-			if err := r.ensureLMCacheNodeLocalCleanupForConsumers(ctx, backend); err != nil {
-				return err
-			}
-		}
 		return r.cleanupLMCacheNodeLocalServerPods(ctx, backend)
 	}
 	demand, err := r.nodeLocalEngineDemand(ctx, backend)
@@ -302,17 +297,10 @@ func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupPod(ctx context.Co
 		return fmt.Errorf("create LMCache NodeLocal SHM cleanup intent: controlled source server is required")
 	}
 	nodeName := server.Annotations[enginebinding.AnnotationNodeLocalTargetNode]
-	var image string
-	for i := range server.Spec.Containers {
-		if server.Spec.Containers[i].Name == lmCacheMPServerStatusContainerName {
-			image = server.Spec.Containers[i].Image
-			break
-		}
-	}
-	return r.ensureLMCacheNodeLocalCleanupForNode(ctx, backend, nodeName, image, server)
+	return r.ensureLMCacheNodeLocalCleanupForNode(ctx, backend, nodeName, server)
 }
 
-func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForNode(ctx context.Context, backend *cachev1alpha1.CacheBackend, nodeName, image string, source *corev1.Pod) error {
+func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForNode(ctx context.Context, backend *cachev1alpha1.CacheBackend, nodeName string, source *corev1.Pod) error {
 	var cleanups corev1.PodList
 	if err := r.Client.List(ctx, &cleanups, client.InNamespace(backend.Namespace), client.MatchingLabels{
 		enginebinding.LabelLMCacheNodeLocalCleanup: "true",
@@ -327,7 +315,7 @@ func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForNode(ctx contex
 		}
 	}
 
-	desired, err := builtinruntime.RenderLMCacheNodeLocalCleanupPod(backend, nodeName, image, source)
+	desired, err := builtinruntime.RenderLMCacheNodeLocalCleanupPod(backend, nodeName, r.NodeLocalShmCleanupImage, source)
 	if err != nil {
 		return err
 	}
@@ -350,12 +338,8 @@ func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForNode(ctx contex
 }
 
 func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForConsumers(ctx context.Context, backend *cachev1alpha1.CacheBackend) error {
-	if backend == nil || backend.UID == "" {
+	if !isTypedLMCacheNodeLocal(backend) || backend.UID == "" {
 		return nil
-	}
-	configuredImage := ""
-	if isTypedLMCacheNodeLocal(backend) && backend.Spec.LMCache.NodeLocal != nil && backend.Spec.LMCache.NodeLocal.Server != nil {
-		configuredImage = backend.Spec.LMCache.NodeLocal.Server.Image
 	}
 	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
 	if err != nil {
@@ -382,14 +366,7 @@ func (r *CacheBackendReconciler) ensureLMCacheNodeLocalCleanupForConsumers(ctx c
 			usesPath = usesPath || (pod.Spec.Volumes[j].HostPath != nil && pod.Spec.Volumes[j].HostPath.Path == wantPath)
 		}
 		if usesPath {
-			image := configuredImage
-			if image == "" {
-				image = builtinruntime.NodeLocalCleanupImageFromSource(pod)
-			}
-			if image == "" {
-				return fmt.Errorf("derive LMCache NodeLocal SHM cleanup image from consumer %s/%s after topology change", pod.Namespace, pod.Name)
-			}
-			if err := r.ensureLMCacheNodeLocalCleanupForNode(ctx, backend, pod.Spec.NodeName, image, pod); err != nil {
+			if err := r.ensureLMCacheNodeLocalCleanupForNode(ctx, backend, pod.Spec.NodeName, pod); err != nil {
 				return err
 			}
 		}

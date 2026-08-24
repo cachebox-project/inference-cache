@@ -72,9 +72,25 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 
 	requireEnum(t, mustProperty(t, specSchema, "type"), []string{"LMCache", "SGLangHiCache"})
 	requireEnum(t, mustProperty(t, specSchema, "runtime"), []string{"VLLM", "SGLang"})
+	validations := mustPath[[]any](t, specSchema, "x-kubernetes-validations")
+	wantImmutableMessages := map[string]bool{
+		"runtime is immutable; create a new CacheBackend and roll the engine workload":                                          true,
+		"type is immutable; create a new CacheBackend and roll the engine workload":                                             true,
+		"LMCache presence and topology are immutable; create a new CacheBackend and roll the engine workload":                   true,
+		"integration mode is immutable; create a new CacheBackend and roll the engine workload":                                 true,
+		"engineSelector is immutable; create a new CacheBackend and roll the engine workload":                                   true,
+		"remoteStorage presence, provider, and ownership are immutable; create a new CacheBackend and roll the engine workload": true,
+	}
+	for _, validation := range validations {
+		delete(wantImmutableMessages, mustPath[string](t, validation, "message"))
+	}
+	if len(validations) != 6 || len(wantImmutableMessages) != 0 {
+		t.Fatalf("CacheBackend spec transition rules = %v, missing immutable architecture messages %v", validations, wantImmutableMessages)
+	}
 	lmCacheSchema := mustProperty(t, specSchema, "lmCache")
 	requireNoProperty(t, lmCacheSchema, "multiprocess")
-	requireEnum(t, mustProperty(t, lmCacheSchema, "topology"), []string{"PodLocal", "NodeLocal"})
+	topologySchema := mustProperty(t, lmCacheSchema, "topology")
+	requireEnum(t, topologySchema, []string{"PodLocal", "NodeLocal"})
 	podLocalSchema := mustProperty(t, lmCacheSchema, "podLocal")
 	requireRequired(t, podLocalSchema, "server")
 	podLocalServerSchema := mustProperty(t, podLocalSchema, "server")
@@ -86,6 +102,7 @@ func TestCacheBackendCRDSchemaFieldsAndEnums(t *testing.T) {
 	requireMinimum(t, mustProperty(t, podLocalServerSchema, "maxWorkers"), 1)
 	nodeLocalSchema := mustProperty(t, lmCacheSchema, "nodeLocal")
 	requireRequired(t, nodeLocalSchema, "server")
+	requireNoProperty(t, nodeLocalSchema, "cleanupImage")
 	requireRequired(t, nodeLocalSchema, "idleRetentionSeconds")
 	idleRetentionSchema := mustProperty(t, nodeLocalSchema, "idleRetentionSeconds")
 	requireMinimum(t, idleRetentionSchema, 0)

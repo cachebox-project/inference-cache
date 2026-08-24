@@ -63,6 +63,9 @@ func newReconciler(scheme *runtime.Scheme, objs ...client.Object) *CacheBackendR
 }
 
 func configureTestRegistries(r *CacheBackendReconciler) {
+	if r.NodeLocalShmCleanupImage == "" {
+		r.NodeLocalShmCleanupImage = "registry.example/inference-cache-shm-cleanup@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	}
 	if r.Registry != nil && r.BackendRegistry != nil {
 		return
 	}

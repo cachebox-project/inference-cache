@@ -31,12 +31,13 @@ if [ ! -f "$dockerfile" ]; then
   exit 1
 fi
 
-targets=(controller server subscriber)
-entrypoints=(/controller /server /kvevent-subscriber)
+targets=(controller server subscriber cleanup)
+entrypoints=(/controller /server /kvevent-subscriber /node-local-shm-cleanup)
 images=(
   "${IMG:-ghcr.io/cachebox-project/inference-cache-controller:dev}"
   "${SERVER_IMG:-ghcr.io/cachebox-project/inference-cache-server:dev}"
   "${SUBSCRIBER_IMG:-ghcr.io/cachebox-project/inference-cache-subscriber:dev}"
+  "${CLEANUP_IMG:-ghcr.io/cachebox-project/inference-cache-shm-cleanup:dev}"
 )
 
 stage_base() {

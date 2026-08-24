@@ -5,9 +5,6 @@
 package runtime
 
 import (
-	"os"
-	"os/exec"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -140,8 +137,7 @@ func TestRenderLMCacheNodeLocalCleanupPod(t *testing.T) {
 	}
 	source := nodeLocalSourceEngine()
 	source.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "engine-pull"}}
-	source.Spec.InitContainers = []corev1.Container{lmCacheNodeLocalGateContainer(cache, "", nil)}
-	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testLMCacheServerImage, source)
+	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testNodeLocalCleanupImage, source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,13 +151,15 @@ func TestRenderLMCacheNodeLocalCleanupPod(t *testing.T) {
 		cleanup.Spec.Volumes[0].HostPath.Path != "/dev/shm/inference-cache/11111111-2222-3333-4444-555555555555" {
 		t.Fatalf("cleanup volumes = %+v", cleanup.Spec.Volumes)
 	}
-	if len(cleanup.Spec.ImagePullSecrets) != 2 || cleanup.Spec.ImagePullSecrets[0].Name != "engine-pull" || cleanup.Spec.ImagePullSecrets[1].Name != "cache-pull" {
+	if len(cleanup.Spec.ImagePullSecrets) != 1 || cleanup.Spec.ImagePullSecrets[0].Name != "cache-pull" {
 		t.Fatalf("cleanup imagePullSecrets = %+v", cleanup.Spec.ImagePullSecrets)
 	}
-	if got := NodeLocalCleanupImageFromSource(source); got != testLMCacheServerImage {
-		t.Fatalf("cleanup image from injected Engine = %q", got)
+	container := cleanup.Spec.Containers[0]
+	if container.Image != testNodeLocalCleanupImage || !reflect.DeepEqual(container.Command, []string{"/node-local-shm-cleanup"}) ||
+		!reflect.DeepEqual(container.Args, []string{lmCacheNodeLocalShmCleanupPath}) {
+		t.Fatalf("cleanup container = image:%q command:%v args:%v", container.Image, container.Command, container.Args)
 	}
-	security := cleanup.Spec.Containers[0].SecurityContext
+	security := container.SecurityContext
 	if security == nil || security.AllowPrivilegeEscalation == nil || *security.AllowPrivilegeEscalation ||
 		security.RunAsUser == nil || *security.RunAsUser != 0 || security.ReadOnlyRootFilesystem == nil || !*security.ReadOnlyRootFilesystem {
 		t.Fatalf("cleanup security context = %+v", security)
@@ -170,7 +168,7 @@ func TestRenderLMCacheNodeLocalCleanupPod(t *testing.T) {
 
 func TestRenderLMCacheNodeLocalCleanupRetryPod(t *testing.T) {
 	cache := newNodeLocalBackend(cachev1alpha1.CacheBackendRuntimeVLLM)
-	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testLMCacheServerImage, nodeLocalSourceEngine())
+	cleanup, err := RenderLMCacheNodeLocalCleanupPod(cache, "gpu-node-a", testNodeLocalCleanupImage, nodeLocalSourceEngine())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,41 +184,6 @@ func TestRenderLMCacheNodeLocalCleanupRetryPod(t *testing.T) {
 	}
 	if retry.Spec.Containers[0].Image != cleanup.Spec.Containers[0].Image || retry.Spec.Volumes[0].HostPath.Path != cleanup.Spec.Volumes[0].HostPath.Path {
 		t.Fatalf("cleanup retry changed image or hostPath: image:%q volumes:%+v", retry.Spec.Containers[0].Image, retry.Spec.Volumes)
-	}
-}
-
-func TestNodeLocalShmCleanupScriptOnlyClearsMountedPool(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 not available")
-	}
-	root := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "outside")
-	if err := os.WriteFile(outside, []byte("keep"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(filepath.Join(root, "nested"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "nested", "ipc"), []byte("data"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(python, "-S", "-c", nodeLocalShmCleanupScript)
-	cmd.Env = append(os.Environ(),
-		"SHM_POOL_PATH="+root,
-	)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("cleanup script: %v: %s", err, output)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("pool after cleanup = %+v, %v", entries, err)
-	}
-	if got, err := os.ReadFile(outside); err != nil || string(got) != "keep" {
-		t.Fatalf("symlink target changed: %q, %v", got, err)
 	}
 }
 

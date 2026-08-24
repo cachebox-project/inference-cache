@@ -27,8 +27,9 @@ Override the output directory with `SBOM_DIR=/path/to/out`.
 make sbom-images TAG=v0.1.0
 ```
 
-By default this builds the controller, server, and kvevent-subscriber images
-locally before scanning them. To scan already-built local images, pass
+By default this builds the controller, server, kvevent-subscriber, and
+NodeLocal cleanup images locally before scanning them. To scan already-built
+local images, pass
 `SBOM_IMAGE_BUILD=0`.
 
 Outputs:
@@ -37,6 +38,7 @@ Outputs:
 dist/sbom/inference-cache-controller-v0.1.0.spdx.json
 dist/sbom/inference-cache-server-v0.1.0.spdx.json
 dist/sbom/inference-cache-subscriber-v0.1.0.spdx.json
+dist/sbom/inference-cache-cleanup-v0.1.0.spdx.json
 ```
 
 ## Registry Image SBOMs
@@ -52,6 +54,7 @@ before scanning:
 ghcr.io/cachebox-project/inference-cache-controller:v0.1.0
 ghcr.io/cachebox-project/inference-cache-server:v0.1.0
 ghcr.io/cachebox-project/inference-cache-subscriber:v0.1.0
+ghcr.io/cachebox-project/inference-cache-shm-cleanup:v0.1.0
 ```
 
 For manifest-list images, the target discovers the platforms present in the

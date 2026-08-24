@@ -8,6 +8,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -273,11 +274,6 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 			Scheduling: &cachev1alpha1.LMCacheNodeLocalSchedulingSpec{},
 		}
 	}
-	toNodeLocal(&persistedMP)
-	if err := k8s.Update(ctx, &persistedMP); err != nil {
-		t.Fatalf("valid PodLocal-to-NodeLocal update should be admitted: %v", err)
-	}
-
 	nodeLocalCreate := validPodLocalMPBackend()
 	nodeLocalCreate.Name = "nodelocal-create"
 	nodeLocalCreate.Namespace = "team-a"
@@ -289,6 +285,53 @@ func TestCacheBackendDefaulter_MinimumViableYAMLGetsFullyDefaulted(t *testing.T)
 	var persistedNodeLocal cachev1alpha1.CacheBackend
 	if err := live.Get(ctx, client.ObjectKeyFromObject(nodeLocalCreate), &persistedNodeLocal); err != nil {
 		t.Fatalf("get back NodeLocal CR: %v", err)
+	}
+	toPodLocal := persistedNodeLocal.DeepCopy()
+	toPodLocal.Spec.LMCache = validPodLocalMPBackend().Spec.LMCache.DeepCopy()
+	if err := k8s.Update(ctx, toPodLocal); err == nil {
+		t.Fatal("NodeLocal-to-PodLocal update should be rejected because topology is immutable")
+	}
+	immutableUpdates := []struct {
+		name    string
+		message string
+		mutate  func(*cachev1alpha1.CacheBackend)
+	}{
+		{name: "runtime", message: "runtime is immutable", mutate: func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Runtime = cachev1alpha1.CacheBackendRuntimeSGLang
+		}},
+		{name: "type", message: "type is immutable", mutate: func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Type = cachev1alpha1.CacheBackendTypeSGLangHiCache
+		}},
+		{name: "LMCache removal", message: "LMCache presence and topology are immutable", mutate: func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.LMCache = nil
+		}},
+		{name: "integration mode", message: "integration mode is immutable", mutate: func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.Integration.Mode = cachev1alpha1.CacheBackendIntegrationModeEventsOnly
+		}},
+		{name: "engine selector", message: "engineSelector is immutable", mutate: func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.EngineSelector.MatchLabels[cachev1alpha1.CacheBackendDomainLabel] = "another-domain"
+		}},
+		{name: "remote storage presence", message: "remoteStorage presence, provider, and ownership are immutable", mutate: func(cb *cachev1alpha1.CacheBackend) {
+			cb.Spec.RemoteStorage = &cachev1alpha1.CacheBackendRemoteStorageSpec{
+				Provider: cachev1alpha1.CacheBackendRemoteStorageProviderRedis, Ownership: cachev1alpha1.CacheBackendRemoteStorageOwnershipExternal,
+				Endpoint: "redis.example:6379", Redis: &cachev1alpha1.RedisRemoteStorageSpec{},
+			}
+		}},
+	}
+	for _, tc := range immutableUpdates {
+		t.Run("immutable "+tc.name, func(t *testing.T) {
+			updated := persistedNodeLocal.DeepCopy()
+			tc.mutate(updated)
+			err := k8s.Update(ctx, updated)
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("update error = %v, want %q", err, tc.message)
+			}
+		})
+	}
+
+	persistedNodeLocal.Spec.LMCache.NodeLocal.IdleRetentionSeconds++
+	if err := k8s.Update(ctx, &persistedNodeLocal); err != nil {
+		t.Fatalf("NodeLocal operational setting should remain mutable: %v", err)
 	}
 	persistedNodeLocal.Spec.LMCache.NodeLocal.Server.HTTPPort = persistedNodeLocal.Spec.LMCache.NodeLocal.Server.Port
 	if err := k8s.Update(ctx, &persistedNodeLocal); err == nil {

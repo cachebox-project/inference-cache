@@ -65,6 +65,9 @@ type CacheBackendReconciler struct {
 	// BackendRegistry resolves remote provider lifecycle independently from
 	// engine/runtime wiring. The composition root must inject it.
 	BackendRegistry *backendadapter.Registry
+	// NodeLocalShmCleanupImage is the platform-owned, digest-pinned helper image
+	// used by one-shot NodeLocal SHM cleanup Pods.
+	NodeLocalShmCleanupImage string
 	// MatchedEnginePodsRequeueInterval overrides the self-requeue cadence
 	// that keeps status.matchedEnginePods fresh between unrelated reconcile
 	// triggers. Zero means "use [DefaultMatchedEnginePodsRequeueInterval]".

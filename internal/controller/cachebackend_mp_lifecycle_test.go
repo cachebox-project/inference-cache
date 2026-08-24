@@ -216,6 +216,9 @@ func TestReconcileNodeLocalZeroIdleRetentionDeletesImmediately(t *testing.T) {
 	if len(cleanup.Spec.SchedulingGates) != 0 || cleanup.Spec.HostNetwork || cleanup.Spec.HostPID || cleanup.Spec.HostIPC {
 		t.Fatalf("released cleanup Pod = gates:%+v hostNetwork:%v hostPID:%v hostIPC:%v", cleanup.Spec.SchedulingGates, cleanup.Spec.HostNetwork, cleanup.Spec.HostPID, cleanup.Spec.HostIPC)
 	}
+	if cleanup.Spec.Containers[0].Image != reconciler.NodeLocalShmCleanupImage {
+		t.Fatalf("cleanup image = %q, want platform helper %q", cleanup.Spec.Containers[0].Image, reconciler.NodeLocalShmCleanupImage)
+	}
 	cleanup.Status.Phase = corev1.PodSucceeded
 	if err := reconciler.Status().Update(context.Background(), &cleanup); err != nil {
 		t.Fatalf("mark cleanup succeeded: %v", err)
@@ -348,77 +351,9 @@ func TestReconcileNodeLocalRetriesFailedCleanupPod(t *testing.T) {
 	}
 }
 
-func TestReconcileNodeLocalFinalizerSurvivesTopologyChange(t *testing.T) {
-	backend := nodeLocalBackend("node-cache", "ns1")
-	engine := nodeLocalEngine(backend, "engine-a", "node-a")
-	wantPath, err := builtinruntime.NodeLocalServerShmHostPath(backend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pathType := corev1.HostPathDirectoryOrCreate
-	engine.Spec.Volumes = []corev1.Volume{{Name: "shm", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: wantPath, Type: &pathType}}}}
-	engine.Spec.InitContainers = []corev1.Container{{
-		Name: "lmcache-node-local-gate", Image: backend.Spec.LMCache.NodeLocal.Server.Image,
-		Env: []corev1.EnvVar{{Name: "INFERENCECACHE_NODE_LOCAL_GATE", Value: "true"}},
-	}}
-	reconciler := newReconciler(newScheme(t), backend, engine)
-	reconcile(t, reconciler, backend.Name, backend.Namespace)
-
-	serverKey := types.NamespacedName{Name: builtinruntime.NodeLocalServerPodName(backend.Name, "node-a"), Namespace: backend.Namespace}
-	var server corev1.Pod
-	if err := reconciler.Get(context.Background(), serverKey, &server); err != nil {
-		t.Fatal(err)
-	}
-	if err := reconciler.Delete(context.Background(), &server); err != nil {
-		t.Fatal(err)
-	}
-
-	live := getBackend(t, reconciler, backend.Name, backend.Namespace)
-	live.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyPodLocal
-	live.Spec.LMCache.NodeLocal = nil
-	live.Spec.LMCache.PodLocal = lmcacheBackend("fixture", "ns1").Spec.LMCache.PodLocal.DeepCopy()
-	if err := reconciler.Update(context.Background(), live); err != nil {
-		t.Fatal(err)
-	}
-	reconcile(t, reconciler, backend.Name, backend.Namespace)
-
-	cleanupKey := types.NamespacedName{Name: builtinruntime.NodeLocalCleanupPodName(backend.UID, "node-a"), Namespace: backend.Namespace}
-	var cleanup corev1.Pod
-	if err := reconciler.Get(context.Background(), cleanupKey, &cleanup); err != nil {
-		t.Fatalf("cleanup intent after topology change: %v", err)
-	}
-	if cleanup.Spec.Containers[0].Image != backend.Spec.LMCache.NodeLocal.Server.Image || len(cleanup.Spec.SchedulingGates) != 1 {
-		t.Fatalf("topology-change cleanup = image:%q gates:%+v", cleanup.Spec.Containers[0].Image, cleanup.Spec.SchedulingGates)
-	}
-
-	live = getBackend(t, reconciler, backend.Name, backend.Namespace)
-	if err := reconciler.Delete(context.Background(), live); err != nil {
-		t.Fatal(err)
-	}
-	reconcile(t, reconciler, backend.Name, backend.Namespace)
-	if err := reconciler.Delete(context.Background(), engine); err != nil {
-		t.Fatal(err)
-	}
-	reconcile(t, reconciler, backend.Name, backend.Namespace)
-	if err := reconciler.Get(context.Background(), cleanupKey, &cleanup); err != nil {
-		t.Fatal(err)
-	}
-	if len(cleanup.Spec.SchedulingGates) != 0 {
-		t.Fatalf("topology-change cleanup gate remained after consumer deletion: %+v", cleanup.Spec.SchedulingGates)
-	}
-	cleanup.Status.Phase = corev1.PodSucceeded
-	if err := reconciler.Status().Update(context.Background(), &cleanup); err != nil {
-		t.Fatal(err)
-	}
-	reconcile(t, reconciler, backend.Name, backend.Namespace)
-	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(backend), &cachev1alpha1.CacheBackend{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("topology-changed backend after cleanup finalization = %v, want NotFound", err)
-	}
-}
-
 func TestReconcileNodeLocalReturnsInvalidCleanupDeleteError(t *testing.T) {
 	backend := nodeLocalBackend("node-cache", "ns1")
-	cleanup, err := builtinruntime.RenderLMCacheNodeLocalCleanupPod(backend, "node-a", backend.Spec.LMCache.NodeLocal.Server.Image, nodeLocalEngine(backend, "engine-a", "node-a"))
+	cleanup, err := builtinruntime.RenderLMCacheNodeLocalCleanupPod(backend, "node-a", "registry.example/inference-cache-shm-cleanup@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", nodeLocalEngine(backend, "engine-a", "node-a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,28 +427,6 @@ func TestReconcileNodeLocalManagedRedisKeepsLifecyclesIndependent(t *testing.T) 
 		if err := reconciler.Get(context.Background(), objectKey, object); err != nil {
 			t.Fatalf("get %s: %v", kind, err)
 		}
-	}
-}
-
-func TestReconcileNodeLocalToPodLocalDeletesServerPods(t *testing.T) {
-	backend := nodeLocalBackend("node-cache", "ns1")
-	engine := nodeLocalEngine(backend, "engine-a", "node-a")
-	reconciler := newReconciler(newScheme(t), backend, engine)
-	reconcile(t, reconciler, backend.Name, backend.Namespace)
-
-	live := getBackend(t, reconciler, backend.Name, backend.Namespace)
-	podLocal := lmcacheBackend("fixture", "ns1").Spec.LMCache.PodLocal.DeepCopy()
-	live.Spec.LMCache.Topology = cachev1alpha1.LMCacheTopologyPodLocal
-	live.Spec.LMCache.NodeLocal = nil
-	live.Spec.LMCache.PodLocal = podLocal
-	if err := reconciler.Update(context.Background(), live); err != nil {
-		t.Fatalf("update backend to PodLocal: %v", err)
-	}
-	reconcile(t, reconciler, backend.Name, backend.Namespace)
-
-	key := types.NamespacedName{Name: builtinruntime.NodeLocalServerPodName(backend.Name, "node-a"), Namespace: backend.Namespace}
-	if err := reconciler.Get(context.Background(), key, &corev1.Pod{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("server Pod after PodLocal transition = %v, want NotFound", err)
 	}
 }
 

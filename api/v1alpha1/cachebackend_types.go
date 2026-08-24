@@ -264,6 +264,8 @@ type LMCacheNodeLocalSchedulingSpec struct {
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
+	// ImagePullSecrets are used by controller-managed Server and cleanup Pods.
+	// The cleanup Pod does not inherit registry credentials from an Engine Pod.
 	// +optional
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 
@@ -316,6 +318,8 @@ type LMCacheNodeLocalSpec struct {
 // storage provider.
 type LMCacheEngineSpec struct {
 	// Topology selects the canonical LMCache MP server placement.
+	// Changing topology requires a new CacheBackend and an explicit engine
+	// rollout; the controller never rewrites existing engine Pods.
 	Topology LMCacheTopology `json:"topology"`
 
 	// PodLocal configures one MP server in each selected engine Pod.
@@ -474,6 +478,12 @@ type CacheBackendObservationSpec struct {
 }
 
 // CacheBackendSpec defines the desired state of a cache backend.
+// +kubebuilder:validation:XValidation:rule="self.runtime == oldSelf.runtime",message="runtime is immutable; create a new CacheBackend and roll the engine workload"
+// +kubebuilder:validation:XValidation:rule="self.type == oldSelf.type",message="type is immutable; create a new CacheBackend and roll the engine workload"
+// +kubebuilder:validation:XValidation:rule="has(self.lmCache) == has(oldSelf.lmCache) && (!has(self.lmCache) || self.lmCache.topology == oldSelf.lmCache.topology)",message="LMCache presence and topology are immutable; create a new CacheBackend and roll the engine workload"
+// +kubebuilder:validation:XValidation:rule="(!has(self.integration) || !has(self.integration.mode) ? 'Offload' : self.integration.mode) == (!has(oldSelf.integration) || !has(oldSelf.integration.mode) ? 'Offload' : oldSelf.integration.mode)",message="integration mode is immutable; create a new CacheBackend and roll the engine workload"
+// +kubebuilder:validation:XValidation:rule="has(self.engineSelector) == has(oldSelf.engineSelector) && (!has(self.engineSelector) || self.engineSelector == oldSelf.engineSelector)",message="engineSelector is immutable; create a new CacheBackend and roll the engine workload"
+// +kubebuilder:validation:XValidation:rule="has(self.remoteStorage) == has(oldSelf.remoteStorage) && (!has(self.remoteStorage) || (self.remoteStorage.provider == oldSelf.remoteStorage.provider && self.remoteStorage.ownership == oldSelf.remoteStorage.ownership))",message="remoteStorage presence, provider, and ownership are immutable; create a new CacheBackend and roll the engine workload"
 type CacheBackendSpec struct {
 	// Runtime identifies the inference runtime. Values are case-sensitive: use
 	// VLLM or SGLang.

@@ -198,22 +198,6 @@ func RenderLMCacheNodeLocalServerPod(cache *cachev1alpha1.CacheBackend, binding 
 	}, nil
 }
 
-const nodeLocalShmCleanupScript = `import os, stat
-root = os.environ["SHM_POOL_PATH"]
-def remove_entry(path):
-    mode = os.lstat(path).st_mode
-    if stat.S_ISDIR(mode):
-        with os.scandir(path) as entries:
-            for entry in entries:
-                remove_entry(entry.path)
-        os.rmdir(path)
-    else:
-        os.unlink(path)
-with os.scandir(root) as entries:
-    for entry in entries:
-        remove_entry(entry.path)
-`
-
 func nodeLocalShmHelperSecurityContext() *corev1.SecurityContext {
 	no := false
 	zero := int64(0)
@@ -271,34 +255,12 @@ func IsNodeLocalCleanupPodName(uid types.UID, nodeName, name string) bool {
 	return true
 }
 
-// NodeLocalCleanupImageFromSource recovers the LMCache image embedded in an
-// immutable, controller-injected NodeLocal Engine Pod. This lets an old UID
-// pool finish cleanup after the CacheBackend has changed topology and no
-// longer carries NodeLocal configuration.
-func NodeLocalCleanupImageFromSource(source *corev1.Pod) string {
-	if source == nil {
-		return ""
-	}
-	for i := range source.Spec.InitContainers {
-		container := &source.Spec.InitContainers[i]
-		if container.Name != lmCacheNodeLocalGateContainerName {
-			continue
-		}
-		for j := range container.Env {
-			if container.Env[j].Name == lmCacheNodeLocalGateManagedEnv && container.Env[j].Value == lmCacheNodeLocalGateManagedValue {
-				return strings.TrimSpace(container.Image)
-			}
-		}
-	}
-	return ""
-}
-
 // RenderLMCacheNodeLocalCleanupPod renders a gated, one-shot cleanup intent.
 // It mounts only the exact UID directory; the controller removes the scheduling
 // gate after all prior consumers have disappeared.
 func RenderLMCacheNodeLocalCleanupPod(cache *cachev1alpha1.CacheBackend, nodeName, image string, source *corev1.Pod) (*corev1.Pod, error) {
-	if cache == nil || cache.UID == "" || strings.TrimSpace(nodeName) == "" || strings.TrimSpace(image) == "" || source == nil {
-		return nil, fmt.Errorf("render LMCache NodeLocal SHM cleanup Pod: backend UID, target node, image, and scheduling source are required")
+	if cache == nil || cache.UID == "" || strings.TrimSpace(image) == "" || strings.TrimSpace(nodeName) == "" || source == nil {
+		return nil, fmt.Errorf("render LMCache NodeLocal SHM cleanup Pod: backend UID, target node, cleanup image, and scheduling source are required")
 	}
 	shmHostPath, err := NodeLocalServerShmHostPath(cache)
 	if err != nil {
@@ -309,17 +271,16 @@ func RenderLMCacheNodeLocalCleanupPod(cache *cachev1alpha1.CacheBackend, nodeNam
 	noToken := false
 	enableServiceLinks := false
 	grace := int64(5)
-	imagePullSecrets := append([]corev1.LocalObjectReference(nil), source.Spec.ImagePullSecrets...)
+	var imagePullSecrets []corev1.LocalObjectReference
 	if cache.Spec.LMCache != nil && cache.Spec.LMCache.NodeLocal != nil && cache.Spec.LMCache.NodeLocal.Scheduling != nil {
-		imagePullSecrets = mergeLocalObjectReferences(imagePullSecrets, cache.Spec.LMCache.NodeLocal.Scheduling.ImagePullSecrets)
+		imagePullSecrets = append(imagePullSecrets, cache.Spec.LMCache.NodeLocal.Scheduling.ImagePullSecrets...)
 	}
 	cleanup := corev1.Container{
 		Name:            lmCacheNodeLocalShmCleanupName,
 		Image:           image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"python3", "-c"},
-		Args:            []string{nodeLocalShmCleanupScript},
-		Env:             []corev1.EnvVar{{Name: "SHM_POOL_PATH", Value: lmCacheNodeLocalShmCleanupPath}},
+		Command:         []string{"/node-local-shm-cleanup"},
+		Args:            []string{lmCacheNodeLocalShmCleanupPath},
 		Resources:       nodeLocalShmHelperResources(),
 		VolumeMounts:    []corev1.VolumeMount{{Name: lmCacheNodeLocalShmVolumeName, MountPath: lmCacheNodeLocalShmCleanupPath}},
 		SecurityContext: nodeLocalShmHelperSecurityContext(),

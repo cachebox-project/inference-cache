@@ -25,6 +25,9 @@ spec:
       containers:
       - args:
         - --leader-elect
+        # Platform-owned implementation detail. Release/install tooling must
+        # replace the placeholder with the matching cleanup image digest.
+        - --node-local-shm-cleanup-image=ghcr.io/cachebox-project/inference-cache-shm-cleanup@sha256:0000000000000000000000000000000000000000000000000000000000000000
         command:
         - /controller
         image: controller:latest
