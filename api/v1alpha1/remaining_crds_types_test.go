@@ -34,6 +34,15 @@ func TestRemainingCRDSchemas(t *testing.T) {
 	requireDurationLike(t, mustProperty(t, policySpec, "evictionTTL"))
 	requireMinimum(t, mustProperty(t, policySpec, "minimumPrefixTokens"), 0)
 	requireMinimum(t, mustProperty(t, policySpec, "lookupTimeoutMs"), 0)
+	rankerOverrides := mustProperty(t, policySpec, "rankerOverrides")
+	requireMinimum(t, mustProperty(t, rankerOverrides, "pressureWeight"), 0)
+	requireMaximum(t, mustProperty(t, rankerOverrides, "pressureWeight"), 4)
+	requireMinimum(t, mustProperty(t, rankerOverrides, "sloTightTTFTMs"), 0)
+	requireMinimum(t, mustProperty(t, rankerOverrides, "sloTightBias"), 0)
+	requireMaximum(t, mustProperty(t, rankerOverrides, "sloTightBias"), 8)
+	requireMinimum(t, mustProperty(t, rankerOverrides, "tenantHotMinHitRate"), 0)
+	requireMaximum(t, mustProperty(t, rankerOverrides, "tenantHotMinHitRate"), 1)
+	requireDurationLike(t, mustProperty(t, rankerOverrides, "tenantHotMaxAge"))
 	policyStrategy := mustProperty(t, policySpec, "strategy")
 	requireDefault(t, mustProperty(t, policyStrategy, "enableChainMatching"), true)
 	requireDefault(t, mustProperty(t, policyStrategy, "requireChain"), false)
@@ -92,12 +101,24 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	enableChainMatching := true
 	requireChain := false
 	enableTenantHot := true
+	pressureWeight := float32(1)
+	sloTightTTFTMs := int32(200)
+	sloTightBias := float32(1)
+	tenantHotMinHitRate := float32(0.1)
+	tenantHotMaxAge := metav1.Duration{Duration: 5 * time.Minute}
 	policy := &CachePolicy{
 		Spec: CachePolicySpec{
 			Eviction:            CachePolicyEvictionAlgorithmLRU,
 			EvictionTTL:         &ttl,
 			MinimumPrefixTokens: &minimumPrefixTokens,
 			LookupTimeoutMs:     &lookupTimeoutMs,
+			RankerOverrides: &CachePolicyRankerOverridesSpec{
+				PressureWeight:      &pressureWeight,
+				SLOTightTTFTMs:      &sloTightTTFTMs,
+				SLOTightBias:        &sloTightBias,
+				TenantHotMinHitRate: &tenantHotMinHitRate,
+				TenantHotMaxAge:     &tenantHotMaxAge,
+			},
 			Strategy: &CachePolicyStrategySpec{
 				EnableChainMatching: &enableChainMatching,
 				RequireChain:        &requireChain,
@@ -111,6 +132,11 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 	*policy.Spec.Strategy.EnableChainMatching = false
 	*policy.Spec.Strategy.RequireChain = true
 	*policy.Spec.Strategy.EnableTenantHot = false
+	*policy.Spec.RankerOverrides.PressureWeight = 2
+	*policy.Spec.RankerOverrides.SLOTightTTFTMs = 100
+	*policy.Spec.RankerOverrides.SLOTightBias = 3
+	*policy.Spec.RankerOverrides.TenantHotMinHitRate = 0.5
+	policy.Spec.RankerOverrides.TenantHotMaxAge.Duration = time.Minute
 	policy.Status.Conditions[0].Message = "changed"
 	if policyCopy.Spec.Eviction != CachePolicyEvictionAlgorithmLRU ||
 		policyCopy.Spec.EvictionTTL.Duration != time.Minute ||
@@ -118,6 +144,12 @@ func TestRemainingCRDDeepCopies(t *testing.T) {
 		policyCopy.Spec.Strategy.EnableChainMatching == nil || !*policyCopy.Spec.Strategy.EnableChainMatching ||
 		policyCopy.Spec.Strategy.RequireChain == nil || *policyCopy.Spec.Strategy.RequireChain ||
 		policyCopy.Spec.Strategy.EnableTenantHot == nil || !*policyCopy.Spec.Strategy.EnableTenantHot ||
+		policyCopy.Spec.RankerOverrides == nil ||
+		policyCopy.Spec.RankerOverrides.PressureWeight == nil || *policyCopy.Spec.RankerOverrides.PressureWeight != 1 ||
+		policyCopy.Spec.RankerOverrides.SLOTightTTFTMs == nil || *policyCopy.Spec.RankerOverrides.SLOTightTTFTMs != 200 ||
+		policyCopy.Spec.RankerOverrides.SLOTightBias == nil || *policyCopy.Spec.RankerOverrides.SLOTightBias != 1 ||
+		policyCopy.Spec.RankerOverrides.TenantHotMinHitRate == nil || *policyCopy.Spec.RankerOverrides.TenantHotMinHitRate != 0.1 ||
+		policyCopy.Spec.RankerOverrides.TenantHotMaxAge == nil || policyCopy.Spec.RankerOverrides.TenantHotMaxAge.Duration != 5*time.Minute ||
 		policyCopy.Status.Conditions[0].Message != "ok" {
 		t.Fatalf("CachePolicy was not deep-copied")
 	}

@@ -53,6 +53,16 @@ spec:
   # survivor).
   routingFloorScore: "0.1"
   lookupTimeoutMs: 20
+  rankerOverrides:
+    # Per-namespace overrides are optional and merge onto the server baseline.
+    # pressureWeight=2 is intentionally observable in the install smoke: a
+    # replica reporting pressure=0.5 is fully demoted (factor 0), proving the
+    # controller -> /policy -> PolicyStore -> index path adopted this object.
+    pressureWeight: 2
+    sloTightTTFTMs: 150
+    sloTightBias: 2
+    tenantHotMinHitRate: 0.25
+    tenantHotMaxAge: 2m
   strategy:
     # Enable longest-common-prefix block-hash chain matching when callers
     # send block_hashes + block_token_counts. Disable to force legacy exact

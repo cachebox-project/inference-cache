@@ -29,6 +29,9 @@ spec:
   evictionTTL: 30m
   minimumMatchedTokens: 64
   routingFloorScore: "0.1"
+  rankerOverrides:
+    pressureWeight: 1
+    tenantHotMaxAge: 5m
   strategy:
     enableChainMatching: true
     enableTenantHot: true
@@ -50,6 +53,20 @@ shared system-prompt prefix; without a floor, that shared framing would match ev
 and produce a useless hint. The `routingFloorScore` gate catches the mirror case — a prefix
 held by *every* replica has zero distinguishing power (see
 [LookupRoute & ranking]({{< relref "/docs/concepts/lookuproute/" >}}).
+
+## Ranker overrides
+
+`spec.rankerOverrides` optionally tunes ranking-v2 for one namespace. Every nested field
+is optional and inherits the server baseline when omitted; an explicit zero keeps its
+kill-switch meaning.
+
+| Field | Range | Baseline | Zero behavior |
+|---|---|---|---|
+| `pressureWeight` | `0..4` | `1.0` | disables pressure penalty |
+| `sloTightTTFTMs` | `>=0` | `200` | SLO bias never fires |
+| `sloTightBias` | `0..8` | `1.0` | disables freshness boost |
+| `tenantHotMinHitRate` | `0..1` | `0.1` | every non-negative hit rate qualifies |
+| `tenantHotMaxAge` | duration `>=0` | `5m` | disables `TENANT_HOT` |
 
 ## Eviction
 

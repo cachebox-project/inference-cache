@@ -7,7 +7,7 @@ package controlplaneapi
 import "time"
 
 // PolicyPropagationVersion identifies the current /policy snapshot schema.
-const PolicyPropagationVersion = 7
+const PolicyPropagationVersion = 8
 
 // PolicyMinimumAcceptedVersion is the oldest /policy schema understood by the
 // current server. Older additive schemas are normalized by the server.
@@ -26,15 +26,27 @@ const (
 // ResolvedPolicy is the flattened CachePolicy shape enforced by the server.
 // The controller is responsible for converting CRD values into this wire type.
 type ResolvedPolicy struct {
-	Namespace            string                  `json:"namespace"`
-	EvictionTTL          time.Duration           `json:"evictionTTL,omitempty"`
-	MinimumPrefixTokens  int32                   `json:"minimumPrefixTokens,omitempty"`
-	MinimumMatchedTokens int32                   `json:"minimumMatchedTokens,omitempty"`
-	RoutingFloorScore    *float32                `json:"routingFloorScore,omitempty"`
-	LookupTimeoutMs      int32                   `json:"lookupTimeoutMs,omitempty"`
-	AffinityRouting      *bool                   `json:"affinityRouting,omitempty"`
-	Eviction             string                  `json:"eviction,omitempty"`
-	Strategy             *ResolvedLookupStrategy `json:"strategy,omitempty"`
+	Namespace            string                   `json:"namespace"`
+	EvictionTTL          time.Duration            `json:"evictionTTL,omitempty"`
+	MinimumPrefixTokens  int32                    `json:"minimumPrefixTokens,omitempty"`
+	MinimumMatchedTokens int32                    `json:"minimumMatchedTokens,omitempty"`
+	RoutingFloorScore    *float32                 `json:"routingFloorScore,omitempty"`
+	LookupTimeoutMs      int32                    `json:"lookupTimeoutMs,omitempty"`
+	AffinityRouting      *bool                    `json:"affinityRouting,omitempty"`
+	Eviction             string                   `json:"eviction,omitempty"`
+	Strategy             *ResolvedLookupStrategy  `json:"strategy,omitempty"`
+	RankerOverrides      *ResolvedRankerOverrides `json:"rankerOverrides,omitempty"`
+}
+
+// ResolvedRankerOverrides carries the presence-aware ranking-v2 overrides
+// flattened from CachePolicy.spec.rankerOverrides. Nil fields inherit the
+// index's server-wide RankerConfig baseline; non-nil zeroes are intentional.
+type ResolvedRankerOverrides struct {
+	PressureWeight      *float32       `json:"pressureWeight,omitempty"`
+	SLOTightTTFTMs      *int32         `json:"sloTightTTFTMs,omitempty"`
+	SLOTightBias        *float32       `json:"sloTightBias,omitempty"`
+	TenantHotMinHitRate *float32       `json:"tenantHotMinHitRate,omitempty"`
+	TenantHotMaxAge     *time.Duration `json:"tenantHotMaxAge,omitempty"`
 }
 
 // ResolvedLookupStrategy carries the server-enforced LookupRoute strategy

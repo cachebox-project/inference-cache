@@ -7,6 +7,7 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
+	"math"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -79,6 +80,7 @@ type CachePolicyValidationRule func(cp *cachev1alpha1.CachePolicy) field.ErrorLi
 var DefaultCachePolicyValidationRules = []CachePolicyValidationRule{
 	rejectNonPositiveEvictionTTL,
 	rejectIncoherentStrategy,
+	rejectInvalidRankerOverrides,
 }
 
 // SetupCachePolicyWebhookWithManager registers the defaulting and validating
@@ -271,4 +273,34 @@ func rejectIncoherentStrategy(cp *cachev1alpha1.CachePolicy) field.ErrorList {
 			"requireChain requires enableChainMatching to be true",
 		),
 	}
+}
+
+// rejectInvalidRankerOverrides mirrors the structural schema bounds in the
+// validating webhook and covers metav1.Duration, which has no numeric
+// kubebuilder marker. Duplication here is intentional: direct webhook tests pin
+// the operator contract, while CRD markers reject malformed objects even when
+// the webhook is unavailable during bootstrap.
+func rejectInvalidRankerOverrides(cp *cachev1alpha1.CachePolicy) field.ErrorList {
+	ro := cp.Spec.RankerOverrides
+	if ro == nil {
+		return nil
+	}
+	path := field.NewPath("spec", "rankerOverrides")
+	var errs field.ErrorList
+	if ro.PressureWeight != nil && (math.IsNaN(float64(*ro.PressureWeight)) || math.IsInf(float64(*ro.PressureWeight), 0) || *ro.PressureWeight < 0 || *ro.PressureWeight > 4) {
+		errs = append(errs, field.Invalid(path.Child("pressureWeight"), *ro.PressureWeight, "must be between 0 and 4"))
+	}
+	if ro.SLOTightTTFTMs != nil && *ro.SLOTightTTFTMs < 0 {
+		errs = append(errs, field.Invalid(path.Child("sloTightTTFTMs"), *ro.SLOTightTTFTMs, "must be greater than or equal to zero"))
+	}
+	if ro.SLOTightBias != nil && (math.IsNaN(float64(*ro.SLOTightBias)) || math.IsInf(float64(*ro.SLOTightBias), 0) || *ro.SLOTightBias < 0 || *ro.SLOTightBias > 8) {
+		errs = append(errs, field.Invalid(path.Child("sloTightBias"), *ro.SLOTightBias, "must be between 0 and 8"))
+	}
+	if ro.TenantHotMinHitRate != nil && (math.IsNaN(float64(*ro.TenantHotMinHitRate)) || math.IsInf(float64(*ro.TenantHotMinHitRate), 0) || *ro.TenantHotMinHitRate < 0 || *ro.TenantHotMinHitRate > 1) {
+		errs = append(errs, field.Invalid(path.Child("tenantHotMinHitRate"), *ro.TenantHotMinHitRate, "must be between 0 and 1"))
+	}
+	if ro.TenantHotMaxAge != nil && ro.TenantHotMaxAge.Duration < 0 {
+		errs = append(errs, field.Invalid(path.Child("tenantHotMaxAge"), ro.TenantHotMaxAge.Duration.String(), "must be greater than or equal to zero"))
+	}
+	return errs
 }

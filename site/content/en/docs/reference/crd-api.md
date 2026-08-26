@@ -61,6 +61,11 @@ Full page: [CacheBackend]({{< relref "/docs/concepts/cachebackend/" >}}).
 | `minimumMatchedTokens` | int32 | `64` (`0` opts out) |
 | `routingFloorScore` | string (float) | `"0.1"` (`"0"` opts out) |
 | `lookupTimeoutMs` | int32 | unset (`0`/≤0 = unbounded) |
+| `rankerOverrides.pressureWeight` | float32, `0..4` | server baseline `1.0` |
+| `rankerOverrides.sloTightTTFTMs` | int32, `>=0` | server baseline `200` |
+| `rankerOverrides.sloTightBias` | float32, `0..8` | server baseline `1.0` |
+| `rankerOverrides.tenantHotMinHitRate` | float32, `0..1` | server baseline `0.1` |
+| `rankerOverrides.tenantHotMaxAge` | non-negative duration | server baseline `5m` |
 | `strategy.enableChainMatching` | bool | `true` |
 | `strategy.requireChain` | bool | `false` |
 | `strategy.enableTenantHot` | bool | `true` |

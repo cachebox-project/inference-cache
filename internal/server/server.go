@@ -141,6 +141,7 @@ func New(opts ...Option) *Service {
 		index.WithTTLResolver(policies),
 		index.WithTenantQuotaResolver(policies),
 		index.WithEvictionResolver(policies),
+		index.WithRankerResolver(policies),
 		// Reserve the probe tenant from the global cap so a concurrent real-
 		// workload Ingest can never pick a real-workload entry as a victim to
 		// make room for the probe's transient ingest. Probe-tenant entries are

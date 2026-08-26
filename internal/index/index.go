@@ -116,6 +116,7 @@ type Index struct {
 	now              func() time.Time
 	metrics          Metrics
 	ranker           RankerConfig
+	rankerResolver   RankerResolver
 	ttlResolver      TTLResolver
 	quotaResolver    TenantQuotaResolver
 	evictionResolver EvictionResolver
@@ -212,6 +213,13 @@ func WithMetrics(m Metrics) Option { return func(i *Index) { i.metrics = m } }
 // matchedTokens × freshness baseline when stats and SLO are absent. Pass
 // RankerConfig{} to disable every v2 strategy and run pure baseline.
 func WithRanker(cfg RankerConfig) Option { return func(i *Index) { i.ranker = cfg } }
+
+// WithRankerResolver wires presence-aware per-tenant overrides onto the
+// server-wide baseline configured by WithRanker. A nil resolver or missing
+// tenant entry preserves that baseline.
+func WithRankerResolver(r RankerResolver) Option {
+	return func(i *Index) { i.rankerResolver = r }
+}
 
 // WithTTLResolver wires a per-tenant TTL resolver. A nil resolver, or one that
 // returns <=0 for a tenant, falls back to the global TTL set via WithTTL (or

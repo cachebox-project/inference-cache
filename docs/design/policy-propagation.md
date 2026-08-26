@@ -162,11 +162,11 @@ index). If the server restarts and loses everything, the controller's
 periodic re-push (default 30s) brings it back into sync without operator
 intervention.
 
-## Wire schema (v7)
+## Wire schema (v8)
 
 ```json
 {
-  "version": 7,
+  "version": 8,
   "policies": [
     {
       "namespace": "team-a",
@@ -175,6 +175,13 @@ intervention.
       "minimumMatchedTokens": 128,
       "routingFloorScore": 5,
       "lookupTimeoutMs": 25,
+      "rankerOverrides": {
+        "pressureWeight": 0.5,
+        "sloTightTTFTMs": 200,
+        "sloTightBias": 1,
+        "tenantHotMinHitRate": 0.2,
+        "tenantHotMaxAge": 120000000000
+      },
       "eviction": "lfu",
       "strategy": {
         "enableChainMatching": true,
@@ -205,14 +212,15 @@ intervention.
   skew is observable; **whether the bump is rejected at decode is set
   separately** by `PolicyMinimumAcceptedVersion` (today `3`) — see the
   Rollout asymmetry note in §Versioning and forward-compat below. v4, v5,
-  v6, and v7 are additive and defaultable, so the v7 server still accepts
-  v3, v4, v5, and v6 bodies; a hypothetical breaking change would bump
+  v6, v7, and v8 are additive and defaultable, so the v8 server still accepts
+  v3 through v7 bodies; a hypothetical breaking change would bump
   `PolicyMinimumAcceptedVersion` in lockstep. The server rejects any
   value outside `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]`
-  (HTTP 400). Currently `7`. Version history: `2` added `tenants`; `3`
+  (HTTP 400). Currently `8`. Version history: `2` added `tenants`; `3`
   added `policies[].eviction`; `4` added
   `policies[].minimumMatchedTokens`; `5` added
-  `policies[].routingFloorScore`; `6` added `policies[].strategy`; `7` added `policies[].affinityRouting`.
+  `policies[].routingFloorScore`; `6` added `policies[].strategy`; `7` added
+  `policies[].affinityRouting`; `8` added `policies[].rankerOverrides`.
 - `policies[]` — full snapshot of all `CachePolicy` CRs in the cluster.
   Sorted by `namespace` for deterministic bodies (and for easier diffing
   in tests).
@@ -286,6 +294,19 @@ intervention.
   survivor's score. See [`lookuproute-ranking.md`](./lookuproute-ranking.md).
 - `policies[].lookupTimeoutMs` — int32 milliseconds. Optional. `<=0` ⇒
   "no deadline".
+- `policies[].rankerOverrides` — optional pointer object containing optional
+  `pressureWeight`, `sloTightTTFTMs`, `sloTightBias`,
+  `tenantHotMinHitRate`, and `tenantHotMaxAge` fields. Float and integer
+  fields use JSON numbers; `tenantHotMaxAge` is a Go `time.Duration`
+  encoded as nanoseconds. The controller preserves nested pointer presence:
+  omitted fields inherit the index's server-wide `WithRanker` baseline,
+  while explicit zero values retain their kill-switch behavior. The public
+  ranges are `0..4`, `>=0`, `0..8`, `0..1`, and duration `>=0`,
+  respectively. CRD markers plus the validating webhook reject violations;
+  the `PolicyStore` defensively drops an out-of-range nested value from a
+  hand-crafted wire body so that field inherits the baseline. A missing
+  object, including every v3-v7 body, needs no normalization because absence
+  already means "use the server baseline."
 - `policies[].eviction` — lower-cased cap-eviction algorithm (`"lru"` /
   `"lfu"`). Optional. `""` ⇒ "use server default" (`LRU`). The controller
   lower-cases the CRD's upper-case enum; the index normalizes any
@@ -303,19 +324,19 @@ intervention.
   the shape of `routingFloorScore` exactly: a nil/missing field on a
   v3/v4/v5/v6 body is normalized to `DefaultAffinityRoutingEnabled`
   (`true`) (see Rollout asymmetry below) so the in-memory store ends
-  up byte-for-byte identical to the post-rollout v7 shape, regardless
+  up byte-for-byte identical to the post-rollout v8 shape, regardless
   of which side of the rollout boundary the body came from. Note that
   the wire SHAPE distinguishes `nil` (omitempty drops the field
   entirely) from `&false` (the literal `"affinityRouting": false`),
   so the normalizer's input is unambiguous; the choice to normalize
   nil → `&true` is a SEMANTIC convention so v3/v4/v5/v6 bodies behave
-  like fresh v7 CRD-defaulted bodies. v7 bodies are NOT normalized;
-  the v7 wire field can take three shapes:
+  like fresh v8 CRD-defaulted bodies. v7 and v8 bodies are NOT normalized
+  for this field; the wire field can take three shapes:
   - **Normal CRD-defaulted shape (the common case).** The CRD has a
     `+kubebuilder:default=Enabled` marker, so an admitted CachePolicy
     always carries a non-nil `spec.affinityRouting`. The controller
     flattens that to `&true` for `Enabled` (or `&false` for `Disabled`)
-    and sends it on the wire. v7 bodies in production traffic look
+    and sends it on the wire. Current bodies in production traffic look
     like this.
   - **Explicit opt-out.** An operator setting
     `spec.affinityRouting: Disabled` reaches the wire as `&false`. The
@@ -426,6 +447,7 @@ namespace key `CachePolicy` uses — see the tenant-quota row below.
 | `minimumMatchedTokens` | Post-lookup floor on each replica's realized `matched_tokens`. The handler resolves the per-tenant floor via `PolicyStore.MinimumMatchedTokens`, which falls back to `DefaultMinimumMatchedTokens` (= 64) for tenants with no `CachePolicy`. Replicas whose `matched_tokens` falls below the floor are filtered from the scored result; if none survive, the response downgrades from `PREFIX_MATCH` to `StrategyNone`, which then surfaces as `reason_code: AFFINITY_HINT` with a stable single replica when `affinityRouting: Enabled` (the default) or as `reason_code: NO_HINT` with empty scores when `affinityRouting: Disabled`. The downgrade runs **before** the LFU `CreditHits` step so a non-delivered hint never bumps the per-entry access counter. See [`lookuproute-ranking.md`](./lookuproute-ranking.md). |
 | `routingFloorScore` | Post-score floor on the per-replica score from the distinguishing-power-aware ranker. The handler resolves the per-tenant floor via `PolicyStore.RoutingFloorScore`, which falls back to `DefaultRoutingFloorScore` (`0.1`) for tenants with no `CachePolicy`. When the top surviving replica's score falls below the floor, the response downgrades from `PREFIX_MATCH` to `StrategyNone`, which then surfaces as `AFFINITY_HINT` or `NO_HINT` per the `affinityRouting` toggle (same shape as the matched-tokens downgrade row above). Composes with `minimumMatchedTokens` — the matched-tokens floor runs first (per-replica filter), then this score floor checks the top survivor. Both downgrades run **before** the LFU `CreditHits` step so a non-delivered hint never bumps an LFU counter. See [`lookuproute-ranking.md`](./lookuproute-ranking.md). |
 | `lookupTimeoutMs` | `LookupRoute` derives a `context.WithTimeout`. A breach yields `reason_code: TIMEOUT` (still fail-open: empty scores). `TIMEOUT` keeps absolute precedence over `AFFINITY_HINT`. |
+| `rankerOverrides.*` | `internal/index` `RankerResolver`. The index copies its server-wide `WithRanker` baseline, overlays only present fields, and uses that immutable effective config for exact-prefix, chain, and `TENANT_HOT` scoring in one lookup. Missing policy/object/field inherits the baseline; explicit zero preserves the field's kill switch. |
 | `affinityRouting` | Per-namespace toggle for the consistent-hash fallback on the `StrategyNone` branch. Resolved via `PolicyStore.AffinityRoutingEnabled`, which falls back to `DefaultAffinityRoutingEnabled` (`true`) for tenants with no `CachePolicy`. When enabled (default), `tryAffinityResponse` reads the index-known replica set for the request's `(tenant, model, hash_scheme)` engine domain from `servingByScope` (scheme-aware, mirroring the `TENANT_HOT` Pass 2 check), sorts by `replica_id` for cross-restart determinism, and modulos the SHA-256 of the length-prefixed `block_hashes` (fall-back to `prefix_hash`) against the sorted set — same prompt content → same replica every time. When disabled, the response stays on `NO_HINT`. Diagnostic codes (`UNKNOWN_TENANT` / `UNKNOWN_MODEL` / `UNKNOWN_HASH_SCHEME`) and `TIMEOUT` keep precedence over `AFFINITY_HINT`; affinity never preempts a real `PREFIX_MATCH` or `TENANT_HOT` that cleared the request-side gates (one exception: a tiny request below the per-namespace `minimumPrefixTokens` gate has its positive-hint result — including `TENANT_HOT` — downgraded to StrategyNone, so the affinity fallback can still fire on it; the operator intent "tiny prompts don’t surface a positive hint" outranks the TENANT_HOT-vs-affinity precedence). See [`grpc-contract.md` § "Affinity routing"](./grpc-contract.md). |
 | `strategy.enableChainMatching` / `strategy.requireChain` / `strategy.enableTenantHot` | Handler-side strategy gates. Chain matching disabled strips request block-hash fields before the index call; chain required rejects non-chain requests with `reason_code: POLICY_REQUIRES_CHAIN` before touching the index; tenant-hot disabled downgrades tenant-hot results to `NO_HINT`. The index remains policy-agnostic. |
 | `CacheTenant.spec.quota.maxIndexEntries` | `internal/index` `TenantQuotaResolver`. Pushed as a `ResolvedTenant{tenantID, maxIndexEntries, isolationMode}` slice alongside the policies. At ingest, if the tenant's distinct-prefix count exceeds the budget, the index evicts that tenant's oldest prefixes (Fairness) down to budget. Fail-open when no `CacheTenant` matches the ingest's `tenant_id`. |
@@ -453,6 +475,11 @@ unbounded (no enforcement).
 - **Server restart.** The server starts with an empty store (server
   defaults everywhere). The next periodic tick re-pushes the full
   snapshot; in steady state this is ≤ 30s.
+- **Malformed ranker override bypasses admission.** The authenticated
+  `/policy` decoder rejects unknown fields and invalid JSON. For a known
+  field whose numeric value is outside the CRD range, `PolicyStore.Ranker`
+  omits that field and the index inherits its baseline value; valid sibling
+  overrides still apply.
 
 ## Versioning and forward-compat
 
@@ -462,13 +489,14 @@ the same `version`; load-bearing or semantically breaking changes bump
 `version` and gate decode on the new value. The controller pushes the
 constant in `internal/controlplaneapi.PolicyPropagationVersion` on every request.
 
-`version` is `7`: `2` added the `tenants` slice; `3` added
+`version` is `8`: `2` added the `tenants` slice; `3` added
 `policies[].eviction` (the per-namespace cap-eviction algorithm); `4` added
 `policies[].minimumMatchedTokens` (the result-side matched-tokens floor); `5`
 added `policies[].routingFloorScore` (the per-namespace post-score floor for
 the distinguishing-power-aware ranker); `6` added `policies[].strategy`
 (per-namespace LookupRoute strategy gates); `7` added
-`policies[].affinityRouting` (the per-namespace consistent-hash fallback toggle).
+`policies[].affinityRouting` (the per-namespace consistent-hash fallback toggle);
+`8` added `policies[].rankerOverrides` (presence-aware ranking-v2 overrides).
 The server decodes with
 `DisallowUnknownFields`, so an older server receiving a newer body still
 fails loud on the unknown field even before its version check fires.
@@ -478,9 +506,9 @@ deliberately asymmetric so a server-first rollout (newer server, older
 controller still pushing the prior schema) does NOT drop existing policy
 state mid-upgrade:
 
-- A v7 server accepts any body whose `version` is in
+- A v8 server accepts any body whose `version` is in
   `[PolicyMinimumAcceptedVersion, PolicyPropagationVersion]` — today
-  `[3, 7]`. Bodies outside the band are rejected with
+  `[3, 8]`. Bodies outside the band are rejected with
   `unsupported policy snapshot version`.
 - For accepted older bodies, each new field is *normalized* before reaching
   the store. v3 has none of `minimumMatchedTokens`, `routingFloorScore`,
@@ -495,7 +523,7 @@ state mid-upgrade:
   (omitempty drops the field) from `&0` / `&false` (literal `0` /
   `false`); the resolver treats `nil` as "use the resolver default",
   but the normalizer still rewrites `nil` to the default value here so
-  the in-memory store ends up byte-for-byte identical to a fresh v7
+  the in-memory store ends up byte-for-byte identical to a fresh v8
   body — a single shape per knob is easier to reason about than two
   shapes that the resolver papers over. The server fills in `DefaultMinimumMatchedTokens` (`64`)
   for v3 bodies, `DefaultRoutingFloorScore` (`0.1`) for v3/v4 bodies,
@@ -504,9 +532,11 @@ state mid-upgrade:
   the effective behavior matches the no-CachePolicy fallbacks
   `PolicyStore.MinimumMatchedTokens` / `PolicyStore.RoutingFloorScore`
   / `PolicyStore.AffinityRoutingEnabled` apply to tenants without a CR.
+  Ranker overrides need no synthesized value: a missing object or nested
+  field is already the explicit instruction to inherit the index baseline.
   Every other knob (TTL, prefix gate, timeout, eviction, tenant quota)
   reaches the store byte-for-byte.
-- v7 bodies are NOT normalized — an operator's explicit
+- v8 bodies are NOT normalized — an operator's explicit
   `routingFloorScore: 0` opt-out (or `minimumMatchedTokens: 0`,
   `strategy.enableTenantHot: false`, or `affinityRouting: false`) reaches the store as written. Each
   normalization fires only when the version says the corresponding new

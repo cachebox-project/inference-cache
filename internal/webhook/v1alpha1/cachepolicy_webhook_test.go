@@ -7,6 +7,7 @@ package v1alpha1
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +127,48 @@ func TestRejectIncoherentStrategy(t *testing.T) {
 			}
 			if tc.wantErr && errs[0].Field != "spec.strategy.requireChain" {
 				t.Errorf("field = %q, want spec.strategy.requireChain", errs[0].Field)
+			}
+		})
+	}
+}
+
+func TestRejectInvalidRankerOverrides(t *testing.T) {
+	f32p := func(v float32) *float32 { return &v }
+	i32p := func(v int32) *int32 { return &v }
+	tests := []struct {
+		name      string
+		overrides *cachev1alpha1.CachePolicyRankerOverridesSpec
+		wantField string
+	}{
+		{name: "nil overrides accepted"},
+		{name: "explicit zeroes accepted", overrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{
+			PressureWeight: f32p(0), SLOTightTTFTMs: i32p(0), SLOTightBias: f32p(0),
+			TenantHotMinHitRate: f32p(0), TenantHotMaxAge: durp(0),
+		}},
+		{name: "upper bounds accepted", overrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{
+			PressureWeight: f32p(4), SLOTightBias: f32p(8), TenantHotMinHitRate: f32p(1),
+		}},
+		{name: "negative pressure rejected", overrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{PressureWeight: f32p(-0.1)}, wantField: "spec.rankerOverrides.pressureWeight"},
+		{name: "large pressure rejected", overrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{PressureWeight: f32p(4.1)}, wantField: "spec.rankerOverrides.pressureWeight"},
+		{name: "nan pressure rejected", overrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{PressureWeight: f32p(float32(math.NaN()))}, wantField: "spec.rankerOverrides.pressureWeight"},
+		{name: "negative ttft rejected", overrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{SLOTightTTFTMs: i32p(-1)}, wantField: "spec.rankerOverrides.sloTightTTFTMs"},
+		{name: "large bias rejected", overrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{SLOTightBias: f32p(8.1)}, wantField: "spec.rankerOverrides.sloTightBias"},
+		{name: "invalid hit rate rejected", overrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{TenantHotMinHitRate: f32p(1.1)}, wantField: "spec.rankerOverrides.tenantHotMinHitRate"},
+		{name: "negative max age rejected", overrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{TenantHotMaxAge: durp(-time.Second)}, wantField: "spec.rankerOverrides.tenantHotMaxAge"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := policy("p1", "team-a")
+			cp.Spec.RankerOverrides = tc.overrides
+			errs := rejectInvalidRankerOverrides(cp)
+			if tc.wantField == "" {
+				if len(errs) != 0 {
+					t.Fatalf("expected no errors, got %v", errs)
+				}
+				return
+			}
+			if len(errs) != 1 || errs[0].Field != tc.wantField {
+				t.Fatalf("errors = %v, want one error for %s", errs, tc.wantField)
 			}
 		})
 	}

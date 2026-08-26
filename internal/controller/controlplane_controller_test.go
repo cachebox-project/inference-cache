@@ -86,6 +86,7 @@ func ttlPtr(d time.Duration) *metav1.Duration { x := metav1.Duration{Duration: d
 func i32Ptr(v int32) *int32                   { return &v }
 func i64Ptr(v int64) *int64                   { return &v }
 func strPtr(s string) *string                 { return &s }
+func float32Ptr(v float32) *float32           { return &v }
 
 // TestPushSnapshotFlattensPoliciesAndTenants proves the single reconciler emits
 // one combined snapshot from BOTH CR types: policies keyed by namespace, tenant
@@ -503,6 +504,13 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 				MinimumMatchedTokens: i32Ptr(128),
 				RoutingFloorScore:    strPtr("2.5"),
 				LookupTimeoutMs:      i32Ptr(10),
+				RankerOverrides: &cachev1alpha1.CachePolicyRankerOverridesSpec{
+					PressureWeight:      float32Ptr(0.5),
+					SLOTightTTFTMs:      i32Ptr(150),
+					SLOTightBias:        float32Ptr(2),
+					TenantHotMinHitRate: float32Ptr(0.25),
+					TenantHotMaxAge:     ttlPtr(2 * time.Minute),
+				},
 			},
 		}).
 		Build()
@@ -535,6 +543,14 @@ func TestPushSnapshotRoundTripsThroughServerPolicyStore(t *testing.T) {
 	}
 	if d := store.TTL("team-a"); d != 12*time.Minute {
 		t.Fatalf("store.TTL = %v", d)
+	}
+	ranker, ok := store.Ranker("team-a")
+	if !ok || ranker.PressureWeight == nil || *ranker.PressureWeight != 0.5 ||
+		ranker.SLOTightTTFTMs == nil || *ranker.SLOTightTTFTMs != 150 ||
+		ranker.SLOTightBias == nil || *ranker.SLOTightBias != 2 ||
+		ranker.TenantHotMinHitRate == nil || *ranker.TenantHotMinHitRate != 0.25 ||
+		ranker.TenantHotMaxAge == nil || *ranker.TenantHotMaxAge != 2*time.Minute {
+		t.Fatalf("store.Ranker = %+v, ok=%v", ranker, ok)
 	}
 	// MinimumMatchedTokens flows through the resolver the server
 	// reads — guards against a future refactor that drops the field on the
