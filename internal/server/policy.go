@@ -12,13 +12,14 @@ import (
 	"time"
 
 	"github.com/cachebox-project/inference-cache/internal/controlplaneapi"
+	"github.com/cachebox-project/inference-cache/internal/index"
 )
 
 // PolicyStore is the server-side cache of resolved policies (indexed by
 // namespace) and resolved tenant quotas (indexed by tenant ID). Reads take
 // the read lock; pushes from /policy (POST or PUT) take the write lock and
 // replace the maps atomically. Satisfies index.TTLResolver,
-// index.TenantQuotaResolver, and index.EvictionResolver.
+// index.TenantQuotaResolver, index.EvictionResolver, and index.RankerResolver.
 //
 // The two indices use different keys on purpose: a CachePolicy is keyed by its
 // namespace (phase-1 tenant boundary for lookups), while a CacheTenant quota is
@@ -118,6 +119,36 @@ func (s *PolicyStore) TTL(tenant string) time.Duration {
 		return p.EvictionTTL
 	}
 	return 0
+}
+
+// Ranker satisfies index.RankerResolver. It preserves pointer presence so the
+// Index can overlay only configured fields onto its own WithRanker baseline;
+// explicit zero values remain valid kill switches. Values that bypass CRD
+// admission and fall outside the public ranges are omitted defensively, which
+// makes that field inherit the baseline instead of producing an absurd score.
+func (s *PolicyStore) Ranker(tenant string) (index.RankerOverrides, bool) {
+	p, ok := s.Lookup(tenant)
+	if !ok || p.RankerOverrides == nil {
+		return index.RankerOverrides{}, false
+	}
+	wire := p.RankerOverrides
+	var out index.RankerOverrides
+	if wire.PressureWeight != nil && *wire.PressureWeight >= 0 && *wire.PressureWeight <= index.MaxPressureWeight {
+		out.PressureWeight = wire.PressureWeight
+	}
+	if wire.SLOTightTTFTMs != nil && *wire.SLOTightTTFTMs >= 0 {
+		out.SLOTightTTFTMs = wire.SLOTightTTFTMs
+	}
+	if wire.SLOTightBias != nil && *wire.SLOTightBias >= 0 && *wire.SLOTightBias <= index.MaxSLOTightBias {
+		out.SLOTightBias = wire.SLOTightBias
+	}
+	if wire.TenantHotMinHitRate != nil && *wire.TenantHotMinHitRate >= 0 && *wire.TenantHotMinHitRate <= 1 {
+		out.TenantHotMinHitRate = wire.TenantHotMinHitRate
+	}
+	if wire.TenantHotMaxAge != nil && *wire.TenantHotMaxAge >= 0 {
+		out.TenantHotMaxAge = wire.TenantHotMaxAge
+	}
+	return out, true
 }
 
 // Eviction satisfies index.EvictionResolver: returns the per-namespace
@@ -367,9 +398,9 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 			return
 		}
 		// Normalize older bodies so server-first rollouts (newer server, older
-		// controller still pushing v3/v4/v5/v6) preserve every other knob a CR
+		// controller still pushing v3-v7) preserve every other knob a CR
 		// carries. Today: older bodies may omit minimumMatchedTokens,
-		// routingFloorScore, strategy, or affinityRouting.
+		// routingFloorScore, strategy, affinityRouting, or rankerOverrides.
 		// JSON decodes the missing fields to their zero values
 		// (int32(0) / nil *float32), which would be indistinguishable from
 		// the explicit opt-outs. Fill in the server defaults so the
@@ -410,9 +441,10 @@ func policyHandler(store *PolicyStore) http.HandlerFunc {
 //     DefaultAffinityRoutingEnabled so a server-first rollout does not
 //     silently disable the consistent-hash fallback for namespaces with a CR.
 //
-// Bodies already at PolicyPropagationVersion are returned untouched so an
-// operator's explicit opt-out (e.g. `routingFloorScore: 0` for raw-recall
-// benchmarking, or `enableTenantHot: false`, or `affinityRouting: false`) reaches the store as written.
+// RankerOverrides needs no normalization: an absent object or nested pointer
+// already means "inherit the index baseline," while non-nil zeroes preserve
+// explicit opt-outs. Bodies already at PolicyPropagationVersion are returned
+// untouched so every explicit opt-out reaches the store as written.
 func normalizePolicySnapshotForVersion(snap *controlplaneapi.PolicySnapshot) {
 	if snap.Version >= controlplaneapi.PolicyPropagationVersion {
 		return

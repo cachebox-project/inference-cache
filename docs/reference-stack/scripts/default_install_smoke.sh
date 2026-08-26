@@ -484,6 +484,38 @@ kubectl -n "$sample_namespace" get cachetenant cachetenant-sample >/dev/null
 kubectl -n "$sample_namespace" get prompttemplate prompttemplate-sample >/dev/null
 kubectl -n "$sample_namespace" get pdtopology pdtopology-sample >/dev/null
 
+ranker_overrides="$(kubectl -n "$sample_namespace" get cachepolicy cachepolicy-sample \
+  -o jsonpath='{.spec.rankerOverrides.pressureWeight},{.spec.rankerOverrides.sloTightTTFTMs},{.spec.rankerOverrides.sloTightBias},{.spec.rankerOverrides.tenantHotMinHitRate},{.spec.rankerOverrides.tenantHotMaxAge}')"
+[ "$ranker_overrides" = "2,150,2,0.25,2m" ] \
+  || fail "CachePolicy rankerOverrides did not round-trip: $ranker_overrides"
+
+# Seed one pressured holder of ranker-target and one serving peer holding a
+# different prefix. With the sample's pressureWeight=2, pressure=0.5 clamps the
+# holder's score to zero; routingFloorScore then downgrades PREFIX_MATCH to the
+# affinity fallback. The default pressureWeight=1 would leave a positive score,
+# so observing AFFINITY_HINT proves the full CRD -> controller -> /policy ->
+# PolicyStore -> index path adopted the override without any engine traffic.
+grpcurl -plaintext -max-time 5 \
+  -import-path proto -proto inferencecache/v1alpha1/inferencecache.proto \
+  -d @ "localhost:$GRPC_LOCAL_PORT" \
+  inferencecache.v1alpha1.InferenceCache/ReportCacheState >/dev/null <<EOF
+{"replicaId":"ranker-loaded","modelId":"ranker-smoke","tenantId":"$sample_namespace","hashScheme":"vllm","prefixes":[{"prefixHash":"cmFua2VyLXRhcmdldA==","tokenCount":100}],"stats":{"pressure":0.5}}
+{"replicaId":"ranker-cool","modelId":"ranker-smoke","tenantId":"$sample_namespace","hashScheme":"vllm","prefixes":[{"prefixHash":"cmFua2VyLW90aGVy","tokenCount":100}],"stats":{"pressure":0}}
+EOF
+
+deadline=$(($(date +%s) + CACHEINDEX_TIMEOUT))
+ranker_response=""
+until grep -Eq '"(reasonCode|reason_code)"[[:space:]]*:[[:space:]]*"AFFINITY_HINT"' <<<"$ranker_response"; do
+  ranker_response="$(grpcurl -plaintext -max-time 5 \
+    -import-path proto -proto inferencecache/v1alpha1/inferencecache.proto \
+    -d "{\"modelId\":\"ranker-smoke\",\"tenantId\":\"$sample_namespace\",\"hashScheme\":\"vllm\",\"prefixHash\":\"cmFua2VyLXRhcmdldA==\",\"prefixTokenCount\":100}" \
+    "localhost:$GRPC_LOCAL_PORT" inferencecache.v1alpha1.InferenceCache/LookupRoute)" \
+    || fail "ranker override LookupRoute request failed"
+  [ "$(date +%s)" -lt "$deadline" ] \
+    || fail "server did not adopt CachePolicy rankerOverrides: $ranker_response"
+  sleep 2
+done
+
 for sample in \
   config/samples/cachebackend-events-only.yaml \
   config/samples/cachebackend-sglang-hicache.yaml; do

@@ -259,7 +259,8 @@ generate: controller-gen ## Generate Kubernetes deepcopy code.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate CRD, RBAC, and webhook manifests.
-	$(CONTROLLER_GEN) rbac:roleName=inference-cache-manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases output:rbac:artifacts:config=config/rbac output:webhook:artifacts:config=config/webhook
+	# CachePolicy.rankerOverrides intentionally exposes bounded float32 fields.
+	$(CONTROLLER_GEN) rbac:roleName=inference-cache-manager-role crd:allowDangerousTypes=true webhook paths="./..." output:crd:artifacts:config=config/crd/bases output:rbac:artifacts:config=config/rbac output:webhook:artifacts:config=config/webhook
 
 .PHONY: proto-gen
 proto-gen: protoc-gen-go ## Generate protobuf Go code.

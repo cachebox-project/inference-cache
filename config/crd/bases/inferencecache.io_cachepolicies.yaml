@@ -136,6 +136,45 @@ spec:
                 format: int32
                 minimum: 0
                 type: integer
+              rankerOverrides:
+                description: |-
+                  RankerOverrides tunes ranking-v2 for this namespace. Each omitted field
+                  inherits the server's RankerConfig baseline; explicit zero values retain
+                  their documented kill-switch behavior.
+                properties:
+                  pressureWeight:
+                    description: PressureWeight controls the replica-pressure penalty.
+                      Zero disables it.
+                    maximum: 4
+                    minimum: 0
+                    type: number
+                  sloTightBias:
+                    description: |-
+                      SLOTightBias controls the freshness boost for tight-TTFT requests. Zero
+                      disables the boost.
+                    maximum: 8
+                    minimum: 0
+                    type: number
+                  sloTightTTFTMs:
+                    description: |-
+                      SLOTightTTFTMs is the TTFT threshold below which SLOTightBias applies.
+                      Zero disables the SLO bias threshold.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  tenantHotMaxAge:
+                    description: |-
+                      TenantHotMaxAge is the maximum age of replica stats eligible for
+                      TENANT_HOT. Zero disables the fallback; negative durations are rejected
+                      by the validating webhook.
+                    type: string
+                  tenantHotMinHitRate:
+                    description: TenantHotMinHitRate is the minimum reported hit rate
+                      for TENANT_HOT.
+                    maximum: 1
+                    minimum: 0
+                    type: number
+                type: object
               routingFloorScore:
                 default: "0.1"
                 description: |-
@@ -176,10 +215,11 @@ spec:
                   affinityRouting: Disabled. An operator can disable either floor by
                   setting it to its opt-out value (0 / "0").
 
-                  Encoded as a stringified float to avoid introducing the first
-                  float-typed field into the CachePolicy schema (the others are
-                  int32 / duration). Validated by the +kubebuilder:validation:Pattern
-                  marker: digits with an optional decimal part, no sign. The pattern
+                  Encoded as a stringified float for backward compatibility with the
+                  original v1alpha1 field and its string-based clients. Unlike the bounded
+                  numeric fields under rankerOverrides, this legacy threshold is validated
+                  by the +kubebuilder:validation:Pattern marker: digits with an optional
+                  decimal part, no sign. The pattern
                   caps the integer part at 8 digits (up to 99,999,999) and the
                   decimal part at 6 digits — well inside float32 representable
                   range (~3.4e38), so a value the apiserver admits CANNOT overflow

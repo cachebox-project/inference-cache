@@ -29,7 +29,42 @@ const (
 	// TENANT_HOT fallback: stats lastSeen within this window count as
 	// "recent" — anything older is treated as cold for the fallback.
 	DefaultTenantHotMaxAge = 5 * time.Minute
+
+	// Admission and the PolicyStore trust boundary enforce these upper bounds
+	// so operator input cannot create negative or unbounded score multipliers.
+	MaxPressureWeight = 4.0
+	MaxSLOTightBias   = 8.0
 )
+
+// rankerFor overlays the tenant's presence-aware overrides onto the Index's
+// server-wide baseline. Resolving once per lookup keeps a concurrent policy
+// replacement from mixing two configs inside one routing decision.
+func (i *Index) rankerFor(tenant string) RankerConfig {
+	base := i.ranker
+	if i.rankerResolver == nil {
+		return base
+	}
+	overrides, ok := i.rankerResolver.Ranker(tenant)
+	if !ok {
+		return base
+	}
+	if overrides.PressureWeight != nil {
+		base.PressureWeight = *overrides.PressureWeight
+	}
+	if overrides.SLOTightTTFTMs != nil {
+		base.SLOTightTTFTMs = *overrides.SLOTightTTFTMs
+	}
+	if overrides.SLOTightBias != nil {
+		base.SLOTightBias = *overrides.SLOTightBias
+	}
+	if overrides.TenantHotMinHitRate != nil {
+		base.TenantHotMinHitRate = *overrides.TenantHotMinHitRate
+	}
+	if overrides.TenantHotMaxAge != nil {
+		base.TenantHotMaxAge = *overrides.TenantHotMaxAge
+	}
+	return base
+}
 
 // applyChainDistinguishingPower folds the depth-aware distinguishing-power
 // factor into a chain-lookup's per-replica scores in place. Unlike the
@@ -112,14 +147,14 @@ func sortScoresDescByScoreThenID(scores []ReplicaScore) {
 // term inside (1 + freshness × coefficient). 0 → no bias (baseline). The
 // bias only fires when (a) the ranker has SLOTightTTFTMs and SLOTightBias
 // configured AND (b) the request carries a TTFT budget below the threshold.
-func (i *Index) sloTightBiasCoefficient(ttftMs int32) float32 {
-	if i.ranker.SLOTightTTFTMs <= 0 || i.ranker.SLOTightBias <= 0 {
+func sloTightBiasCoefficient(ttftMs int32, ranker RankerConfig) float32 {
+	if ranker.SLOTightTTFTMs <= 0 || ranker.SLOTightBias <= 0 {
 		return 0
 	}
-	if ttftMs <= 0 || ttftMs >= i.ranker.SLOTightTTFTMs {
+	if ttftMs <= 0 || ttftMs >= ranker.SLOTightTTFTMs {
 		return 0
 	}
-	return i.ranker.SLOTightBias
+	return ranker.SLOTightBias
 }
 
 // pressureFactorAt computes 1 - weight × pressure, clamped to [0, 1]. Kept

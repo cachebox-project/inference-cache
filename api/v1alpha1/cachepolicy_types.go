@@ -147,10 +147,11 @@ type CachePolicySpec struct {
 	// affinityRouting: Disabled. An operator can disable either floor by
 	// setting it to its opt-out value (0 / "0").
 	//
-	// Encoded as a stringified float to avoid introducing the first
-	// float-typed field into the CachePolicy schema (the others are
-	// int32 / duration). Validated by the +kubebuilder:validation:Pattern
-	// marker: digits with an optional decimal part, no sign. The pattern
+	// Encoded as a stringified float for backward compatibility with the
+	// original v1alpha1 field and its string-based clients. Unlike the bounded
+	// numeric fields under rankerOverrides, this legacy threshold is validated
+	// by the +kubebuilder:validation:Pattern marker: digits with an optional
+	// decimal part, no sign. The pattern
 	// caps the integer part at 8 digits (up to 99,999,999) and the
 	// decimal part at 6 digits — well inside float32 representable
 	// range (~3.4e38), so a value the apiserver admits CANNOT overflow
@@ -173,6 +174,12 @@ type CachePolicySpec struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	LookupTimeoutMs *int32 `json:"lookupTimeoutMs,omitempty"`
+
+	// RankerOverrides tunes ranking-v2 for this namespace. Each omitted field
+	// inherits the server's RankerConfig baseline; explicit zero values retain
+	// their documented kill-switch behavior.
+	// +optional
+	RankerOverrides *CachePolicyRankerOverridesSpec `json:"rankerOverrides,omitempty"`
 
 	// Strategy controls which LookupRoute matching strategies may produce a
 	// hint for this namespace. Defaults preserve the historical behavior:
@@ -206,6 +213,41 @@ type CachePolicySpec struct {
 	// +kubebuilder:validation:Enum=Enabled;Disabled
 	// +kubebuilder:default=Enabled
 	AffinityRouting *CachePolicyAffinityRouting `json:"affinityRouting,omitempty"`
+}
+
+// CachePolicyRankerOverridesSpec carries presence-aware per-namespace
+// overrides for the ranking-v2 pressure, SLO, and TENANT_HOT knobs.
+type CachePolicyRankerOverridesSpec struct {
+	// PressureWeight controls the replica-pressure penalty. Zero disables it.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=4
+	PressureWeight *float32 `json:"pressureWeight,omitempty"`
+
+	// SLOTightTTFTMs is the TTFT threshold below which SLOTightBias applies.
+	// Zero disables the SLO bias threshold.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	SLOTightTTFTMs *int32 `json:"sloTightTTFTMs,omitempty"`
+
+	// SLOTightBias controls the freshness boost for tight-TTFT requests. Zero
+	// disables the boost.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=8
+	SLOTightBias *float32 `json:"sloTightBias,omitempty"`
+
+	// TenantHotMinHitRate is the minimum reported hit rate for TENANT_HOT.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	TenantHotMinHitRate *float32 `json:"tenantHotMinHitRate,omitempty"`
+
+	// TenantHotMaxAge is the maximum age of replica stats eligible for
+	// TENANT_HOT. Zero disables the fallback; negative durations are rejected
+	// by the validating webhook.
+	// +optional
+	TenantHotMaxAge *metav1.Duration `json:"tenantHotMaxAge,omitempty"`
 }
 
 // CachePolicyStrategySpec controls per-namespace LookupRoute strategy gates.

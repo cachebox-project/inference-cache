@@ -828,6 +828,21 @@ Every factor and threshold is tunable through a `RankerConfig` (in-binary
 defaults) or a `CachePolicy` CR (per-namespace overrides). Defaults are
 set so that:
 
+| `CachePolicy.spec.rankerOverrides` field | `RankerConfig` field | Valid range | Inherited default |
+|---|---|---|---|
+| `pressureWeight` | `PressureWeight` | `0..4` | `1.0` |
+| `sloTightTTFTMs` | `SLOTightTTFTMs` | `>= 0` | `200` |
+| `sloTightBias` | `SLOTightBias` | `0..8` | `1.0` |
+| `tenantHotMinHitRate` | `TenantHotMinHitRate` | `0..1` | `0.1` |
+| `tenantHotMaxAge` | `TenantHotMaxAge` | duration `>= 0` | `5m` |
+
+The object and all five fields are optional. The index resolves one effective
+configuration per lookup by copying its server-wide `WithRanker` baseline and
+overlaying only non-nil fields. This keeps an omitted field on the calibrated
+baseline while preserving explicit zero as a real kill switch. A missing
+policy, a missing `rankerOverrides` object, or a deleted policy all use the
+server baseline.
+
 - A deployment with **no stats reported** sees pressure factor 1 and no
   `TENANT_HOT` candidates qualify — those two strategies collapse to the
   pre-PR baseline. The §2.6 matched-tokens floor and the §2.7

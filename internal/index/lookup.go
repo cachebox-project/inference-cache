@@ -36,7 +36,7 @@ import (
 // drops the entry — "a wrong hint is worse than a stale one"). When neither
 // chain field is set, the legacy exact-match path on PrefixHash is used.
 func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
-	scores, _ := i.lookupWithHits(req)
+	scores, _ := i.lookupWithHits(req, i.rankerFor(req.Tenant))
 	return scores
 }
 
@@ -50,7 +50,7 @@ func (i *Index) Lookup(req LookupRequest) []ReplicaScore {
 // lets a post-lookup filter (the service-layer matched-tokens floor) drop
 // sub-floor replicas' entries from the credit list in lockstep with
 // dropping their Scores.
-func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
+func (i *Index) lookupWithHits(req LookupRequest, ranker RankerConfig) ([]ReplicaScore, map[string][]*replicaEntry) {
 	// Without a known hash_scheme, opaque hash bytes cannot be matched
 	// safely (they would span engines), so fail open with no hint.
 	if req.HashScheme == "" {
@@ -60,9 +60,9 @@ func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]
 		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
 			return nil, nil
 		}
-		return i.lookupChain(req)
+		return i.lookupChain(req, ranker)
 	}
-	return i.lookupExact(req)
+	return i.lookupExact(req, ranker)
 }
 
 // lookupExact is the legacy single-blob exact-match path. The wire shape
@@ -79,10 +79,10 @@ func (i *Index) lookupWithHits(req LookupRequest) ([]ReplicaScore, map[string][]
 // NO_HINT under affinityRouting: Disabled. Old gateway clients that only
 // inspect reason_code
 // continue to fail open on a downgrade.
-func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
+func (i *Index) lookupExact(req LookupRequest, ranker RankerConfig) ([]ReplicaScore, map[string][]*replicaEntry) {
 	key := prefixKey{req.Tenant, req.Model, req.HashScheme, req.Adapter, string(req.PrefixHash)}
 	now := i.now()
-	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
+	sloBiasFactor := sloTightBiasCoefficient(req.TTFTBudgetMs, ranker)
 
 	ttl := i.ttlFor(req.Tenant)
 	// Resolve the algorithm once, outside the lock (the resolver owns its own
@@ -183,7 +183,7 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 			freshnessAt(now, s.statsReported, ttl) > 0 {
 			pressure = s.stats.Pressure
 		}
-		pressureFactor := pressureFactorAt(pressure, i.ranker.PressureWeight)
+		pressureFactor := pressureFactorAt(pressure, ranker.PressureWeight)
 		sloBias := 1 + fresh*sloBiasFactor
 		scores = append(scores, ReplicaScore{
 			ReplicaID:             id,
@@ -225,7 +225,7 @@ func (i *Index) lookupExact(req LookupRequest) ([]ReplicaScore, map[string][]*re
 // The pressure and SLO factors from lookupExact compose unchanged: the chain
 // walk only changes how matched_tokens is derived; the score formula
 // (matched_tokens × freshness × pressureFactor × sloBias) is the same.
-func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*replicaEntry) {
+func (i *Index) lookupChain(req LookupRequest, ranker RankerConfig) ([]ReplicaScore, map[string][]*replicaEntry) {
 	type running struct {
 		matchedTokens  int32
 		oldestLastSeen time.Time
@@ -244,7 +244,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 	}
 	now := i.now()
 	ttl := i.ttlFor(req.Tenant)
-	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
+	sloBiasFactor := sloTightBiasCoefficient(req.TTFTBudgetMs, ranker)
 	// Resolve the algorithm once, outside the lock (see lookupExact): LFU
 	// tracks the per-block entry pointers so each contributing block's counter
 	// can be bumped; LRU skips both the tracking and the bump.
@@ -329,7 +329,7 @@ func (i *Index) lookupChain(req LookupRequest) ([]ReplicaScore, map[string][]*re
 			freshnessAt(now, s.statsReported, ttl) > 0 {
 			pressure = s.stats.Pressure
 		}
-		pressureFactor := pressureFactorAt(pressure, i.ranker.PressureWeight)
+		pressureFactor := pressureFactorAt(pressure, ranker.PressureWeight)
 		sloBias := 1 + fresh*sloBiasFactor
 		scores = append(scores, ReplicaScore{
 			ReplicaID:             id,
@@ -396,6 +396,7 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 	if req.Tenant == "" || req.Model == "" || req.HashScheme == "" {
 		return LookupResult{Strategy: StrategyNone}
 	}
+	ranker := i.rankerFor(req.Tenant)
 	// Chain-bearing requests short-circuit on ANY chain failure (malformed
 	// parallel arrays OR a well-formed chain with zero overlap) — never
 	// fall through to TENANT_HOT. The chain caller is asking specifically
@@ -410,17 +411,17 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 		if len(req.BlockHashes) != len(req.BlockTokenCounts) {
 			return LookupResult{Strategy: StrategyNone}
 		}
-		if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
+		if scores, hits := i.lookupWithHits(req, ranker); len(scores) > 0 {
 			return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hitsByReplica: hits}
 		}
 		// Chain misses never fall through to TENANT_HOT (by design — see
 		// contract doc), so run the miss classifier directly.
 		return LookupResult{Strategy: i.classifyMiss(req)}
 	}
-	if scores, hits := i.lookupWithHits(req); len(scores) > 0 {
+	if scores, hits := i.lookupWithHits(req, ranker); len(scores) > 0 {
 		return LookupResult{Scores: scores, Strategy: StrategyPrefixMatch, hitsByReplica: hits}
 	}
-	if hot := i.tenantHotCandidates(req); len(hot) > 0 {
+	if hot := i.tenantHotCandidates(req, ranker); len(hot) > 0 {
 		// TENANT_HOT carries MatchedTokens=0, so no hits to credit — it is a
 		// softer locality nudge, not a prefix HIT.
 		return LookupResult{Scores: hot, Strategy: StrategyTenantHot}
@@ -456,8 +457,8 @@ func (i *Index) LookupRoute(req LookupRequest) LookupResult {
 // by definition here) and reuses the same pressure/SLO factors as the
 // prefix-match path so a tight-SLO caller still gets a freshness-biased
 // ranking.
-func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
-	if i.ranker.TenantHotMaxAge <= 0 {
+func (i *Index) tenantHotCandidates(req LookupRequest, ranker RankerConfig) []ReplicaScore {
+	if ranker.TenantHotMaxAge <= 0 {
 		return nil
 	}
 	// LookupRoute already short-circuits an empty hash_scheme to NO_HINT,
@@ -468,9 +469,9 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 		return nil
 	}
 	now := i.now()
-	maxAge := i.ranker.TenantHotMaxAge
-	minHitRate := i.ranker.TenantHotMinHitRate
-	sloBiasFactor := i.sloTightBiasCoefficient(req.TTFTBudgetMs)
+	maxAge := ranker.TenantHotMaxAge
+	minHitRate := ranker.TenantHotMinHitRate
+	sloBiasFactor := sloTightBiasCoefficient(req.TTFTBudgetMs, ranker)
 
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -548,7 +549,7 @@ func (i *Index) tenantHotCandidates(req LookupRequest) []ReplicaScore {
 		default:
 			recency = 1 - float32(age)/float32(maxAge)
 		}
-		pressureFactor := pressureFactorAt(w.pressure, i.ranker.PressureWeight)
+		pressureFactor := pressureFactorAt(w.pressure, ranker.PressureWeight)
 		sloBias := 1 + recency*sloBiasFactor
 		scores = append(scores, ReplicaScore{
 			ReplicaID: id,

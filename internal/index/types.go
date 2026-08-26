@@ -41,6 +41,24 @@ type TTLResolver interface {
 	TTL(tenant string) time.Duration
 }
 
+// RankerOverrides is a presence-aware set of per-tenant ranking-v2 knobs.
+// Nil fields inherit the Index baseline configured through WithRanker; a
+// non-nil zero preserves the knob's documented kill-switch behavior.
+type RankerOverrides struct {
+	PressureWeight      *float32
+	SLOTightTTFTMs      *int32
+	SLOTightBias        *float32
+	TenantHotMinHitRate *float32
+	TenantHotMaxAge     *time.Duration
+}
+
+// RankerResolver returns per-tenant ranker overrides. ok=false (including a
+// nil resolver) means the tenant uses the Index's WithRanker baseline. The
+// resolver implementation owns its own concurrency.
+type RankerResolver interface {
+	Ranker(tenant string) (overrides RankerOverrides, ok bool)
+}
+
 // Eviction algorithm identifiers. The wire form is lower-case ("lru"/"lfu") to
 // match the casing of ResolvedPolicy.Eviction and reason_code; the CRD enum is
 // upper-case per K8s convention and the controller lower-cases when flattening.

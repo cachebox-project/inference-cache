@@ -38,7 +38,7 @@ func TestTenantQuotaExemptsProbeTenant(t *testing.T) {
 	}
 }
 
-// TestPolicyPropagationVersionIsV7 pins the wire-format version. v2 accompanied
+// TestPolicyPropagationVersionIsV8 pins the wire-format version. v2 accompanied
 // the Tenants slice; v3 accompanied ResolvedPolicy.Eviction (per-namespace
 // cap-eviction algorithm); v4 accompanied ResolvedPolicy.MinimumMatchedTokens
 // (the result-side matched-tokens floor); v5 accompanied
@@ -46,12 +46,13 @@ func TestTenantQuotaExemptsProbeTenant(t *testing.T) {
 // the distinguishing-power-aware LookupRoute ranker); v6 accompanied
 // ResolvedPolicy.Strategy (per-namespace LookupRoute strategy gates); v7
 // accompanied ResolvedPolicy.AffinityRouting (the per-namespace toggle for
-// consistent-hash fallback routing on the NO_HINT path). A controller/server
+// consistent-hash fallback routing on the NO_HINT path); v8 accompanied
+// ResolvedPolicy.RankerOverrides. A controller/server
 // version mismatch outside the accepted band is rejected with a clear
 // "unsupported version" rather than a decode error.
-func TestPolicyPropagationVersionIsV7(t *testing.T) {
-	if controlplaneapi.PolicyPropagationVersion != 7 {
-		t.Fatalf("controlplaneapi.PolicyPropagationVersion = %d, want 7", controlplaneapi.PolicyPropagationVersion)
+func TestPolicyPropagationVersionIsV8(t *testing.T) {
+	if controlplaneapi.PolicyPropagationVersion != 8 {
+		t.Fatalf("controlplaneapi.PolicyPropagationVersion = %d, want 8", controlplaneapi.PolicyPropagationVersion)
 	}
 	// PolicyMinimumAcceptedVersion bounds the lenience window for older bodies.
 	// v3, v4, and v5 must be accepted so a server-first rollout does not drop
@@ -65,7 +66,7 @@ func TestPolicyPropagationVersionIsV7(t *testing.T) {
 }
 
 // TestPolicySnapshotV3AcceptedWithFloorDefault pins the server-first rollout
-// invariant: a v7 server MUST accept a v3 controller's snapshot AND normalize
+// invariant: a v8 server MUST accept a v3 controller's snapshot AND normalize
 // missing fields — minimumMatchedTokens to DefaultMinimumMatchedTokens,
 // routingFloorScore to DefaultRoutingFloorScore, strategy to its defaults, and
 // affinityRouting to DefaultAffinityRoutingEnabled — on each policy.
@@ -173,13 +174,13 @@ func TestPolicySnapshotV3AcceptedWithFloorDefault(t *testing.T) {
 //     disables the new floor for every namespace.
 //  3. The missing affinityRouting on the same v4 body MUST be
 //     normalized to DefaultAffinityRoutingEnabled. v4 predates the
-//     affinity-routing field too, so a v7 server receiving a v4
+//     affinity-routing field too, so a v8 server receiving a v4
 //     body must synthesize the default; otherwise a v4 controller
 //     pushing during a server-first rollout silently flips affinity
 //     off for every namespace.
 //
 // Written against a literal v4 body (not PolicyPropagationVersion, which is
-// now v7) so the v4-specific behavior under v3→v4→v5→v6→v7 server stays pinned
+// now v8) so the v4-specific behavior under later servers stays pinned
 // even after the constant advances.
 func TestPolicySnapshotV4ExplicitZeroPreservedAndRoutingFloorNormalized(t *testing.T) {
 	store := NewPolicyStore()
@@ -241,7 +242,7 @@ func TestPolicySnapshotV4ExplicitZeroPreservedAndRoutingFloorNormalized(t *testi
 // normalization tests above: a v5 controller that EXPLICITLY pushes
 // routingFloorScore=0 (the documented opt-out, useful for raw-recall
 // benchmarks) must NOT have its zero rewritten to the default when
-// processed by a v7 server. The normalization only fires for the
+// processed by a v8 server. The normalization only fires for the
 // fields the body's version says could not have been present
 // (routingFloorScore was added at v5, so a v5 body's &0 reaches the
 // store byte-for-byte). The test uses a literal Version: 5 — NOT
@@ -255,7 +256,7 @@ func TestPolicySnapshotV5ExplicitRoutingFloorZeroPreserved(t *testing.T) {
 
 	zero := float32(0)
 	body, err := json.Marshal(controlplaneapi.PolicySnapshot{
-		Version: 5, // literal v5 — must reach the store byte-for-byte even on a v7 server.
+		Version: 5, // literal v5 — must reach the store byte-for-byte even on a v8 server.
 		Policies: []controlplaneapi.ResolvedPolicy{
 			{Namespace: "raw-recall", RoutingFloorScore: &zero},
 		},

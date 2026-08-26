@@ -343,6 +343,19 @@ func resolveOnePolicy(cp *cachev1alpha1.CachePolicy) controlplaneapi.ResolvedPol
 	if cp.Spec.LookupTimeoutMs != nil {
 		rp.LookupTimeoutMs = *cp.Spec.LookupTimeoutMs
 	}
+	if cp.Spec.RankerOverrides != nil {
+		ro := cp.Spec.RankerOverrides
+		rp.RankerOverrides = &controlplaneapi.ResolvedRankerOverrides{
+			PressureWeight:      ro.PressureWeight,
+			SLOTightTTFTMs:      ro.SLOTightTTFTMs,
+			SLOTightBias:        ro.SLOTightBias,
+			TenantHotMinHitRate: ro.TenantHotMinHitRate,
+		}
+		if ro.TenantHotMaxAge != nil {
+			v := ro.TenantHotMaxAge.Duration
+			rp.RankerOverrides.TenantHotMaxAge = &v
+		}
+	}
 	if cp.Spec.Strategy != nil {
 		rp.Strategy = &controlplaneapi.ResolvedLookupStrategy{
 			EnableChainMatching: cp.Spec.Strategy.EnableChainMatching,

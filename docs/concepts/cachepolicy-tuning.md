@@ -25,7 +25,7 @@ snapshot. The CR is purely declarative: the controller pushes its resolved field
 server, which is where enforcement actually happens (see
 [Propagation](#propagation-controller--server) below).
 
-## The seven spec knobs
+## The nine spec knobs
 
 | Field | Type | Default | When to tune |
 |---|---|---|---|
@@ -36,6 +36,7 @@ server, which is where enforcement actually happens (see
 | `routingFloorScore` | stringified float, e.g. `"0.1"`, `"5"`, `"0"` | `"0.1"` | Per-replica *score* floor below which a `PREFIX_MATCH` response is downgraded off the prefix-match path. Applied AFTER the lookup runs, against the per-replica score from the distinguishing-power-aware ranker (`matched_tokens × freshness × pressure_factor × slo_bias × distinguishing_power`). Overlaps held by every replica (chat-template framing, RAG corpus headers, custom system prompts shared across the deployment) produce `distinguishing_power = 0` and score = 0 — this floor catches them. The downgrade lands on `StrategyNone`, which surfaces as `AFFINITY_HINT` (default-enabled affinity) or `NO_HINT` (affinity disabled). Composes with `minimumMatchedTokens` — the matched-tokens floor runs first (per-replica), then this score floor gates the top survivor. Set to `"0"` to disable entirely (raw-recall benchmarking / debug). |
 | `affinityRouting` | enum `Enabled` \| `Disabled` | `Enabled` | Toggles the consistent-hash fallback on the `StrategyNone` branch. With `Enabled` (the default), any `StrategyNone` result with a usable seed + at least one replica in `servingByScope[(tenant, model, hash_scheme)]` surfaces as `AFFINITY_HINT` with a stable single-replica pick (`SHA-256(canonical_seed) mod len(sorted servingByScope)`) — repeat prompts pin to the same replica and warm T1 on diffuse single-turn workloads. With `Disabled`, the same response stays on `NO_HINT` and the gateway round-robins; useful for raw-recall benchmarking and ranker debugging. Diagnostic codes (`UNKNOWN_*`) and `TIMEOUT` keep precedence over `AFFINITY_HINT`. |
 | `lookupTimeoutMs` | int32 (min `0`) | unset = no deadline | Per-lookup latency budget in milliseconds. A breach returns reason code `TIMEOUT` (still fail-open — empty result, never an error to the gateway). See the foot-gun in [Gotchas](#two-gotchas). |
+| `rankerOverrides` | object | server `RankerConfig` baseline | Optional per-namespace overlay for `pressureWeight` (`0..4`), `sloTightTTFTMs` (`>=0`), `sloTightBias` (`0..8`), `tenantHotMinHitRate` (`0..1`), and `tenantHotMaxAge` (non-negative duration). Omitted nested fields inherit the server baseline; explicit zero values retain their kill-switch meaning. |
 | `strategy` | object | chain matching on, chain not required, tenant-hot on | Per-namespace LookupRoute strategy gates. Use `enableChainMatching: false` to force exact `prefix_hash` matching, `requireChain: true` to reject non-chain callers with `POLICY_REQUIRES_CHAIN`, or `enableTenantHot: false` to suppress soft tenant-hot hints. |
 
 `status` carries only `observedGeneration` + `conditions`, and both are **reserved** — the
@@ -61,6 +62,12 @@ spec:
   routingFloorScore: "0.1"   # downgrade off PREFIX_MATCH when top score is below the floor — surfaces as AFFINITY_HINT under default-enabled affinity or NO_HINT when disabled (result-side score floor, default "0.1")
   affinityRouting: Enabled   # consistent-hash fallback on the StrategyNone branch; set Disabled for raw-recall benchmarking / debug
   lookupTimeoutMs: 20        # positive => a real 20ms deadline (NOT 0 — see Gotchas)
+  rankerOverrides:           # optional; omitted fields keep the server baseline
+    pressureWeight: 1
+    sloTightTTFTMs: 200
+    sloTightBias: 1
+    tenantHotMinHitRate: 0.1
+    tenantHotMaxAge: 5m
   strategy:
     enableChainMatching: true # default: use block-hash longest-prefix matching when callers send chains
     requireChain: false       # default: legacy exact prefix_hash callers still work

@@ -7,6 +7,7 @@ package controlplaneapi
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func TestProbeResultAllPassed(t *testing.T) {
@@ -46,11 +47,23 @@ func TestPolicySnapshotWireShape(t *testing.T) {
 	t.Parallel()
 
 	score := float32(0)
+	pressureWeight := float32(2)
+	sloTightTTFTMs := int32(150)
+	sloTightBias := float32(0)
+	tenantHotMinHitRate := float32(0.25)
+	tenantHotMaxAge := 2 * time.Minute
 	body, err := json.Marshal(PolicySnapshot{
 		Version: PolicyPropagationVersion,
 		Policies: []ResolvedPolicy{{
 			Namespace:         "team-a",
 			RoutingFloorScore: &score,
+			RankerOverrides: &ResolvedRankerOverrides{
+				PressureWeight:      &pressureWeight,
+				SLOTightTTFTMs:      &sloTightTTFTMs,
+				SLOTightBias:        &sloTightBias,
+				TenantHotMinHitRate: &tenantHotMinHitRate,
+				TenantHotMaxAge:     &tenantHotMaxAge,
+			},
 		}},
 		Tenants: []ResolvedTenant{{TenantID: "tenant-a", MaxIndexEntries: 10}},
 	})
@@ -58,7 +71,7 @@ func TestPolicySnapshotWireShape(t *testing.T) {
 		t.Fatalf("marshal snapshot: %v", err)
 	}
 
-	want := `{"version":7,"policies":[{"namespace":"team-a","routingFloorScore":0}],"tenants":[{"tenantID":"tenant-a","maxIndexEntries":10}]}`
+	want := `{"version":8,"policies":[{"namespace":"team-a","routingFloorScore":0,"rankerOverrides":{"pressureWeight":2,"sloTightTTFTMs":150,"sloTightBias":0,"tenantHotMinHitRate":0.25,"tenantHotMaxAge":120000000000}}],"tenants":[{"tenantID":"tenant-a","maxIndexEntries":10}]}`
 	if string(body) != want {
 		t.Fatalf("snapshot JSON = %s, want %s", body, want)
 	}
